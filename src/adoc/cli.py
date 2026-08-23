@@ -2,11 +2,14 @@
 
 Subcommands mirror PLAN.md's phasing: `init` does real work (validates
 Settings/models.yaml, then creates the data-repo layout via
-`DataRepo.init_at`); `ingest` (scan `<data_dir>/inbox/`) and `backfill
-<directory>` are wired to the real `ingest.pipeline` with a real
-`LlmClient`/`VisionClient` (`_build_llm_client`/`_build_vision_client` are
-the seams tests override with fakes). `onboard`, `review`, `serve`, `eval`
-remain stubbed scaffold placeholders for a later slice.
+`DataRepo.init_at`); `ingest` (scan `<data_dir>/inbox/`, optional
+`--reason` post-ingest reasoning pass) and `backfill <directory>` are
+wired to the real `ingest.pipeline` with a real `LlmClient`/`VisionClient`
+(`_build_llm_client`/`_build_vision_client` are the seams tests override
+with fakes); `review` runs the real weekly deep review
+(`reason.review.run_weekly_review`); `eval` runs the offline self-eval
+suites (`evals.runner`). `onboard` is likewise real; `serve` remains a
+stubbed scaffold placeholder for a later slice.
 """
 
 from __future__ import annotations
@@ -16,8 +19,10 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
-from adoc.casefile.repo import DataRepo
+from adoc.casefile.repo import LEDGER_RELPATH, DataRepo
 from adoc.config import Settings, load_model_bindings
+from adoc.evals.report import write_comparison_report, write_report
+from adoc.evals.runner import known_suites, run_suite
 from adoc.ingest.archive import PageRenderer, pdftoppm_renderer
 from adoc.ingest.pipeline import IngestReport, ingest_directory, ingest_inbox
 from adoc.ingest.vision import VisionClient
@@ -25,7 +30,9 @@ from adoc.intake.cli import run_onboarding_session
 from adoc.intake.wizard import IntakeWizard
 from adoc.labs.db import LabsDb
 from adoc.privacy import Scrubber
-from adoc.reason.client import LlmClient
+from adoc.reason.client import LlmClient, LlmError
+from adoc.reason.review import run_weekly_review
+from adoc.reason.stages import render_new_evidence_note, run_post_ingest_dag
 
 
 def _cmd_init(_args: argparse.Namespace) -> int:
@@ -117,7 +124,7 @@ def _print_ingest_report(report: IngestReport) -> None:
     )
 
 
-def _run_ingest(settings: Settings, directory: Path | None) -> int:
+def _run_ingest(settings: Settings, directory: Path | None, *, reason: bool = False) -> int:
     repo = DataRepo(settings.data_dir)
     if not repo.is_initialized:
         print(
@@ -136,21 +143,60 @@ def _run_ingest(settings: Settings, directory: Path | None) -> int:
         else:
             report = ingest_inbox(repo=repo, db=db, vision=vision, renderer=renderer)
 
+        if reason:
+            evidence_note = render_new_evidence_note(report)
+            if evidence_note is None:
+                print("ingest: --reason given but no rows were added; skipping reasoning pass")
+            else:
+                ledger_path = repo.root / LEDGER_RELPATH
+                new_ledger = run_post_ingest_dag(llm_client, repo, db, ledger_path, evidence_note)
+                print(f"ingest: reasoning pass updated the ledger to version {new_ledger.version}")
+
     _print_ingest_report(report)
     return 1 if any(f.outcome == "error" for f in report.files) else 0
 
 
-def _cmd_ingest(_args: argparse.Namespace) -> int:
+def _cmd_ingest(args: argparse.Namespace) -> int:
     try:
         settings = Settings()
     except Exception as exc:  # noqa: BLE001 - surface any config error to the user
         print(f"ingest: configuration error: {exc}", file=sys.stderr)
         return 1
-    return _run_ingest(settings, directory=None)
+    return _run_ingest(settings, directory=None, reason=args.reason)
 
 
 def _cmd_review(_args: argparse.Namespace) -> int:
-    return _stub("review")
+    try:
+        settings = Settings()
+    except Exception as exc:  # noqa: BLE001 - surface any config error to the user
+        print(f"review: configuration error: {exc}", file=sys.stderr)
+        return 1
+
+    repo = DataRepo(settings.data_dir)
+    if not repo.is_initialized:
+        print(
+            f"review: data repo not initialized at {settings.data_dir} - run `adoc init` first",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        client = _build_llm_client(settings)
+    except Exception as exc:  # noqa: BLE001 - surface any config error to the user
+        print(f"review: configuration error: {exc}", file=sys.stderr)
+        return 1
+
+    db_path = settings.data_dir / "labs.sqlite"
+    with LabsDb(db_path) as db:
+        report = run_weekly_review(repo, db, client)
+
+    print(
+        f"review: {report.review_date.isoformat()} — ledger {report.ledger_version_before} "
+        f"-> {report.ledger_version_after}"
+    )
+    print(f"review: committed {report.commit_sha[:12]}, tagged {report.tag}")
+    print(f"review: report written to {report.markdown_path}")
+    return 0
 
 
 def _cmd_serve(_args: argparse.Namespace) -> int:
@@ -170,8 +216,52 @@ def _cmd_backfill(args: argparse.Namespace) -> int:
     return _run_ingest(settings, directory=directory)
 
 
-def _cmd_eval(_args: argparse.Namespace) -> int:
-    return _stub("eval")
+def _eval_out_dir(explicit: str | None) -> Path:
+    """`--out`, if given; otherwise `<data_dir>/work/eval` when a
+    configured data repo is available, else `./work/eval` (PLAN.md's
+    `eval.yml` CI run always passes `--out` explicitly, so it never
+    depends on `Settings`/`ADOC_DATA_DIR` being set at all)."""
+    if explicit is not None:
+        return Path(explicit)
+    try:
+        settings = Settings()
+    except Exception:  # noqa: BLE001 - fall back rather than fail eval on missing config
+        return Path("work") / "eval"
+    return settings.data_dir / "work" / "eval"
+
+
+def _eval_client_factory() -> LlmClient:
+    """Both current suites (`extraction`, `redteam`) never call the client
+    this builds — see `evals.runner`'s module docstring — so this raises
+    rather than silently returning something misleading if a future suite
+    ever does call it without a real one wired in.
+    """
+    raise LlmError("no real LlmClient is wired into `adoc eval` for this suite")
+
+
+def _cmd_eval(args: argparse.Namespace) -> int:
+    suite_names: list[str] = args.suites or known_suites()
+    out_dir = _eval_out_dir(args.out)
+
+    all_passed = True
+    for name in sorted(suite_names):
+        incumbent = run_suite(name, client_factory=_eval_client_factory)
+        write_report(incumbent, out_dir)
+        print(f"eval: {name}: {incumbent.pass_rate:.0%} pass rate ({len(incumbent.cases)} cases)")
+        for case in incumbent.cases:
+            if not case.passed:
+                print(f"  eval: {name}: FAIL {case.case_id}: {case.detail}")
+        all_passed = all_passed and incumbent.passed
+
+        if args.candidate:
+            candidate = run_suite(
+                name, client_factory=_eval_client_factory, candidate=args.candidate
+            )
+            write_comparison_report(incumbent, candidate, out_dir)
+            print(f"eval: {name}: comparison report written for candidate {args.candidate}")
+
+    print(f"eval: reports written to {out_dir}")
+    return 0 if all_passed else 1
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -184,9 +274,17 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("onboard", help="run the onboarding intake wizard").set_defaults(
         func=_cmd_onboard
     )
-    subparsers.add_parser("ingest", help="run the document ingestion pipeline").set_defaults(
-        func=_cmd_ingest
+    ingest_parser = subparsers.add_parser("ingest", help="run the document ingestion pipeline")
+    ingest_parser.add_argument(
+        "--reason",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "run the diagnostic reasoning DAG over newly-ingested evidence to update the "
+            "ledger (default: --no-reason)"
+        ),
     )
+    ingest_parser.set_defaults(func=_cmd_ingest)
     subparsers.add_parser("review", help="run the weekly deep review").set_defaults(
         func=_cmd_review
     )
@@ -194,9 +292,25 @@ def build_parser() -> argparse.ArgumentParser:
     backfill_parser = subparsers.add_parser("backfill", help="backfill historical documents")
     backfill_parser.add_argument("directory", help="directory of documents to ingest")
     backfill_parser.set_defaults(func=_cmd_backfill)
-    subparsers.add_parser("eval", help="run the self-evaluation benchmark suite").set_defaults(
-        func=_cmd_eval
+    eval_parser = subparsers.add_parser("eval", help="run the self-evaluation benchmark suite")
+    eval_parser.add_argument(
+        "--suite",
+        action="append",
+        dest="suites",
+        choices=known_suites(),
+        help="suite to run (repeatable; default: all known suites)",
     )
+    eval_parser.add_argument(
+        "--candidate",
+        default=None,
+        help="provider:model to compare against the incumbent binding",
+    )
+    eval_parser.add_argument(
+        "--out",
+        default=None,
+        help="output directory for the report (default: <data_dir>/work/eval)",
+    )
+    eval_parser.set_defaults(func=_cmd_eval)
     return parser
 
 

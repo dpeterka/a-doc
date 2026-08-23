@@ -15,6 +15,7 @@ from __future__ import annotations
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 from conftest import TINY_PDF_BYTES, fake_page_renderer
@@ -22,11 +23,13 @@ from conftest import TINY_PDF_BYTES, fake_page_renderer
 import adoc.cli as cli
 from adoc.casefile.repo import DataRepo
 from adoc.cli import main
+from adoc.config import ModelBinding
 from adoc.ingest.schema import ClassifyResult, DocumentExtraction
+from adoc.reason.client import AnthropicProvider, LlmClient, TransportRequest, TransportResponse
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-_STUB_COMMANDS = ["review", "serve", "eval"]
+_STUB_COMMANDS = ["serve"]
 
 
 class _FakeVisionClient:
@@ -65,7 +68,7 @@ def test_init_succeeds_with_valid_env(
     assert code == 0
     out = capsys.readouterr().out
     assert "data_dir=" in out
-    assert "loaded 6 model role bindings" in out
+    assert "loaded 7 model role bindings" in out
 
 
 def test_init_creates_data_repo_and_is_idempotent(
@@ -218,6 +221,128 @@ def test_onboard_runs_the_wizard_loop_against_an_initialized_repo(
     out = capsys.readouterr().out
     assert "[1/10] Basics" in out
     assert "resume anytime with `adoc onboard`" in out
+
+
+def _empty_review_fake_client() -> LlmClient:
+    """A fake client that answers every review-DAG role with an empty
+    result — valid against an empty seed ledger (no active hypotheses,
+    so every completeness postcondition is vacuously satisfied)."""
+
+    def transport(request: TransportRequest) -> TransportResponse:
+        assert request.schema is not None
+        name = request.schema.__name__
+        tool_input: dict[str, Any]
+        if name == "BlindDifferentialPayload":
+            tool_input = {"items": []}
+        elif name == "AdjudicationPayload":
+            tool_input = {"decisions": []}
+        elif name == "ChallengeSweepPayload":
+            tool_input = {"notes": []}
+        elif name == "TestChooserPayload":
+            tool_input = {"items": []}
+        else:  # pragma: no cover - defensive
+            raise AssertionError(f"unexpected schema: {name}")
+        return TransportResponse(text="", tool_input=tool_input, input_tokens=1, output_tokens=1)
+
+    bindings: dict[str, list[ModelBinding]] = {
+        "blind_panel": [
+            ModelBinding(provider="anthropic", model="fake-blind-0"),
+            ModelBinding(provider="anthropic", model="fake-blind-1"),
+        ],
+        "challenger": [ModelBinding(provider="anthropic", model="fake-challenger")],
+        "test_chooser": [ModelBinding(provider="anthropic", model="fake-test-chooser")],
+    }
+    providers = {"anthropic": AnthropicProvider(api_key=None, transport=transport)}
+    return LlmClient(bindings, providers)
+
+
+def test_review_fails_without_data_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("ADOC_DATA_DIR", raising=False)
+
+    code = main(["review"])
+
+    assert code == 1
+    assert "configuration error" in capsys.readouterr().err
+
+
+def test_review_fails_if_data_repo_not_initialized(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("ADOC_DATA_DIR", str(tmp_path / "a-doc-data"))
+    monkeypatch.setenv("ADOC_MODELS_FILE", str(REPO_ROOT / "models.yaml"))
+
+    code = main(["review"])
+
+    assert code == 1
+    assert "run `adoc init` first" in capsys.readouterr().err
+
+
+def test_review_runs_end_to_end_with_a_fake_client(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    data_dir = tmp_path / "a-doc-data"
+    DataRepo.init_at(data_dir)
+    monkeypatch.setenv("ADOC_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("ADOC_MODELS_FILE", str(REPO_ROOT / "models.yaml"))
+    monkeypatch.setattr(cli, "_build_llm_client", lambda settings: _empty_review_fake_client())
+
+    code = main(["review"])
+
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "ledger 0 -> 1" in out
+    assert "tagged review-" in out
+
+
+def test_eval_runs_offline_with_out_dir(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    out_dir = tmp_path / "eval-out"
+
+    code = main(["eval", "--suite", "extraction", "--suite", "redteam", "--out", str(out_dir)])
+
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "extraction:" in out
+    assert "redteam:" in out
+    assert (out_dir / "extraction-report.md").exists()
+    assert (out_dir / "redteam-report.md").exists()
+
+
+def test_eval_default_suites_runs_all_known_suites(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    out_dir = tmp_path / "eval-out"
+
+    code = main(["eval", "--out", str(out_dir)])
+
+    assert code == 0
+    assert (out_dir / "extraction-report.md").exists()
+    assert (out_dir / "redteam-report.md").exists()
+
+
+def test_eval_with_candidate_writes_a_comparison_report(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    out_dir = tmp_path / "eval-out"
+
+    code = main(
+        [
+            "eval",
+            "--suite",
+            "redteam",
+            "--out",
+            str(out_dir),
+            "--candidate",
+            "openai:gpt-9000",
+        ]
+    )
+
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "comparison report written" in out
+    assert (out_dir / "redteam-comparison.md").exists()
 
 
 def test_unknown_subcommand_exits_nonzero() -> None:

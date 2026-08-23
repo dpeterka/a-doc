@@ -34,6 +34,7 @@ from adoc.casefile.schema import (
     Provenance,
     UpdateHypothesis,
 )
+from adoc.ingest.pipeline import IngestReport
 from adoc.labs.db import LabsDb
 from adoc.reason.client import LlmClient, LlmResult, Message
 from adoc.reason.context import ContextPack, build_context
@@ -458,27 +459,86 @@ def run_informational_turn(
 ) -> LlmResult | RedFlagResult:
     """Entry point for one informational chat turn (PLAN.md loop (b)).
 
-    A minimal single-call, read-only answer over the context pack (with
-    the ledger withheld — informational turns never mutate or need it).
-    Full whitelisted-tool support (`query_labs`/`search_case`/web search)
-    is `reason/tools.py`, a later slice; this is deliberately the simplest
-    thing that respects the same "red-flag screen before any client call"
-    rule as the diagnostic path.
+    Delegates the actual call to `reason.tools.informational_llm_result` —
+    the MVP tool loop (`query_labs`/`search_case`/`list_encounters`, PLAN.md
+    "Reasoner integration": "Chat tool-use ... runs inside a single
+    whitelisted-tools node"). This entry point still owns the red-flag
+    screen (so it runs before any client call, exactly as the diagnostic
+    path does) and keeps this function's `LlmResult | RedFlagResult`
+    return type stable for existing callers; `tools.answer_informational`
+    is the string-returning, treatment-gated variant for direct use (e.g.
+    from a future chat route).
     """
+    # Imported here, not at module level: `reason.tools` is a later slice
+    # that this module now delegates to, and importing it lazily avoids
+    # committing to an import-order assumption between the two modules.
+    from adoc.reason.tools import informational_llm_result
 
-    def _proceed() -> LlmResult:
-        context_pack = build_context(repo, db, include_ledger=False)
-        system = (
-            "You are answering a read-only, informational question about the patient's "
-            "own case file. Answer only from the provided context; never produce a "
-            "diagnosis, a probability judgment, or any treatment/dosing advice. If the "
-            "context does not support an answer, say so plainly rather than guessing."
-        )
-        user_content = f"{context_pack.render()}\n\n## Patient Question\n\n{text}\n"
-        return client.complete(
-            "primary_reasoner",
-            system=system,
-            messages=[Message(role="user", content=user_content)],
-        )
+    return guarded_turn(text, lambda: informational_llm_result(client, repo, db, text))
 
-    return guarded_turn(text, _proceed)
+
+def render_new_evidence_note(report: IngestReport) -> str | None:
+    """Render a short "new evidence" note from an `IngestReport`, for the
+    post-ingest reasoning pass (PLAN.md loop (a), `adoc ingest --reason`).
+
+    Returns `None` if the report added no rows at all (nothing to reason
+    about — `run_post_ingest_dag` is skipped by its caller in that case).
+    Deliberately does not restate the actual lab values here: the
+    up-to-date labs section is already part of the context pack the DAG
+    is run with, so this note is just a pointer at what just changed.
+    """
+    lines: list[str] = []
+    for outcome in report.files:
+        if outcome.outcome != "ingested":
+            continue
+        if outcome.rows_auto == 0 and outcome.rows_pending == 0:
+            continue
+        pending_note = (
+            f", {outcome.rows_pending} queued for confirmation" if outcome.rows_pending else ""
+        )
+        lines.append(
+            f"- {Path(outcome.path).name} ({outcome.doc_type or 'document'}): "
+            f"{outcome.rows_auto} new lab result(s) auto-accepted{pending_note} — see the "
+            "updated Labs section above for current values."
+        )
+    if not lines:
+        return None
+    return "New evidence just arrived from document ingestion:\n" + "\n".join(lines)
+
+
+def run_post_ingest_dag(
+    client: LlmClient,
+    repo: DataRepo,
+    db: LabsDb,
+    ledger_path: Path,
+    evidence_note: str,
+) -> Ledger:
+    """Run the diagnostic DAG (`build_diagnostic_dag`) over newly-ingested
+    evidence (PLAN.md loop (a): "incremental reasoning: Ledger-Maintainer
+    diff -> Challenger ... -> apply"). Callers (`adoc ingest --reason`)
+    supply `evidence_note` from `render_new_evidence_note` and are
+    responsible for skipping the call entirely when no rows were added.
+
+    No red-flag screen here: this is triggered by document ingestion, not
+    by free-text patient chat, so there is no patient utterance to screen.
+    Returns the applied `Ledger` (the DAG's `apply` node output); the
+    Composer's rendered reply is also produced (the DAG contract requires
+    it) but is not the point of this entry point and is discarded.
+    """
+    context_pack = build_context(repo, db, include_ledger=True)
+    prior_ledger = load_ledger(ledger_path)
+    sink: dict[str, BaseModel] = {}
+    dag = build_diagnostic_dag(client, repo, ledger_path, sink)
+
+    run(
+        dag,
+        {
+            "context_pack": context_pack,
+            "patient_turn": PatientTurn(text=evidence_note),
+            "ledger": prior_ledger,
+        },
+    )
+
+    new_ledger = sink["apply"]
+    assert isinstance(new_ledger, Ledger)
+    return new_ledger
