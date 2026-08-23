@@ -22,7 +22,7 @@ Parameters:
     Description: EC2 instance type (arm64 — t4g family per PLAN.md).
   AmiId:
     Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
-    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-minimal-arm64
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-minimal-kernel-default-arm64
     Description: Latest Amazon Linux 2023 minimal arm64 AMI, resolved via SSM.
   DataVolumeSizeGiB:
     Type: Number
