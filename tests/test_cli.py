@@ -396,6 +396,133 @@ def test_serve_defaults_to_localhost_8080(
     assert port == 8080
 
 
+def test_user_add_creates_a_user_with_injected_getpass(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    data_dir = tmp_path / "a-doc-data"
+    DataRepo.init_at(data_dir)
+    monkeypatch.setenv("ADOC_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("ADOC_MODELS_FILE", str(REPO_ROOT / "models.yaml"))
+
+    passwords = iter(["a-good-password", "a-good-password"])
+    monkeypatch.setattr(cli, "_getpass", lambda _prompt: next(passwords))
+
+    code = main(["user", "add", "alice"])
+
+    assert code == 0
+    assert "added user 'alice'" in capsys.readouterr().out
+    from adoc.web.users import verify_user
+
+    assert verify_user(data_dir / "work" / "users.yaml", "alice", "a-good-password") is True
+
+
+def test_user_add_fails_when_passwords_do_not_match(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    data_dir = tmp_path / "a-doc-data"
+    DataRepo.init_at(data_dir)
+    monkeypatch.setenv("ADOC_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("ADOC_MODELS_FILE", str(REPO_ROOT / "models.yaml"))
+
+    passwords = iter(["first-password", "second-password"])
+    monkeypatch.setattr(cli, "_getpass", lambda _prompt: next(passwords))
+
+    code = main(["user", "add", "alice"])
+
+    assert code == 1
+    assert "did not match" in capsys.readouterr().err
+
+
+def test_user_add_fails_on_empty_password(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    data_dir = tmp_path / "a-doc-data"
+    DataRepo.init_at(data_dir)
+    monkeypatch.setenv("ADOC_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("ADOC_MODELS_FILE", str(REPO_ROOT / "models.yaml"))
+
+    monkeypatch.setattr(cli, "_getpass", lambda _prompt: "")
+
+    code = main(["user", "add", "alice"])
+
+    assert code == 1
+    assert "must not be empty" in capsys.readouterr().err
+
+
+def test_user_list_reports_no_users_when_empty(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    data_dir = tmp_path / "a-doc-data"
+    DataRepo.init_at(data_dir)
+    monkeypatch.setenv("ADOC_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("ADOC_MODELS_FILE", str(REPO_ROOT / "models.yaml"))
+
+    code = main(["user", "list"])
+
+    assert code == 0
+    assert "no users configured" in capsys.readouterr().out
+
+
+def test_user_list_prints_usernames(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    data_dir = tmp_path / "a-doc-data"
+    DataRepo.init_at(data_dir)
+    monkeypatch.setenv("ADOC_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("ADOC_MODELS_FILE", str(REPO_ROOT / "models.yaml"))
+    from adoc.web.users import add_user
+
+    add_user(data_dir / "work" / "users.yaml", "alice", "some-password")
+
+    code = main(["user", "list"])
+
+    assert code == 0
+    assert "alice" in capsys.readouterr().out
+
+
+def test_user_remove_removes_an_existing_user(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    data_dir = tmp_path / "a-doc-data"
+    DataRepo.init_at(data_dir)
+    monkeypatch.setenv("ADOC_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("ADOC_MODELS_FILE", str(REPO_ROOT / "models.yaml"))
+    from adoc.web.users import add_user
+
+    add_user(data_dir / "work" / "users.yaml", "alice", "some-password")
+
+    code = main(["user", "remove", "alice"])
+
+    assert code == 0
+    assert "removed user 'alice'" in capsys.readouterr().out
+
+
+def test_user_remove_fails_for_an_unknown_user(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    data_dir = tmp_path / "a-doc-data"
+    DataRepo.init_at(data_dir)
+    monkeypatch.setenv("ADOC_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("ADOC_MODELS_FILE", str(REPO_ROOT / "models.yaml"))
+
+    code = main(["user", "remove", "no-such-user"])
+
+    assert code == 1
+    assert "no such user" in capsys.readouterr().err
+
+
+def test_user_add_fails_without_data_dir(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)  # hermetic: a developer .env must not leak into Settings
+    monkeypatch.delenv("ADOC_DATA_DIR", raising=False)
+
+    code = main(["user", "add", "alice"])
+
+    assert code == 1
+    assert "configuration error" in capsys.readouterr().err
+
+
 def test_unknown_subcommand_exits_nonzero() -> None:
     with pytest.raises(SystemExit) as excinfo:
         main(["not-a-real-command"])

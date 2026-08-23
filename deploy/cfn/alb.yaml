@@ -1,0 +1,123 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  a-doc ALB stack: public-facing Application Load Balancer, ACM certificate,
+  and the Route53 alias record for the patient-facing domain. This is the
+  public entry point that replaced Tailscale (explicit user decision) — the
+  instance itself is still not directly reachable from the internet (see
+  network.yaml's InstanceSecurityGroup, which only admits the ALB's
+  security group on port 8080). Authentication is now an in-app
+  username/password gate with in-app rate limiting (src/adoc/web); this
+  stack adds no WAF and no additional network-level auth by design.
+
+Parameters:
+  NetworkStackName:
+    Type: String
+    Default: a-doc-network
+    Description: Name of the deployed network stack (for cross-stack imports).
+  InstanceStackName:
+    Type: String
+    Default: a-doc-instance
+    Description: Name of the deployed instance stack (for cross-stack imports).
+  DomainName:
+    Type: String
+    Default: adoc.petabloc.io
+    Description: Public DNS name patients use to reach the app.
+  HostedZoneId:
+    Type: String
+    Default: Z009458513KFY2WNUS7C0
+    Description: Route53 hosted zone id for petabloc.io.
+
+Resources:
+  Certificate:
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName: !Ref DomainName
+      ValidationMethod: DNS
+      DomainValidationOptions:
+        - DomainName: !Ref DomainName
+          HostedZoneId: !Ref HostedZoneId
+      Tags:
+        - Key: Name
+          Value: a-doc-cert
+
+  Alb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: a-doc-alb
+      Type: application
+      Scheme: internet-facing
+      Subnets:
+        - Fn::ImportValue: !Sub "${NetworkStackName}-SubnetId"
+        - Fn::ImportValue: !Sub "${NetworkStackName}-Subnet2Id"
+      SecurityGroups:
+        - Fn::ImportValue: !Sub "${NetworkStackName}-AlbSecurityGroupId"
+      Tags:
+        - Key: Name
+          Value: a-doc-alb
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: a-doc-tg
+      VpcId:
+        Fn::ImportValue: !Sub "${NetworkStackName}-VpcId"
+      Port: 8080
+      Protocol: HTTP
+      TargetType: instance
+      HealthCheckEnabled: true
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /healthz
+      HealthCheckIntervalSeconds: 30
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Targets:
+        - Id:
+            Fn::ImportValue: !Sub "${InstanceStackName}-InstanceId"
+          Port: 8080
+      Tags:
+        - Key: Name
+          Value: a-doc-tg
+
+  HttpsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref Alb
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !Ref Certificate
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref Alb
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: redirect
+          RedirectConfig:
+            Protocol: HTTPS
+            Port: "443"
+            StatusCode: HTTP_301
+
+  DnsRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Sub "${DomainName}."
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt Alb.DNSName
+        HostedZoneId: !GetAtt Alb.CanonicalHostedZoneID
+        EvaluateTargetHealth: true
+
+Outputs:
+  AlbDnsName:
+    Value: !GetAtt Alb.DNSName
+    Export:
+      Name: !Sub "${AWS::StackName}-AlbDnsName"
+  Url:
+    Value: !Sub "https://${DomainName}/"
