@@ -1,0 +1,31 @@
+{
+  "pass_a": {
+    "doc_type": "lab_report",
+    "facility": "Quest Diagnostics",
+    "collection_date": "2026-05-02",
+    "report_date": "2026-05-03",
+    "results": [
+      {
+        "name_raw": "Ferritin",
+        "value": 45,
+        "unit_raw": "ng/mL",
+        "ref_range_raw": "20-250",
+        "page": 1,
+        "confidence": "high"
+      }
+    ],
+    "narrative_findings": [],
+    "illegible_regions": []
+  },
+  "pass_b": {
+    "doc_type": "lab_report",
+    "facility": "Quest Diagnostics",
+    "collection_date": "2026-05-02",
+    "report_date": "2026-05-03",
+    "results": [],
+    "narrative_findings": [],
+    "illegible_regions": [
+      {"page": 1, "description": "bottom row smudged, could not read Ferritin"}
+    ]
+  }
+}
