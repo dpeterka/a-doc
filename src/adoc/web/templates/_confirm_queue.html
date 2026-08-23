@@ -1,0 +1,86 @@
+<div id="confirm-queue">
+  {% if error %}
+    <p class="error" role="alert">{{ error }}</p>
+  {% endif %}
+
+  {% if rows %}
+    <p class="muted">{{ rows | length }} row{{ "s" if rows | length != 1 else "" }} waiting for your review.</p>
+    {% for item in rows %}
+      {% set row = item.row %}
+      <article class="confirm-row card">
+        <div class="confirm-row-body">
+          <div class="confirm-source-image">
+            {% if item.image_url %}
+              <img src="{{ item.image_url }}" alt="Source document page for {{ row.name }}" loading="lazy">
+            {% else %}
+              <p class="muted">No source page image available.</p>
+            {% endif %}
+          </div>
+
+          <div class="confirm-fields">
+            <h3>{{ row.name }} <span class="muted">({{ row.date.isoformat() }})</span></h3>
+            <p class="muted">As read from the document: {{ row.name_raw }}</p>
+            <p>
+              Value:
+              <strong>{{ row.value if row.value is not none else row.value_text }}</strong>
+              {% if row.ucum_unit %}{{ row.ucum_unit }}{% endif %}
+              {% if row.flag %}<span class="chip chip-flag">{{ row.flag.value }}</span>{% endif %}
+            </p>
+            {% if row.ref_text %}<p class="muted">Reference range: {{ row.ref_text }}</p>{% endif %}
+
+            <div class="button-row">
+              <form hx-post="/confirm/{{ row.id }}/confirm" hx-target="#confirm-queue" hx-swap="outerHTML">
+                <button type="submit" class="button-primary">Confirm</button>
+              </form>
+              <form hx-post="/confirm/{{ row.id }}/reject" hx-target="#confirm-queue" hx-swap="outerHTML">
+                <button type="submit" class="button-danger">Reject</button>
+              </form>
+            </div>
+
+            <details class="correct-details">
+              <summary>Something's wrong — let me fix it</summary>
+              <form hx-post="/confirm/{{ row.id }}/correct" hx-target="#confirm-queue" hx-swap="outerHTML"
+                    class="correct-form">
+                <label>
+                  Date
+                  <input type="date" name="date" value="{{ row.date.isoformat() }}">
+                </label>
+                <label>
+                  Name
+                  <input type="text" name="name" value="{{ row.name }}">
+                </label>
+                <label>
+                  Value
+                  <input type="text" name="value" value="{{ row.value if row.value is not none else '' }}">
+                </label>
+                <label>
+                  Value (text)
+                  <input type="text" name="value_text" value="{{ row.value_text or '' }}">
+                </label>
+                <label>
+                  Unit
+                  <input type="text" name="ucum_unit" value="{{ row.ucum_unit or '' }}">
+                </label>
+                <label>
+                  Reference low
+                  <input type="text" name="ref_low" value="{{ row.ref_low if row.ref_low is not none else '' }}">
+                </label>
+                <label>
+                  Reference high
+                  <input type="text" name="ref_high" value="{{ row.ref_high if row.ref_high is not none else '' }}">
+                </label>
+                <label>
+                  Flag
+                  <input type="text" name="flag" value="{{ row.flag.value if row.flag else '' }}">
+                </label>
+                <button type="submit">Save correction</button>
+              </form>
+            </details>
+          </div>
+        </div>
+      </article>
+    {% endfor %}
+  {% else %}
+    <p>Nothing waiting for review right now.</p>
+  {% endif %}
+</div>

@@ -8,7 +8,7 @@ a-doc is a single-patient, longitudinal medical-diagnostic assistant (Python). R
 - Test: `uv run pytest` (coverage gate enforced in CI)
 - Lint/format: `uv run ruff check --fix . && uv run ruff format .`
 - Types: `uv run mypy src`
-- App CLI: `uv run adoc <init|onboard|ingest|review|serve|backfill|eval>`
+- App CLI: `uv run adoc <init|onboard|ingest|review|serve|backfill|eval|user>`
 
 ## Hard rules
 
@@ -29,7 +29,7 @@ a-doc is a single-patient, longitudinal medical-diagnostic assistant (Python). R
 ## Infrastructure
 
 - All AWS resources are CloudFormation in `deploy/cfn/` (network, instance, backup, ci). No console-created resources; changes go through PRs and change sets. Deploys run from GitHub Actions via the OIDC role.
-- The EC2 instance is reachable via SSM and Tailscale only — no SSH keys, no public ingress.
+- The EC2 instance has no SSH keys and no direct public ingress; a shell is reachable via SSM only. The app is reached through a public ALB (`deploy/cfn/alb.yaml`) at `https://adoc.petabloc.io`, with username/password auth + in-app rate limiting in `src/adoc/web` (explicit user decision, superseding the earlier Tailscale-only design — see PLAN.md).
 
 ## Code conventions
 

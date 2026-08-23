@@ -4,6 +4,10 @@ Subcommands are invoked by calling `main()` directly (not via subprocess) so
 that coverage.py can attribute execution to these tests. A separate
 subprocess-based test exercises the real console entrypoint end-to-end for
 `--help` / an unknown subcommand.
+
+`ingest`/`backfill` are wired to the real `ingest.pipeline`; tests exercise
+them by monkeypatching `adoc.cli._build_vision_client` (the seam the module
+docstring calls out) so no real provider/network call ever happens.
 """
 
 from __future__ import annotations
@@ -11,22 +15,35 @@ from __future__ import annotations
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
+from conftest import TINY_PDF_BYTES, fake_page_renderer
 
+import adoc.cli as cli
+from adoc.casefile.repo import DataRepo
 from adoc.cli import main
+from adoc.config import ModelBinding
+from adoc.ingest.schema import ClassifyResult, DocumentExtraction
+from adoc.reason.client import AnthropicProvider, LlmClient, TransportRequest, TransportResponse
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-_STUB_COMMANDS = ["onboard", "ingest", "review", "serve", "backfill", "eval"]
+
+class _FakeVisionClient:
+    """Routes every role to a fixed `clinical_note` classification - enough
+    to exercise the CLI's ingest wiring without a real provider call.
+    """
+
+    def extract(self, role, *, system, parts, schema, binding_index=0, max_tokens=4096):  # type: ignore[no-untyped-def]
+        if role == "classifier":
+            return ClassifyResult(doc_type="clinical_note", doc_date=None)
+        return DocumentExtraction(doc_type="clinical_note")  # pragma: no cover - not reached
 
 
-@pytest.mark.parametrize("command", _STUB_COMMANDS)
-def test_stub_subcommands_exit_zero(command: str, capsys: pytest.CaptureFixture[str]) -> None:
-    code = main([command])
-    assert code == 0
-    out = capsys.readouterr().out
-    assert "not implemented (phase 1)" in out
+def _patch_fake_vision(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli, "_build_vision_client", lambda llm_client: _FakeVisionClient())
+    monkeypatch.setattr(cli, "_build_renderer", lambda: fake_page_renderer(1))
 
 
 def test_init_succeeds_with_valid_env(
@@ -41,12 +58,32 @@ def test_init_succeeds_with_valid_env(
     assert code == 0
     out = capsys.readouterr().out
     assert "data_dir=" in out
-    assert "loaded 6 model role bindings" in out
+    assert "loaded 7 model role bindings" in out
+
+
+def test_init_creates_data_repo_and_is_idempotent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    data_dir = tmp_path / "a-doc-data"
+    monkeypatch.setenv("ADOC_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("ADOC_MODELS_FILE", str(REPO_ROOT / "models.yaml"))
+
+    first_code = main(["init"])
+    first_out = capsys.readouterr().out
+    assert first_code == 0
+    assert f"initialized data repo at {data_dir}" in first_out
+    assert (data_dir / "case" / "differential-ledger.yaml").exists()
+
+    second_code = main(["init"])
+    second_out = capsys.readouterr().out
+    assert second_code == 0
+    assert f"already initialized at {data_dir}" in second_out
 
 
 def test_init_fails_without_data_dir(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
+    monkeypatch.chdir(tmp_path)  # hermetic: a developer .env must not leak into Settings
     monkeypatch.delenv("ADOC_DATA_DIR", raising=False)
 
     code = main(["init"])
@@ -54,6 +91,436 @@ def test_init_fails_without_data_dir(
     assert code == 1
     err = capsys.readouterr().err
     assert "configuration error" in err
+
+
+def test_ingest_fails_without_an_initialized_data_repo(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("ADOC_DATA_DIR", str(tmp_path / "a-doc-data"))
+    monkeypatch.setenv("ADOC_MODELS_FILE", str(REPO_ROOT / "models.yaml"))
+
+    code = main(["ingest"])
+
+    assert code == 1
+    assert "not initialized" in capsys.readouterr().err
+
+
+def test_ingest_scans_the_inbox_and_prints_a_report(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    data_dir = tmp_path / "a-doc-data"
+    repo = DataRepo.init_at(data_dir)
+    (repo.root / "inbox" / "visit.pdf").write_bytes(TINY_PDF_BYTES)
+    monkeypatch.setenv("ADOC_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("ADOC_MODELS_FILE", str(REPO_ROOT / "models.yaml"))
+    _patch_fake_vision(monkeypatch)
+
+    code = main(["ingest"])
+
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "visit.pdf" in out
+    assert "ingested" in out
+    encounters = list((repo.root / "case" / "encounters").glob("*.md"))
+    assert len(encounters) == 1
+
+
+def test_backfill_ingests_a_given_directory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    data_dir = tmp_path / "a-doc-data"
+    DataRepo.init_at(data_dir)
+    backfill_dir = tmp_path / "historical"
+    backfill_dir.mkdir()
+    (backfill_dir / "old-visit.pdf").write_bytes(TINY_PDF_BYTES)
+    monkeypatch.setenv("ADOC_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("ADOC_MODELS_FILE", str(REPO_ROOT / "models.yaml"))
+    _patch_fake_vision(monkeypatch)
+
+    code = main(["backfill", str(backfill_dir)])
+
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "old-visit.pdf" in out
+
+
+def test_backfill_fails_for_a_missing_directory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    data_dir = tmp_path / "a-doc-data"
+    DataRepo.init_at(data_dir)
+    monkeypatch.setenv("ADOC_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("ADOC_MODELS_FILE", str(REPO_ROOT / "models.yaml"))
+
+    code = main(["backfill", str(tmp_path / "does-not-exist")])
+
+    assert code == 1
+    assert "not a directory" in capsys.readouterr().err
+
+
+def test_onboard_fails_without_data_dir(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)  # hermetic: a developer .env must not leak into Settings
+    monkeypatch.delenv("ADOC_DATA_DIR", raising=False)
+
+    code = main(["onboard"])
+
+    assert code == 1
+    err = capsys.readouterr().err
+    assert "configuration error" in err
+
+
+def test_onboard_fails_if_data_repo_not_initialized(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    data_dir = tmp_path / "a-doc-data"
+    monkeypatch.setenv("ADOC_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("ADOC_MODELS_FILE", str(REPO_ROOT / "models.yaml"))
+
+    code = main(["onboard"])
+
+    assert code == 1
+    err = capsys.readouterr().err
+    assert "run `adoc init` first" in err
+
+
+def test_onboard_runs_the_wizard_loop_against_an_initialized_repo(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    data_dir = tmp_path / "a-doc-data"
+    monkeypatch.setenv("ADOC_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("ADOC_MODELS_FILE", str(REPO_ROOT / "models.yaml"))
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+    assert main(["init"]) == 0
+    capsys.readouterr()
+
+    def _eof_input(_prompt: str = "") -> str:
+        raise EOFError
+
+    monkeypatch.setattr("builtins.input", _eof_input)
+
+    # Immediate EOF: no LLM call is ever made, so no network / API key is
+    # needed to exercise the wiring end-to-end.
+    code = main(["onboard"])
+
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "[1/10] Basics" in out
+    assert "resume anytime with `adoc onboard`" in out
+
+
+def _empty_review_fake_client() -> LlmClient:
+    """A fake client that answers every review-DAG role with an empty
+    result — valid against an empty seed ledger (no active hypotheses,
+    so every completeness postcondition is vacuously satisfied)."""
+
+    def transport(request: TransportRequest) -> TransportResponse:
+        assert request.schema is not None
+        name = request.schema.__name__
+        tool_input: dict[str, Any]
+        if name == "BlindDifferentialPayload":
+            tool_input = {"items": []}
+        elif name == "AdjudicationPayload":
+            tool_input = {"decisions": []}
+        elif name == "ChallengeSweepPayload":
+            tool_input = {"notes": []}
+        elif name == "TestChooserPayload":
+            tool_input = {"items": []}
+        else:  # pragma: no cover - defensive
+            raise AssertionError(f"unexpected schema: {name}")
+        return TransportResponse(text="", tool_input=tool_input, input_tokens=1, output_tokens=1)
+
+    bindings: dict[str, list[ModelBinding]] = {
+        "blind_panel": [
+            ModelBinding(provider="anthropic", model="fake-blind-0"),
+            ModelBinding(provider="anthropic", model="fake-blind-1"),
+        ],
+        "challenger": [ModelBinding(provider="anthropic", model="fake-challenger")],
+        "test_chooser": [ModelBinding(provider="anthropic", model="fake-test-chooser")],
+    }
+    providers = {"anthropic": AnthropicProvider(api_key=None, transport=transport)}
+    return LlmClient(bindings, providers)
+
+
+def test_review_fails_without_data_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("ADOC_DATA_DIR", raising=False)
+
+    code = main(["review"])
+
+    assert code == 1
+    assert "configuration error" in capsys.readouterr().err
+
+
+def test_review_fails_if_data_repo_not_initialized(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("ADOC_DATA_DIR", str(tmp_path / "a-doc-data"))
+    monkeypatch.setenv("ADOC_MODELS_FILE", str(REPO_ROOT / "models.yaml"))
+
+    code = main(["review"])
+
+    assert code == 1
+    assert "run `adoc init` first" in capsys.readouterr().err
+
+
+def test_review_runs_end_to_end_with_a_fake_client(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    data_dir = tmp_path / "a-doc-data"
+    DataRepo.init_at(data_dir)
+    monkeypatch.setenv("ADOC_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("ADOC_MODELS_FILE", str(REPO_ROOT / "models.yaml"))
+    monkeypatch.setattr(cli, "_build_llm_client", lambda settings: _empty_review_fake_client())
+
+    code = main(["review"])
+
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "ledger 0 -> 1" in out
+    assert "tagged review-" in out
+
+
+def test_eval_runs_offline_with_out_dir(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    out_dir = tmp_path / "eval-out"
+
+    code = main(["eval", "--suite", "extraction", "--suite", "redteam", "--out", str(out_dir)])
+
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "extraction:" in out
+    assert "redteam:" in out
+    assert (out_dir / "extraction-report.md").exists()
+    assert (out_dir / "redteam-report.md").exists()
+
+
+def test_eval_default_suites_runs_all_known_suites(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    out_dir = tmp_path / "eval-out"
+
+    code = main(["eval", "--out", str(out_dir)])
+
+    assert code == 0
+    assert (out_dir / "extraction-report.md").exists()
+    assert (out_dir / "redteam-report.md").exists()
+
+
+def test_eval_with_candidate_writes_a_comparison_report(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    out_dir = tmp_path / "eval-out"
+
+    code = main(
+        [
+            "eval",
+            "--suite",
+            "redteam",
+            "--out",
+            str(out_dir),
+            "--candidate",
+            "openai:gpt-9000",
+        ]
+    )
+
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "comparison report written" in out
+    assert (out_dir / "redteam-comparison.md").exists()
+
+
+def test_serve_fails_without_data_dir(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)  # hermetic: a developer .env must not leak into Settings
+    monkeypatch.delenv("ADOC_DATA_DIR", raising=False)
+
+    code = main(["serve"])
+
+    assert code == 1
+    assert "configuration error" in capsys.readouterr().err
+
+
+def test_serve_builds_the_app_and_runs_uvicorn_with_host_and_port(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    data_dir = tmp_path / "a-doc-data"
+    DataRepo.init_at(data_dir)
+    monkeypatch.setenv("ADOC_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("ADOC_MODELS_FILE", str(REPO_ROOT / "models.yaml"))
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+    calls: list[tuple[object, str, int]] = []
+    monkeypatch.setattr(
+        cli, "_run_uvicorn", lambda app, *, host, port: calls.append((app, host, port))
+    )
+
+    code = main(["serve", "--host", "0.0.0.0", "--port", "9000"])
+
+    assert code == 0
+    assert len(calls) == 1
+    app, host, port = calls[0]
+    assert host == "0.0.0.0"
+    assert port == 9000
+    from fastapi import FastAPI
+
+    assert isinstance(app, FastAPI)
+    assert "starting on http://0.0.0.0:9000" in capsys.readouterr().out
+
+
+def test_serve_defaults_to_localhost_8080(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    data_dir = tmp_path / "a-doc-data"
+    DataRepo.init_at(data_dir)
+    monkeypatch.setenv("ADOC_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("ADOC_MODELS_FILE", str(REPO_ROOT / "models.yaml"))
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+    calls: list[tuple[object, str, int]] = []
+    monkeypatch.setattr(
+        cli, "_run_uvicorn", lambda app, *, host, port: calls.append((app, host, port))
+    )
+
+    code = main(["serve"])
+
+    assert code == 0
+    _app, host, port = calls[0]
+    assert host == "127.0.0.1"
+    assert port == 8080
+
+
+def test_user_add_creates_a_user_with_injected_getpass(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    data_dir = tmp_path / "a-doc-data"
+    DataRepo.init_at(data_dir)
+    monkeypatch.setenv("ADOC_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("ADOC_MODELS_FILE", str(REPO_ROOT / "models.yaml"))
+
+    passwords = iter(["a-good-password", "a-good-password"])
+    monkeypatch.setattr(cli, "_getpass", lambda _prompt: next(passwords))
+
+    code = main(["user", "add", "alice"])
+
+    assert code == 0
+    assert "added user 'alice'" in capsys.readouterr().out
+    from adoc.web.users import verify_user
+
+    assert verify_user(data_dir / "work" / "users.yaml", "alice", "a-good-password") is True
+
+
+def test_user_add_fails_when_passwords_do_not_match(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    data_dir = tmp_path / "a-doc-data"
+    DataRepo.init_at(data_dir)
+    monkeypatch.setenv("ADOC_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("ADOC_MODELS_FILE", str(REPO_ROOT / "models.yaml"))
+
+    passwords = iter(["first-password", "second-password"])
+    monkeypatch.setattr(cli, "_getpass", lambda _prompt: next(passwords))
+
+    code = main(["user", "add", "alice"])
+
+    assert code == 1
+    assert "did not match" in capsys.readouterr().err
+
+
+def test_user_add_fails_on_empty_password(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    data_dir = tmp_path / "a-doc-data"
+    DataRepo.init_at(data_dir)
+    monkeypatch.setenv("ADOC_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("ADOC_MODELS_FILE", str(REPO_ROOT / "models.yaml"))
+
+    monkeypatch.setattr(cli, "_getpass", lambda _prompt: "")
+
+    code = main(["user", "add", "alice"])
+
+    assert code == 1
+    assert "must not be empty" in capsys.readouterr().err
+
+
+def test_user_list_reports_no_users_when_empty(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    data_dir = tmp_path / "a-doc-data"
+    DataRepo.init_at(data_dir)
+    monkeypatch.setenv("ADOC_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("ADOC_MODELS_FILE", str(REPO_ROOT / "models.yaml"))
+
+    code = main(["user", "list"])
+
+    assert code == 0
+    assert "no users configured" in capsys.readouterr().out
+
+
+def test_user_list_prints_usernames(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    data_dir = tmp_path / "a-doc-data"
+    DataRepo.init_at(data_dir)
+    monkeypatch.setenv("ADOC_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("ADOC_MODELS_FILE", str(REPO_ROOT / "models.yaml"))
+    from adoc.web.users import add_user
+
+    add_user(data_dir / "work" / "users.yaml", "alice", "some-password")
+
+    code = main(["user", "list"])
+
+    assert code == 0
+    assert "alice" in capsys.readouterr().out
+
+
+def test_user_remove_removes_an_existing_user(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    data_dir = tmp_path / "a-doc-data"
+    DataRepo.init_at(data_dir)
+    monkeypatch.setenv("ADOC_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("ADOC_MODELS_FILE", str(REPO_ROOT / "models.yaml"))
+    from adoc.web.users import add_user
+
+    add_user(data_dir / "work" / "users.yaml", "alice", "some-password")
+
+    code = main(["user", "remove", "alice"])
+
+    assert code == 0
+    assert "removed user 'alice'" in capsys.readouterr().out
+
+
+def test_user_remove_fails_for_an_unknown_user(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    data_dir = tmp_path / "a-doc-data"
+    DataRepo.init_at(data_dir)
+    monkeypatch.setenv("ADOC_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("ADOC_MODELS_FILE", str(REPO_ROOT / "models.yaml"))
+
+    code = main(["user", "remove", "no-such-user"])
+
+    assert code == 1
+    assert "no such user" in capsys.readouterr().err
+
+
+def test_user_add_fails_without_data_dir(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)  # hermetic: a developer .env must not leak into Settings
+    monkeypatch.delenv("ADOC_DATA_DIR", raising=False)
+
+    code = main(["user", "add", "alice"])
+
+    assert code == 1
+    assert "configuration error" in capsys.readouterr().err
 
 
 def test_unknown_subcommand_exits_nonzero() -> None:

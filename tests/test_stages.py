@@ -1,0 +1,413 @@
+"""Tests for adoc.reason.stages: stage functions, DAG assembly, entry points.
+
+Uses fake `LlmClient` transports throughout — no network, ever. The four
+red-team scenarios (patient-theory anchoring, dosing leak blocked by the
+gate, zero API calls on a red flag, a Challenger-less DAG failing closed)
+are pinned as data in `tests/fixtures/redteam.yaml` and exercised
+end-to-end here.
+"""
+
+from __future__ import annotations
+
+import json
+from datetime import date
+from pathlib import Path
+from typing import Any
+
+import pytest
+from pydantic import BaseModel
+from ruamel.yaml import YAML
+
+from adoc.casefile.ledger import load_ledger
+from adoc.casefile.repo import LEDGER_RELPATH, DataRepo
+from adoc.casefile.schema import LedgerDiff
+from adoc.config import ModelBinding
+from adoc.labs.db import LabsDb
+from adoc.labs.models import LabDocument, LabResult
+from adoc.reason.client import (
+    AnthropicProvider,
+    LlmClient,
+    OpenAIProvider,
+    TransportRequest,
+    TransportResponse,
+)
+from adoc.reason.context import ContextPack, build_context
+from adoc.reason.dag import ContractViolation, Ctx, Dag, Node, require_prior_node, run
+from adoc.reason.safety import RedFlagResult
+from adoc.reason.stages import (
+    PatientReply,
+    PatientTurn,
+    build_diagnostic_dag,
+    ledger_maintainer_stage,
+    run_diagnostic_turn,
+)
+
+FIXTURE_PATH = Path(__file__).parent / "fixtures" / "redteam.yaml"
+SHA = "b" * 64
+
+
+def _load_fixture() -> dict[str, Any]:
+    yaml = YAML(typ="safe")
+    with FIXTURE_PATH.open("r", encoding="utf-8") as fh:
+        data = yaml.load(fh)
+    assert isinstance(data, dict)
+    return data
+
+
+FIXTURE = _load_fixture()
+
+
+def _redteam_case(case_id: str) -> dict[str, Any]:
+    for case in FIXTURE["diagnostic_turn_redteam"]:
+        if case["id"] == case_id:
+            return case
+    raise KeyError(case_id)
+
+
+# --- fixtures ------------------------------------------------------------------------------
+
+
+@pytest.fixture
+def repo(tmp_path: Path) -> DataRepo:
+    return DataRepo.init_at(tmp_path / "data")
+
+
+@pytest.fixture
+def db(tmp_path: Path) -> LabsDb:
+    store = LabsDb(tmp_path / "labs.sqlite")
+    store.upsert_document(
+        LabDocument(sha256=SHA, filename="doc.pdf", doc_type="lab-result", page_count=1)
+    )
+    store.insert_results(
+        [
+            LabResult(
+                date=date(2026, 5, 2),
+                name="ana-titer",
+                name_raw="ANA",
+                value_text="1:640",
+                source_doc=SHA,
+                raw_json=json.dumps({"name_raw": "ANA"}),
+            )
+        ]
+    )
+    return store
+
+
+# --- fake transport helpers -----------------------------------------------------------------
+
+
+def _make_primary_transport(
+    ledger_ops: list[dict[str, Any]],
+    patient_reply: dict[str, Any],
+    calls: list[TransportRequest],
+):
+    """Services role `primary_reasoner` (ledger-maintainer + composer) and,
+    if ever exercised, `classifier` — dispatching on the requested schema."""
+
+    def transport(request: TransportRequest) -> TransportResponse:
+        calls.append(request)
+        assert request.schema is not None
+        name = request.schema.__name__
+        if name == "_LedgerDiffPayload":
+            tool_input: dict[str, Any] = {"rationale": "proposed diff", "ops": ledger_ops}
+        elif name == "PatientReply":
+            tool_input = patient_reply
+        elif name == "TurnRoute":
+            tool_input = {"route": "diagnostic", "rationale": "new clinical detail"}
+        else:  # pragma: no cover - defensive
+            raise AssertionError(f"unexpected schema for primary transport: {name}")
+        return TransportResponse(text="", tool_input=tool_input, input_tokens=10, output_tokens=10)
+
+    return transport
+
+
+def _make_challenger_transport(
+    counter_arguments: list[dict[str, Any]],
+    additional_ops: list[dict[str, Any]],
+    calls: list[TransportRequest],
+):
+    def transport(request: TransportRequest) -> TransportResponse:
+        calls.append(request)
+        tool_input = {
+            "counter_arguments": counter_arguments,
+            "additional_ops": additional_ops,
+            "verdict_notes": "reviewed",
+        }
+        return TransportResponse(text="", tool_input=tool_input, input_tokens=10, output_tokens=10)
+
+    return transport
+
+
+def _build_client(primary_transport: Any, challenger_transport: Any) -> LlmClient:
+    bindings: dict[str, list[ModelBinding]] = {
+        "primary_reasoner": [ModelBinding(provider="anthropic", model="fake-primary")],
+        "challenger": [ModelBinding(provider="openai", model="fake-challenger")],
+        "classifier": [ModelBinding(provider="anthropic", model="fake-primary")],
+    }
+    providers = {
+        "anthropic": AnthropicProvider(api_key=None, transport=primary_transport),
+        "openai": OpenAIProvider(api_key=None, transport=challenger_transport),
+    }
+    return LlmClient(bindings, providers)
+
+
+_SLE_MOST_LIKELY_OP = {
+    "op": "add_hypothesis",
+    "hypothesis": {
+        "id": "sle-01",
+        "name": "Systemic lupus erythematosus",
+        "tier": "most-likely",
+        "probability": "moderate",
+        "status": "active",
+        "origin": "model",
+        "first_proposed": "2026-08-01",
+        "evidence_for": [
+            {"claim": "ANA elevated", "source": "labs:ana-titer:2026-05-02", "strength": "strong"}
+        ],
+    },
+}
+
+_PE_CANT_MISS_OP = {
+    "op": "add_hypothesis",
+    "hypothesis": {
+        "id": "pe-01",
+        "name": "Pulmonary embolism",
+        "tier": "cant-miss",
+        "probability": "low",
+        "status": "active",
+        "origin": "model",
+        "first_proposed": "2026-08-01",
+    },
+}
+
+
+# --- happy path -----------------------------------------------------------------------------
+
+
+def test_full_diagnostic_dag_happy_path(repo: DataRepo, db: LabsDb) -> None:
+    calls: list[TransportRequest] = []
+    patient_reply = {
+        "tiers_rendered": (
+            "Most Likely: a lupus-like presentation — this is a lead to discuss with your "
+            "doctor.\nCan't-Miss: pulmonary embolism remains on the board.\nAsk your doctor "
+            "about ordering a complement (C3/C4) panel."
+        ),
+        "tests_to_request": ["Complement C3/C4 panel"],
+        "framing_ack": True,
+    }
+    primary_transport = _make_primary_transport(
+        [_SLE_MOST_LIKELY_OP, _PE_CANT_MISS_OP], patient_reply, calls
+    )
+    challenger_transport = _make_challenger_transport(
+        counter_arguments=[
+            {"hypothesis_id": "sle-01", "argument": "Anti-dsDNA has not been checked yet."}
+        ],
+        additional_ops=[],
+        calls=calls,
+    )
+    client = _build_client(primary_transport, challenger_transport)
+
+    result = run_diagnostic_turn(
+        client,
+        repo,
+        db,
+        repo.root / LEDGER_RELPATH,
+        "My joints have been aching for weeks and I'm constantly exhausted.",
+    )
+
+    assert isinstance(result, PatientReply)
+    assert "discuss with your doctor" in result.tiers_rendered
+    assert result.tests_to_request == ["Complement C3/C4 panel"]
+    assert len(calls) == 3  # ledger_maintainer, challenger, composer
+
+    new_ledger = load_ledger(repo.root / LEDGER_RELPATH)
+    assert new_ledger.version == 1
+    assert {h.id for h in new_ledger.hypotheses} == {"sle-01", "pe-01"}
+
+
+# --- red-team (a): patient-theory anchoring --------------------------------------------------
+
+
+def test_redteam_patient_theory_is_quarantined_and_context_wired_through(
+    repo: DataRepo, db: LabsDb
+) -> None:
+    case = _redteam_case("patient_theory_anchoring")
+    repo.write(
+        "case/patient-theories.md",
+        f"# Patient Theories\n\n- I think I have {case['patient_theories_file_contains']}.\n",
+    )
+
+    calls: list[TransportRequest] = []
+    ledger_ops = [
+        {
+            "op": "add_hypothesis",
+            "hypothesis": {
+                "id": "mcas-01",
+                "name": "Mast cell activation syndrome",
+                "tier": "expanded",
+                "probability": "low",
+                "status": "patient-proposed",
+                "origin": "patient",
+                "first_proposed": "2026-08-01",
+            },
+        },
+        _PE_CANT_MISS_OP,
+    ]
+    patient_reply = {
+        "tiers_rendered": (
+            "Expanded: your own theory is included here and is a lead to discuss with your "
+            "doctor, alongside the other possibilities.\nCan't-Miss: pulmonary embolism."
+        ),
+        "tests_to_request": [],
+        "framing_ack": True,
+    }
+    primary_transport = _make_primary_transport(ledger_ops, patient_reply, calls)
+    challenger_transport = _make_challenger_transport(
+        counter_arguments=[],
+        additional_ops=[
+            {
+                "op": "record_challenge",
+                "id": "mcas-01",
+                "note": "Tryptase level not yet checked; alternative explanations not excluded.",
+            }
+        ],
+        calls=calls,
+    )
+    client = _build_client(primary_transport, challenger_transport)
+
+    result = run_diagnostic_turn(client, repo, db, repo.root / LEDGER_RELPATH, case["turn_text"])
+
+    assert isinstance(result, PatientReply)
+
+    ledger_maintainer_calls = [
+        c for c in calls if c.schema is not None and c.schema.__name__ == "_LedgerDiffPayload"
+    ]
+    assert len(ledger_maintainer_calls) == 1
+    sent_content = "\n".join(m.content for m in ledger_maintainer_calls[0].messages)
+    assert "Patient Theories" in sent_content
+    assert case["patient_theories_file_contains"] in sent_content
+
+    new_ledger = load_ledger(repo.root / LEDGER_RELPATH)
+    patient_hyp = next(h for h in new_ledger.hypotheses if h.id == "mcas-01")
+    assert patient_hyp.origin == "patient"
+    assert patient_hyp.tier != "most-likely"
+    assert patient_hyp.challenger_notes  # a challenge was recorded alongside the proposal
+
+
+# --- red-team (b): dosing leak blocked by the treatment-gate contract ------------------------
+
+
+def test_redteam_dosing_output_blocked_by_treatment_gate_contract(
+    repo: DataRepo, db: LabsDb
+) -> None:
+    case = _redteam_case("dosing_leak_blocked_by_gate")
+    calls: list[TransportRequest] = []
+    bad_patient_reply = {
+        "tiers_rendered": f"Most Likely: lupus. You should {case['composer_output_contains']}.",
+        "tests_to_request": [],
+        "framing_ack": True,
+    }
+    primary_transport = _make_primary_transport(
+        [_SLE_MOST_LIKELY_OP, _PE_CANT_MISS_OP], bad_patient_reply, calls
+    )
+    challenger_transport = _make_challenger_transport(
+        counter_arguments=[
+            {"hypothesis_id": "sle-01", "argument": "Anti-dsDNA negative on two occasions."}
+        ],
+        additional_ops=[],
+        calls=calls,
+    )
+    client = _build_client(primary_transport, challenger_transport)
+
+    with pytest.raises(ContractViolation) as excinfo:
+        run_diagnostic_turn(
+            client,
+            repo,
+            db,
+            repo.root / LEDGER_RELPATH,
+            "My joints hurt and I'm exhausted.",
+        )
+
+    assert excinfo.value.contract_name == case["expected_contract_name"]
+
+
+# --- red-team (c): red-flag turn makes zero API calls ----------------------------------------
+
+
+def test_redteam_red_flag_turn_makes_zero_api_calls(repo: DataRepo, db: LabsDb) -> None:
+    case = _redteam_case("red_flag_zero_api_calls")
+    calls: list[TransportRequest] = []
+
+    def _explode(request: TransportRequest) -> TransportResponse:
+        calls.append(request)
+        raise AssertionError("transport must never be called for a red-flag turn")
+
+    client = _build_client(_explode, _explode)
+
+    result = run_diagnostic_turn(client, repo, db, repo.root / LEDGER_RELPATH, case["turn_text"])
+
+    assert isinstance(result, RedFlagResult)
+    assert result.flagged is True
+    assert calls == []
+
+
+# --- red-team (d): a DAG without a completed Challenger node fails closed -------------------
+
+
+def test_redteam_dag_without_challenger_node_fails_require_prior_node(
+    repo: DataRepo, db: LabsDb
+) -> None:
+    case = _redteam_case("missing_challenger_node_fails_closed")
+    calls: list[TransportRequest] = []
+    primary_transport = _make_primary_transport([_PE_CANT_MISS_OP], {}, calls)
+    client = _build_client(primary_transport, primary_transport)  # challenger never invoked
+
+    def _ledger_maintainer_fn(ctx: Ctx) -> BaseModel:
+        context_pack = ctx["context_pack"]
+        patient_turn = ctx["patient_turn"]
+        assert isinstance(context_pack, ContextPack)
+        assert isinstance(patient_turn, PatientTurn)
+        return ledger_maintainer_stage(client, context_pack, patient_turn.text)
+
+    def _composer_like_fn(_ctx: Ctx) -> BaseModel:  # never reached
+        raise AssertionError("composer must not run when the challenger precondition fails")
+
+    ledger_maintainer_node = Node(
+        name="ledger_maintainer",
+        fn=_ledger_maintainer_fn,
+        input_model=ContextPack,
+        output_model=LedgerDiff,
+        depends_on="context_pack",
+    )
+    composer_like_node = Node(
+        name="composer",
+        fn=_composer_like_fn,
+        input_model=LedgerDiff,
+        output_model=PatientReply,
+        depends_on="ledger_maintainer",
+        preconditions=[require_prior_node("challenger")],
+    )
+    dag = Dag([ledger_maintainer_node, composer_like_node])
+    context_pack = build_context(repo, db, include_ledger=True)
+
+    with pytest.raises(ContractViolation) as excinfo:
+        run(
+            dag,
+            {
+                "context_pack": context_pack,
+                "patient_turn": PatientTurn(text="new symptom: joint swelling"),
+            },
+        )
+
+    assert excinfo.value.contract_name == case["expected_contract_name"]
+
+
+def test_build_diagnostic_dag_has_the_four_expected_nodes(repo: DataRepo) -> None:
+    client = _build_client(lambda r: None, lambda r: None)  # not called in this test
+    dag = build_diagnostic_dag(client, repo, repo.root / LEDGER_RELPATH)
+    assert [node.name for node in dag.nodes] == [
+        "ledger_maintainer",
+        "challenger",
+        "apply",
+        "composer",
+    ]

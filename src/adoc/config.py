@@ -39,6 +39,7 @@ class Settings(BaseSettings):
 
     data_dir: Path
     models_file: Path = _DEFAULT_MODELS_FILE
+    dropbox_folder: str = "Dropbox/a-doc-inbox"
 
     anthropic_api_key: SecretStr | None = Field(
         default=None, validation_alias=AliasChoices("ANTHROPIC_API_KEY")
@@ -50,7 +51,20 @@ class Settings(BaseSettings):
         default=None, validation_alias=AliasChoices("FEATHERLESS_API_KEY")
     )
 
+    # Legacy single-passphrase web login. Kept for backward compatibility
+    # only — the login route (`web.routes.auth`) now checks per-user
+    # credentials in `web.users` instead, and no longer reads this field.
     session_passphrase: SecretStr | None = None
+
+    # True iff the process is only ever reachable through the ALB (see
+    # `deploy/cfn/network.yaml`'s InstanceSecurityGroup, which admits
+    # inbound 8080 from the ALB's security group only): when true, the
+    # login rate limiter and secure-cookie logic trust the last hop of
+    # `X-Forwarded-For`/`X-Forwarded-Proto`. Defaults to false so a local
+    # `adoc serve` or a test run never trusts a client-supplied header;
+    # `deploy/install.sh` sets `ADOC_TRUST_FORWARDED_FOR=true` in the
+    # deployed environment.
+    trust_forwarded_for: bool = False
 
 
 class ModelBinding(BaseModel):

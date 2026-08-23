@@ -1,3 +1,7 @@
+# Binds all interfaces: patient access is now via the public ALB
+# (deploy/cfn/alb.yaml), which forwards to this port. Safe to bind wide
+# because deploy/cfn/network.yaml's InstanceSecurityGroup only admits
+# inbound 8080 from the ALB's security group — nothing else can reach it.
 [Unit]
 Description=a-doc web UI (FastAPI/uvicorn)
 After=network.target
@@ -7,7 +11,7 @@ Type=simple
 User=adoc
 WorkingDirectory=/opt/a-doc
 EnvironmentFile=/etc/adoc/env
-ExecStart=/opt/a-doc/.venv/bin/uvicorn adoc.web.app:app --host 127.0.0.1 --port 8080
+ExecStart=/opt/a-doc/.venv/bin/uvicorn adoc.web.app:app --host 0.0.0.0 --port 8080
 Restart=on-failure
 RestartSec=5
 

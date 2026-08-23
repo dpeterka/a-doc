@@ -156,6 +156,47 @@ Resources:
                 # stable across redeploys (it is currently re-creatable by
                 # backup.yaml, which would otherwise require updating this
                 # policy on every key rotation/stack recreation).
+              # deploy/cfn/alb.yaml: ALB, listeners, and target group.
+              - Sid: ElasticLoadBalancingBroad
+                Effect: Allow
+                Action:
+                  - elasticloadbalancing:*
+                Resource: "*"
+                # TODO: scope down to a-doc-alb/a-doc-tg once ELBv2's
+                # resource-level permission model (which mixes ARNs that
+                # don't exist until create-time) is worth the added
+                # complexity here.
+              # deploy/cfn/alb.yaml: the ACM certificate for adoc.petabloc.io
+              # (DNS-validated; ACM has no resource-level permissions for
+              # RequestCertificate, so this is account-wide by necessity).
+              - Sid: AcmCertificateManagement
+                Effect: Allow
+                Action:
+                  - acm:RequestCertificate
+                  - acm:DescribeCertificate
+                  - acm:DeleteCertificate
+                  - acm:AddTagsToCertificate
+                  - acm:ListTagsForCertificate
+                Resource: "*"
+              # deploy/cfn/alb.yaml: the DNS validation record ACM needs and
+              # the patient-facing alias record, both in the petabloc.io
+              # hosted zone only.
+              - Sid: Route53RecordManagement
+                Effect: Allow
+                Action:
+                  - route53:ChangeResourceRecordSets
+                Resource: "arn:aws:route53:::hostedzone/Z009458513KFY2WNUS7C0"
+              - Sid: Route53ReadAndChangeStatus
+                Effect: Allow
+                Action:
+                  - route53:GetHostedZone
+                  - route53:ListResourceRecordSets
+                Resource: "arn:aws:route53:::hostedzone/Z009458513KFY2WNUS7C0"
+              - Sid: Route53GetChange
+                Effect: Allow
+                Action:
+                  - route53:GetChange
+                Resource: "arn:aws:route53:::change/*"
 
 Outputs:
   DeployRoleArn:

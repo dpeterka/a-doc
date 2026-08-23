@@ -1,8 +1,12 @@
 name: eval
 
 # Monthly self-evaluation run against synthetic fixtures only — no PHI in
-# CI (see CLAUDE.md rule 1). `adoc eval` is a Phase-0 stub that exits 0;
-# this workflow becomes meaningful once Phase 1 implements the harness.
+# CI (see CLAUDE.md rule 1). Both suites run fully offline: `extraction`
+# replays tests/fixtures/extractions/*.json through the real,
+# deterministic ingest.reconcile (no model call); `redteam` drives a
+# scripted FAKE LlmClient built inside the suite itself (no real
+# provider, no network). `--out tmp` means this never touches
+# ADOC_DATA_DIR or a data repo either.
 
 on:
   schedule:
@@ -24,5 +28,11 @@ jobs:
       - name: Install dependencies
         run: uv sync --all-extras
 
-      - name: Run eval suite
-        run: uv run adoc eval
+      - name: Run eval suites (extraction + redteam, offline)
+        run: uv run adoc eval --suite redteam --suite extraction --out tmp
+
+      - name: Upload eval reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-reports
+          path: tmp/
