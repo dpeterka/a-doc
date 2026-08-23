@@ -13,6 +13,8 @@ ALL_TEMPLATE_NAMES = (
     "composer",
     "classifier",
     "blind_reviewer",
+    "divergence_adjudicator",
+    "challenge_sweep",
 )
 
 

@@ -113,3 +113,21 @@ class DataRepo:
             repo.index.add(paths)
         commit = repo.index.commit(message, author=_COMMIT_ACTOR, committer=_COMMIT_ACTOR)
         return commit.hexsha
+
+    def tag(self, name: str, *, ref: str | None = None, message: str | None = None) -> str:
+        """Create a git tag named `name` (PLAN.md "State": "weekly reviews
+        tagged"), pointing at `ref` (default: `HEAD`). An annotated tag is
+        created when `message` is given, a lightweight tag otherwise.
+        Returns `name`. Never touches a remote — same as `commit`.
+
+        This is an addition, not a change, to `DataRepo`'s existing API
+        (CLAUDE.md/PLAN.md constraint on the merged foundation): no
+        existing method's signature or behavior is touched.
+        """
+        repo = Repo(self.root)
+        target = repo.commit(ref) if ref is not None else repo.head.commit
+        if message is not None:
+            repo.create_tag(name, ref=target, message=message)
+        else:
+            repo.create_tag(name, ref=target)
+        return name
