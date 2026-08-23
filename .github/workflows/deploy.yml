@@ -62,5 +62,6 @@ jobs:
             --parameter-overrides \
               NetworkStackName=a-doc-network \
               BackupStackName=a-doc-backup \
+              AmiId=/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64 \
             --capabilities CAPABILITY_NAMED_IAM \
             --no-fail-on-empty-changeset
