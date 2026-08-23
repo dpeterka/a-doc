@@ -19,9 +19,23 @@ Parameters:
   GitHubOrg:
     Type: String
     Default: dpeterka
+  GitHubOrgId:
+    Type: Number
+    Default: 754814
+    Description: >
+      Immutable GitHub account ID for GitHubOrg. GitHub's OIDC tokens embed
+      immutable IDs in the sub claim (repo:owner@ID/repo@ID:ref:...), so the
+      trust condition must include them; pinning IDs also defends against
+      owner/repo rename-and-recreate attacks. (`gh api users/<org> --jq .id`)
   RepoName:
     Type: String
     Default: a-doc
+  RepoId:
+    Type: Number
+    Default: 1343763065
+    Description: >
+      Immutable GitHub repository ID for RepoName.
+      (`gh api repos/<org>/<repo> --jq .id`)
   OidcProviderArn:
     Type: String
     Default: ""
@@ -65,7 +79,7 @@ Resources:
               StringEquals:
                 "token.actions.githubusercontent.com:aud": sts.amazonaws.com
               StringLike:
-                "token.actions.githubusercontent.com:sub": !Sub "repo:${GitHubOrg}/${RepoName}:ref:refs/heads/main"
+                "token.actions.githubusercontent.com:sub": !Sub "repo:${GitHubOrg}@${GitHubOrgId}/${RepoName}@${RepoId}:ref:refs/heads/main"
       Policies:
         - PolicyName: a-doc-deploy-policy
           PolicyDocument:
