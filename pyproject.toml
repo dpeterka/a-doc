@@ -1,0 +1,61 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "adoc"
+version = "0.1.0"
+description = "a-doc — personal longitudinal medical diagnostic assistant"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Proprietary" }
+dependencies = [
+  "anthropic",
+  "openai",
+  "fastapi",
+  "uvicorn[standard]",
+  "pydantic>=2",
+  "pydantic-settings",
+  "jinja2",
+  "ruamel.yaml",
+  "GitPython",
+  "httpx",
+]
+
+[project.scripts]
+adoc = "adoc.cli:main"
+
+[dependency-groups]
+dev = [
+  "ruff",
+  "mypy",
+  "pytest",
+  "pytest-cov",
+  "pre-commit",
+  "types-PyYAML",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/adoc"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+plugins = ["pydantic.mypy"]
+python_version = "3.12"
+disallow_untyped_defs = true
+warn_unused_ignores = true
+warn_return_any = true
+check_untyped_defs = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--cov=adoc --cov-report=term-missing --cov-fail-under=70"
+
+[tool.coverage.run]
+source = ["src/adoc"]

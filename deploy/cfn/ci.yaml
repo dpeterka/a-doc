@@ -1,0 +1,135 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  a-doc CI stack: an OIDC identity provider trust for GitHub Actions and a
+  deploy role it can assume, scoped to this repo's main branch (see PLAN.md
+  "Deployment": "ci.yaml (OIDC role for GitHub Actions deploys)").
+
+  Bootstrap note (chicken-and-egg): this stack creates the very role that
+  .github/workflows/deploy.yml assumes to deploy CloudFormation stacks —
+  including, potentially, updates to this stack itself. That means the
+  *first* deployment of ci.yaml cannot be done by the GitHub Actions
+  workflow it enables; it must be applied once, manually, from a local
+  admin AWS session (e.g. `aws cloudformation deploy --template-file
+  deploy/cfn/ci.yaml ...`). After that one-time bootstrap, this stack's
+  `DeployRoleArn` output is copied into the `AWS_DEPLOY_ROLE_ARN` GitHub
+  repository variable, and all subsequent deploys (including future changes
+  to ci.yaml itself) go through CI like every other stack.
+
+Parameters:
+  GitHubOrg:
+    Type: String
+    Default: dpeterka
+  RepoName:
+    Type: String
+    Default: a-doc
+  OidcProviderArn:
+    Type: String
+    Default: ""
+    Description: >
+      ARN of an existing token.actions.githubusercontent.com OIDC provider
+      in this account, if one was already created (an AWS account may only
+      have one). Leave blank to have this stack create it.
+
+Conditions:
+  CreateOidcProvider: !Equals [!Ref OidcProviderArn, ""]
+
+Resources:
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: CreateOidcProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList:
+        - sts.amazonaws.com
+      # CloudFormation/IAM can fetch the provider's thumbprint automatically
+      # for this well-known GitHub endpoint; ThumbprintList is included
+      # explicitly for older account behavior that still requires it.
+      ThumbprintList:
+        - 6938fd4d98bab03faadb97b34396831e3780aea1
+
+  DeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: a-doc-deploy-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !If
+                - CreateOidcProvider
+                - !Ref GitHubOidcProvider
+                - !Ref OidcProviderArn
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                "token.actions.githubusercontent.com:aud": sts.amazonaws.com
+              StringLike:
+                "token.actions.githubusercontent.com:sub": !Sub "repo:${GitHubOrg}/${RepoName}:ref:refs/heads/main"
+      Policies:
+        - PolicyName: a-doc-deploy-policy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # TODO: scope down — CloudFormation/EC2 actions are broad
+              # because Phase 0 doesn't yet know the full set of resource
+              # types future stacks will need. Tighten once instance/backup
+              # stacks stabilize.
+              - Sid: CloudFormationDeploy
+                Effect: Allow
+                Action:
+                  - cloudformation:*
+                Resource:
+                  - !Sub "arn:aws:cloudformation:*:${AWS::AccountId}:stack/a-doc-*/*"
+              - Sid: PassInstanceRole
+                Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource:
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/a-doc-instance-role"
+              - Sid: Ec2Broad
+                Effect: Allow
+                Action:
+                  - ec2:*
+                Resource: "*"
+              - Sid: IamRoleManagement
+                Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:GetRole
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:CreateInstanceProfile
+                  - iam:DeleteInstanceProfile
+                  - iam:AddRoleToInstanceProfile
+                  - iam:RemoveRoleFromInstanceProfile
+                  - iam:TagRole
+                Resource:
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/a-doc-*"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:instance-profile/a-doc-*"
+              - Sid: BackupBucketBroad
+                Effect: Allow
+                Action:
+                  - s3:*
+                Resource:
+                  - "arn:aws:s3:::a-doc-*"
+                  - "arn:aws:s3:::a-doc-*/*"
+              - Sid: KmsBroad
+                Effect: Allow
+                Action:
+                  - kms:*
+                Resource: "*"
+                # TODO: scope to the specific backup KMS key ARN once it is
+                # stable across redeploys (it is currently re-creatable by
+                # backup.yaml, which would otherwise require updating this
+                # policy on every key rotation/stack recreation).
+
+Outputs:
+  DeployRoleArn:
+    Description: >
+      Copy this value into the AWS_DEPLOY_ROLE_ARN GitHub repository
+      variable after the first (manual) deploy of this stack.
+    Value: !GetAtt DeployRole.Arn

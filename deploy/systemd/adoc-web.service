@@ -1,0 +1,15 @@
+[Unit]
+Description=a-doc web UI (FastAPI/uvicorn)
+After=network.target
+
+[Service]
+Type=simple
+User=adoc
+WorkingDirectory=/opt/a-doc
+EnvironmentFile=/etc/adoc/env
+ExecStart=/opt/a-doc/.venv/bin/uvicorn adoc.web.app:app --host 127.0.0.1 --port 8080
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

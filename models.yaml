@@ -1,0 +1,50 @@
+# Role -> model bindings (see PLAN.md "Model strategy & self-evaluation").
+#
+# Every role is loaded by `adoc.config.load_model_bindings()` as a *list* of
+# bindings, even when only one model fills the role — this keeps the loader's
+# return type uniform (`dict[str, list[ModelBinding]]`) regardless of whether
+# a role is single-bound (most roles) or multi-bound (blind_panel). Changing
+# a binding requires an `adoc eval` comparison report and a PR (see CLAUDE.md
+# rule 4) — never hardcode model ids in code.
+
+roles:
+  primary_reasoner:
+    provider: anthropic
+    model: claude-opus-5
+    params:
+      effort: high
+
+  challenger:
+    provider: openai
+    model: gpt-5.2-thinking
+    params:
+      effort: high
+
+  blind_panel:
+    - provider: anthropic
+      model: claude-opus-5
+      params:
+        effort: high
+    - provider: openai
+      model: gpt-5.2-thinking
+      params:
+        effort: high
+    - provider: featherless
+      # TODO: confirm exact Featherless model slug/availability before Phase 1.
+      model: deepseek-ai/DeepSeek-R1
+      params: {}
+
+  extractor_pass_a:
+    provider: anthropic
+    model: claude-sonnet-5
+    params: {}
+
+  extractor_pass_b:
+    provider: openai
+    model: gpt-5.2
+    params: {}
+
+  classifier:
+    provider: anthropic
+    model: claude-haiku-4-5-20251001
+    params: {}
