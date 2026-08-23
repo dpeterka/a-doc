@@ -29,8 +29,12 @@ def _cmd_init(_args: argparse.Namespace) -> int:
     print(f"init: data_dir={settings.data_dir}")
     print(f"init: loaded {len(bindings)} model role bindings from {settings.models_file}")
 
-    already_initialized = DataRepo(settings.data_dir).is_initialized
-    DataRepo.init_at(settings.data_dir)
+    try:
+        already_initialized = DataRepo(settings.data_dir).is_initialized
+        DataRepo.init_at(settings.data_dir)
+    except OSError as exc:
+        print(f"init: configuration error: cannot create data dir: {exc}", file=sys.stderr)
+        return 1
     if already_initialized:
         print(f"init: data repo already initialized at {settings.data_dir}")
     else:
