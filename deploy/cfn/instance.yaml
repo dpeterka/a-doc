@@ -81,7 +81,7 @@ Resources:
             Version: "2012-10-17"
             Statement:
               # UserData/install.sh read these once-created SecureString
-              # parameters at boot: /a-doc/github-deploy-token,
+              # parameters at boot:
               # /a-doc/rclone-conf, /a-doc/anthropic-api-key,
               # /a-doc/openai-api-key, /a-doc/featherless-api-key. See
               # README.md "One-time SSM parameters" for the exact
@@ -186,11 +186,8 @@ Resources:
             echo '/dev/xvdb /data ext4 defaults,nofail 0 2' >> /etc/fstab
           mountpoint -q /data || mount /data
 
-          # --- Clone (or update) the application repo using a scoped,
-          # read-only GitHub deploy token (this repo is private) ---
-          GITHUB_TOKEN="$(aws ssm get-parameter --name /a-doc/github-deploy-token \
-            --with-decryption --query Parameter.Value --output text)"
-          REPO_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/dpeterka/a-doc.git"
+          # --- Clone (or update) the application repo (public, anonymous HTTPS) ---
+          REPO_URL="https://github.com/dpeterka/a-doc.git"
           if [ -d /opt/a-doc/.git ]; then
             git -C /opt/a-doc remote set-url origin "$REPO_URL"
             git -C /opt/a-doc fetch origin main

@@ -67,8 +67,8 @@ fi
 uv python install 3.12 || true
 
 echo "==> Fetching/updating application code"
-GITHUB_TOKEN="$(ssm_get /a-doc/github-deploy-token)"
-REPO_URL="https://x-access-token:${GITHUB_TOKEN}@${REPO_URL_BASE}"
+# The repository is public: clone anonymously over HTTPS.
+REPO_URL="https://${REPO_URL_BASE}"
 if [ -d "$APP_DIR/.git" ]; then
   git -C "$APP_DIR" remote set-url origin "$REPO_URL"
   git -C "$APP_DIR" fetch origin "$REPO_BRANCH"
