@@ -1,8 +1,11 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
-  a-doc network stack: VPC, one public subnet, and a security group with no
-  inbound rules (the instance is reached via SSM + Tailscale only, never
-  public ingress — see PLAN.md "Deployment" and CLAUDE.md "Infrastructure").
+  a-doc network stack: VPC, two public subnets (in different AZs, required
+  by the ALB), and security groups. Patient access moved from Tailscale to
+  a public ALB (explicit user decision, see PLAN.md "Deployment" history) —
+  the instance itself still has no direct public ingress: only the ALB
+  security group may reach it, on the app port only. SSM remains the only
+  way to reach a shell on the box.
 
 Parameters:
   VpcCidr:
@@ -12,7 +15,15 @@ Parameters:
   SubnetCidr:
     Type: String
     Default: 10.42.0.0/25
-    Description: CIDR block for the single public subnet.
+    Description: CIDR block for the first public subnet (AZ #1).
+  SubnetCidr2:
+    Type: String
+    Default: 10.42.0.128/25
+    Description: >
+      CIDR block for the second public subnet (AZ #2), required so the ALB
+      spans two Availability Zones. Exactly tiles the rest of VpcCidr
+      alongside SubnetCidr's default (10.42.0.0/25 + 10.42.0.128/25 =
+      10.42.0.0/24), so no change to SubnetCidr's default was needed.
 
 Resources:
   Vpc:
@@ -43,13 +54,44 @@ Resources:
     Properties:
       VpcId: !Ref Vpc
       CidrBlock: !Ref SubnetCidr
-      # Instance needs a public IP for egress (SSM, Tailscale, package
-      # installs) — this VPC has no NAT gateway (cost) and the SG has no
-      # ingress rules, so exposure is outbound-only.
+      # No explicit AvailabilityZone here, deliberately unchanged from the
+      # original template: AvailabilityZone is an immutable property on
+      # AWS::EC2::Subnet, and this subnet (with the EC2 instance attached to
+      # it) already exists in a deployed stack. Adding an explicit AZ value
+      # now risks CloudFormation seeing a property change and REPLACING this
+      # subnet (and the instance attached to it) if the literal value picked
+      # doesn't match whatever AZ EC2 already assigned it. The new
+      # PublicSubnet2 below gets an explicit, different AZ instead — that
+      # guarantees the two-AZ spread the ALB requires without touching this
+      # resource at all.
+      #
+      # Instance needs a public IP for egress (SSM, package installs) — this
+      # VPC has no NAT gateway (cost) and the instance SG still has no
+      # public ingress, so exposure is outbound-only.
       MapPublicIpOnLaunch: true
       Tags:
         - Key: Name
           Value: a-doc-public-subnet
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref SubnetCidr2
+      # Explicit second AZ so this subnet is (almost certainly) in a
+      # different AZ than PublicSubnet's implicit one — new accounts/regions
+      # consistently hand out the first public subnet in a VPC to the first
+      # AZ EC2's own selection algorithm considers, which is the same AZ
+      # Fn::GetAZs returns at index 0. Picking index 1 here avoids ever
+      # needing to touch PublicSubnet's AZ. Both subnets are new/existing
+      # public subnets in the same route table either way, so a same-AZ
+      # collision (if it ever happened) would be a resilience nit, not a
+      # correctness bug — the ALB still just needs >= 2 distinct subnets.
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: a-doc-public-subnet-2
 
   PublicRouteTable:
     Type: AWS::EC2::RouteTable
@@ -73,17 +115,53 @@ Resources:
       SubnetId: !Ref PublicSubnet
       RouteTableId: !Ref PublicRouteTable
 
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "a-doc ALB SG: public ingress on 80/443 only, forwards to the instance SG on 8080."
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: Public HTTPS.
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: Public HTTP (redirected to HTTPS by the listener).
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound (to the instance SG on 8080, and AWS health-check plumbing).
+      Tags:
+        - Key: Name
+          Value: a-doc-alb-sg
+
   InstanceSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
       # Plain single-line scalar: a folded block (>) leaves a trailing
       # newline, which EC2 rejects in GroupDescription.
-      GroupDescription: "a-doc instance SG, no ingress. Reachable only via AWS SSM and Tailscale (both outbound-initiated)."
+      GroupDescription: "a-doc instance SG. Only the ALB SG may reach port 8080; no SSH, no other ingress. Shell access is SSM-only."
       VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !GetAtt AlbSecurityGroup.GroupId
+          Description: adoc-web, reachable only from the ALB.
       SecurityGroupEgress:
         - IpProtocol: "-1"
           CidrIp: 0.0.0.0/0
-          Description: Allow all outbound (SSM, Tailscale, package installs, API calls).
+          Description: Allow all outbound (SSM, package installs, API calls).
       Tags:
         - Key: Name
           Value: a-doc-instance-sg
@@ -97,7 +175,15 @@ Outputs:
     Value: !Ref PublicSubnet
     Export:
       Name: !Sub "${AWS::StackName}-SubnetId"
+  Subnet2Id:
+    Value: !Ref PublicSubnet2
+    Export:
+      Name: !Sub "${AWS::StackName}-Subnet2Id"
   SecurityGroupId:
     Value: !Ref InstanceSecurityGroup
     Export:
       Name: !Sub "${AWS::StackName}-SecurityGroupId"
+  AlbSecurityGroupId:
+    Value: !Ref AlbSecurityGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-AlbSecurityGroupId"

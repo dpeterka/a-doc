@@ -2,7 +2,9 @@ AWSTemplateFormatVersion: "2010-09-09"
 Description: >
   a-doc instance stack: the single always-on EC2 node (SQLite + git want
   one persistent instance — see PLAN.md "Deployment"). No SSH key pair, no
-  public ingress; reachable via SSM and Tailscale only. Imports its subnet,
+  direct public ingress; a shell is reachable via SSM only. The app itself
+  is reached through the public ALB in alb.yaml, which the instance security
+  group admits on port 8080 (see network.yaml). Imports its subnet,
   security group, and backup bucket/key from the network and backup stacks
   via Fn::ImportValue rather than manually threaded parameters, so deploy.yml
   only needs to know the two stack names.
@@ -79,12 +81,13 @@ Resources:
             Version: "2012-10-17"
             Statement:
               # UserData/install.sh read these once-created SecureString
-              # parameters at boot: /a-doc/tailscale-auth-key,
-              # /a-doc/github-deploy-token, /a-doc/rclone-conf,
-              # /a-doc/anthropic-api-key, /a-doc/openai-api-key,
-              # /a-doc/featherless-api-key, /a-doc/session-passphrase. See
+              # parameters at boot: /a-doc/github-deploy-token,
+              # /a-doc/rclone-conf, /a-doc/anthropic-api-key,
+              # /a-doc/openai-api-key, /a-doc/featherless-api-key. See
               # README.md "One-time SSM parameters" for the exact
-              # `aws ssm put-parameter` commands used to create them.
+              # `aws ssm put-parameter` commands used to create them. Web
+              # login credentials are managed separately via `adoc user
+              # add` (SSM Session Manager shell), not an SSM parameter.
               - Sid: SsmParameterRead
                 Effect: Allow
                 Action:
@@ -131,7 +134,7 @@ Resources:
         Fn::ImportValue: !Sub "${NetworkStackName}-SubnetId"
       SecurityGroupIds:
         - Fn::ImportValue: !Sub "${NetworkStackName}-SecurityGroupId"
-      # No KeyName — no SSH keys (CLAUDE.md "Infrastructure": SSM + Tailscale only).
+      # No KeyName — no SSH keys (CLAUDE.md "Infrastructure": SSM-only shell access).
       BlockDeviceMappings:
         - DeviceName: /dev/xvda
           Ebs:
@@ -183,17 +186,6 @@ Resources:
             echo '/dev/xvdb /data ext4 defaults,nofail 0 2' >> /etc/fstab
           mountpoint -q /data || mount /data
 
-          # --- Tailscale: join the tailnet, then publish the local web UI
-          # over it via `tailscale serve` (uvicorn stays bound to loopback —
-          # see adoc-web.service — Tailscale itself does the TLS-terminated
-          # tailnet-only exposure). Requires "HTTPS Certificates" enabled
-          # once in the tailnet admin console — see README.md.
-          command -v tailscale &>/dev/null || curl -fsSL https://tailscale.com/install.sh | sh
-          TS_AUTHKEY="$(aws ssm get-parameter --name /a-doc/tailscale-auth-key \
-            --with-decryption --query Parameter.Value --output text)"
-          tailscale up --authkey="$TS_AUTHKEY" --ssh=false --hostname=a-doc
-          tailscale serve --bg 8080
-
           # --- Clone (or update) the application repo using a scoped,
           # read-only GitHub deploy token (this repo is private) ---
           GITHUB_TOKEN="$(aws ssm get-parameter --name /a-doc/github-deploy-token \
@@ -217,5 +209,7 @@ Resources:
 Outputs:
   InstanceId:
     Value: !Ref Instance
+    Export:
+      Name: !Sub "${AWS::StackName}-InstanceId"
   PrivateIp:
     Value: !GetAtt Instance.PrivateIp

@@ -65,3 +65,20 @@ jobs:
               AmiId=/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64 \
             --capabilities CAPABILITY_NAMED_IAM \
             --no-fail-on-empty-changeset
+
+      # Must come after the instance stack: alb.yaml imports the instance's
+      # InstanceId export to register it as the target group's target.
+      # Parameters are passed explicitly (not left to the template's
+      # defaults) because parameter defaults never reach an already-deployed
+      # stack on update — only the values `deploy` actually sends do.
+      - name: Deploy ALB stack
+        run: |
+          aws cloudformation deploy \
+            --stack-name a-doc-alb \
+            --template-file deploy/cfn/alb.yaml \
+            --parameter-overrides \
+              NetworkStackName=a-doc-network \
+              InstanceStackName=a-doc-instance \
+              DomainName=adoc.petabloc.io \
+              HostedZoneId=Z009458513KFY2WNUS7C0 \
+            --no-fail-on-empty-changeset

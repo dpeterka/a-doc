@@ -97,8 +97,17 @@ echo "==> Writing /etc/adoc/env from SSM parameters"
   echo "ANTHROPIC_API_KEY=$(ssm_get /a-doc/anthropic-api-key)"
   echo "OPENAI_API_KEY=$(ssm_get /a-doc/openai-api-key)"
   echo "FEATHERLESS_API_KEY=$(ssm_get /a-doc/featherless-api-key 2>/dev/null || true)"
-  echo "ADOC_SESSION_PASSPHRASE=$(ssm_get /a-doc/session-passphrase)"
+  # Web login is now username/password (`adoc user add/list/remove`, run
+  # over an SSM Session Manager shell), not this passphrase — the
+  # ADOC_SESSION_PASSPHRASE parameter is optional/legacy and only fetched
+  # if it still exists.
+  echo "ADOC_SESSION_PASSPHRASE=$(ssm_get /a-doc/session-passphrase 2>/dev/null || true)"
   echo "ADOC_BACKUP_BUCKET=$BACKUP_BUCKET"
+  # Trusting the last hop of X-Forwarded-For for rate-limiting/logging is
+  # safe here specifically because network.yaml's InstanceSecurityGroup
+  # only admits inbound 8080 from the ALB's security group - no other path
+  # can reach this port, so the header can only have been set by the ALB.
+  echo "ADOC_TRUST_FORWARDED_FOR=true"
 } > "$CONFIG_DIR/env"
 chmod 600 "$CONFIG_DIR/env"
 chown "$APP_USER:$APP_USER" "$CONFIG_DIR/env"
