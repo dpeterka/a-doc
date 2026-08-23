@@ -1,0 +1,31 @@
+<div id="onboard-panel">
+  <p class="muted">Section {{ progress[0] }} of {{ progress[1] }} complete.</p>
+  <progress value="{{ progress[0] }}" max="{{ progress[1] }}"></progress>
+
+  {% if error %}
+    <p class="error" role="alert">{{ error }}</p>
+  {% endif %}
+
+  {% if section_key %}
+    <div class="onboard-prompt">{{ prompt_text }}</div>
+
+    <form hx-post="/onboard/submit" hx-target="#onboard-panel" hx-swap="outerHTML">
+      <label for="onboard-text" class="sr-only">Your answer</label>
+      <textarea id="onboard-text" name="text" rows="4"
+        placeholder="Type your answer here, in your own words..."></textarea>
+      <div class="button-row">
+        <button type="submit">
+          {% if status == "awaiting_confirmation" %}Revise{% else %}Send{% endif %}
+        </button>
+      </div>
+    </form>
+
+    {% if status == "awaiting_confirmation" %}
+      <form hx-post="/onboard/confirm" hx-target="#onboard-panel" hx-swap="outerHTML">
+        <button type="submit" class="button-primary">Confirm — this looks right</button>
+      </form>
+    {% endif %}
+  {% else %}
+    <p>Onboarding is complete — every section has been recorded and committed.</p>
+  {% endif %}
+</div>

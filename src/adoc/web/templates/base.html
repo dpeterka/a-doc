@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}a-doc{% endblock %}</title>
+  <link rel="stylesheet" href="/static/styles.css">
+  <script src="/static/vendor/htmx.min.js" defer></script>
+</head>
+<body>
+  <header class="app-header">
+    <a class="app-title" href="/">a-doc</a>
+    <nav class="app-nav">
+      <a href="/">Home</a>
+      <a href="/chat">Chat</a>
+      <a href="/upload">Add a document</a>
+      <a href="/confirm">Review queue</a>
+      <a href="/labs">Labs</a>
+      <a href="/ledger">Full picture</a>
+      <a href="/reviews">Weekly reviews</a>
+    </nav>
+    <form action="/logout" method="post" class="logout-form">
+      <button type="submit" class="link-button">Log out</button>
+    </form>
+  </header>
+
+  <main class="app-main">
+    {% block content %}{% endblock %}
+  </main>
+
+  <footer class="disclaimer">
+    <p>{{ disclaimer_text }}</p>
+  </footer>
+</body>
+</html>

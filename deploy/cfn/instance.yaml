@@ -74,6 +74,46 @@ Resources:
                   - kms:GenerateDataKey
                 Resource:
                   Fn::ImportValue: !Sub "${BackupStackName}-KmsKeyArn"
+        - PolicyName: a-doc-bootstrap-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # UserData/install.sh read these once-created SecureString
+              # parameters at boot: /a-doc/tailscale-auth-key,
+              # /a-doc/github-deploy-token, /a-doc/rclone-conf,
+              # /a-doc/anthropic-api-key, /a-doc/openai-api-key,
+              # /a-doc/featherless-api-key, /a-doc/session-passphrase. See
+              # README.md "One-time SSM parameters" for the exact
+              # `aws ssm put-parameter` commands used to create them.
+              - Sid: SsmParameterRead
+                Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                Resource:
+                  - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/a-doc/*"
+              # These parameters are SecureString encrypted with the
+              # account's AWS-managed default key (alias/aws/ssm) — we never
+              # passed --key-id when creating them, so no custom KMS key
+              # policy is needed. If a customer-managed key were used
+              # instead, that key's own key policy would additionally need
+              # to grant kms:Decrypt to this role (the aws/ssm default key's
+              # policy already allows account principals with IAM
+              # permission to use it, which this statement grants).
+              - Sid: SsmDefaultKmsDecrypt
+                Effect: Allow
+                Action:
+                  - kms:Decrypt
+                Resource:
+                  - !Sub "arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/aws/ssm"
+              # install.sh resolves the backup bucket name once per run via
+              # this account/region-wide (non resource-scopable) action
+              # rather than requiring the bucket name to be threaded through
+              # as a CFN parameter; see README.md "Deploy runbook".
+              - Sid: BackupBucketExportLookup
+                Effect: Allow
+                Action:
+                  - cloudformation:ListExports
+                Resource: "*"
 
   InstanceProfile:
     Type: AWS::IAM::InstanceProfile
@@ -106,17 +146,70 @@ Resources:
       UserData:
         Fn::Base64: |
           #!/bin/bash
+          # a-doc instance bootstrap entrypoint. Kept deliberately minimal —
+          # deploy/install.sh (fetched below, from the app repo itself) owns
+          # all real provisioning logic and is safe to re-run; see
+          # README.md "Deploy runbook" for the full picture and the
+          # one-time SSM parameters this depends on.
           set -euo pipefail
-          # TODO: replace with a real Tailscale auth key delivered via SSM
-          # Parameter Store / Secrets Manager, not baked into UserData.
-          curl -fsSL https://tailscale.com/install.sh | sh
-          tailscale up --authkey="TODO-fetch-from-ssm-parameter-store" || true
-          # TODO: confirm branch/path exist at deploy time — install.sh is
-          # part of this same repo and only resolvable once it has a home
-          # on GitHub at the referenced ref.
-          curl -fsSL https://raw.githubusercontent.com/dpeterka/a-doc/main/deploy/install.sh \
-            -o /tmp/install.sh
-          bash /tmp/install.sh
+          exec > >(tee -a /var/log/a-doc-userdata.log) 2>&1
+          echo "=== a-doc UserData run at $(date -u --iso-8601=seconds) ==="
+
+          # --- Resolve region via IMDSv2 (every aws cli call below needs it) ---
+          IMDS_TOKEN="$(curl -fsS -X PUT "http://169.254.169.254/latest/api/token" \
+            -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")"
+          export AWS_DEFAULT_REGION="$(curl -fsS \
+            -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" \
+            http://169.254.169.254/latest/meta-data/placement/region)"
+
+          # --- Ensure git + the AWS CLI are present before we can fetch
+          # anything from SSM or clone the app repo ---
+          command -v git &>/dev/null || dnf install -y git
+          if ! command -v aws &>/dev/null; then
+            dnf install -y unzip
+            curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" \
+              -o /tmp/awscliv2.zip
+            unzip -q -o /tmp/awscliv2.zip -d /tmp
+            /tmp/aws/install
+            rm -rf /tmp/awscliv2.zip /tmp/aws
+          fi
+
+          # --- Format (first boot only) and mount the data EBS volume ---
+          if ! blkid /dev/xvdb &>/dev/null; then
+            mkfs -t ext4 /dev/xvdb
+          fi
+          mkdir -p /data
+          grep -q '^/dev/xvdb ' /etc/fstab || \
+            echo '/dev/xvdb /data ext4 defaults,nofail 0 2' >> /etc/fstab
+          mountpoint -q /data || mount /data
+
+          # --- Tailscale: join the tailnet, then publish the local web UI
+          # over it via `tailscale serve` (uvicorn stays bound to loopback —
+          # see adoc-web.service — Tailscale itself does the TLS-terminated
+          # tailnet-only exposure). Requires "HTTPS Certificates" enabled
+          # once in the tailnet admin console — see README.md.
+          command -v tailscale &>/dev/null || curl -fsSL https://tailscale.com/install.sh | sh
+          TS_AUTHKEY="$(aws ssm get-parameter --name /a-doc/tailscale-auth-key \
+            --with-decryption --query Parameter.Value --output text)"
+          tailscale up --authkey="$TS_AUTHKEY" --ssh=false --hostname=a-doc
+          tailscale serve --bg 8080
+
+          # --- Clone (or update) the application repo using a scoped,
+          # read-only GitHub deploy token (this repo is private) ---
+          GITHUB_TOKEN="$(aws ssm get-parameter --name /a-doc/github-deploy-token \
+            --with-decryption --query Parameter.Value --output text)"
+          REPO_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/dpeterka/a-doc.git"
+          if [ -d /opt/a-doc/.git ]; then
+            git -C /opt/a-doc remote set-url origin "$REPO_URL"
+            git -C /opt/a-doc fetch origin main
+            git -C /opt/a-doc checkout main
+            git -C /opt/a-doc reset --hard origin/main
+          else
+            git clone --branch main "$REPO_URL" /opt/a-doc
+          fi
+
+          # --- Hand off: all further provisioning logic lives in install.sh ---
+          bash /opt/a-doc/deploy/install.sh
       Tags:
         - Key: Name
           Value: a-doc-instance

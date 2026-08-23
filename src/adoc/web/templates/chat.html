@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% import "_chat_macros.html" as chat_macros %}
+{% block title %}Chat — a-doc{% endblock %}
+{% block content %}
+  <h1>Chat</h1>
+  <p class="muted">
+    Ask a question about your case file, or tell a-doc about something new — a symptom, a
+    result, anything. Every message is checked for emergency warning signs before anything else.
+  </p>
+
+  <div id="chat-transcript" class="chat-transcript">
+    {% for entry in transcript %}
+      {{ chat_macros.bubble(entry) }}
+    {% endfor %}
+  </div>
+
+  <form hx-post="/chat/send" hx-target="#chat-transcript" hx-swap="beforeend" hx-on--after-request="this.reset()">
+    <label for="chat-text" class="sr-only">Message</label>
+    <textarea id="chat-text" name="text" rows="3" placeholder="Type a message..." required></textarea>
+    <div class="button-row">
+      <button type="submit">Send</button>
+    </div>
+  </form>
+{% endblock %}

@@ -20,6 +20,8 @@ dependencies = [
   "ruamel.yaml",
   "GitPython",
   "httpx",
+  "python-multipart",
+  "sse-starlette",
 ]
 
 [project.scripts]
@@ -44,6 +46,12 @@ target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.ruff.lint.per-file-ignores]
+# FastAPI's `Depends(...)` in a parameter default is the framework's own
+# documented dependency-injection pattern, not the mutable-default-argument
+# bug bugbear's B008 targets.
+"src/adoc/web/**/*.py" = ["B008"]
 
 [tool.mypy]
 plugins = ["pydantic.mypy"]
