@@ -73,7 +73,7 @@ public internet.
 
 | Phase | Description | Status |
 |---|---|---|
-| 0 | Project scaffold | in progress |
+| 0 | Project scaffold | complete |
 | 1 | MVP (onboarding, ingestion, DAG reasoning, web UI, AWS deploy) | not started |
 | 2 | Grounding & anti-hallucination hardening | not started |
 | 3 | Knowledge layer (HPO/LIRICAL/Monarch, ACR/EULAR criteria) + full eval | not started |
