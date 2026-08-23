@@ -1,0 +1,9 @@
+[Unit]
+Description=a-doc weekly deep review (one-shot)
+
+[Service]
+Type=oneshot
+User=adoc
+WorkingDirectory=/opt/a-doc
+EnvironmentFile=/etc/adoc/env
+ExecStart=/opt/a-doc/.venv/bin/adoc review

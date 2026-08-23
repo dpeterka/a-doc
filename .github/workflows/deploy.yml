@@ -1,0 +1,66 @@
+name: deploy
+
+# Deploys the network, backup, and instance CloudFormation stacks in order.
+#
+# NOTE — bootstrap chicken-and-egg: `deploy/cfn/ci.yaml` creates the OIDC
+# IAM role that *this workflow* assumes below. That means ci.yaml itself
+# cannot be deployed by this workflow the first time — it must be deployed
+# once, manually, from a local admin session (see README.md "Deploy
+# overview"). After that one-time bootstrap, its `DeployRoleArn` output is
+# copied into the `AWS_DEPLOY_ROLE_ARN` repository variable and this
+# workflow can deploy everything else (including future updates to
+# ci.yaml, at which point it is self-hosting).
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      # Change sets are reviewed via PR before merge (see CLAUDE.md
+      # "Infrastructure"); `aws cloudformation deploy` below applies the
+      # already-reviewed template directly. To inspect a change set instead
+      # of applying it, add `--no-execute-changeset` to any of the deploy
+      # commands below and review it before a follow-up execute.
+
+      - name: Deploy network stack
+        run: |
+          aws cloudformation deploy \
+            --stack-name a-doc-network \
+            --template-file deploy/cfn/network.yaml \
+            --capabilities CAPABILITY_IAM \
+            --no-fail-on-empty-changeset
+
+      - name: Deploy backup stack
+        run: |
+          aws cloudformation deploy \
+            --stack-name a-doc-backup \
+            --template-file deploy/cfn/backup.yaml \
+            --capabilities CAPABILITY_IAM \
+            --no-fail-on-empty-changeset
+
+      - name: Deploy instance stack
+        run: |
+          aws cloudformation deploy \
+            --stack-name a-doc-instance \
+            --template-file deploy/cfn/instance.yaml \
+            --parameter-overrides \
+              NetworkStackName=a-doc-network \
+              BackupStackName=a-doc-backup \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --no-fail-on-empty-changeset
