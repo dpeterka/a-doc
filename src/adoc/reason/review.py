@@ -1,0 +1,1207 @@
+"""The weekly deep review (PLAN.md "Session loops (c)"), as a typed DAG.
+
+`run_weekly_review` assembles and runs an explicit `reason.dag.Dag` (so the
+contracts below are enforced by code, not hoped for by a prompt):
+
+  trend_scan -> blind_panel_0..N-1 -> current_ledger -> divergence_diff
+    -> adjudication -> challenge_sweep -> apply_review_diff -> test_chooser
+    -> staleness_scan -> ops_metrics -> render_report
+
+Contracts:
+  - every `blind_panel_i` node's precondition is `forbid_context_key("ledger")`
+    (ADR 0002's "blind-reviewer rule") — the ledger is never loaded into the
+    DAG's run context until *after* every blind panel member has produced its
+    de novo differential, so there is nothing for the contract to catch in a
+    correct run; a caller who sneaks a `"ledger"` key into `initial` (the
+    negative test in `tests/test_review.py`) trips it immediately.
+  - `adjudication`'s postcondition (`adjudication_covers_every_divergence`)
+    requires an explicit accept/reject decision for every divergence the
+    deterministic diff produced (PLAN.md "Anti-anchoring").
+  - `challenge_sweep`'s postcondition (`challenge_sweep_covers_every_active_hypothesis`)
+    requires a substantive note for every currently-active hypothesis.
+  - `apply_review_diff`'s postcondition requires the ledger version to have
+    incremented.
+
+`apply_review_diff` merges the accepted-divergence ops and the full
+challenge-sweep's `RecordChallenge` ops into ONE `LedgerDiff`, applied in a
+single `apply_and_save` call — recording a challenge for every currently
+active hypothesis in the same diff is what keeps `ledger.apply_diff`'s
+staleness invariant (c) satisfied regardless of how stale any hypothesis
+was going into the review; that is the entire point of a weekly full sweep.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from collections import defaultdict
+from collections.abc import Callable
+from datetime import UTC, date, datetime
+from pathlib import Path
+from typing import Any, Literal
+
+from pydantic import BaseModel, Field
+
+from adoc import __version__
+from adoc.casefile.ledger import ACTIVE_STATUSES, apply_and_save, load_ledger
+from adoc.casefile.repo import HISTORY_RELPATH, LEDGER_RELPATH, DataRepo
+from adoc.casefile.schema import (
+    AddHypothesis,
+    Hypothesis,
+    Ledger,
+    LedgerDiff,
+    LedgerOp,
+    ProbabilityBucket,
+    Provenance,
+    RecordChallenge,
+    Tier,
+    UpdateHypothesis,
+)
+from adoc.labs.db import LabsDb
+from adoc.labs.queries import abnormal_summary
+from adoc.labs.validate import trend_outlier
+from adoc.reason.client import LlmClient, Message
+from adoc.reason.context import ContextPack, build_context
+from adoc.reason.dag import Contract, Ctx, Dag, Node, forbid_context_key, run
+from adoc.reason.prompts import load_prompt
+
+# --------------------------------------------------------------------------
+# Stage-IO models
+# --------------------------------------------------------------------------
+
+
+class Marker(BaseModel):
+    """A trivial initial-context payload for a node with no real input."""
+
+    value: str = "start"
+
+
+class TrendFinding(BaseModel):
+    analyte: str
+    date: date
+    value: float | None
+    message: str
+
+
+class TrendScanResult(BaseModel):
+    findings: list[TrendFinding] = Field(default_factory=list)
+
+
+class BlindDifferentialItem(BaseModel):
+    """One hypothesis in a blind panel member's de novo differential —
+    the schema `reason/prompts/blind_reviewer.md` describes."""
+
+    name: str
+    probability_bucket: ProbabilityBucket
+    why: str
+    cant_miss: bool = False
+
+
+class BlindDifferentialPayload(BaseModel):
+    """What the `blind_panel` LLM call itself returns."""
+
+    items: list[BlindDifferentialItem] = Field(default_factory=list)
+
+
+class BlindDifferential(BaseModel):
+    """A `BlindDifferentialPayload` stamped with which panel member (by
+    binding index) and model produced it — stamped by code, mirroring
+    `reason.stages._LedgerDiffPayload`/`Provenance`."""
+
+    items: list[BlindDifferentialItem] = Field(default_factory=list)
+    panel_index: int
+    model_id: str = ""
+
+
+DivergenceKind = Literal["panel_only", "probability_mismatch", "ledger_only"]
+
+
+class Divergence(BaseModel):
+    """One place the blind panel's pooled output disagrees with the
+    current ledger, from the deterministic diff in `compute_divergences`."""
+
+    id: str
+    kind: DivergenceKind
+    name: str
+    ledger_hypothesis_id: str | None = None
+    panel_probability_bucket: ProbabilityBucket | None = None
+    ledger_probability_bucket: ProbabilityBucket | None = None
+    panel_cant_miss: bool = False
+    support_count: int = 1
+    rationale_hint: str = ""
+
+
+class DivergenceSet(BaseModel):
+    divergences: list[Divergence] = Field(default_factory=list)
+
+
+class DivergenceDecisionPayload(BaseModel):
+    divergence: str
+    decision: Literal["accept", "reject"]
+    rationale: str
+
+
+class AdjudicationPayload(BaseModel):
+    """What the `challenger` LLM call itself returns for divergence adjudication."""
+
+    decisions: list[DivergenceDecisionPayload] = Field(default_factory=list)
+
+
+class AdjudicationResult(BaseModel):
+    decisions: list[DivergenceDecisionPayload] = Field(default_factory=list)
+    model_id: str = ""
+    prompt_template_version: str = ""
+
+
+class HypothesisChallengeNote(BaseModel):
+    id: str
+    note: str
+
+
+class ChallengeSweepPayload(BaseModel):
+    """What the `challenger` LLM call itself returns for the full sweep."""
+
+    notes: list[HypothesisChallengeNote] = Field(default_factory=list)
+
+
+class ChallengeSweepResult(BaseModel):
+    notes: list[HypothesisChallengeNote] = Field(default_factory=list)
+    model_id: str = ""
+    prompt_template_version: str = ""
+
+
+class TestChooserItem(BaseModel):
+    text: str
+    hypothesis_ids: list[str] = Field(default_factory=list)
+
+
+class TestChooserPayload(BaseModel):
+    items: list[TestChooserItem] = Field(default_factory=list)
+
+
+class TestChooserResult(BaseModel):
+    items: list[TestChooserItem] = Field(default_factory=list)
+    questions_open_markdown: str = ""
+
+
+class StaleArtifact(BaseModel):
+    hypothesis_id: str
+    hypothesis_name: str
+    dag_node: str
+    model_id: str
+    prompt_template_version: str
+    generations_behind: int
+
+
+class StalenessReport(BaseModel):
+    stale: list[StaleArtifact] = Field(default_factory=list)
+
+
+class RoleCost(BaseModel):
+    role: str
+    calls: int
+    input_tokens: int
+    output_tokens: int
+    cost_estimate: float
+
+
+class OpsMetrics(BaseModel):
+    role_costs: list[RoleCost] = Field(default_factory=list)
+    total_cost_estimate: float = 0.0
+    ledger_churn_tier_moves: int = 0
+    hypothesis_ages_days: dict[str, int] = Field(default_factory=dict)
+    challenger_kill_rate: float | None = None
+    blind_panel_divergence_rate: float = 0.0
+    stale_artifact_count: int = 0
+
+
+class ReviewReport(BaseModel):
+    """The weekly review's final, committed artifact — `run_weekly_review`'s
+    return value."""
+
+    review_date: date
+    markdown_path: str
+    commit_sha: str
+    tag: str
+    ledger_version_before: int
+    ledger_version_after: int
+    trend_findings: list[TrendFinding] = Field(default_factory=list)
+    divergences: DivergenceSet
+    adjudication: AdjudicationResult
+    staleness: StalenessReport
+    metrics: OpsMetrics
+
+
+# --------------------------------------------------------------------------
+# Deterministic helpers (no LLM)
+# --------------------------------------------------------------------------
+
+
+def deterministic_trend_scan(db: LabsDb) -> TrendScanResult:
+    """Deterministic trend scan (PLAN.md loop (c) step (a)): every
+    currently-flagged result plus each analyte's latest reading, checked
+    against `labs.validate.trend_outlier`. No LLM call."""
+    candidates = {row.id: row for row in db.latest_panel()}
+    for row in abnormal_summary(db):
+        candidates[row.id] = row
+
+    findings: list[TrendFinding] = []
+    for row in candidates.values():
+        issue = trend_outlier(db, row)
+        if issue is not None:
+            findings.append(
+                TrendFinding(
+                    analyte=row.name, date=row.date, value=row.value, message=issue.message
+                )
+            )
+    findings.sort(key=lambda f: (f.analyte, f.date))
+    return TrendScanResult(findings=findings)
+
+
+def _normalize_name(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", name.lower())
+
+
+def compute_divergences(ledger: Ledger, panels: list[BlindDifferential]) -> DivergenceSet:
+    """Deterministic diff of the pooled blind-panel output against the
+    current ledger, matched by normalized name (PLAN.md loop (c) step
+    (c): "match by normalized name/mondo" — panel items carry no mondo
+    code, so normalized name is the only match key available here). No
+    LLM call.
+    """
+    active = [h for h in ledger.hypotheses if h.status in ACTIVE_STATUSES]
+    active_by_norm = {_normalize_name(h.name): h for h in active}
+
+    panel_by_norm: dict[str, list[tuple[int, BlindDifferentialItem]]] = defaultdict(list)
+    for panel in panels:
+        for item in panel.items:
+            panel_by_norm[_normalize_name(item.name)].append((panel.panel_index, item))
+
+    divergences: list[Divergence] = []
+    covered_norms: set[str] = set()
+
+    for norm in sorted(panel_by_norm):
+        entries = panel_by_norm[norm]
+        hyp = active_by_norm.get(norm)
+        if hyp is None:
+            cant_miss = any(item.cant_miss for _, item in entries)
+            why = "; ".join(f"panel[{idx}]: {item.why}" for idx, item in entries)
+            divergences.append(
+                Divergence(
+                    id=f"panel-only:{norm}",
+                    kind="panel_only",
+                    name=entries[0][1].name,
+                    panel_probability_bucket=entries[0][1].probability_bucket,
+                    panel_cant_miss=cant_miss,
+                    support_count=len(entries),
+                    rationale_hint=why,
+                )
+            )
+        else:
+            covered_norms.add(norm)
+            mismatched = [item for _, item in entries if item.probability_bucket != hyp.probability]
+            if mismatched:
+                why = "; ".join(f"panel: {item.why}" for item in mismatched)
+                divergences.append(
+                    Divergence(
+                        id=f"probability:{hyp.id}",
+                        kind="probability_mismatch",
+                        name=hyp.name,
+                        ledger_hypothesis_id=hyp.id,
+                        panel_probability_bucket=mismatched[0].probability_bucket,
+                        ledger_probability_bucket=hyp.probability,
+                        support_count=len(mismatched),
+                        rationale_hint=why,
+                    )
+                )
+
+    for norm, hyp in sorted(active_by_norm.items()):
+        if norm in covered_norms or norm in panel_by_norm:
+            continue
+        divergences.append(
+            Divergence(
+                id=f"ledger-only:{hyp.id}",
+                kind="ledger_only",
+                name=hyp.name,
+                ledger_hypothesis_id=hyp.id,
+                ledger_probability_bucket=hyp.probability,
+                rationale_hint="No blind panel member proposed this hypothesis independently.",
+            )
+        )
+
+    return DivergenceSet(divergences=divergences)
+
+
+def _slug_for_new_hypothesis(name: str, ledger: Ledger) -> str:
+    base = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "hypothesis"
+    existing = {h.id for h in ledger.hypotheses}
+    candidate = base
+    suffix = 2
+    while candidate in existing:
+        candidate = f"{base}-{suffix}"
+        suffix += 1
+    return candidate
+
+
+def build_review_ledger_diff(
+    current_ledger: Ledger,
+    divergence_set: DivergenceSet,
+    adjudication: AdjudicationResult,
+    challenge_sweep: ChallengeSweepResult,
+    *,
+    today: date,
+) -> LedgerDiff:
+    """Merge accepted-divergence ops (`origin: challenger`) and the full
+    challenge sweep's `RecordChallenge` ops into ONE `LedgerDiff` — see
+    the module docstring for why this must be a single diff, not two.
+    """
+    divergence_by_id = {d.id: d for d in divergence_set.divergences}
+    ops: list[LedgerOp] = []
+    accepted_summaries: list[str] = []
+
+    for decision in adjudication.decisions:
+        divergence = divergence_by_id.get(decision.divergence)
+        if divergence is None or decision.decision != "accept":
+            continue
+        if divergence.kind == "panel_only":
+            new_id = _slug_for_new_hypothesis(divergence.name, current_ledger)
+            tier: Tier = "cant-miss" if divergence.panel_cant_miss else "expanded"
+            ops.append(
+                AddHypothesis(
+                    hypothesis=Hypothesis(
+                        id=new_id,
+                        name=divergence.name,
+                        tier=tier,
+                        probability=divergence.panel_probability_bucket or "low",
+                        status="active",
+                        origin="challenger",
+                        first_proposed=today,
+                        challenger_notes=(
+                            "Added from weekly blind-panel divergence adjudication: "
+                            f"{decision.rationale}"
+                        ),
+                    )
+                )
+            )
+        elif divergence.kind == "probability_mismatch" and divergence.ledger_hypothesis_id:
+            ops.append(
+                UpdateHypothesis(
+                    id=divergence.ledger_hypothesis_id,
+                    probability=divergence.panel_probability_bucket,
+                )
+            )
+        elif divergence.kind == "ledger_only" and divergence.ledger_hypothesis_id:
+            ops.append(
+                RecordChallenge(
+                    id=divergence.ledger_hypothesis_id,
+                    note=(
+                        "Weekly blind panel did not independently surface this hypothesis: "
+                        f"{decision.rationale}"
+                    ),
+                )
+            )
+        accepted_summaries.append(f"{divergence.name} ({divergence.kind}): {decision.rationale}")
+
+    active_ids = {h.id for h in current_ledger.hypotheses if h.status in ACTIVE_STATUSES}
+    already_challenged = {op.id for op in ops if isinstance(op, RecordChallenge)}
+    for note in challenge_sweep.notes:
+        if note.id in active_ids and note.id not in already_challenged and note.note.strip():
+            ops.append(RecordChallenge(id=note.id, note=note.note.strip()))
+
+    rationale = "Weekly review: blind-panel divergence adjudication + full challenge sweep."
+    if accepted_summaries:
+        rationale += "\n" + "\n".join(accepted_summaries)
+
+    provenance = Provenance(
+        app_version=__version__,
+        prompt_template_version=challenge_sweep.prompt_template_version or "unknown@v0",
+        model_id=challenge_sweep.model_id or "unknown",
+        dag_node="apply_review_diff",
+        timestamp=datetime.now(UTC),
+    )
+    return LedgerDiff(provenance=provenance, rationale=rationale, ops=ops)
+
+
+def _ops_hypothesis_ids(ops: list[dict[str, Any]]) -> set[str]:
+    ids: set[str] = set()
+    for op in ops:
+        opname = op.get("op")
+        if opname == "add_hypothesis":
+            hyp = op.get("hypothesis") or {}
+            hid = hyp.get("id")
+            if hid:
+                ids.add(hid)
+        elif opname in ("update_hypothesis", "add_evidence", "record_challenge"):
+            hid = op.get("id")
+            if hid:
+                ids.add(hid)
+    return ids
+
+
+def _load_history_records(history_path: Path) -> list[dict[str, Any]]:
+    if not history_path.exists():
+        return []
+    records: list[dict[str, Any]] = []
+    with history_path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if line:
+                records.append(json.loads(line))
+    return records
+
+
+def scan_staleness(history_path: Path, ledger: Ledger, *, horizon: int = 2) -> StalenessReport:
+    """Staleness scanner (PLAN.md "Provenance & re-evaluation policy"): for
+    every active hypothesis, find the most recent `ledger-history.jsonl`
+    diff that touched it and compare that diff's `(model_id,
+    prompt_template_version)` against the most recent one seen for that
+    same DAG node anywhere in history.
+
+    "Generations behind" is counted as the number of *other* distinct
+    `(model_id, prompt_template_version)` pairs seen for that DAG node
+    strictly after the artifact's own, in the order they first appear in
+    `ledger-history.jsonl` (an append-only log) — the closest deterministic
+    proxy available from committed data for PLAN.md's "bindings old"
+    without a separate `models.yaml`-change history. Flags a hypothesis
+    when that count is `>= horizon` (default 2, PLAN.md's threshold).
+    """
+    records = _load_history_records(history_path)
+
+    generation_index: dict[str, dict[tuple[str, str], int]] = defaultdict(dict)
+    for record in records:
+        provenance = record["diff"]["provenance"]
+        node = provenance["dag_node"]
+        key = (provenance["model_id"], provenance["prompt_template_version"])
+        node_generations = generation_index[node]
+        if key not in node_generations:
+            node_generations[key] = len(node_generations)
+
+    latest_touch: dict[str, dict[str, Any]] = {}
+    for record in records:
+        for hid in _ops_hypothesis_ids(record["diff"]["ops"]):
+            latest_touch[hid] = record
+
+    stale: list[StaleArtifact] = []
+    for h in ledger.hypotheses:
+        if h.status not in ACTIVE_STATUSES:
+            continue
+        touch_record = latest_touch.get(h.id)
+        if touch_record is None:
+            continue
+        provenance = touch_record["diff"]["provenance"]
+        node = provenance["dag_node"]
+        node_generations = generation_index.get(node, {})
+        key = (provenance["model_id"], provenance["prompt_template_version"])
+        if key not in node_generations or not node_generations:
+            continue
+        artifact_gen = node_generations[key]
+        current_gen = max(node_generations.values())
+        behind = current_gen - artifact_gen
+        if behind >= horizon:
+            stale.append(
+                StaleArtifact(
+                    hypothesis_id=h.id,
+                    hypothesis_name=h.name,
+                    dag_node=node,
+                    model_id=provenance["model_id"],
+                    prompt_template_version=provenance["prompt_template_version"],
+                    generations_behind=behind,
+                )
+            )
+    stale.sort(key=lambda s: (-s.generations_behind, s.hypothesis_id))
+    return StalenessReport(stale=stale)
+
+
+def parse_audit_costs(audit_log_path: Path) -> list[RoleCost]:
+    """Aggregate `reason.client.LlmClient`'s audit JSONL by role (PLAN.md
+    "Ops metrics logged continuously"). No LLM call — pure parsing.
+    """
+    if not audit_log_path.exists():
+        return []
+    totals: dict[str, dict[str, float]] = defaultdict(
+        lambda: {"calls": 0.0, "input_tokens": 0.0, "output_tokens": 0.0, "cost_estimate": 0.0}
+    )
+    with audit_log_path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            record = json.loads(line)
+            role = record.get("role", "unknown")
+            bucket = totals[role]
+            bucket["calls"] += 1
+            bucket["input_tokens"] += record.get("input_tokens") or 0
+            bucket["output_tokens"] += record.get("output_tokens") or 0
+            bucket["cost_estimate"] += record.get("cost_estimate") or 0.0
+    return [
+        RoleCost(
+            role=role,
+            calls=int(v["calls"]),
+            input_tokens=int(v["input_tokens"]),
+            output_tokens=int(v["output_tokens"]),
+            cost_estimate=v["cost_estimate"],
+        )
+        for role, v in sorted(totals.items())
+    ]
+
+
+def ledger_churn(history_path: Path, *, last_n: int = 10) -> int:
+    """Count of `update_hypothesis` ops that moved a `tier`, across the
+    last `last_n` history entries (PLAN.md "Ops metrics": "ledger churn").
+    """
+    records = _load_history_records(history_path)
+    moves = 0
+    for record in records[-last_n:]:
+        for op in record["diff"]["ops"]:
+            if op.get("op") == "update_hypothesis" and op.get("tier") is not None:
+                moves += 1
+    return moves
+
+
+def hypothesis_ages_days(ledger: Ledger, *, today: date) -> dict[str, int]:
+    return {
+        h.id: (today - h.first_proposed).days
+        for h in ledger.hypotheses
+        if h.status in ACTIVE_STATUSES
+    }
+
+
+def challenger_kill_rate(ledger: Ledger) -> float | None:
+    """Fraction of ever-challenged hypotheses that ended up `ruled-out`
+    (PLAN.md "Ops metrics": "challenger kill-rate"). `None` if nothing has
+    ever been challenged (avoids a misleading 0.0)."""
+    ever_challenged = [
+        h for h in ledger.hypotheses if h.last_challenged is not None or h.challenger_notes.strip()
+    ]
+    if not ever_challenged:
+        return None
+    ruled_out = sum(1 for h in ever_challenged if h.status == "ruled-out")
+    return ruled_out / len(ever_challenged)
+
+
+def blind_panel_divergence_rate(
+    divergence_set: DivergenceSet, panels: list[BlindDifferential]
+) -> float:
+    total_items = sum(len(p.items) for p in panels)
+    if total_items == 0:
+        return 0.0
+    return len(divergence_set.divergences) / total_items
+
+
+def compute_ops_metrics(
+    *,
+    audit_log_path: Path,
+    history_path: Path,
+    ledger: Ledger,
+    divergence_set: DivergenceSet,
+    panels: list[BlindDifferential],
+    staleness: StalenessReport,
+    today: date,
+) -> OpsMetrics:
+    role_costs = parse_audit_costs(audit_log_path)
+    return OpsMetrics(
+        role_costs=role_costs,
+        total_cost_estimate=sum(r.cost_estimate for r in role_costs),
+        ledger_churn_tier_moves=ledger_churn(history_path),
+        hypothesis_ages_days=hypothesis_ages_days(ledger, today=today),
+        challenger_kill_rate=challenger_kill_rate(ledger),
+        blind_panel_divergence_rate=blind_panel_divergence_rate(divergence_set, panels),
+        stale_artifact_count=len(staleness.stale),
+    )
+
+
+def render_review_markdown(
+    *,
+    review_date: date,
+    trend_findings: list[TrendFinding],
+    divergence_set: DivergenceSet,
+    adjudication: AdjudicationResult,
+    challenge_sweep: ChallengeSweepResult,
+    test_chooser: TestChooserResult,
+    staleness: StalenessReport,
+    metrics: OpsMetrics,
+    ledger_before: Ledger,
+    ledger_after: Ledger,
+) -> str:
+    """Render the review report: plain-language "what changed"/"what to
+    ask your doctor" up top for a non-technical reader, a metrics
+    appendix at the bottom for anyone who wants the detail.
+    """
+    decisions_by_id = {d.divergence: d for d in adjudication.decisions}
+    accepted = [
+        (divergence, decisions_by_id[divergence.id])
+        for divergence in divergence_set.divergences
+        if decisions_by_id.get(divergence.id) is not None
+        and decisions_by_id[divergence.id].decision == "accept"
+    ]
+
+    lines: list[str] = [f"# Weekly Review — {review_date.isoformat()}", ""]
+
+    lines.append("## What changed this week")
+    lines.append("")
+    if not accepted:
+        lines.append(
+            "A second, independent read of your case this week did not turn up anything new "
+            "that changed the leads being tracked."
+        )
+    else:
+        for divergence, decision in accepted:
+            if divergence.kind == "panel_only":
+                lines.append(
+                    f"- A new possibility was added to your case for further discussion: "
+                    f"**{divergence.name}**. {decision.rationale}"
+                )
+            elif divergence.kind == "probability_mismatch":
+                lines.append(
+                    f"- How likely **{divergence.name}** seems was updated. {decision.rationale}"
+                )
+            else:
+                lines.append(
+                    f"- **{divergence.name}** was flagged for extra scrutiny. {decision.rationale}"
+                )
+    lines.append("")
+
+    if trend_findings:
+        lines.append("## Trend alerts")
+        lines.append("")
+        for finding in trend_findings:
+            lines.append(
+                f"- **{finding.analyte}** on {finding.date.isoformat()}: {finding.message}"
+            )
+        lines.append("")
+
+    lines.append("## What to ask your doctor")
+    lines.append("")
+    if test_chooser.items:
+        for item in test_chooser.items:
+            lines.append(f"- {item.text}")
+    else:
+        lines.append("_Nothing new to bring to your next appointment this week._")
+    lines.append("")
+
+    lines.append("## Metrics appendix")
+    lines.append("")
+    lines.append(f"- Leads re-reviewed this week: {len(challenge_sweep.notes)}")
+    lines.append(f"- Ledger version: {ledger_before.version} -> {ledger_after.version}")
+    active_count = len(hypothesis_ages_days(ledger_after, today=review_date))
+    lines.append(f"- Active hypotheses: {active_count}")
+    lines.append(f"- Ledger churn (tier moves, last 10 diffs): {metrics.ledger_churn_tier_moves}")
+    kill_rate = (
+        f"{metrics.challenger_kill_rate:.0%}" if metrics.challenger_kill_rate is not None else "n/a"
+    )
+    lines.append(f"- Challenger kill-rate (challenged -> ruled-out): {kill_rate}")
+    lines.append(f"- Blind-panel divergence rate: {metrics.blind_panel_divergence_rate:.0%}")
+    lines.append(
+        f"- Stale artifacts (>= 2 generations behind, still active): {metrics.stale_artifact_count}"
+    )
+    if staleness.stale:
+        for artifact in staleness.stale:
+            lines.append(
+                f"  - {artifact.hypothesis_name} ({artifact.hypothesis_id}): "
+                f"{artifact.generations_behind} generation(s) behind on {artifact.dag_node}"
+            )
+    lines.append(f"- Estimated cost this review: ${metrics.total_cost_estimate:.2f}")
+    for role_cost in metrics.role_costs:
+        lines.append(
+            f"  - {role_cost.role}: {role_cost.calls} call(s), "
+            f"{role_cost.input_tokens}+{role_cost.output_tokens} tokens, "
+            f"${role_cost.cost_estimate:.2f}"
+        )
+    lines.append(f"- Divergences considered: {len(divergence_set.divergences)}")
+    lines.append("")
+
+    return "\n".join(lines) + "\n"
+
+
+# --------------------------------------------------------------------------
+# DAG contracts
+# --------------------------------------------------------------------------
+
+
+def _adjudication_completeness_contract() -> Contract:
+    def predicate(ctx: Ctx, value: BaseModel | None) -> str | None:
+        divergence_set = ctx.get("divergence_diff")
+        if not isinstance(divergence_set, DivergenceSet):
+            return "divergence_diff missing from context"
+        assert isinstance(value, AdjudicationResult)
+        expected = {d.id for d in divergence_set.divergences}
+        got = {d.divergence for d in value.decisions}
+        missing = expected - got
+        if missing:
+            return f"missing adjudication decision(s) for divergence id(s): {sorted(missing)}"
+        return None
+
+    return Contract(name="adjudication_covers_every_divergence", predicate=predicate)
+
+
+def _challenge_sweep_completeness_contract() -> Contract:
+    def predicate(ctx: Ctx, value: BaseModel | None) -> str | None:
+        ledger = ctx.get("current_ledger")
+        if not isinstance(ledger, Ledger):
+            return "current_ledger missing from context"
+        assert isinstance(value, ChallengeSweepResult)
+        active_ids = {h.id for h in ledger.hypotheses if h.status in ACTIVE_STATUSES}
+        noted_ids = {n.id for n in value.notes if n.note.strip()}
+        missing = active_ids - noted_ids
+        if missing:
+            return f"missing challenge-sweep note(s) for active hypothesis id(s): {sorted(missing)}"
+        return None
+
+    return Contract(name="challenge_sweep_covers_every_active_hypothesis", predicate=predicate)
+
+
+def _review_version_incremented_contract() -> Contract:
+    def predicate(ctx: Ctx, value: BaseModel | None) -> str | None:
+        assert isinstance(value, Ledger)
+        prior = ctx.get("current_ledger")
+        if not isinstance(prior, Ledger):
+            return "current_ledger missing from context"
+        if value.version <= prior.version:
+            return f"ledger version did not increment: prior={prior.version} new={value.version}"
+        return None
+
+    return Contract(name="review_apply_ledger_version_incremented", predicate=predicate)
+
+
+# --------------------------------------------------------------------------
+# DAG assembly
+# --------------------------------------------------------------------------
+
+
+def build_review_dag(
+    client: LlmClient,
+    repo: DataRepo,
+    db: LabsDb,
+    ledger_path: Path,
+    *,
+    clock: Callable[[], datetime],
+    sink: dict[str, BaseModel] | None = None,
+) -> Dag:
+    """Assemble the weekly-review DAG (PLAN.md loop (c)) — see the module
+    docstring for topology and contracts.
+
+    Expected `run()` initial context: `{"initial": Marker(),
+    "blind_context_pack": ContextPack}` (built with `include_ledger=False`).
+    Deliberately does NOT expect a `"ledger"` key — the current ledger is
+    loaded by the `current_ledger` node, *after* every blind panel node has
+    already run, so `forbid_context_key("ledger")` has nothing to catch in
+    a correct run (see the negative test in `tests/test_review.py` for the
+    incorrect case).
+    """
+    results: dict[str, BaseModel] = sink if sink is not None else {}
+    num_panel = len(client._bindings.get("blind_panel", []))  # noqa: SLF001
+    if num_panel < 1:
+        raise ValueError("role 'blind_panel' must have at least one model binding")
+    panel_node_names = [f"blind_panel_{i}" for i in range(num_panel)]
+
+    def _trend_scan_fn(_ctx: Ctx) -> BaseModel:
+        result = deterministic_trend_scan(db)
+        results["trend_scan"] = result
+        return result
+
+    def _make_blind_panel_fn(index: int) -> Callable[[Ctx], BaseModel]:
+        def fn(ctx: Ctx) -> BaseModel:
+            context_pack = ctx["blind_context_pack"]
+            assert isinstance(context_pack, ContextPack)
+            prompt = load_prompt("blind_reviewer")
+            user_content = context_pack.render()
+            result = client.complete(
+                "blind_panel",
+                system=prompt.text,
+                messages=[Message(role="user", content=user_content)],
+                schema=BlindDifferentialPayload,
+                binding_index=index,
+            )
+            payload = result.parsed
+            assert isinstance(payload, BlindDifferentialPayload)
+            diff = BlindDifferential(
+                items=payload.items, panel_index=index, model_id=result.model_id
+            )
+            results[f"blind_panel_{index}"] = diff
+            return diff
+
+        return fn
+
+    def _current_ledger_fn(_ctx: Ctx) -> BaseModel:
+        ledger = load_ledger(ledger_path)
+        results["current_ledger"] = ledger
+        return ledger
+
+    def _divergence_diff_fn(ctx: Ctx) -> BaseModel:
+        ledger = ctx["current_ledger"]
+        assert isinstance(ledger, Ledger)
+        panels: list[BlindDifferential] = []
+        for name in panel_node_names:
+            panel = ctx[name]
+            assert isinstance(panel, BlindDifferential)
+            panels.append(panel)
+        divergence_set = compute_divergences(ledger, panels)
+        results["divergence_diff"] = divergence_set
+        return divergence_set
+
+    def _adjudication_fn(ctx: Ctx) -> BaseModel:
+        divergence_set = ctx["divergence_diff"]
+        assert isinstance(divergence_set, DivergenceSet)
+        context_pack = build_context(repo, db, include_ledger=True)
+        prompt = load_prompt("divergence_adjudicator")
+        divergences_json = divergence_set.model_dump_json(indent=2)
+        user_content = (
+            f"{context_pack.render()}\n\n## Divergences To Adjudicate\n\n"
+            f"```json\n{divergences_json}\n```\n"
+        )
+        result = client.complete(
+            "challenger",
+            system=prompt.text,
+            messages=[Message(role="user", content=user_content)],
+            schema=AdjudicationPayload,
+        )
+        payload = result.parsed
+        assert isinstance(payload, AdjudicationPayload)
+        adjudication = AdjudicationResult(
+            decisions=payload.decisions,
+            model_id=result.model_id,
+            prompt_template_version=f"{prompt.name}@v{prompt.version}",
+        )
+        results["adjudication"] = adjudication
+        return adjudication
+
+    def _challenge_sweep_fn(ctx: Ctx) -> BaseModel:
+        ledger = ctx["current_ledger"]
+        assert isinstance(ledger, Ledger)
+        context_pack = build_context(repo, db, include_ledger=True)
+        prompt = load_prompt("challenge_sweep")
+        active_ids = [h.id for h in ledger.hypotheses if h.status in ACTIVE_STATUSES]
+        user_content = (
+            f"{context_pack.render()}\n\n## Active Hypothesis IDs Requiring A Challenge Note\n\n"
+            f"{', '.join(active_ids) or '_none_'}\n"
+        )
+        result = client.complete(
+            "challenger",
+            system=prompt.text,
+            messages=[Message(role="user", content=user_content)],
+            schema=ChallengeSweepPayload,
+        )
+        payload = result.parsed
+        assert isinstance(payload, ChallengeSweepPayload)
+        sweep = ChallengeSweepResult(
+            notes=payload.notes,
+            model_id=result.model_id,
+            prompt_template_version=f"{prompt.name}@v{prompt.version}",
+        )
+        results["challenge_sweep"] = sweep
+        return sweep
+
+    def _apply_review_diff_fn(ctx: Ctx) -> BaseModel:
+        current_ledger = ctx["current_ledger"]
+        assert isinstance(current_ledger, Ledger)
+        divergence_set = ctx["divergence_diff"]
+        assert isinstance(divergence_set, DivergenceSet)
+        adjudication = ctx["adjudication"]
+        assert isinstance(adjudication, AdjudicationResult)
+        sweep = ctx["challenge_sweep"]
+        assert isinstance(sweep, ChallengeSweepResult)
+
+        diff = build_review_ledger_diff(
+            current_ledger, divergence_set, adjudication, sweep, today=clock().date()
+        )
+        history_path = repo.root / HISTORY_RELPATH
+        new_ledger = apply_and_save(ledger_path, history_path, diff)
+        results["apply_review_diff"] = new_ledger
+        return new_ledger
+
+    def _test_chooser_fn(ctx: Ctx) -> BaseModel:
+        ledger = ctx["apply_review_diff"]
+        assert isinstance(ledger, Ledger)
+        context_pack = build_context(repo, db, include_ledger=True)
+        prompt = load_prompt("test_chooser")
+        result = client.complete(
+            "test_chooser",
+            system=prompt.text,
+            messages=[Message(role="user", content=context_pack.render())],
+            schema=TestChooserPayload,
+        )
+        payload = result.parsed
+        assert isinstance(payload, TestChooserPayload)
+        markdown = _render_questions_open(payload)
+        repo.write("case/questions-open.md", markdown)
+        tc_result = TestChooserResult(items=payload.items, questions_open_markdown=markdown)
+        results["test_chooser"] = tc_result
+        return tc_result
+
+    def _staleness_scan_fn(ctx: Ctx) -> BaseModel:
+        ledger = ctx["apply_review_diff"]
+        assert isinstance(ledger, Ledger)
+        report = scan_staleness(repo.root / HISTORY_RELPATH, ledger)
+        results["staleness_scan"] = report
+        return report
+
+    def _ops_metrics_fn(ctx: Ctx) -> BaseModel:
+        ledger = ctx["apply_review_diff"]
+        assert isinstance(ledger, Ledger)
+        divergence_set = ctx["divergence_diff"]
+        assert isinstance(divergence_set, DivergenceSet)
+        staleness = ctx["staleness_scan"]
+        assert isinstance(staleness, StalenessReport)
+        panels: list[BlindDifferential] = []
+        for name in panel_node_names:
+            panel = ctx[name]
+            assert isinstance(panel, BlindDifferential)
+            panels.append(panel)
+
+        metrics = compute_ops_metrics(
+            audit_log_path=repo.root / "logs" / "api-audit.jsonl",
+            history_path=repo.root / HISTORY_RELPATH,
+            ledger=ledger,
+            divergence_set=divergence_set,
+            panels=panels,
+            staleness=staleness,
+            today=clock().date(),
+        )
+        results["ops_metrics"] = metrics
+        return metrics
+
+    def _render_report_fn(ctx: Ctx) -> BaseModel:
+        review_date = clock().date()
+        ledger_before = ctx["current_ledger"]
+        assert isinstance(ledger_before, Ledger)
+        ledger_after = ctx["apply_review_diff"]
+        assert isinstance(ledger_after, Ledger)
+        divergence_set = ctx["divergence_diff"]
+        assert isinstance(divergence_set, DivergenceSet)
+        adjudication = ctx["adjudication"]
+        assert isinstance(adjudication, AdjudicationResult)
+        sweep = ctx["challenge_sweep"]
+        assert isinstance(sweep, ChallengeSweepResult)
+        test_chooser = ctx["test_chooser"]
+        assert isinstance(test_chooser, TestChooserResult)
+        staleness = ctx["staleness_scan"]
+        assert isinstance(staleness, StalenessReport)
+        metrics = ctx["ops_metrics"]
+        assert isinstance(metrics, OpsMetrics)
+        trend_scan = ctx["trend_scan"]
+        assert isinstance(trend_scan, TrendScanResult)
+
+        markdown = render_review_markdown(
+            review_date=review_date,
+            trend_findings=trend_scan.findings,
+            divergence_set=divergence_set,
+            adjudication=adjudication,
+            challenge_sweep=sweep,
+            test_chooser=test_chooser,
+            staleness=staleness,
+            metrics=metrics,
+            ledger_before=ledger_before,
+            ledger_after=ledger_after,
+        )
+        relpath = f"case/reviews/{review_date.isoformat()}-review.md"
+        repo.write(relpath, markdown)
+
+        commit_sha = repo.commit(
+            f"review: weekly review {review_date.isoformat()}",
+            paths=["case"],
+        )
+        tag_name = f"review-{review_date.isoformat()}"
+        repo.tag(tag_name, message=f"Weekly review {review_date.isoformat()}")
+
+        report = ReviewReport(
+            review_date=review_date,
+            markdown_path=relpath,
+            commit_sha=commit_sha,
+            tag=tag_name,
+            ledger_version_before=ledger_before.version,
+            ledger_version_after=ledger_after.version,
+            trend_findings=trend_scan.findings,
+            divergences=divergence_set,
+            adjudication=adjudication,
+            staleness=staleness,
+            metrics=metrics,
+        )
+        results["render_report"] = report
+        return report
+
+    nodes: list[Node] = [
+        Node(
+            name="trend_scan",
+            fn=_trend_scan_fn,
+            input_model=Marker,
+            output_model=TrendScanResult,
+            depends_on="initial",
+        )
+    ]
+    prior_name = "trend_scan"
+    for index in range(num_panel):
+        node_name = f"blind_panel_{index}"
+        nodes.append(
+            Node(
+                name=node_name,
+                fn=_make_blind_panel_fn(index),
+                input_model=ContextPack,
+                output_model=BlindDifferential,
+                depends_on="blind_context_pack",
+                preconditions=[forbid_context_key("ledger")],
+            )
+        )
+        prior_name = node_name
+
+    nodes.append(
+        Node(
+            name="current_ledger",
+            fn=_current_ledger_fn,
+            input_model=BlindDifferential,
+            output_model=Ledger,
+            depends_on=prior_name,
+        )
+    )
+    nodes.append(
+        Node(
+            name="divergence_diff",
+            fn=_divergence_diff_fn,
+            input_model=Ledger,
+            output_model=DivergenceSet,
+            depends_on="current_ledger",
+        )
+    )
+    nodes.append(
+        Node(
+            name="adjudication",
+            fn=_adjudication_fn,
+            input_model=DivergenceSet,
+            output_model=AdjudicationResult,
+            depends_on="divergence_diff",
+            postconditions=[_adjudication_completeness_contract()],
+        )
+    )
+    nodes.append(
+        Node(
+            name="challenge_sweep",
+            fn=_challenge_sweep_fn,
+            input_model=AdjudicationResult,
+            output_model=ChallengeSweepResult,
+            depends_on="adjudication",
+            postconditions=[_challenge_sweep_completeness_contract()],
+        )
+    )
+    nodes.append(
+        Node(
+            name="apply_review_diff",
+            fn=_apply_review_diff_fn,
+            input_model=ChallengeSweepResult,
+            output_model=Ledger,
+            depends_on="challenge_sweep",
+            postconditions=[_review_version_incremented_contract()],
+        )
+    )
+    nodes.append(
+        Node(
+            name="test_chooser",
+            fn=_test_chooser_fn,
+            input_model=Ledger,
+            output_model=TestChooserResult,
+            depends_on="apply_review_diff",
+        )
+    )
+    nodes.append(
+        Node(
+            name="staleness_scan",
+            fn=_staleness_scan_fn,
+            input_model=TestChooserResult,
+            output_model=StalenessReport,
+            depends_on="test_chooser",
+        )
+    )
+    nodes.append(
+        Node(
+            name="ops_metrics",
+            fn=_ops_metrics_fn,
+            input_model=StalenessReport,
+            output_model=OpsMetrics,
+            depends_on="staleness_scan",
+        )
+    )
+    nodes.append(
+        Node(
+            name="render_report",
+            fn=_render_report_fn,
+            input_model=OpsMetrics,
+            output_model=ReviewReport,
+            depends_on="ops_metrics",
+        )
+    )
+
+    return Dag(nodes)
+
+
+def _render_questions_open(payload: TestChooserPayload) -> str:
+    lines = ["# Open Questions for Next Appointment", ""]
+    if not payload.items:
+        lines.append("_None yet._")
+    else:
+        for item in payload.items:
+            tag = f" (re: {', '.join(item.hypothesis_ids)})" if item.hypothesis_ids else ""
+            lines.append(f"- {item.text}{tag}")
+    return "\n".join(lines) + "\n"
+
+
+# --------------------------------------------------------------------------
+# Entry point
+# --------------------------------------------------------------------------
+
+
+def _utcnow() -> datetime:
+    return datetime.now(UTC)
+
+
+def run_weekly_review(
+    repo: DataRepo,
+    db: LabsDb,
+    client: LlmClient,
+    *,
+    clock: Callable[[], datetime] | None = None,
+) -> ReviewReport:
+    """Run the weekly deep review end to end (PLAN.md "Session loops (c)")
+    and return the committed, tagged `ReviewReport`. See the module
+    docstring for the DAG topology and contracts.
+    """
+    clock = clock if clock is not None else _utcnow
+    ledger_path = repo.root / LEDGER_RELPATH
+    blind_context_pack = build_context(repo, db, include_ledger=False)
+
+    sink: dict[str, BaseModel] = {}
+    dag = build_review_dag(client, repo, db, ledger_path, clock=clock, sink=sink)
+    run(
+        dag,
+        {
+            "initial": Marker(),
+            "blind_context_pack": blind_context_pack,
+        },
+    )
+
+    report = sink["render_report"]
+    assert isinstance(report, ReviewReport)
+    return report
+
+
+__all__ = [
+    "AdjudicationResult",
+    "BlindDifferential",
+    "ChallengeSweepResult",
+    "Divergence",
+    "DivergenceSet",
+    "OpsMetrics",
+    "ReviewReport",
+    "StalenessReport",
+    "TestChooserResult",
+    "TrendScanResult",
+    "build_review_dag",
+    "build_review_ledger_diff",
+    "challenger_kill_rate",
+    "compute_divergences",
+    "compute_ops_metrics",
+    "deterministic_trend_scan",
+    "hypothesis_ages_days",
+    "ledger_churn",
+    "parse_audit_costs",
+    "render_review_markdown",
+    "run_weekly_review",
+    "scan_staleness",
+]

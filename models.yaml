@@ -48,3 +48,12 @@ roles:
     provider: anthropic
     model: claude-haiku-4-5-20251001
     params: {}
+
+  # Test-Chooser (PLAN.md "Session loops (c)"): rewrites case/questions-open.md
+  # from the post-challenge ledger. Bound to the primary reasoner's model since
+  # it needs the same case-level judgment as the Ledger-Maintainer/Composer.
+  test_chooser:
+    provider: anthropic
+    model: claude-opus-5
+    params:
+      effort: high

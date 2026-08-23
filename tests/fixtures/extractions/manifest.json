@@ -1,0 +1,19 @@
+{
+  "clean_agreement.json": [
+    {"name_raw": "Potassium", "canonical_name": "potassium", "status": "auto"},
+    {"name_raw": "Glucose", "canonical_name": "glucose", "status": "auto"}
+  ],
+  "value_disagreement.json": [
+    {"name_raw": "Potassium", "canonical_name": "potassium", "status": "pending"}
+  ],
+  "unit_mismatch.json": [
+    {"name_raw": "Creatinine", "canonical_name": "creatinine", "status": "pending"}
+  ],
+  "single_pass_only.json": [
+    {"name_raw": "Ferritin", "canonical_name": "ferritin", "status": "pending"}
+  ],
+  "low_confidence.json": [
+    {"name_raw": "TSH", "canonical_name": "TSH", "status": "pending"}
+  ],
+  "non_lab_clinical_note.json": []
+}
