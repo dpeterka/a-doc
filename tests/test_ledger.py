@@ -562,3 +562,20 @@ def test_ledger_yaml_is_human_diffable_plain_text(tmp_path: Path) -> None:
     assert "hypotheses:" in text
     assert "pe-01" in text
     assert not text.startswith("!!")  # no python-object tags, plain YAML
+
+
+def test_patient_origin_cannot_be_added_directly_at_most_likely() -> None:
+    """Invariant (b), add-path: origin=patient may never ENTER at most-likely."""
+    ledger = empty_ledger()
+    diff = diff_with(
+        [
+            AddHypothesis(hypothesis=make_cant_miss()),
+            AddHypothesis(
+                hypothesis=make_hypothesis(
+                    id="pt-1", tier="most-likely", origin="patient", status="patient-proposed"
+                )
+            ),
+        ]
+    )
+    with pytest.raises(LedgerInvariantError, match="challenged before promotion"):
+        apply_diff(ledger, diff)

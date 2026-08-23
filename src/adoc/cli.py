@@ -21,6 +21,8 @@ from adoc.config import Settings, load_model_bindings
 from adoc.ingest.archive import PageRenderer, pdftoppm_renderer
 from adoc.ingest.pipeline import IngestReport, ingest_directory, ingest_inbox
 from adoc.ingest.vision import VisionClient
+from adoc.intake.cli import run_onboarding_session
+from adoc.intake.wizard import IntakeWizard
 from adoc.labs.db import LabsDb
 from adoc.privacy import Scrubber
 from adoc.reason.client import LlmClient
@@ -57,7 +59,27 @@ def _stub(name: str) -> int:
 
 
 def _cmd_onboard(_args: argparse.Namespace) -> int:
-    return _stub("onboard")
+    try:
+        settings = Settings()
+    except Exception as exc:  # noqa: BLE001 - surface any config error to the user
+        print(f"onboard: configuration error: {exc}", file=sys.stderr)
+        return 1
+
+    repo = DataRepo(settings.data_dir)
+    if not repo.is_initialized:
+        print("onboard: data repo not initialized; run `adoc init` first", file=sys.stderr)
+        return 1
+
+    try:
+        client = LlmClient.from_settings(settings)
+    except Exception as exc:  # noqa: BLE001 - surface any config error to the user
+        print(f"onboard: configuration error: {exc}", file=sys.stderr)
+        return 1
+
+    wizard = IntakeWizard(repo, client, dropbox_folder=settings.dropbox_folder)
+    # `input`/`print` are looked up here (not bound as a default parameter
+    # value at import time) so tests can monkeypatch `builtins.input`.
+    return run_onboarding_session(wizard, input_fn=input, print_fn=print)
 
 
 def _build_llm_client(settings: Settings) -> LlmClient:
