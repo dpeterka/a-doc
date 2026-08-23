@@ -1,0 +1,20 @@
+{% macro bubble(entry) %}
+  {% if entry.role == "patient" %}
+    <div class="chat-bubble chat-bubble-patient">
+      <p>{{ entry.text }}</p>
+    </div>
+  {% else %}
+    <div class="chat-bubble chat-bubble-assistant chat-kind-{{ entry.kind }}">
+      {% if entry.kind == "urgent" %}
+        <p class="chat-urgent-label">Please seek care now</p>
+      {% endif %}
+      <p>{{ entry.text }}</p>
+      {% if entry.tests_to_request %}
+        <p class="muted">Tests to ask your doctor about:</p>
+        <ul>
+          {% for t in entry.tests_to_request %}<li>{{ t }}</li>{% endfor %}
+        </ul>
+      {% endif %}
+    </div>
+  {% endif %}
+{% endmacro %}

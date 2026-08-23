@@ -26,7 +26,7 @@ from adoc.ingest.schema import ClassifyResult, DocumentExtraction
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-_STUB_COMMANDS = ["review", "serve", "eval"]
+_STUB_COMMANDS = ["review", "eval"]
 
 
 class _FakeVisionClient:
@@ -218,6 +218,67 @@ def test_onboard_runs_the_wizard_loop_against_an_initialized_repo(
     out = capsys.readouterr().out
     assert "[1/10] Basics" in out
     assert "resume anytime with `adoc onboard`" in out
+
+
+def test_serve_fails_without_data_dir(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)  # hermetic: a developer .env must not leak into Settings
+    monkeypatch.delenv("ADOC_DATA_DIR", raising=False)
+
+    code = main(["serve"])
+
+    assert code == 1
+    assert "configuration error" in capsys.readouterr().err
+
+
+def test_serve_builds_the_app_and_runs_uvicorn_with_host_and_port(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    data_dir = tmp_path / "a-doc-data"
+    DataRepo.init_at(data_dir)
+    monkeypatch.setenv("ADOC_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("ADOC_MODELS_FILE", str(REPO_ROOT / "models.yaml"))
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+    calls: list[tuple[object, str, int]] = []
+    monkeypatch.setattr(
+        cli, "_run_uvicorn", lambda app, *, host, port: calls.append((app, host, port))
+    )
+
+    code = main(["serve", "--host", "0.0.0.0", "--port", "9000"])
+
+    assert code == 0
+    assert len(calls) == 1
+    app, host, port = calls[0]
+    assert host == "0.0.0.0"
+    assert port == 9000
+    from fastapi import FastAPI
+
+    assert isinstance(app, FastAPI)
+    assert "starting on http://0.0.0.0:9000" in capsys.readouterr().out
+
+
+def test_serve_defaults_to_localhost_8080(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    data_dir = tmp_path / "a-doc-data"
+    DataRepo.init_at(data_dir)
+    monkeypatch.setenv("ADOC_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("ADOC_MODELS_FILE", str(REPO_ROOT / "models.yaml"))
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+    calls: list[tuple[object, str, int]] = []
+    monkeypatch.setattr(
+        cli, "_run_uvicorn", lambda app, *, host, port: calls.append((app, host, port))
+    )
+
+    code = main(["serve"])
+
+    assert code == 0
+    _app, host, port = calls[0]
+    assert host == "127.0.0.1"
+    assert port == 8080
 
 
 def test_unknown_subcommand_exits_nonzero() -> None:
