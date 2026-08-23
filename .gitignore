@@ -36,3 +36,6 @@ uv.lock.bak
 
 # Never let PHI data-repo paths get nested/committed here by accident
 /data/
+
+# Claude Code agent worktrees (local only)
+.claude/
