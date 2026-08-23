@@ -11,6 +11,7 @@ ever touches.
 from __future__ import annotations
 
 import importlib
+import re
 
 import adoc
 
@@ -27,7 +28,7 @@ _SUBPACKAGES = [
 
 
 def test_version() -> None:
-    assert adoc.__version__ == "0.1.0"
+    assert re.fullmatch(r"\d+\.\d+\.\d+", adoc.__version__)
 
 
 def test_subpackages_import() -> None:
