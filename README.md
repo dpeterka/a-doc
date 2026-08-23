@@ -258,7 +258,7 @@ If the installed Tailscale client's CLI has since changed `serve` syntax,
 | Phase | Description | Status |
 |---|---|---|
 | 0 | Project scaffold | complete |
-| 1 | MVP (onboarding, ingestion, DAG reasoning, web UI, AWS deploy) | not started |
+| 1 | MVP (onboarding, ingestion, DAG reasoning, web UI, AWS deploy) | code complete — instance deploy verification pending |
 | 2 | Grounding & anti-hallucination hardening | not started |
 | 3 | Knowledge layer (HPO/LIRICAL/Monarch, ACR/EULAR criteria) + full eval | not started |
 | 4 | Extras (Apple Health import, specialist finder, notifications) | not started |
