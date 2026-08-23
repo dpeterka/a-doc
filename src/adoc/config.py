@@ -39,6 +39,7 @@ class Settings(BaseSettings):
 
     data_dir: Path
     models_file: Path = _DEFAULT_MODELS_FILE
+    dropbox_folder: str = "Dropbox/a-doc-inbox"
 
     anthropic_api_key: SecretStr | None = Field(
         default=None, validation_alias=AliasChoices("ANTHROPIC_API_KEY")
