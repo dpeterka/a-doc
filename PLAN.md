@@ -1,0 +1,186 @@
+# a-doc — Personal Longitudinal Medical Diagnostic Assistant
+
+## Context
+
+A single-patient interactive diagnostic-support agent. Designed for the common shape of a long diagnostic odyssey: a complex, still-undiagnosed condition (autoimmune-domain focus), care fragmented across specialist referrals, and a real risk of anchoring on self-diagnosis that the system counteracts. The tool becomes the "whole-picture holder": it ingests lab PDFs and scanned doctor reports (via Dropbox) plus structured records (Apple Health FHIR export), maintains a longitudinal case file, and produces evidence-linked diagnostic *leads*, test suggestions, and specialist recommendations — framed as material to bring to doctors, never as diagnoses.
+
+**Confirmed decisions:** operator = the end user (assumed non-technical → web chat UI); Anthropic frontier API approved; budget $100+/mo; Python; deployment on AWS with CloudFormation-managed infrastructure; GitFlow; Apple Health Records import deferred to Phase 4 (over-valued relative to the Dropbox PDF path); anti-hallucination grounding is its own phase.
+
+## Research conclusions (3 parallel research passes; full reports in session transcripts)
+
+1. **The six linked resources**: none maintains longitudinal patient state; none handles real scanned documents or lab-value structuring — those two gaps are this project's core. Borrow: RAG pipeline patterns from `souvikmajumder26/Multi-Agent-Medical-Assistant` (Apache-2.0); dual-index retrieval + iterative differential loop from MRD-RAG (arXiv 2504.07724); persistent "Visit Log" + mediated record access from DynamiCare (PMC13274293); geteff1's 302-case rare-disease dataset for evaluation. Skip MAM and AjayTiwari94.
+2. **Agent decomposition — the user's hypothesis is supported by the literature.** Specialty personas add no knowledge and can degrade accuracy (persona-ablation studies; MedAgentBoard: single strong LLM beats multi-agent on medical QA; debate gains ≈ self-consistency at matched compute). What *does* help: **functional/cognitive decomposition** (Microsoft MAI-DxO, arXiv 2506.22405 — Hypothesis ledger / Test-Chooser / Challenger / Stewardship as prompt-loop stages of ONE model: 81.9% vs 78.6% for the bare model at ~60% cost on NEJM cases; physicians 20%) applied **adaptively** (MDAgents: single-pass by default, deliberation only on hard/stuck cases). Closest analogue: Google AMIE longitudinal management (Nature 2026) — dialogue agent + deep-reasoning pass over cross-visit context; g-AMIE's "structure findings for a human clinician, block individualized treatment advice" guardrail.
+3. **Anchoring is the #1 failure mode** for this use case: LLMs measurably anchor and are sycophantic toward user-presented theories. Evidence-backed mitigations, all adopted below: persistent hypothesis ledger, mandatory challenger pass, patient's theory quarantined as just-another-hypothesis, forced "Can't-Miss" tier (Glass Health pattern), periodic *blind re-differential*. Expectation-setting: on real diagnostic-odyssey cases (UDN study, JAMA Netw Open 2025) frontier models hit exact diagnosis ~13% and useful leads ~20% more — outputs are leads, not answers.
+4. **Building blocks**: Claude native PDF/vision ingestion wins for scanned reports (~$0.02–0.05/report; 95–99% field accuracy on clean PDFs, 85–95% on photos → double-pass + validation + human-confirm queue design); files+git+SQLite beats vector/graph stores at N=1 (auditable, revertible); free knowledge sources: UMLS (register week 1), Orphanet/Orphadata (CC-BY), HPO `phenotype.hpoa`, Mondo, Monarch KG (SQLite dump + hosted sem-sim API), LIRICAL phenotype-only mode, PubMed E-utilities/PMC OA, StatPearls/GeneReviews tarballs, hand-encoded ACR/EULAR criteria + ICAP ANA patterns (~2 days curation; no drop-in dataset exists). Do NOT ingest UpToDate/Merck/DynaMed (license-blocked). Featherless: optional flat-rate second-opinion channel only. rclone-on-a-timer beats Dropbox API/webhooks.
+
+## Headline architecture decisions
+
+| Decision | Choice |
+|---|---|
+| Agent topology | **One primary frontier reasoner, zero specialty personas.** Functional stages as code-controlled passes: Ledger-Maintainer → Challenger (mandatory, separate call, **different model family**) → Test-Chooser → Composer/Steward. Adaptive depth: fused single call by default; multi-call deliberation when the ledger is stuck/churning. Adaptive thinking; `effort: high` for chat, `xhigh` for weekly review. |
+| Reasoning pipeline as a **typed DAG with contracts** | Each loop (ingest, chat-diagnostic, weekly review) is an explicit DAG (own ~200-line runner in `reason/dag.py`, no framework): nodes = stages, edges carry Pydantic-validated artifacts, and every node declares **pre/postcondition contracts enforced by code** — e.g. Challenger's postcondition requires ≥1 substantive counter-argument per `most-likely` hypothesis or the run fails; the Blind-Reviewer node's precondition asserts the ledger is absent from its context pack; the Composer's precondition asserts a Challenger node completed this run. Every node execution is logged with input/output hashes → replayable, auditable, and testable node-by-node. |
+| Reasoner integration | Provider-agnostic adapter in `reason/client.py`: Anthropic SDK + OpenAI-compatible client (covers OpenAI and Featherless) behind one interface with structured-output support, PHI scrub, cost/audit logging. Role→model bindings live in `models.yaml`, not code. NOT the Claude Agent SDK — stage order and context assembly must be enforced by the DAG, and model-driven file tools must never reach PHI. Chat tool-use (`query_labs`, `search_case`, web search) runs inside a single whitelisted-tools node. |
+| State | **Two git repos: code vs data.** Data repo (`/data/a-doc-data` on the instance) = system of record: markdown case files + `differential-ledger.yaml` + immutable `sources/` + `labs.sqlite` (rebuildable from committed `labs-export.jsonl`). Every mutation = one git commit; weekly reviews tagged. SQLite FTS5 before vectors; no graph DB in v1. |
+| UI | **FastAPI + Jinja2 + HTMX + SSE + Plotly.js** (not Chainlit): 3 of 5 surfaces are page CRUD (confirm queue with page images, ledger dashboard, trend charts), not chat. |
+| Ingestion | Dropbox app folder → `rclone move` on a timer → double-pass Claude vision extraction (PDF block pass + page-PNG pass, strict Pydantic schema) → deterministic validation (per-analyte unit whitelist, physiologic bounds, trend-outlier check) → agree+valid = auto-accept, else human-confirm queue in UI (extracted row beside source page image). Apple Health Records FHIR import exists as a secondary path but is deferred to Phase 4. |
+| Safety | Deterministic red-flag screen (chest pain, stroke signs, anaphylaxis, suicidality…) runs BEFORE any API call → urgent-care template. Output gate blocks dosing/treatment instructions. All framing: "leads to discuss with your doctor." |
+| Anti-anchoring (code-enforced, not prompt-hoped) | Ledger invariants in `ledger.py`: Can't-Miss tier never empty; `origin: patient` hypotheses cannot be promoted to most-likely in the diff that creates them (Challenger must run first); every hypothesis must be re-challenged within 2 ledger versions; doctor-confirmed diagnoses stay challengeable at a raised bar (new contradicting evidence required). **Structured adversarial runs across model families**: the Challenger always runs on a different family than the Ledger-Maintainer (shared-model blind spots don't survive a cross-family attack); the weekly review runs a **blind re-differential panel** — 2–3 diverse models each produce a de novo differential without seeing the ledger, and divergences from the ledger are adjudicated by a Challenger node with the DAG contract that every divergence gets an explicit accept/reject rationale. Phase 2 adds LIRICAL/Monarch as independent *non-LLM* differential engines for a third, mechanistically different check. |
+| Model strategy & self-evaluation | See "Model strategy" section below: `models.yaml` role bindings, `adoc eval` benchmark harness, gated model rotation. |
+| Deployment (AWS, **CloudFormation-managed**) | Single always-on node — SQLite + git want one persistent instance: **EC2 t4g.small/medium (arm), encrypted gp3 EBS, systemd units** for `adoc-web`, `adoc-ingest.timer` (10 min), `adoc-review.timer` (weekly). All infra as CloudFormation stacks in `deploy/cfn/`: `network.yaml` (VPC/subnet/SG — no inbound except Tailscale), `instance.yaml` (EC2, IAM role, encrypted EBS, SSM access — no SSH keys), `backup.yaml` (versioned SSE-KMS S3 bucket + lifecycle), `ci.yaml` (OIDC role for GitHub Actions deploys). Patient access via **Tailscale**; app has passphrase session auth and binds to tailnet only — never public. Backup: nightly `git bundle` + `labs-export.jsonl` + `sources/` sync to the S3 bucket. Stack changes go through PRs like code (`aws cloudformation deploy` from CI or locally via change sets). |
+| Privacy | API only (never consumer apps); direct identifiers (name/DOB/MRN/address) stripped from all text paths in `privacy.py`; vision extraction necessarily sends raw documents — accepted per user's privacy decision. Avoid retention-extending API features (Files/Batch) in v1. |
+
+## Model strategy & self-evaluation
+
+**Role→model bindings (`models.yaml`, config not code; every role swappable without a release):**
+
+| Role | Initial binding | Rationale |
+|---|---|---|
+| Primary reasoner (Ledger-Maintainer, Composer, chat) | `claude-opus-5` (Anthropic API) | Strongest current hard-case medical reasoning (2026 evals); adaptive thinking + effort dial. |
+| Challenger / adversarial passes | `gpt-5.2-thinking` (OpenAI API) | Cross-family by design — a different model attacks the primary's reasoning. |
+| Blind-review panel (weekly) | claude-opus-5 + gpt-5.2-thinking + DeepSeek-R1-class via Featherless ($25/mo flat) | Three families, three independent de novo differentials. |
+| Extraction pass A / pass B | `claude-sonnet-5` (PDF block) / `gpt-5.2` vision (page PNGs) | Cross-family double-pass makes correlated extraction errors far less likely than same-model-twice. |
+| Classifier/router | `claude-haiku-4-5` | Cheap, latency-sensitive. |
+
+**Self-evaluation (`adoc eval`, run on demand and monthly by timer):**
+- **Benchmark suite**: (a) geteff1's 302 rare-disease cases (MIT) — score differential recall@10 against known diagnoses; (b) golden extraction fixtures (synthetic + real anonymized lab PDFs) — field-level F1; (c) the red-team transcript — safety-gate pass rate, anchor-resistance (planted "I'm sure I have X" turns must not be adopted); (d) **retrospective self-cases**: once any finding is doctor-confirmed, replay the case file as of earlier dates and check whether/when the system surfaced it — the only eval that measures *this patient's* effectiveness.
+- **Ops metrics logged continuously** (per-call in `logs/api-audit`, aggregated in each weekly review): cost/tokens per role, extraction auto-accept vs queue rate, ledger churn, hypothesis age, challenger kill-rate, blind-panel divergence rate.
+- **Model rotation**: when a new model releases, `adoc eval --candidate <provider:model>` runs the full suite against the incumbent binding and emits a comparison report; rebinding is a human-approved edit to `models.yaml` (git-tracked, so every model change is dated and revertible). No silent upgrades.
+
+## Onboarding & end-user experience
+
+**First run = a guided intake wizard** (chat-shaped, but driven by a predefined state machine in `intake/`, not free conversation). Sections, in order, each backed by a Pydantic schema:
+1. Basics — age, sex at birth, height/weight, occupation/exposures
+2. Current symptoms — free narrative, model extracts a structured symptom list (→ seeds the Phase-2 HPO profile) and asks targeted follow-ups (onset, frequency, triggers)
+3. Major medical event history — timeline walk ("earliest first"); each event becomes an `encounters/` file
+4. Prior diagnoses & workups — including the patient's own suspected diagnoses, which are recorded straight into the ledger as `origin: patient`
+5. Family history — structured relative/condition entries (autoimmune, cancer, cardiac, early deaths) → `case/family-history.md`
+6. Medications — current + past-significant, dose-free is fine → `case/medications.md`
+7. Supplements — same file, flagged separately (interacts with labs, e.g. biotin)
+8. Allergies & reactions
+9. Care team & insurance — current doctors, specialists seen, insurer → `case/care-team.md`
+10. Document drop — prompt to put existing PDFs in the Dropbox folder / connect Apple Health portals
+
+Mechanics: after each section the model plays back what it recorded ("Here's what I've noted — anything wrong or missing?") and only confirmed entries are committed; progress bar across sections; fully resumable (intake state in the data repo); each completed section = one git commit. Until intake is complete, diagnostic answers carry a visible "baseline incomplete — these leads may shift" banner. Re-runnable later per section ("update my medications").
+
+**Steady state UX**: home screen = current three-tier differential + "what changed since you last looked" + open questions for the next appointment; chat for anything; upload/confirm queue when documents arrive; trend charts per analyte; weekly review readable as a report. Everything phrased as leads and preparation for doctors, with source links back to the patient's own documents.
+
+## Engineering practice (this is a GitHub software project)
+
+- **Repo docs**: this plan is committed as `PLAN.md` (kept current as phases complete); `CLAUDE.md` instructs the coding agent — build/test commands, GitFlow rules, prompt-edit policy (safety tests must pass), the PHI boundary (data repo is never read into context, fixtures only), models.yaml change procedure, ADR requirement for architectural changes.
+- **GitFlow**: `main` = released/deployed (every merge tagged semver, auto-deployed via CI); `develop` = integration; `feature/*` branch from develop, PR back with required CI; `release/*` for stabilization; `hotfix/*` from main. Branch protection on main and develop; conventional commits; CHANGELOG per release. GitHub Issues/Milestones mirror the phases below.
+- **Infrastructure as code**: CloudFormation stacks in `deploy/cfn/` (see Deployment row) — reviewed via PR, deployed by change set; no console-created resources. GitHub Actions assumes an OIDC deploy role; instance bootstrap via SSM + a versioned install script, so a rebuilt instance restores from S3 to a working system (tested restore is a release gate).
+- **CI (GitHub Actions)**: ruff (lint+format), mypy, pytest with coverage gate on every PR; the golden red-team transcript and ledger-invariant/DAG-contract tests are required checks — prompt edits cannot merge if they weaken safety behavior. Merge to main → build, cfn deploy (change set), release. Monthly scheduled `adoc eval` run against fixtures (no PHI in CI).
+- **Hygiene**: pre-commit hooks (ruff, gitleaks secret scan); Dependabot; `.env` never committed; **PHI lives only in the data repo, which has no remote** — CI and the code repo see synthetic fixtures only.
+- **Docs**: README (setup/deploy/runbook), `docs/adr/` architecture decision records for the choices in this plan (model bindings, DAG contracts, storage, CloudFormation layout), prompt templates versioned in-repo and reviewed like code.
+
+## Provenance & re-evaluation policy (software/model changes vs persisted state)
+
+Every persisted LLM-derived artifact (ledger diff, extraction, encounter summary, review) is stamped with **provenance**: `{app_version (git sha), prompt_template_version, model_id, dag_node, timestamp}` — stored in the artifact (ledger diffs record it per applied diff; labs rows carry it in `raw_json`). Raw sources are immutable, so every derived artifact is rebuildable.
+
+Re-trigger rules (implemented as a staleness scanner run at the start of each weekly review):
+- **Reasoner model rebinding or major-version prompt change** → the next weekly review automatically runs the full blind panel + a complete challenge sweep over all `active` hypotheses (not just stale ones), and the review report notes "re-evaluated under <model/prompt>".
+- **Extraction model/prompt change** → no mass re-extraction; re-extract on demand (`adoc backfill --re-extract [--since|--doc]`) prioritizing rows that were `pending/corrected` or `confidence != high` under the old extractor. Confirmed rows are never silently overwritten — a re-extraction disagreement with a human-confirmed value goes to the queue.
+- **Schema changes** (ledger YAML, labs DDL) → versioned migration scripts in-repo; ledger schema version recorded in the file; migrations are commits in the data repo, so state and software version travel together and old software refuses newer state (version check at load).
+- **Staleness policy**: artifacts whose provenance model/prompt is ≥2 bindings old and which still influence `active` hypotheses are queued for re-evaluation, highest-probability hypotheses first; the weekly review prints the stale-artifact count so drift is visible, never silent.
+
+## Repo layout (code repo: `/home/dpeterka/src/a-doc`)
+
+```
+PLAN.md CLAUDE.md         # this plan; coding-agent instructions (first Phase-0 commits)
+pyproject.toml            # uv; deps: anthropic, openai, fastapi, uvicorn, pydantic(+settings), jinja2,
+                          #   ruamel.yaml, pdf2image, GitPython, fhir.resources (phase 4)
+.github/workflows/        # ci.yml (ruff, mypy, pytest+coverage), deploy.yml (cfn change sets, OIDC),
+                          #   eval.yml (monthly fixture eval)
+.pre-commit-config.yaml   # ruff, gitleaks
+models.yaml               # role→model bindings (see Model strategy)
+deploy/cfn/               # network.yaml, instance.yaml, backup.yaml, ci.yaml + install script (SSM)
+deploy/systemd/           # adoc-web.service, adoc-ingest.timer, adoc-review.timer
+docs/adr/                 # architecture decision records
+src/adoc/
+  config.py cli.py        # pydantic-settings; `adoc init|onboard|ingest|review|serve|backfill|import-apple-health|eval`
+  privacy.py              # identifier scrub hook applied in the API client wrapper
+  casefile/               # repo.py (git plumbing), schema.py, ledger.py (invariants+diff apply), encounters.py
+  labs/                   # db.py (DDL/FTS5/migrations/JSONL export), models.py, validate.py, queries.py
+  ingest/                 # pipeline.py, extract.py (cross-model double-pass), reconcile.py, confirm.py,
+                          #   archive.py; apple_health.py (FHIR zip importer, phase 4)
+  intake/                 # onboarding state machine: sections.py (schemas), wizard.py, playback confirm loop
+  reason/                 # client.py (provider adapter: scrub+audit+bindings), dag.py (typed DAG runner +
+                          #   node contracts), context.py (deterministic context packs), stages.py, router.py,
+                          #   tools.py, safety.py, review.py, prompts/*.md
+  evals/                  # runner.py, suites/{rare302,extraction,redteam,retrospective}.py, report.py
+  knowledge/              # phase 2: phenotype.py (HPO profile), lirical.py, monarch.py, pubmed.py, criteria/*
+  web/                    # app.py, routes/{chat,ledger,confirm,labs,docs,onboard}.py, templates/, static/
+tests/                    # fixtures: synthetic lab PDFs + golden extractions + golden ledger diffs +
+                          #   red-team transcript; test_{validate,ledger,reconcile,safety,criteria,dag,intake}.py
+```
+
+Data repo layout (no remote, PHI-only): `case/{case-summary.md, differential-ledger.yaml, questions-open.md, family-history.md, medications.md, care-team.md, intake-state.yaml, encounters/, reviews/}`, `sources/` (immutable originals + per-page PNGs), `labs.sqlite` (gitignored) + committed `labs-export.jsonl`, `inbox/ work/ logs/` (gitignored).
+
+## Key schemas
+
+**`differential-ledger.yaml`** (YAML, machine-mutated via structured-output diffs, human-diffable in git):
+```yaml
+hypotheses:
+  - id: sle-01
+    name: "Systemic lupus erythematosus"
+    mondo: "MONDO:0007915"            # phase 2
+    tier: most-likely                  # most-likely | expanded | cant-miss
+    probability: moderate              # buckets: high|moderate|low|minimal (+ prior_probability for movement)
+    status: active                     # active|patient-proposed|challenged|ruled-out|confirmed-by-doctor|parked
+    origin: patient                    # model|patient|doctor|challenger
+    evidence_for:  [{claim: "ANA 1:640 homogeneous", source: "labs:ana:2026-05-02", strength: strong}]
+    evidence_against: [{claim: "Anti-dsDNA negative x2", source: "labs:anti-dsdna:2026-07-10", strength: moderate}]
+    discriminators: ["Complement C3/C4"]   # feeds Test-Chooser
+    challenger_notes: "..."
+    last_challenged: "2026-08-16"
+```
+Source-ref grammar (mandatory on every claim): `labs:<analyte>:<date>` | `doc:<file>#p<page>` | `encounter:<file>` | `pmid:<id>` | `patient-report:<date>`.
+
+**`labs` table**: `documents(sha256 PK, filename, doc_type, doc_date, status)` + `labs(id, date, loinc_code NULL, name /*canonical*/, name_raw, value REAL, value_text /*titers, "positive"*/, ucum_unit, ref_low, ref_high, ref_text, flag, source_doc FK, source_page, extraction_status auto|confirmed|corrected|pending|rejected, raw_json, UNIQUE(date,name,source_doc))` + FTS5. Confirm queue = `extraction_status='pending'` rows. LOINC nullable; canonical-name mapping table for this patient's ~100 recurring analytes — never block ingestion on coding.
+
+**Extraction schema** (strict structured output, per document): doc_type, facility, collection/report dates, `results[]` (name_raw, value|value_text, unit_raw, ref_range_raw, flag_raw, page, confidence), `narrative_findings[]` (serology comments matter for autoimmune workups), `illegible_regions[]`.
+
+**Encounter files**: markdown + frontmatter (date, type: lab-result|specialist-visit|imaging|patient-report|phone|procedure, provider, sources, symptoms→HPO in phase 2). Patient chat reports enter as `type: patient-report` encounters — same door as doctor notes, labeled.
+
+## Session loops
+
+**(a) Document lands:** rclone timer → sha256 dedupe → archive original + render page PNGs → classify call → (labs) double-pass extract → validate → reconcile → auto/pending rows + JSONL append → incremental reasoning: Ledger-Maintainer diff → Challenger (separate call, must attack) → invariant-checked apply → case-summary update → one git commit → UI banner ("12 rows added, 2 need confirmation").
+
+**(b) Chat turn:** deterministic red-flag screen (pre-API) → route informational vs diagnostic. Informational: one streamed tool-runner call (query_labs / search_case / web literature). Diagnostic: new info → patient-report encounter; patient theory → logged `origin: patient`, never the frame; Ledger-Maintainer → mandatory Challenger → apply → Composer/Steward renders three-tier differential with source refs + next-most-informative tests, treatment-advice gate on output. Adaptive escalation to multi-call deliberation on ledger churn/stuckness.
+
+**(c) Weekly deep review (timer, `xhigh`):** deterministic trend scan → **blind re-differential panel** (2–3 model families, each de novo, no ledger in context — DAG contract enforces its absence) → divergence adjudication via cross-family Challenger (contract: every divergence gets an explicit accept/reject rationale) → full challenge sweep → Test-Chooser rewrites `questions-open.md` as a prioritized next-appointment list (tests to request, specialist types) → literature refresh on top-3 hypotheses → ops metrics appended (churn, hypothesis age, challenger kill-rate, cost) → committed + tagged review report; UI notification.
+
+Estimated spend: $1–3/document ingest, $0.20–1/diagnostic turn, $8–20/deep review (multi-family panel), + $25/mo Featherless flat → ~$70–150/mo. Within budget.
+
+## Phasing
+
+**Phase 0 — Project scaffold (~6–10 h):** commit `PLAN.md` (this plan) and `CLAUDE.md` (agent instructions) as the first commits; repo bootstrap — pyproject (uv), ruff/mypy/pytest, pre-commit + gitleaks, GitHub Actions CI, GitFlow branches + protection, README, first ADRs (model bindings, DAG contracts, storage, IaC), CloudFormation stack skeletons in `deploy/cfn/` + OIDC deploy role, issue milestones for the phases.
+
+**Phase 1 — MVP (~60–80 h):** everything above except `knowledge/`; `adoc init` + **onboarding intake wizard** (all 10 sections, resumable, playback-confirm); backfill of historical PDFs; full ingestion + confirm queue; web UI (onboarding, chat/SSE, upload, queue with page images, ledger view, Plotly trends); DAG runner with node contracts; staged reasoning with mandatory cross-family Challenger; `models.yaml` + provider adapter; safety gates; weekly review with blind panel; `adoc eval` with the extraction + red-team suites; AWS deploy (EC2+EBS+Tailscale+S3 backup). Register UMLS week 1 (approval lead time).
+*Acceptance:* full onboarding run produces a complete committed baseline case file from a scripted persona; 10+ real PDFs backfilled with **0 incorrect auto-accepted rows** on 5 manually-verified docs (disagreements must queue); ledger invariants and DAG node contracts code-enforced + tested (a run with a skipped Challenger node must fail); red-team suite passes in CI ("I'm sure I have X" → patient-origin + challenged, not adopted; dosing question → blocked; red-flag phrase → urgent-care template, zero API calls); every state change is a data-repo commit; labs.sqlite rebuildable from JSONL + git.
+
+**Phase 2 — Grounding & anti-hallucination hardening (~30–45 h, dedicated):** contracts and verification that make fabrication structurally difficult, layered on the Phase-1 pipeline:
+- **Deterministic citation checker**: every evidence claim's source ref (grammar above) is resolved by code — `labs:` refs must match an actual row (value quoted in the claim must equal the stored value exactly), `doc:`/`encounter:` refs must resolve to the file/page, `pmid:` refs must exist via E-utilities. Unresolvable or mismatched refs reject the ledger diff (DAG contract), not just warn.
+- **Claim-level entailment verifier node**: a separate cross-family model receives (claim, cited source text) pairs and must judge entailment; non-entailed claims bounce the diff back to the Ledger-Maintainer with the verifier's objection. Composer output gets the same pass on quantitative statements ("your CRP doubled") against `labs.sqlite`.
+- **Abstention calibration**: prompts + contracts require "insufficient evidence" as a first-class output; eval probes measure whether the system says so when the case file genuinely lacks support.
+- **Hallucination eval suite** added to `adoc eval` and CI: planted-fact probes (does a fabricated lab value survive to output?), fabricated-citation detection rate, entailment-verifier precision/recall on a labeled fixture set, abstention rate on unanswerable probes.
+*Acceptance:* zero unresolvable source refs can reach the committed ledger (enforced + tested); planted-fact and fabricated-citation probes pass at 100% in CI; every quantitative claim in patient-facing output is machine-checked against the labs DB.
+
+**Phase 3 — Knowledge layer + full eval (~45–65 h):** patient HPO phenotype profile; LIRICAL (phenotype-only) + Monarch sem-sim as independent differential engines rendered alongside the LLM panel in weekly reviews with divergence adjudication; Monarch KG SQLite + Orphadata + phenotype.hpoa + Mondo as chat tools; ~10 hand-encoded ACR/EULAR classification scorers (SLE 2019, Sjögren 2016, SLICC, CASPAR, myositis, ANCA vasculitides…) + ICAP ANA-pattern mapping, computed deterministically from labs+phenotype, always labeled "classification, not diagnostic, criteria"; PubMed E-utilities with PMID-linked citations; StatPearls/GeneReviews local FTS5; `adoc eval` gains the rare-302 differential-recall suite and the retrospective self-case replay, enabling gated model rotation.
+*Acceptance:* reviews show LLM vs LIRICAL differentials with explicit divergence adjudication; criteria render itemized (points, threshold); every literature claim carries a PMID; `adoc eval --candidate` produces an incumbent-vs-candidate comparison report from a single command.
+
+**Phase 4 — Extras:** Apple Health Records import (deliberately deprioritized: patient connects portals once, "Export All Health Data" zip → Dropbox → `apple_health.py` parses `clinical-records/` FHIR → labs/encounters deduped against PDF rows; PDFs remain the richer source for autoimmune serology narratives); specialist finder via NPPES NPI registry (taxonomy + location + insurance fit); one-page appointment-prep PDF export; medication/supplement interaction flags; genetics path if sequencing ever happens (Exomiser needs a VCF; Phen2Gene works from phenotypes now); email notifications (SES); vectors only if FTS5 demonstrably misses.
+
+## Key risks
+
+1. **Extraction integrity** is the top data risk — design optimizes for zero silent errors (cross-model double-pass + validation + queue); if >30% of rows queue, add a targeted re-ask pass.
+2. **Self-anchoring over time** (the ledger anchoring the system): mitigated structurally — DAG contracts make the Challenger and ledger-blind nodes non-skippable, the challenger and blind panel run on different model families, and Phase 2's non-LLM engines (LIRICAL/Monarch/criteria scorers) add a mechanistically independent check; churn/age/kill-rate metrics printed in every review make stagnation visible.
+3. **Over-trust/framing drift:** steward language lives in one template + one deterministic gate, both pinned by the red-team suite as a required CI check — prompt edits that weaken safety behavior cannot merge.
+4. **PHI:** unredacted documents go to the API (required for vision; per user's accepted privacy posture). Standard API data isn't trained on; note Fable-tier models mandate 30-day retention — `claude-opus-5` doesn't.
+5. **Expectation ceiling:** ~13% exact-hit on true odyssey cases in the best published study — the product's honest job is *leads, structure, and preparation*, and it should say so in the UI.
+
+## Verification
+
+- CI on every PR: ruff, mypy, `pytest` — validators, ledger invariants, DAG node contracts (skipped-Challenger run must fail), reconciliation, safety gates, intake state machine, criteria scorers — against golden fixtures (synthetic lab PDFs + golden extractions + golden diffs + red-team transcript).
+- End-to-end: `adoc init` → `adoc onboard` with a scripted persona → drop 5 verified historical PDFs in inbox → `adoc ingest` → confirm-queue precision check → chat session exercising informational + diagnostic + red-flag turns → `adoc review` → inspect committed review, blind-panel divergence adjudications, and git history → `adoc eval` produces a scored report.
+- Deploy check on EC2: timers fire, Dropbox round-trip works, UI reachable over tailnet only, S3 backup restores to a working data repo.
