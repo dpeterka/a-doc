@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+{% block title %}{{ name }} — a-doc{% endblock %}
+{% block content %}
+  <h1>{{ name }}</h1>
+  <p class="muted"><a href="/labs">&larr; back to all labs</a></p>
+
+  {% if has_data %}
+    <div id="labs-chart" class="labs-chart"></div>
+    <script src="/static/vendor/plotly-basic.min.js" defer></script>
+    <script defer>
+      (function () {
+        var analyteName = {{ name | tojson }};
+        fetch("/labs/" + encodeURIComponent(analyteName) + "/data")
+          .then(function (response) { return response.json(); })
+          .then(function (data) {
+            var valueTrace = {
+              x: data.dates,
+              y: data.values,
+              mode: "lines+markers",
+              name: analyteName,
+              marker: { color: "#2f6f5e" },
+            };
+            var traces = [valueTrace];
+            if (data.ref_low.some(function (v) { return v !== null; })) {
+              traces.push({
+                x: data.dates, y: data.ref_low, mode: "lines", name: "reference low",
+                line: { dash: "dot", color: "#9aa5ad" },
+              });
+            }
+            if (data.ref_high.some(function (v) { return v !== null; })) {
+              traces.push({
+                x: data.dates, y: data.ref_high, mode: "lines", name: "reference high",
+                line: { dash: "dot", color: "#9aa5ad" },
+              });
+            }
+            Plotly.newPlot("labs-chart", traces, {
+              margin: { t: 20, r: 20, b: 40, l: 50 },
+              showlegend: true,
+            }, { responsive: true, displayModeBar: false });
+          });
+      })();
+    </script>
+  {% else %}
+    <p>No results recorded yet for this analyte.</p>
+  {% endif %}
+{% endblock %}

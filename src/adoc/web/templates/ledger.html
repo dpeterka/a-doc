@@ -1,0 +1,68 @@
+{% extends "base.html" %}
+{% block title %}Full picture — a-doc{% endblock %}
+{% block content %}
+  <h1>The full picture</h1>
+  <p class="muted">
+    Every lead a-doc has considered, version {{ ledger.version }}, last updated
+    {{ ledger.updated.date().isoformat() }}. This is the complete, unfiltered record — read-only.
+  </p>
+
+  {% if ledger.hypotheses %}
+    {% for h in ledger.hypotheses %}
+      <article class="card hypothesis-full">
+        <h2>{{ h.name }}</h2>
+        <div class="chips">
+          <span class="chip chip-tier chip-tier-{{ h.tier }}">{{ h.tier | tier_label }}</span>
+          <span class="chip chip-status">{{ h.status | status_label }}</span>
+          <span class="chip chip-origin chip-origin-{{ h.origin }}" data-origin="{{ h.origin }}">
+            origin: {{ h.origin }}
+          </span>
+          <span class="chip chip-probability">confidence: {{ h.probability }}</span>
+        </div>
+
+        {% if h.evidence_for %}
+          <h3>Evidence for</h3>
+          <ul class="evidence-list">
+            {% for e in h.evidence_for %}
+              <li>
+                {{ e.claim }}
+                {% set href = source_ref_href(e.source) %}
+                {% if href %}
+                  <a href="{{ href }}" class="source-ref">({{ e.source }})</a>
+                {% else %}
+                  <span class="muted">({{ e.source }})</span>
+                {% endif %}
+              </li>
+            {% endfor %}
+          </ul>
+        {% endif %}
+
+        {% if h.evidence_against %}
+          <h3>Evidence against</h3>
+          <ul class="evidence-list">
+            {% for e in h.evidence_against %}
+              <li>
+                {{ e.claim }}
+                {% set href = source_ref_href(e.source) %}
+                {% if href %}
+                  <a href="{{ href }}" class="source-ref">({{ e.source }})</a>
+                {% else %}
+                  <span class="muted">({{ e.source }})</span>
+                {% endif %}
+              </li>
+            {% endfor %}
+          </ul>
+        {% endif %}
+
+        {% if h.discriminators %}
+          <p class="muted">Tests that would help tell this apart: {{ h.discriminators | join(", ") }}</p>
+        {% endif %}
+        {% if h.challenger_notes %}
+          <p class="muted">Challenge notes: {{ h.challenger_notes }}</p>
+        {% endif %}
+      </article>
+    {% endfor %}
+  {% else %}
+    <p>Nothing recorded yet.</p>
+  {% endif %}
+{% endblock %}
