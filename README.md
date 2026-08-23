@@ -55,9 +55,9 @@ uv run adoc init       # validates Settings + models.yaml load cleanly
 
 All AWS resources are CloudFormation stacks in `deploy/cfn/`, deployed in
 this order: `ci` (once, manually — see note below) → `network` → `backup` →
-`instance`. Deploys after the initial bootstrap run from GitHub Actions via
-an OIDC-assumed role (`deploy/cfn/ci.yaml`) — no long-lived AWS credentials
-are stored in the repo.
+`instance` → `alb`. Deploys after the initial bootstrap run from GitHub
+Actions via an OIDC-assumed role (`deploy/cfn/ci.yaml`) — no long-lived AWS
+credentials are stored in the repo.
 
 `ci.yaml` creates the very IAM role that GitHub Actions needs in order to
 deploy anything, including `ci.yaml` itself — that first deployment is a
@@ -65,9 +65,19 @@ manual, one-time bootstrap (e.g. `aws cloudformation deploy` from a local
 admin session), after which its `DeployRoleArn` output is copied into the
 `AWS_DEPLOY_ROLE_ARN` repository variable so future deploys are automated.
 
-The EC2 instance has no SSH keys and no public ingress; it is reachable via
-AWS SSM and Tailscale only, and the app binds to the tailnet, never the
-public internet.
+**Patient access is via a public ALB** at `https://adoc.petabloc.io`
+(`deploy/cfn/alb.yaml`) — an explicit user decision that replaced the
+original Tailscale-only design. The EC2 instance itself still has no SSH
+keys and no direct public ingress: `deploy/cfn/network.yaml`'s
+`InstanceSecurityGroup` admits inbound port 8080 from the ALB's security
+group only, so the app process is unreachable except through the ALB. A
+shell on the instance remains **SSM Session Manager only**, exactly as
+before — the ALB changes how *patients* reach the app, not how operators
+reach the box. In-app authentication (username/password, scrypt-hashed,
+with in-app rate limiting) is the only auth layer in front of the app now
+that there is no tailnet gate — see "User provisioning" and "How the
+patient reaches the UI" below. There is deliberately no WAF and no TOTP in
+this design.
 
 ### One-time SSM parameters
 
@@ -86,10 +96,6 @@ IAM-permitted principal in the account, which the instance role's policy
 statement grants; a custom key's policy does not, by default).
 
 ```bash
-# Tailscale auth key (mint below, then paste it here)
-aws ssm put-parameter --name /a-doc/tailscale-auth-key \
-  --type SecureString --value "tskey-auth-xxxxxxxxxxxxxxxx"
-
 # GitHub fine-grained deploy token, read-only on this repo (mint below)
 aws ssm put-parameter --name /a-doc/github-deploy-token \
   --type SecureString --value "github_pat_xxxxxxxxxxxxxxxx"
@@ -108,11 +114,15 @@ aws ssm put-parameter --name /a-doc/openai-api-key \
 # optional — only needed if the Featherless blind-panel role is enabled
 aws ssm put-parameter --name /a-doc/featherless-api-key \
   --type SecureString --value "xxxxxxxxxxxxxxxx"
-
-# Web UI session passphrase (ADOC_SESSION_PASSPHRASE)
-aws ssm put-parameter --name /a-doc/session-passphrase \
-  --type SecureString --value "choose-a-long-passphrase"
 ```
+
+There is no SSM parameter for web login credentials — those are created
+directly on the instance with `adoc user add` (see "User provisioning"
+below), not threaded through SSM/UserData. (The old
+`/a-doc/session-passphrase` parameter and its `ADOC_SESSION_PASSPHRASE`
+env var are gone from the required set; `install.sh` still reads that
+parameter if it happens to exist, purely for backward compatibility, but
+nothing requires it any more.)
 
 To rotate any of these later, add `--overwrite` and re-run the same command,
 then either wait for the next `install.sh` run (e.g. a code deploy) or
@@ -148,27 +158,32 @@ token only ever needs read access to code, never more:
    SecureString --overwrite --value "<new token>"`, then re-run
    `install.sh` on the instance (or just wait for the next boot).
 
-#### Minting a Tailscale auth key
+### User provisioning
 
-1. Tailscale admin console → Settings → Keys → Generate auth key.
-2. **Reusable**: on, so `install.sh` re-runs and instance replacements don't
-   need a fresh key each time. **Ephemeral**: off (this is a persistent
-   node, not a CI runner). Set an expiration and a tag if you use ACL tags;
-   otherwise leave tags empty.
-3. Copy the `tskey-auth-...` value into `/a-doc/tailscale-auth-key` above.
+Web login is username/password, one entry per person who needs access
+(scrypt-hashed, stored at `<data_dir>/work/users.yaml` on the instance —
+gitignored, never in the data repo's git history). There is no SSM
+parameter and no CloudFormation resource for this; it is managed directly
+on the instance, over an SSM Session Manager shell (the only shell access
+this instance ever has):
 
-#### One-time tailnet admin console step (HTTPS for the UI)
+```bash
+aws ssm start-session --target <instance-id>
+sudo -u adoc /opt/a-doc/.venv/bin/adoc user add <username>    # prompts twice for a password
+sudo -u adoc /opt/a-doc/.venv/bin/adoc user list
+sudo -u adoc /opt/a-doc/.venv/bin/adoc user remove <username>
+```
 
-The instance publishes the web UI over the tailnet via `tailscale serve`
-(see "How the patient reaches the UI" below), which requires **HTTPS
-Certificates** to be turned on once per tailnet: Tailscale admin console →
-DNS → enable "HTTPS Certificates". MagicDNS (also under DNS) should already
-be on by default and is required for the `https://a-doc.<tailnet>.ts.net`
-hostname to resolve.
+`adoc user add` on an existing username replaces that user's password
+(useful for rotation). Login also has in-app rate limiting: 5 consecutive
+failures for a username, or 20 for a client IP, within a 15-minute sliding
+window locks further attempts (HTTP 429) until the window clears; counters
+are in-memory only, so a service restart resets them (an accepted
+tradeoff — see `src/adoc/web/security.py`).
 
 ### Stack deploy order
 
-`ci` (once, manually) → `network` → `backup` → `instance`, matching
+`ci` (once, manually) → `network` → `backup` → `instance` → `alb`, matching
 `.github/workflows/deploy.yml`. Backup must exist before instance because
 `instance.yaml` imports the backup bucket/KMS key via `Fn::ImportValue`, and
 `install.sh` separately resolves the bucket name at boot via
@@ -177,7 +192,9 @@ statement in `instance.yaml`) rather than a CFN parameter — this keeps the
 bucket name out of `deploy.yml`'s `--parameter-overrides` entirely, so no
 change to that workflow was needed for this slice. Once resolved, the
 bucket name is written into `/etc/adoc/env` as `ADOC_BACKUP_BUCKET` for
-`adoc-backup.service` to read.
+`adoc-backup.service` to read. `alb.yaml` must come after `instance.yaml`
+because it imports the instance's `InstanceId` export to register it as
+the ALB target group's target.
 
 ### Instance replacement behavior
 
@@ -227,31 +244,28 @@ just once at setup:
    `labs-export.jsonl`.
 5. Confirm the web UI and timers come back: `systemctl status
    adoc-web.service adoc-ingest.timer adoc-review.timer
-   adoc-backup.timer`, and that the UI is reachable over Tailscale (below).
+   adoc-backup.timer`, and that `https://adoc.petabloc.io/healthz` returns
+   `ok` and the ALB target group shows the instance healthy (below).
 
-### How the patient reaches the UI over Tailscale
+### How the patient reaches the UI
 
-`adoc-web.service` runs uvicorn bound to `127.0.0.1:8080` only — it is never
-directly reachable from the tailnet interface. Instead, `UserData` runs
-`tailscale serve --bg 8080` once the node joins the tailnet (hostname
-`a-doc`, set via `tailscale up --hostname=a-doc`), which publishes that
-local port over the tailnet at `https://a-doc.<your-tailnet-name>.ts.net/`
-with a Tailscale-issued TLS certificate — no public exposure, no
-self-managed certs, and uvicorn itself never has to bind anything but
-loopback. This requires the one-time "HTTPS Certificates" tailnet setting
-above.
+`adoc-web.service` runs uvicorn bound to `0.0.0.0:8080` — safe to bind
+widely because `deploy/cfn/network.yaml`'s `InstanceSecurityGroup` admits
+inbound 8080 from the ALB's security group only, so nothing else can reach
+it. `deploy/cfn/alb.yaml` puts a public, internet-facing Application Load
+Balancer in front of it: an ACM certificate for `adoc.petabloc.io`
+(DNS-validated against the `petabloc.io` Route53 hosted zone,
+`Z009458513KFY2WNUS7C0` — CloudFormation creates the validation record and
+waits for issuance automatically, no manual step), an HTTPS:443 listener
+forwarding to the instance, an HTTP:80 listener that redirects to HTTPS,
+and a Route53 alias A record pointing `adoc.petabloc.io` at the ALB. The
+target group's health check hits the unauthenticated `/healthz` route.
 
-For the patient: install the Tailscale app on their phone/laptop, log into
-the same tailnet, then open `https://a-doc.<tailnet-name>.ts.net/` in a
-browser. The app's own passphrase gate (`ADOC_SESSION_PASSPHRASE`, from
-`/a-doc/session-passphrase`) is the second, application-level factor behind
-that network-level restriction — so a device has to be on the tailnet *and*
-know the passphrase.
-
-If the installed Tailscale client's CLI has since changed `serve` syntax,
-`tailscale serve status` on the instance shows current config, and
-`tailscale serve --help` documents the current flags to adjust
-`deploy/cfn/instance.yaml`'s `UserData` against.
+For the patient: open `https://adoc.petabloc.io/` in any browser and sign
+in with a username/password provisioned via `adoc user add` (see "User
+provisioning" above). There is no VPN/tailnet step any more — the
+in-app login and its rate limiting are the only gate, by explicit user
+decision (no WAF, no TOTP in this design).
 
 ## Phase status
 
