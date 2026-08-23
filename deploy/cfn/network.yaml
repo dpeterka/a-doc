@@ -73,10 +73,9 @@ Resources:
   InstanceSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: >
-        a-doc instance SG, deliberately no ingress rules. Reachable only
-        via AWS SSM (outbound-initiated) and Tailscale (also
-        outbound-initiated to the tailnet coordination service).
+      # Plain single-line scalar: a folded block (>) leaves a trailing
+      # newline, which EC2 rejects in GroupDescription.
+      GroupDescription: "a-doc instance SG, no ingress. Reachable only via AWS SSM and Tailscale (both outbound-initiated)."
       VpcId: !Ref Vpc
       SecurityGroupEgress:
         - IpProtocol: "-1"
