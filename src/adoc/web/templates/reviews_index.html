@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block title %}Weekly reviews — a-doc{% endblock %}
+{% block content %}
+  <h1>Weekly reviews</h1>
+  <p class="muted">A deeper look a-doc takes periodically, with a second opinion built in.</p>
+
+  {% if filenames %}
+    <ul>
+      {% for filename in filenames %}
+        <li><a href="/reviews/{{ filename }}">{{ filename }}</a></li>
+      {% endfor %}
+    </ul>
+  {% else %}
+    <p>No reviews yet.</p>
+  {% endif %}
+{% endblock %}

@@ -8,8 +8,10 @@ wired to the real `ingest.pipeline` with a real `LlmClient`/`VisionClient`
 (`_build_llm_client`/`_build_vision_client` are the seams tests override
 with fakes); `review` runs the real weekly deep review
 (`reason.review.run_weekly_review`); `eval` runs the offline self-eval
-suites (`evals.runner`). `onboard` is likewise real; `serve` remains a
-stubbed scaffold placeholder for a later slice.
+suites (`evals.runner`); `serve` builds the real `web.app.create_app()`
+and runs it under uvicorn (`_run_uvicorn` is the seam tests override so a
+test run never actually binds a socket). `onboard` is wired to the real
+intake wizard. No stubs remain.
 """
 
 from __future__ import annotations
@@ -18,6 +20,8 @@ import argparse
 import sys
 from collections.abc import Sequence
 from pathlib import Path
+
+from fastapi import FastAPI
 
 from adoc.casefile.repo import LEDGER_RELPATH, DataRepo
 from adoc.config import Settings, load_model_bindings
@@ -199,8 +203,27 @@ def _cmd_review(_args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_serve(_args: argparse.Namespace) -> int:
-    return _stub("serve")
+def _run_uvicorn(app: FastAPI, *, host: str, port: int) -> None:  # pragma: no cover - real server
+    """Real wiring for `serve`. Overridden by tests so a test run never
+    actually binds a socket or blocks."""
+    import uvicorn
+
+    uvicorn.run(app, host=host, port=port)
+
+
+def _cmd_serve(args: argparse.Namespace) -> int:
+    try:
+        settings = Settings()
+    except Exception as exc:  # noqa: BLE001 - surface any config error to the user
+        print(f"serve: configuration error: {exc}", file=sys.stderr)
+        return 1
+
+    from adoc.web.app import create_app
+
+    app = create_app(settings)
+    print(f"serve: starting on http://{args.host}:{args.port}")
+    _run_uvicorn(app, host=args.host, port=args.port)
+    return 0
 
 
 def _cmd_backfill(args: argparse.Namespace) -> int:
@@ -288,7 +311,10 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("review", help="run the weekly deep review").set_defaults(
         func=_cmd_review
     )
-    subparsers.add_parser("serve", help="run the web UI").set_defaults(func=_cmd_serve)
+    serve_parser = subparsers.add_parser("serve", help="run the web UI")
+    serve_parser.add_argument("--host", default="127.0.0.1", help="bind host (default: 127.0.0.1)")
+    serve_parser.add_argument("--port", type=int, default=8080, help="bind port (default: 8080)")
+    serve_parser.set_defaults(func=_cmd_serve)
     backfill_parser = subparsers.add_parser("backfill", help="backfill historical documents")
     backfill_parser.add_argument("directory", help="directory of documents to ingest")
     backfill_parser.set_defaults(func=_cmd_backfill)

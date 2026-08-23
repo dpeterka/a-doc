@@ -51,7 +51,7 @@ uv run adoc init       # validates Settings + models.yaml load cleanly
   `pytest` with a coverage gate. The red-team transcript, ledger-invariant,
   and DAG-contract tests are required checks — see `CLAUDE.md`.
 
-## Deploy overview
+## Deploy runbook
 
 All AWS resources are CloudFormation stacks in `deploy/cfn/`, deployed in
 this order: `ci` (once, manually — see note below) → `network` → `backup` →
@@ -68,6 +68,190 @@ admin session), after which its `DeployRoleArn` output is copied into the
 The EC2 instance has no SSH keys and no public ingress; it is reachable via
 AWS SSM and Tailscale only, and the app binds to the tailnet, never the
 public internet.
+
+### One-time SSM parameters
+
+The instance's `UserData` and `deploy/install.sh` read a fixed set of
+`SecureString` parameters under the `/a-doc/` path at boot. They are created
+once, by hand, from a local admin AWS session — they are secrets, so they
+are deliberately *not* CloudFormation resources (a template's parameters
+would land in the stack's event history and drift-detection output in
+plaintext). All of them use the AWS-managed default key (`alias/aws/ssm`) —
+omit `--key-id` when creating them, since `a-doc-instance-role`'s
+`kms:Decrypt` grant in `deploy/cfn/instance.yaml` is scoped to that default
+key only. If a customer-managed KMS key is ever used for one of these
+instead, that key's own key policy must separately grant `kms:Decrypt` to
+`a-doc-instance-role` (the default key's policy already permits any
+IAM-permitted principal in the account, which the instance role's policy
+statement grants; a custom key's policy does not, by default).
+
+```bash
+# Tailscale auth key (mint below, then paste it here)
+aws ssm put-parameter --name /a-doc/tailscale-auth-key \
+  --type SecureString --value "tskey-auth-xxxxxxxxxxxxxxxx"
+
+# GitHub fine-grained deploy token, read-only on this repo (mint below)
+aws ssm put-parameter --name /a-doc/github-deploy-token \
+  --type SecureString --value "github_pat_xxxxxxxxxxxxxxxx"
+
+# rclone config defining the "dropbox" remote used by adoc-ingest.service
+# (run `rclone config` locally against the Dropbox app-folder backend,
+# complete the OAuth flow in a browser, then paste the resulting file)
+aws ssm put-parameter --name /a-doc/rclone-conf \
+  --type SecureString --value "$(cat ~/.config/rclone/rclone.conf)"
+
+# LLM provider API keys
+aws ssm put-parameter --name /a-doc/anthropic-api-key \
+  --type SecureString --value "sk-ant-xxxxxxxxxxxxxxxx"
+aws ssm put-parameter --name /a-doc/openai-api-key \
+  --type SecureString --value "sk-xxxxxxxxxxxxxxxx"
+# optional — only needed if the Featherless blind-panel role is enabled
+aws ssm put-parameter --name /a-doc/featherless-api-key \
+  --type SecureString --value "xxxxxxxxxxxxxxxx"
+
+# Web UI session passphrase (ADOC_SESSION_PASSPHRASE)
+aws ssm put-parameter --name /a-doc/session-passphrase \
+  --type SecureString --value "choose-a-long-passphrase"
+```
+
+To rotate any of these later, add `--overwrite` and re-run the same command,
+then either wait for the next `install.sh` run (e.g. a code deploy) or
+trigger one via `aws ssm send-command` — values are only read at
+`install.sh` time, not live-reloaded by the running services.
+
+**These parameters must exist *before* the instance stack is deployed for
+the first time.** `UserData` runs exactly once, at first boot, with no
+automatic retry; if a parameter is missing, the boot script fails partway
+and the instance is left half-provisioned. Recovery is either (a) fix the
+parameter and let CloudFormation replace the instance (e.g. a harmless
+`UpdateReplacePolicy`-neutral property nudge, or delete+redeploy the
+instance stack), or (b) if the failure happened after the initial package
+installs, re-run the same logic in place via
+`aws ssm send-command --document-name AWS-RunShellScript --targets ...
+--parameters commands="bash /opt/a-doc/deploy/install.sh"` once `/opt/a-doc`
+exists.
+
+#### Minting the GitHub fine-grained deploy token
+
+The instance clones this repo over HTTPS using an `x-access-token`, so the
+token only ever needs read access to code, never more:
+
+1. github.com → Settings → Developer settings → Personal access tokens →
+   Fine-grained tokens → Generate new token.
+2. Resource owner: `dpeterka`. Repository access: **Only select
+   repositories** → `a-doc`.
+3. Permissions → Repository permissions → **Contents: Read-only**. Leave
+   every other permission at "No access."
+4. Set an expiration (fine-grained tokens cap out at 1 year) and set a
+   calendar reminder to rotate it before then — regenerate, then
+   `aws ssm put-parameter --name /a-doc/github-deploy-token --type
+   SecureString --overwrite --value "<new token>"`, then re-run
+   `install.sh` on the instance (or just wait for the next boot).
+
+#### Minting a Tailscale auth key
+
+1. Tailscale admin console → Settings → Keys → Generate auth key.
+2. **Reusable**: on, so `install.sh` re-runs and instance replacements don't
+   need a fresh key each time. **Ephemeral**: off (this is a persistent
+   node, not a CI runner). Set an expiration and a tag if you use ACL tags;
+   otherwise leave tags empty.
+3. Copy the `tskey-auth-...` value into `/a-doc/tailscale-auth-key` above.
+
+#### One-time tailnet admin console step (HTTPS for the UI)
+
+The instance publishes the web UI over the tailnet via `tailscale serve`
+(see "How the patient reaches the UI" below), which requires **HTTPS
+Certificates** to be turned on once per tailnet: Tailscale admin console →
+DNS → enable "HTTPS Certificates". MagicDNS (also under DNS) should already
+be on by default and is required for the `https://a-doc.<tailnet>.ts.net`
+hostname to resolve.
+
+### Stack deploy order
+
+`ci` (once, manually) → `network` → `backup` → `instance`, matching
+`.github/workflows/deploy.yml`. Backup must exist before instance because
+`instance.yaml` imports the backup bucket/KMS key via `Fn::ImportValue`, and
+`install.sh` separately resolves the bucket name at boot via
+`aws cloudformation list-exports` (see the `BackupBucketExportLookup`
+statement in `instance.yaml`) rather than a CFN parameter — this keeps the
+bucket name out of `deploy.yml`'s `--parameter-overrides` entirely, so no
+change to that workflow was needed for this slice. Once resolved, the
+bucket name is written into `/etc/adoc/env` as `ADOC_BACKUP_BUCKET` for
+`adoc-backup.service` to read.
+
+### Instance replacement behavior
+
+The EC2 instance's data volume (`/dev/xvdb` → `/data`) is declared inline in
+`instance.yaml`'s `BlockDeviceMappings`, not as a separate persistent
+`AWS::EC2::Volume`. That is deliberate simplicity, not an oversight — it
+means the data volume's lifecycle is tied to the instance's: a **stack
+update that replaces the instance** (e.g. changing `AmiId` or an
+immutable-once-set property) or a **stack delete** destroys that volume
+along with it. There is no snapshot/persistent-volume trick keeping data
+alive across a replacement.
+
+This is intentional: PLAN.md and `CLAUDE.md` treat "a rebuilt instance
+restores to a working system from S3" as the actual reliability mechanism,
+not EBS persistence — so instance replacement is expected to be routine and
+recoverable, exercised by the drill below, rather than something to avoid.
+A plain **reboot** or **stop/start** of the same instance does *not* lose
+`/data` (EBS volumes attached to a still-existing instance persist across
+those).
+
+### Restore-from-backup drill (release gate)
+
+PLAN.md's Phase-1 acceptance criteria and `CLAUDE.md`/ADR 0004 call a tested
+restore a release gate — do this before considering a deploy "done," not
+just once at setup:
+
+1. Confirm a real backup exists: `aws s3 ls
+   s3://<backup-bucket>/latest/a-doc-data.bundle` (bucket name is the
+   `BackupBucketName` output of the `a-doc-backup` stack).
+2. Force a rebuild of the instance. There is no auto-scaling group behind
+   it, so this means deleting the `a-doc-instance` stack and redeploying it
+   — either by re-running the `deploy` GitHub Actions workflow, or locally:
+   `aws cloudformation delete-stack --stack-name a-doc-instance`, wait for
+   deletion to finish, then `aws cloudformation deploy --stack-name
+   a-doc-instance --template-file deploy/cfn/instance.yaml
+   --parameter-overrides NetworkStackName=a-doc-network
+   BackupStackName=a-doc-backup --capabilities CAPABILITY_NAMED_IAM`.
+3. Watch `/var/log/a-doc-userdata.log` (via SSM Session Manager or
+   `aws ssm send-command`) for the UserData run, then `install.sh`'s own
+   output — `$DATA_DIR is empty; restoring from s3://.../latest/` confirms
+   the restore path (rather than the fresh-`adoc init` fallback) ran.
+4. Verify the restored repo: `sudo -u adoc git -C /data/a-doc-data log
+   --oneline -5` shows real history, not an empty init commit;
+   `sudo -u adoc /opt/a-doc/.venv/bin/adoc init` reports "already
+   initialized" rather than creating a new empty case file; and (once labs
+   data exists) the labs SQLite DB rebuilds cleanly from the restored
+   `labs-export.jsonl`.
+5. Confirm the web UI and timers come back: `systemctl status
+   adoc-web.service adoc-ingest.timer adoc-review.timer
+   adoc-backup.timer`, and that the UI is reachable over Tailscale (below).
+
+### How the patient reaches the UI over Tailscale
+
+`adoc-web.service` runs uvicorn bound to `127.0.0.1:8080` only — it is never
+directly reachable from the tailnet interface. Instead, `UserData` runs
+`tailscale serve --bg 8080` once the node joins the tailnet (hostname
+`a-doc`, set via `tailscale up --hostname=a-doc`), which publishes that
+local port over the tailnet at `https://a-doc.<your-tailnet-name>.ts.net/`
+with a Tailscale-issued TLS certificate — no public exposure, no
+self-managed certs, and uvicorn itself never has to bind anything but
+loopback. This requires the one-time "HTTPS Certificates" tailnet setting
+above.
+
+For the patient: install the Tailscale app on their phone/laptop, log into
+the same tailnet, then open `https://a-doc.<tailnet-name>.ts.net/` in a
+browser. The app's own passphrase gate (`ADOC_SESSION_PASSPHRASE`, from
+`/a-doc/session-passphrase`) is the second, application-level factor behind
+that network-level restriction — so a device has to be on the tailnet *and*
+know the passphrase.
+
+If the installed Tailscale client's CLI has since changed `serve` syntax,
+`tailscale serve status` on the instance shows current config, and
+`tailscale serve --help` documents the current flags to adjust
+`deploy/cfn/instance.yaml`'s `UserData` against.
 
 ## Phase status
 
