@@ -18,7 +18,7 @@ from adoc.cli import main
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-_STUB_COMMANDS = ["onboard", "ingest", "review", "serve", "backfill", "eval"]
+_STUB_COMMANDS = ["ingest", "review", "serve", "backfill", "eval"]
 
 
 @pytest.mark.parametrize("command", _STUB_COMMANDS)
@@ -74,6 +74,61 @@ def test_init_fails_without_data_dir(
     assert code == 1
     err = capsys.readouterr().err
     assert "configuration error" in err
+
+
+def test_onboard_fails_without_data_dir(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)  # hermetic: a developer .env must not leak into Settings
+    monkeypatch.delenv("ADOC_DATA_DIR", raising=False)
+
+    code = main(["onboard"])
+
+    assert code == 1
+    err = capsys.readouterr().err
+    assert "configuration error" in err
+
+
+def test_onboard_fails_if_data_repo_not_initialized(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    data_dir = tmp_path / "a-doc-data"
+    monkeypatch.setenv("ADOC_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("ADOC_MODELS_FILE", str(REPO_ROOT / "models.yaml"))
+
+    code = main(["onboard"])
+
+    assert code == 1
+    err = capsys.readouterr().err
+    assert "run `adoc init` first" in err
+
+
+def test_onboard_runs_the_wizard_loop_against_an_initialized_repo(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    data_dir = tmp_path / "a-doc-data"
+    monkeypatch.setenv("ADOC_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("ADOC_MODELS_FILE", str(REPO_ROOT / "models.yaml"))
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+    assert main(["init"]) == 0
+    capsys.readouterr()
+
+    def _eof_input(_prompt: str = "") -> str:
+        raise EOFError
+
+    monkeypatch.setattr("builtins.input", _eof_input)
+
+    # Immediate EOF: no LLM call is ever made, so no network / API key is
+    # needed to exercise the wiring end-to-end.
+    code = main(["onboard"])
+
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "[1/10] Basics" in out
+    assert "resume anytime with `adoc onboard`" in out
 
 
 def test_unknown_subcommand_exits_nonzero() -> None:
