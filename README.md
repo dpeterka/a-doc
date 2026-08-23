@@ -96,10 +96,6 @@ IAM-permitted principal in the account, which the instance role's policy
 statement grants; a custom key's policy does not, by default).
 
 ```bash
-# GitHub fine-grained deploy token, read-only on this repo (mint below)
-aws ssm put-parameter --name /a-doc/github-deploy-token \
-  --type SecureString --value "github_pat_xxxxxxxxxxxxxxxx"
-
 # rclone config defining the "dropbox" remote used by adoc-ingest.service
 # (run `rclone config` locally against the Dropbox app-folder backend,
 # complete the OAuth flow in a browser, then paste the resulting file)
@@ -141,22 +137,6 @@ installs, re-run the same logic in place via
 --parameters commands="bash /opt/a-doc/deploy/install.sh"` once `/opt/a-doc`
 exists.
 
-#### Minting the GitHub fine-grained deploy token
-
-The instance clones this repo over HTTPS using an `x-access-token`, so the
-token only ever needs read access to code, never more:
-
-1. github.com → Settings → Developer settings → Personal access tokens →
-   Fine-grained tokens → Generate new token.
-2. Resource owner: `dpeterka`. Repository access: **Only select
-   repositories** → `a-doc`.
-3. Permissions → Repository permissions → **Contents: Read-only**. Leave
-   every other permission at "No access."
-4. Set an expiration (fine-grained tokens cap out at 1 year) and set a
-   calendar reminder to rotate it before then — regenerate, then
-   `aws ssm put-parameter --name /a-doc/github-deploy-token --type
-   SecureString --overwrite --value "<new token>"`, then re-run
-   `install.sh` on the instance (or just wait for the next boot).
 
 ### User provisioning
 
