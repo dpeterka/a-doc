@@ -1,9 +1,10 @@
 """adoc command-line entrypoint.
 
 Subcommands mirror PLAN.md's phasing: `init` does real work now (it
-validates that Settings and models.yaml load cleanly); everything else
-(`onboard`, `ingest`, `review`, `serve`, `backfill`, `eval`) is Phase-1+
-functionality and is stubbed here as a scaffold placeholder.
+validates that Settings and models.yaml load cleanly, then creates the
+data-repo layout via `DataRepo.init_at` — idempotent, safe to re-run);
+everything else (`onboard`, `ingest`, `review`, `serve`, `backfill`, `eval`)
+is Phase-1+ functionality and is stubbed here as a scaffold placeholder.
 """
 
 from __future__ import annotations
@@ -12,11 +13,12 @@ import argparse
 import sys
 from collections.abc import Sequence
 
+from adoc.casefile.repo import DataRepo
 from adoc.config import Settings, load_model_bindings
 
 
 def _cmd_init(_args: argparse.Namespace) -> int:
-    """Validate that Settings and models.yaml load cleanly."""
+    """Validate config, then create (or confirm) the data-repo layout."""
     try:
         settings = Settings()
         bindings = load_model_bindings(settings.models_file)
@@ -26,6 +28,13 @@ def _cmd_init(_args: argparse.Namespace) -> int:
 
     print(f"init: data_dir={settings.data_dir}")
     print(f"init: loaded {len(bindings)} model role bindings from {settings.models_file}")
+
+    already_initialized = DataRepo(settings.data_dir).is_initialized
+    DataRepo.init_at(settings.data_dir)
+    if already_initialized:
+        print(f"init: data repo already initialized at {settings.data_dir}")
+    else:
+        print(f"init: initialized data repo at {settings.data_dir}")
     return 0
 
 
