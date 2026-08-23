@@ -177,6 +177,14 @@ def apply_diff(ledger: Ledger, diff: LedgerDiff) -> Ledger:
                 raise LedgerInvariantError(
                     f"cannot add hypothesis {op.hypothesis.id!r}: id already exists"
                 )
+            # Invariant (b), add-path: a patient-origin hypothesis can never
+            # ENTER the ledger at most-likely — a Challenger pass in a later
+            # diff must precede any promotion (anti-anchoring; PLAN.md).
+            if op.hypothesis.origin == "patient" and op.hypothesis.tier == "most-likely":
+                raise LedgerInvariantError(
+                    f"cannot add patient-origin hypothesis {op.hypothesis.id!r} at "
+                    "tier=most-likely: it must be challenged before promotion"
+                )
             new_hyp = op.hypothesis.model_copy(deep=True)
             new_hyp.last_challenged_version = new_version
             working.append(new_hyp)
