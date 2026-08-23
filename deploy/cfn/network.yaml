@@ -43,7 +43,10 @@ Resources:
     Properties:
       VpcId: !Ref Vpc
       CidrBlock: !Ref SubnetCidr
-      MapPublicIpOnLaunch: false
+      # Instance needs a public IP for egress (SSM, Tailscale, package
+      # installs) — this VPC has no NAT gateway (cost) and the SG has no
+      # ingress rules, so exposure is outbound-only.
+      MapPublicIpOnLaunch: true
       Tags:
         - Key: Name
           Value: a-doc-public-subnet
