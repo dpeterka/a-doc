@@ -126,8 +126,17 @@ class DataRepo:
         """
         repo = Repo(self.root)
         target = repo.commit(ref) if ref is not None else repo.head.commit
-        if message is not None:
-            repo.create_tag(name, ref=target, message=message)
-        else:
-            repo.create_tag(name, ref=target)
+        # Annotated tags need a committer identity; supply the same explicit
+        # actor commits use so this never depends on host git config
+        # (CI runners have none — "Committer identity unknown").
+        with repo.git.custom_environment(
+            GIT_COMMITTER_NAME=_COMMIT_ACTOR.name,
+            GIT_COMMITTER_EMAIL=_COMMIT_ACTOR.email,
+            GIT_AUTHOR_NAME=_COMMIT_ACTOR.name,
+            GIT_AUTHOR_EMAIL=_COMMIT_ACTOR.email,
+        ):
+            if message is not None:
+                repo.create_tag(name, ref=target, message=message)
+            else:
+                repo.create_tag(name, ref=target)
         return name
