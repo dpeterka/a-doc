@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block title %}Labs — a-doc{% endblock %}
+{% block content %}
+  <h1>Labs</h1>
+  <p class="muted">Your recurring lab results over time. Tap an analyte for the full trend.</p>
+
+  {% if analytes %}
+    <ul class="labs-list">
+      {% for item in analytes %}
+        <li class="labs-list-row">
+          <a href="/labs/{{ item.url_name }}" class="labs-list-link">
+            <span class="labs-name">{{ item.name }}</span>
+            <span class="labs-sparkline">{{ item.sparkline_svg | safe }}</span>
+            <span class="labs-latest">
+              {{ item.latest.value if item.latest.value is not none else item.latest.value_text }}
+              {% if item.latest.ucum_unit %}{{ item.latest.ucum_unit }}{% endif %}
+              {% if item.latest.flag %}<span class="chip chip-flag">{{ item.latest.flag.value }}</span>{% endif %}
+            </span>
+          </a>
+        </li>
+      {% endfor %}
+    </ul>
+  {% else %}
+    <p>No labs recorded yet. <a href="/upload">Add a document</a> to get started.</p>
+  {% endif %}
+{% endblock %}

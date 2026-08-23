@@ -161,7 +161,14 @@ class LabsDb:
         self._path = path
         if str(path) != ":memory:":
             Path(path).parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(path))
+        # check_same_thread=False: a single LabsDb is shared across an ASGI
+        # server's worker threads (FastAPI's sync-route thread pool, or a
+        # test client's per-call portal thread) - the connection itself is
+        # never touched concurrently from two threads at once (this app is
+        # single-user/single-request-at-a-time), only sequentially from
+        # different ones, which sqlite3's default same-thread check would
+        # otherwise reject.
+        self._conn = sqlite3.connect(str(path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")

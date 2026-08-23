@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+{% block title %}{{ filename }} — a-doc{% endblock %}
+{% block content %}
+  <p class="muted"><a href="/reviews">&larr; back to weekly reviews</a></p>
+  {% if content is not none %}
+    <article class="card">
+      {{ content | markdown_lite | safe }}
+    </article>
+  {% else %}
+    <p>That review could not be found.</p>
+  {% endif %}
+{% endblock %}
