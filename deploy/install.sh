@@ -68,10 +68,12 @@ if ! command -v rclone &>/dev/null; then
 fi
 
 echo "==> Ensuring uv + Python 3.12 are available"
-if ! command -v uv &>/dev/null; then
-  curl -LsSf https://astral.sh/uv/install.sh | sh
-  export PATH="$HOME/.local/bin:$PATH"
+# Install uv system-wide: dependency sync below runs as the adoc user via
+# sudo, which cannot see a root-only ~/.local/bin install.
+if ! command -v uv &>/dev/null && [ ! -x /usr/local/bin/uv ]; then
+  curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR=/usr/local/bin sh
 fi
+export PATH="/usr/local/bin:$PATH"
 uv python install 3.12 || true
 
 echo "==> Fetching/updating application code"
