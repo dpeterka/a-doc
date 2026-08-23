@@ -1,0 +1,38 @@
+{
+  "pass_a": {
+    "doc_type": "lab_report",
+    "facility": "Quest Diagnostics",
+    "collection_date": "2026-05-02",
+    "report_date": "2026-05-03",
+    "results": [
+      {
+        "name_raw": "TSH",
+        "value": 2.1,
+        "unit_raw": "mIU/L",
+        "ref_range_raw": "0.4-4.0",
+        "page": 1,
+        "confidence": "medium"
+      }
+    ],
+    "narrative_findings": [],
+    "illegible_regions": []
+  },
+  "pass_b": {
+    "doc_type": "lab_report",
+    "facility": "Quest Diagnostics",
+    "collection_date": "2026-05-02",
+    "report_date": "2026-05-03",
+    "results": [
+      {
+        "name_raw": "TSH",
+        "value": 2.1,
+        "unit_raw": "mIU/L",
+        "ref_range_raw": "0.4-4.0",
+        "page": 1,
+        "confidence": "high"
+      }
+    ],
+    "narrative_findings": [],
+    "illegible_regions": []
+  }
+}

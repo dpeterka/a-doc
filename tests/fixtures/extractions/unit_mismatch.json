@@ -1,0 +1,38 @@
+{
+  "pass_a": {
+    "doc_type": "lab_report",
+    "facility": "Quest Diagnostics",
+    "collection_date": "2026-05-02",
+    "report_date": "2026-05-03",
+    "results": [
+      {
+        "name_raw": "Creatinine",
+        "value": 0.9,
+        "unit_raw": "mg/dL",
+        "ref_range_raw": "0.6-1.3",
+        "page": 1,
+        "confidence": "high"
+      }
+    ],
+    "narrative_findings": [],
+    "illegible_regions": []
+  },
+  "pass_b": {
+    "doc_type": "lab_report",
+    "facility": "Quest Diagnostics",
+    "collection_date": "2026-05-02",
+    "report_date": "2026-05-03",
+    "results": [
+      {
+        "name_raw": "Creatinine",
+        "value": 0.9,
+        "unit_raw": "umol/L",
+        "ref_range_raw": "0.6-1.3",
+        "page": 1,
+        "confidence": "high"
+      }
+    ],
+    "narrative_findings": [],
+    "illegible_regions": []
+  }
+}

@@ -4,6 +4,10 @@ Subcommands are invoked by calling `main()` directly (not via subprocess) so
 that coverage.py can attribute execution to these tests. A separate
 subprocess-based test exercises the real console entrypoint end-to-end for
 `--help` / an unknown subcommand.
+
+`ingest`/`backfill` are wired to the real `ingest.pipeline`; tests exercise
+them by monkeypatching `adoc.cli._build_vision_client` (the seam the module
+docstring calls out) so no real provider/network call ever happens.
 """
 
 from __future__ import annotations
@@ -13,12 +17,32 @@ import sys
 from pathlib import Path
 
 import pytest
+from conftest import TINY_PDF_BYTES, fake_page_renderer
 
+import adoc.cli as cli
+from adoc.casefile.repo import DataRepo
 from adoc.cli import main
+from adoc.ingest.schema import ClassifyResult, DocumentExtraction
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-_STUB_COMMANDS = ["ingest", "review", "serve", "backfill", "eval"]
+_STUB_COMMANDS = ["review", "serve", "eval"]
+
+
+class _FakeVisionClient:
+    """Routes every role to a fixed `clinical_note` classification - enough
+    to exercise the CLI's ingest wiring without a real provider call.
+    """
+
+    def extract(self, role, *, system, parts, schema, binding_index=0, max_tokens=4096):  # type: ignore[no-untyped-def]
+        if role == "classifier":
+            return ClassifyResult(doc_type="clinical_note", doc_date=None)
+        return DocumentExtraction(doc_type="clinical_note")  # pragma: no cover - not reached
+
+
+def _patch_fake_vision(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli, "_build_vision_client", lambda llm_client: _FakeVisionClient())
+    monkeypatch.setattr(cli, "_build_renderer", lambda: fake_page_renderer(1))
 
 
 @pytest.mark.parametrize("command", _STUB_COMMANDS)
@@ -74,6 +98,71 @@ def test_init_fails_without_data_dir(
     assert code == 1
     err = capsys.readouterr().err
     assert "configuration error" in err
+
+
+def test_ingest_fails_without_an_initialized_data_repo(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("ADOC_DATA_DIR", str(tmp_path / "a-doc-data"))
+    monkeypatch.setenv("ADOC_MODELS_FILE", str(REPO_ROOT / "models.yaml"))
+
+    code = main(["ingest"])
+
+    assert code == 1
+    assert "not initialized" in capsys.readouterr().err
+
+
+def test_ingest_scans_the_inbox_and_prints_a_report(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    data_dir = tmp_path / "a-doc-data"
+    repo = DataRepo.init_at(data_dir)
+    (repo.root / "inbox" / "visit.pdf").write_bytes(TINY_PDF_BYTES)
+    monkeypatch.setenv("ADOC_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("ADOC_MODELS_FILE", str(REPO_ROOT / "models.yaml"))
+    _patch_fake_vision(monkeypatch)
+
+    code = main(["ingest"])
+
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "visit.pdf" in out
+    assert "ingested" in out
+    encounters = list((repo.root / "case" / "encounters").glob("*.md"))
+    assert len(encounters) == 1
+
+
+def test_backfill_ingests_a_given_directory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    data_dir = tmp_path / "a-doc-data"
+    DataRepo.init_at(data_dir)
+    backfill_dir = tmp_path / "historical"
+    backfill_dir.mkdir()
+    (backfill_dir / "old-visit.pdf").write_bytes(TINY_PDF_BYTES)
+    monkeypatch.setenv("ADOC_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("ADOC_MODELS_FILE", str(REPO_ROOT / "models.yaml"))
+    _patch_fake_vision(monkeypatch)
+
+    code = main(["backfill", str(backfill_dir)])
+
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "old-visit.pdf" in out
+
+
+def test_backfill_fails_for_a_missing_directory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    data_dir = tmp_path / "a-doc-data"
+    DataRepo.init_at(data_dir)
+    monkeypatch.setenv("ADOC_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("ADOC_MODELS_FILE", str(REPO_ROOT / "models.yaml"))
+
+    code = main(["backfill", str(tmp_path / "does-not-exist")])
+
+    assert code == 1
+    assert "not a directory" in capsys.readouterr().err
 
 
 def test_onboard_fails_without_data_dir(

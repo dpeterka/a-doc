@@ -1,10 +1,12 @@
 """adoc command-line entrypoint.
 
-Subcommands mirror PLAN.md's phasing: `init` does real work now (it
-validates that Settings and models.yaml load cleanly, then creates the
-data-repo layout via `DataRepo.init_at` — idempotent, safe to re-run);
-everything else (`onboard`, `ingest`, `review`, `serve`, `backfill`, `eval`)
-is Phase-1+ functionality and is stubbed here as a scaffold placeholder.
+Subcommands mirror PLAN.md's phasing: `init` does real work (validates
+Settings/models.yaml, then creates the data-repo layout via
+`DataRepo.init_at`); `ingest` (scan `<data_dir>/inbox/`) and `backfill
+<directory>` are wired to the real `ingest.pipeline` with a real
+`LlmClient`/`VisionClient` (`_build_llm_client`/`_build_vision_client` are
+the seams tests override with fakes). `onboard`, `review`, `serve`, `eval`
+remain stubbed scaffold placeholders for a later slice.
 """
 
 from __future__ import annotations
@@ -12,11 +14,17 @@ from __future__ import annotations
 import argparse
 import sys
 from collections.abc import Sequence
+from pathlib import Path
 
 from adoc.casefile.repo import DataRepo
 from adoc.config import Settings, load_model_bindings
+from adoc.ingest.archive import PageRenderer, pdftoppm_renderer
+from adoc.ingest.pipeline import IngestReport, ingest_directory, ingest_inbox
+from adoc.ingest.vision import VisionClient
 from adoc.intake.cli import run_onboarding_session
 from adoc.intake.wizard import IntakeWizard
+from adoc.labs.db import LabsDb
+from adoc.privacy import Scrubber
 from adoc.reason.client import LlmClient
 
 
@@ -74,8 +82,71 @@ def _cmd_onboard(_args: argparse.Namespace) -> int:
     return run_onboarding_session(wizard, input_fn=input, print_fn=print)
 
 
+def _build_llm_client(settings: Settings) -> LlmClient:
+    """Real wiring for `LlmClient`: bindings from `models.yaml`, scrubbing,
+    and an audit log under the data repo's (gitignored) `logs/` dir.
+    """
+    scrubber = Scrubber.from_file(settings.data_dir / "case" / "identifiers.yaml")
+    audit_log_path = settings.data_dir / "logs" / "api-audit.jsonl"
+    return LlmClient.from_settings(settings, scrubber=scrubber, audit_log_path=audit_log_path)
+
+
+def _build_vision_client(llm_client: LlmClient) -> VisionClient:
+    """Real wiring for `VisionClient`. Overridden by tests to inject fakes."""
+    return VisionClient(llm_client)
+
+
+def _build_renderer() -> PageRenderer:
+    """Real wiring for the page renderer (`pdftoppm`). Overridden by tests
+    so CI never depends on poppler being installed.
+    """
+    return pdftoppm_renderer
+
+
+def _print_ingest_report(report: IngestReport) -> None:
+    for outcome in report.files:
+        print(
+            f"ingest: {outcome.path}: {outcome.outcome}"
+            f" (auto={outcome.rows_auto} pending={outcome.rows_pending})"
+        )
+        for issue in outcome.issues:
+            print(f"  - {issue}")
+    print(
+        f"ingest: {len(report.files)} file(s), "
+        f"{report.total_auto} auto, {report.total_pending} pending"
+    )
+
+
+def _run_ingest(settings: Settings, directory: Path | None) -> int:
+    repo = DataRepo(settings.data_dir)
+    if not repo.is_initialized:
+        print(
+            f"ingest: data repo not initialized at {settings.data_dir} - run `adoc init` first",
+            file=sys.stderr,
+        )
+        return 1
+
+    llm_client = _build_llm_client(settings)
+    vision = _build_vision_client(llm_client)
+    renderer = _build_renderer()
+    db_path = settings.data_dir / "labs.sqlite"
+    with LabsDb(db_path) as db:
+        if directory is not None:
+            report = ingest_directory(directory, repo=repo, db=db, vision=vision, renderer=renderer)
+        else:
+            report = ingest_inbox(repo=repo, db=db, vision=vision, renderer=renderer)
+
+    _print_ingest_report(report)
+    return 1 if any(f.outcome == "error" for f in report.files) else 0
+
+
 def _cmd_ingest(_args: argparse.Namespace) -> int:
-    return _stub("ingest")
+    try:
+        settings = Settings()
+    except Exception as exc:  # noqa: BLE001 - surface any config error to the user
+        print(f"ingest: configuration error: {exc}", file=sys.stderr)
+        return 1
+    return _run_ingest(settings, directory=None)
 
 
 def _cmd_review(_args: argparse.Namespace) -> int:
@@ -86,8 +157,17 @@ def _cmd_serve(_args: argparse.Namespace) -> int:
     return _stub("serve")
 
 
-def _cmd_backfill(_args: argparse.Namespace) -> int:
-    return _stub("backfill")
+def _cmd_backfill(args: argparse.Namespace) -> int:
+    try:
+        settings = Settings()
+    except Exception as exc:  # noqa: BLE001 - surface any config error to the user
+        print(f"backfill: configuration error: {exc}", file=sys.stderr)
+        return 1
+    directory = Path(args.directory)
+    if not directory.is_dir():
+        print(f"backfill: not a directory: {directory}", file=sys.stderr)
+        return 1
+    return _run_ingest(settings, directory=directory)
 
 
 def _cmd_eval(_args: argparse.Namespace) -> int:
@@ -111,9 +191,9 @@ def build_parser() -> argparse.ArgumentParser:
         func=_cmd_review
     )
     subparsers.add_parser("serve", help="run the web UI").set_defaults(func=_cmd_serve)
-    subparsers.add_parser("backfill", help="backfill historical documents").set_defaults(
-        func=_cmd_backfill
-    )
+    backfill_parser = subparsers.add_parser("backfill", help="backfill historical documents")
+    backfill_parser.add_argument("directory", help="directory of documents to ingest")
+    backfill_parser.set_defaults(func=_cmd_backfill)
     subparsers.add_parser("eval", help="run the self-evaluation benchmark suite").set_defaults(
         func=_cmd_eval
     )
