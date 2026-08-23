@@ -13,6 +13,10 @@
 
 set -euo pipefail
 
+# SSM RunCommand executes without HOME set; uv and rclone config paths need
+# one, and this script runs as root in every supported invocation path.
+export HOME="${HOME:-/root}"
+
 REPO_URL_BASE="github.com/dpeterka/a-doc.git"
 REPO_BRANCH="main"
 APP_DIR="/opt/a-doc"
