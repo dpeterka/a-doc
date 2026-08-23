@@ -1,4 +1,5 @@
-"""Single-user session auth: signed cookie over a stdlib HMAC.
+"""Single-user-per-session-cookie auth: signed cookie over a stdlib HMAC,
+plus in-app login rate limiting.
 
 `itsdangerous` is deliberately not a dependency (task constraint) — a
 session token is `<issued_at>.<hex hmac-sha256 signature>`, verified with
@@ -6,11 +7,10 @@ session token is `<issued_at>.<hex hmac-sha256 signature>`, verified with
 bytes persisted at `<data_dir>/work/session-secret` (created on first use,
 never committed — `work/` is gitignored per `casefile.repo`).
 
-The passphrase check itself (`check_passphrase`) is the other constant-time
-comparison this module provides: the login form's submitted passphrase is
-compared against `Settings.session_passphrase` via `hmac.compare_digest`,
-never `==`, so response timing cannot leak how many leading characters
-matched.
+Login itself (username/password) is verified by `web.users.verify_user`.
+This module owns everything *around* that check: the rate limiter that
+guards it, the client-IP heuristic the limiter keys on, and the
+session-cookie mechanics that follow a successful login.
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ import hashlib
 import hmac
 import secrets
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
@@ -26,13 +27,22 @@ from starlette.requests import Request
 from starlette.responses import RedirectResponse, Response
 
 from adoc.casefile.repo import DataRepo
-from adoc.config import Settings
 
 SESSION_COOKIE_NAME = "adoc_session"
 SESSION_MAX_AGE_SECONDS = 30 * 24 * 3600  # 30 days
 LOGIN_PATH = "/login"
+HEALTHZ_PATH = "/healthz"
 _PUBLIC_PREFIXES = ("/static/",)
+_PUBLIC_PATHS = (LOGIN_PATH, HEALTHZ_PATH)
 _SESSION_SECRET_RELPATH = Path("work") / "session-secret"
+
+# Login lockout thresholds (PLAN.md/README "patient access"): a username
+# under sustained attack is locked out sooner than a shared IP, since a
+# single IP (e.g. a household NAT, or in production the ALB itself for
+# malformed X-Forwarded-For cases) legitimately produces more noise.
+USERNAME_FAILURE_LIMIT = 5
+IP_FAILURE_LIMIT = 20
+LOCKOUT_WINDOW_SECONDS = 15 * 60
 
 
 def load_or_create_session_secret(repo: DataRepo) -> bytes:
@@ -74,12 +84,6 @@ def verify_session_token(
     return 0 <= (time.time() - issued) < max_age_seconds
 
 
-def check_passphrase(submitted: str, expected: str) -> bool:
-    """Constant-time compare of a submitted login passphrase against the
-    configured `Settings.session_passphrase`."""
-    return hmac.compare_digest(submitted.encode("utf-8"), expected.encode("utf-8"))
-
-
 def is_authenticated(request: Request) -> bool:
     secret: bytes = request.app.state.session_secret
     token = request.cookies.get(SESSION_COOKIE_NAME)
@@ -90,14 +94,15 @@ def is_authenticated(request: Request) -> bool:
 
 class SessionAuthMiddleware(BaseHTTPMiddleware):
     """Redirects every unauthenticated request to `/login`, except the
-    login route itself and static assets. HTMX requests (`HX-Request:
-    true`) get an `HX-Redirect` header instead of a body redirect, so a
-    partial-swap request still navigates the whole page to `/login`.
+    login route, the unauthenticated `/healthz` (ALB health check target),
+    and static assets. HTMX requests (`HX-Request: true`) get an
+    `HX-Redirect` header instead of a body redirect, so a partial-swap
+    request still navigates the whole page to `/login`.
     """
 
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
         path = request.url.path
-        if path == LOGIN_PATH or any(path.startswith(p) for p in _PUBLIC_PREFIXES):
+        if path in _PUBLIC_PATHS or any(path.startswith(p) for p in _PUBLIC_PREFIXES):
             return await call_next(request)
 
         if is_authenticated(request):
@@ -110,13 +115,18 @@ class SessionAuthMiddleware(BaseHTTPMiddleware):
         return RedirectResponse(url=LOGIN_PATH, status_code=303)
 
 
-def set_session_cookie(response: Response, secret: bytes) -> None:
+def set_session_cookie(response: Response, secret: bytes, *, secure: bool) -> None:
+    """`secure` should be true whenever the request arrived over HTTPS.
+    Callers derive that from `X-Forwarded-Proto` (set by the ALB) rather
+    than `request.url.scheme`, since uvicorn itself only ever sees plain
+    HTTP behind the load balancer."""
     token = make_session_token(secret)
     response.set_cookie(
         SESSION_COOKIE_NAME,
         token,
         httponly=True,
         samesite="lax",
+        secure=secure,
         max_age=SESSION_MAX_AGE_SECONDS,
     )
 
@@ -125,7 +135,78 @@ def clear_session_cookie(response: Response) -> None:
     response.delete_cookie(SESSION_COOKIE_NAME)
 
 
-def passphrase_from_settings(settings: Settings) -> str | None:
-    if settings.session_passphrase is None:
-        return None
-    return settings.session_passphrase.get_secret_value()
+def client_ip(request: Request, *, trust_forwarded_for: bool) -> str:
+    """Best-effort client IP for rate-limiting purposes.
+
+    `trust_forwarded_for` must only be true when every request that can
+    reach this process has passed through the ALB — true in the deployed
+    app (`deploy/cfn/network.yaml`'s InstanceSecurityGroup admits inbound
+    8080 from the ALB security group only, so nothing else can set this
+    header), false by default (`Settings.trust_forwarded_for`) so a local
+    `adoc serve` or a test run never trusts a client-supplied header.
+
+    When trusted, the *last* hop of `X-Forwarded-For` is used — that's the
+    address the ALB itself appended, which cannot be spoofed by the
+    original client (earlier hops can be arbitrary attacker-supplied
+    values).
+    """
+    if trust_forwarded_for:
+        forwarded = request.headers.get("x-forwarded-for")
+        if forwarded:
+            last_hop = forwarded.split(",")[-1].strip()
+            if last_hop:
+                return last_hop
+    client = request.client
+    return client.host if client is not None else "unknown"
+
+
+class LoginRateLimiter:
+    """In-memory, per-process login failure tracker (PLAN.md/README
+    "patient access"): a sliding 15-minute window per username and per
+    client IP. Deliberately not persisted — a process restart resets every
+    counter, which is an accepted tradeoff for a single-patient app with
+    no multi-instance deployment (documented in README).
+
+    Not thread-safe against true concurrent access, but uvicorn's default
+    single-worker/async-event-loop model never calls this from two threads
+    at once here.
+    """
+
+    def __init__(
+        self,
+        *,
+        username_limit: int = USERNAME_FAILURE_LIMIT,
+        ip_limit: int = IP_FAILURE_LIMIT,
+        window_seconds: float = LOCKOUT_WINDOW_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._username_limit = username_limit
+        self._ip_limit = ip_limit
+        self._window_seconds = window_seconds
+        self._clock = clock
+        self._username_failures: dict[str, list[float]] = {}
+        self._ip_failures: dict[str, list[float]] = {}
+
+    def _now(self) -> float:
+        return self._clock()
+
+    def _prune(self, failures: list[float], now: float) -> list[float]:
+        cutoff = now - self._window_seconds
+        return [t for t in failures if t > cutoff]
+
+    def is_locked(self, *, username: str, ip: str) -> bool:
+        now = self._now()
+        username_failures = self._prune(self._username_failures.get(username, []), now)
+        ip_failures = self._prune(self._ip_failures.get(ip, []), now)
+        self._username_failures[username] = username_failures
+        self._ip_failures[ip] = ip_failures
+        return len(username_failures) >= self._username_limit or len(ip_failures) >= self._ip_limit
+
+    def record_failure(self, *, username: str, ip: str) -> None:
+        now = self._now()
+        self._username_failures.setdefault(username, []).append(now)
+        self._ip_failures.setdefault(ip, []).append(now)
+
+    def clear(self, *, username: str, ip: str) -> None:
+        self._username_failures.pop(username, None)
+        self._ip_failures.pop(ip, None)

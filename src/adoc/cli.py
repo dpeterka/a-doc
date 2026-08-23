@@ -11,7 +11,9 @@ with fakes); `review` runs the real weekly deep review
 suites (`evals.runner`); `serve` builds the real `web.app.create_app()`
 and runs it under uvicorn (`_run_uvicorn` is the seam tests override so a
 test run never actually binds a socket). `onboard` is wired to the real
-intake wizard. No stubs remain.
+intake wizard. `user add|list|remove` manages the web login credential
+store (`web.users`) — `add`'s password prompts go through `_getpass`, a
+seam tests override so a test run never blocks on stdin. No stubs remain.
 """
 
 from __future__ import annotations
@@ -37,6 +39,7 @@ from adoc.privacy import Scrubber
 from adoc.reason.client import LlmClient, LlmError
 from adoc.reason.review import run_weekly_review
 from adoc.reason.stages import render_new_evidence_note, run_post_ingest_dag
+from adoc.web.users import USERS_RELPATH, add_user, list_users, remove_user
 
 
 def _cmd_init(_args: argparse.Namespace) -> int:
@@ -67,6 +70,70 @@ def _cmd_init(_args: argparse.Namespace) -> int:
 def _stub(name: str) -> int:
     print(f"{name}: not implemented (phase 1)")
     return 0
+
+
+def _getpass(prompt: str) -> str:  # pragma: no cover - exercises the real terminal
+    """Real wiring for `adoc user add`'s password prompts. Overridden by
+    tests (`monkeypatch.setattr(cli, "_getpass", ...)`) so a test run never
+    blocks on stdin."""
+    import getpass
+
+    return getpass.getpass(prompt)
+
+
+def _users_path(settings: Settings) -> Path:
+    return settings.data_dir / USERS_RELPATH
+
+
+def _cmd_user_add(args: argparse.Namespace) -> int:
+    try:
+        settings = Settings()
+    except Exception as exc:  # noqa: BLE001 - surface any config error to the user
+        print(f"user add: configuration error: {exc}", file=sys.stderr)
+        return 1
+
+    password = _getpass("Password: ")
+    confirm = _getpass("Confirm password: ")
+    if password != confirm:
+        print("user add: passwords did not match", file=sys.stderr)
+        return 1
+    if not password:
+        print("user add: password must not be empty", file=sys.stderr)
+        return 1
+
+    add_user(_users_path(settings), args.username, password)
+    print(f"user add: added user {args.username!r}")
+    return 0
+
+
+def _cmd_user_list(_args: argparse.Namespace) -> int:
+    try:
+        settings = Settings()
+    except Exception as exc:  # noqa: BLE001 - surface any config error to the user
+        print(f"user list: configuration error: {exc}", file=sys.stderr)
+        return 1
+
+    users = list_users(_users_path(settings))
+    if not users:
+        print("user list: no users configured")
+        return 0
+    for username in users:
+        print(username)
+    return 0
+
+
+def _cmd_user_remove(args: argparse.Namespace) -> int:
+    try:
+        settings = Settings()
+    except Exception as exc:  # noqa: BLE001 - surface any config error to the user
+        print(f"user remove: configuration error: {exc}", file=sys.stderr)
+        return 1
+
+    if remove_user(_users_path(settings), args.username):
+        print(f"user remove: removed user {args.username!r}")
+        return 0
+    print(f"user remove: no such user {args.username!r}", file=sys.stderr)
+    return 1
 
 
 def _cmd_onboard(_args: argparse.Namespace) -> int:
@@ -337,6 +404,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="output directory for the report (default: <data_dir>/work/eval)",
     )
     eval_parser.set_defaults(func=_cmd_eval)
+
+    user_parser = subparsers.add_parser("user", help="manage web login users")
+    user_subparsers = user_parser.add_subparsers(dest="user_command", required=True)
+    user_add_parser = user_subparsers.add_parser(
+        "add", help="add (or reset the password of) a web login user"
+    )
+    user_add_parser.add_argument("username")
+    user_add_parser.set_defaults(func=_cmd_user_add)
+    user_list_parser = user_subparsers.add_parser("list", help="list web login usernames")
+    user_list_parser.set_defaults(func=_cmd_user_list)
+    user_remove_parser = user_subparsers.add_parser("remove", help="remove a web login user")
+    user_remove_parser.add_argument("username")
+    user_remove_parser.set_defaults(func=_cmd_user_remove)
+
     return parser
 
 

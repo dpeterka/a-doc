@@ -7,8 +7,9 @@ repo, sqlite file, or network. `vision`/`renderer` are additional,
 optional seams for the same reason (the upload route's ingestion pipeline
 needs both) — real callers (`cli.py`'s `serve` command) never pass them.
 
-Everything except `/login` and `/static/*` requires a valid session
-cookie (see `web.security.SessionAuthMiddleware`).
+Everything except `/login`, `/healthz` (the ALB health check target), and
+`/static/*` requires a valid session cookie (see
+`web.security.SessionAuthMiddleware`).
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ from adoc.ingest.vision import VisionClient
 from adoc.labs.db import LabsDb
 from adoc.reason.client import LlmClient
 from adoc.web.routes import auth, chat, confirm, files, home, labs, ledger, onboard, reviews, upload
-from adoc.web.security import SessionAuthMiddleware, load_or_create_session_secret
+from adoc.web.security import LoginRateLimiter, SessionAuthMiddleware, load_or_create_session_secret
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -54,6 +55,7 @@ def create_app(
     app.state.vision = resolved_vision
     app.state.renderer = resolved_renderer
     app.state.session_secret = load_or_create_session_secret(resolved_repo)
+    app.state.login_rate_limiter = LoginRateLimiter()
 
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
     app.add_middleware(SessionAuthMiddleware)

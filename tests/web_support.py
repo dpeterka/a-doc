@@ -29,8 +29,10 @@ from adoc.reason.client import (
     TransportResponse,
 )
 from adoc.web.app import create_app
+from adoc.web.users import USERS_RELPATH, add_user
 
-DEFAULT_PASSPHRASE = "correct-horse-battery-staple"
+DEFAULT_USERNAME = "patient"
+DEFAULT_PASSWORD = "correct-horse-battery-staple"
 
 Transport = Callable[[TransportRequest], TransportResponse]
 
@@ -127,16 +129,19 @@ def build_fake_client(primary_transport: Transport, challenger_transport: Transp
 def build_app(
     tmp_path: Path,
     *,
-    passphrase: str = DEFAULT_PASSPHRASE,
+    username: str = DEFAULT_USERNAME,
+    password: str = DEFAULT_PASSWORD,
+    trust_forwarded_for: bool = False,
     primary_transport: Transport | None = None,
     challenger_transport: Transport | None = None,
     vision: VisionClient | None = None,
     renderer: PageRenderer | None = None,
 ) -> tuple[FastAPI, DataRepo, LabsDb, list[TransportRequest]]:
     """Build a fully-wired `create_app(...)` over a tmp_path data repo, an
-    in-memory `LabsDb`, and a fake-transport `LlmClient`. Returns
-    `(app, repo, db, calls)` — `calls` accumulates every `TransportRequest`
-    any fake provider transport received, in order."""
+    in-memory `LabsDb`, and a fake-transport `LlmClient`. Seeds one web
+    login user (`username`/`password`) in the repo's `work/users.yaml`.
+    Returns `(app, repo, db, calls)` — `calls` accumulates every
+    `TransportRequest` any fake provider transport received, in order."""
     calls: list[TransportRequest] = []
     primary = primary_transport or exploding_transport(calls)
     challenger = challenger_transport or exploding_transport(calls)
@@ -144,14 +149,19 @@ def build_app(
 
     data_dir = tmp_path / "data"
     repo = DataRepo.init_at(data_dir)
+    add_user(repo.root / USERS_RELPATH, username, password)
     db = LabsDb(":memory:")
-    settings = Settings(data_dir=data_dir, session_passphrase=passphrase)
+    settings = Settings(data_dir=data_dir, trust_forwarded_for=trust_forwarded_for)
 
     app = create_app(settings, repo=repo, db=db, client=client, vision=vision, renderer=renderer)
     return app, repo, db, calls
 
 
-def login(client: TestClient, passphrase: str = DEFAULT_PASSPHRASE) -> None:
-    response = client.post("/login", data={"passphrase": passphrase}, follow_redirects=False)
+def login(
+    client: TestClient, username: str = DEFAULT_USERNAME, password: str = DEFAULT_PASSWORD
+) -> None:
+    response = client.post(
+        "/login", data={"username": username, "password": password}, follow_redirects=False
+    )
     assert response.status_code == 303
     assert "adoc_session" in response.cookies
