@@ -98,18 +98,34 @@ Resources:
                   - iam:CreateRole
                   - iam:DeleteRole
                   - iam:GetRole
+                  - iam:GetRolePolicy
+                  - iam:ListRolePolicies
+                  - iam:ListAttachedRolePolicies
+                  - iam:ListInstanceProfilesForRole
                   - iam:PutRolePolicy
                   - iam:DeleteRolePolicy
                   - iam:AttachRolePolicy
                   - iam:DetachRolePolicy
                   - iam:CreateInstanceProfile
                   - iam:DeleteInstanceProfile
+                  - iam:GetInstanceProfile
                   - iam:AddRoleToInstanceProfile
                   - iam:RemoveRoleFromInstanceProfile
                   - iam:TagRole
+                  - iam:UntagRole
                 Resource:
                   - !Sub "arn:aws:iam::${AWS::AccountId}:role/a-doc-*"
                   - !Sub "arn:aws:iam::${AWS::AccountId}:instance-profile/a-doc-*"
+              # instance.yaml resolves its AMI via an SSM parameter type
+              # (AWS::SSM::Parameter::Value<...>); CloudFormation resolves it
+              # with the *calling* principal's permissions, so the deploy role
+              # needs read access to the public AMI parameters.
+              - Sid: SsmPublicAmiParameters
+                Effect: Allow
+                Action:
+                  - ssm:GetParameters
+                Resource:
+                  - "arn:aws:ssm:*::parameter/aws/service/ami-amazon-linux-latest/*"
               - Sid: BackupBucketBroad
                 Effect: Allow
                 Action:
