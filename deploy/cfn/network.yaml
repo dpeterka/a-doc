@@ -150,7 +150,13 @@ Resources:
     Properties:
       # Plain single-line scalar: a folded block (>) leaves a trailing
       # newline, which EC2 rejects in GroupDescription.
-      GroupDescription: "a-doc instance SG. Only the ALB SG may reach port 8080; no SSH, no other ingress. Shell access is SSM-only."
+      #
+      # NOTE: this description text is STALE ON PURPOSE. GroupDescription is
+      # an immutable property — changing it REPLACES the security group,
+      # which CloudFormation forbids while a-doc-instance imports the
+      # exported SG id. The real posture: only the ALB SG may reach 8080,
+      # no SSH, shell via SSM only.
+      GroupDescription: "a-doc instance SG, no ingress. Reachable only via AWS SSM and Tailscale (both outbound-initiated)."
       VpcId: !Ref Vpc
       SecurityGroupIngress:
         - IpProtocol: tcp
