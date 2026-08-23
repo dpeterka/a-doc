@@ -1,0 +1,8 @@
+{% import "_chat_macros.html" as chat_macros %}
+{{ chat_macros.bubble({"role": "patient", "text": user_text}) }}
+{{ chat_macros.bubble({
+  "role": "assistant",
+  "kind": turn.kind,
+  "text": turn.text,
+  "tests_to_request": turn.tests_to_request,
+}) }}

@@ -1,0 +1,75 @@
+{% extends "base.html" %}
+{% block title %}Home — a-doc{% endblock %}
+{% block content %}
+  <h1>Your case file</h1>
+
+  {% if baseline_incomplete %}
+    <div class="banner banner-warning">
+      <strong>Baseline incomplete</strong> — you're {{ intake_progress[0] }} of {{ intake_progress[1] }}
+      onboarding sections done. These leads may shift as you finish.
+      <a href="/onboard">Continue onboarding &rarr;</a>
+    </div>
+  {% endif %}
+
+  {% if pending_count > 0 %}
+    <div class="banner banner-info">
+      <strong>{{ pending_count }}</strong> document row{{ "s" if pending_count != 1 else "" }}
+      waiting for you to confirm.
+      <a href="/confirm">Go to the review queue &rarr;</a>
+    </div>
+  {% endif %}
+
+  {% if whats_new %}
+    <section class="card">
+      <h2>What's new since your last visit</h2>
+      <ul class="whats-new-list">
+        {% for entry in whats_new %}
+          <li>
+            <span class="muted">v{{ entry.resulting_version }}</span>
+            {{ entry.diff.rationale }}
+          </li>
+        {% endfor %}
+      </ul>
+    </section>
+  {% endif %}
+
+  <section class="card">
+    <h2>Your current picture</h2>
+    <p class="muted">
+      These are leads to bring up with your doctor — not a diagnosis.
+    </p>
+    {% for tier, hypotheses in tiers %}
+      <div class="tier-block tier-{{ tier }}">
+        <h3>{{ tier | tier_label }}</h3>
+        {% if hypotheses %}
+          <ul class="hypothesis-list">
+            {% for h in hypotheses %}
+              <li class="hypothesis">
+                <div class="hypothesis-name">{{ h.name }}</div>
+                <div class="chips">
+                  <span class="chip chip-status">{{ h.status | status_label }}</span>
+                  <span class="chip chip-origin chip-origin-{{ h.origin }}">{{ h.origin | origin_label }}</span>
+                  <span class="chip chip-probability">confidence: {{ h.probability }}</span>
+                </div>
+                {% if h.evidence_for %}
+                  <ul class="evidence-list evidence-for">
+                    {% for e in h.evidence_for %}
+                      <li>{{ e.claim }} <span class="muted">({{ e.source }})</span></li>
+                    {% endfor %}
+                  </ul>
+                {% endif %}
+              </li>
+            {% endfor %}
+          </ul>
+        {% else %}
+          <p class="muted">Nothing here yet.</p>
+        {% endif %}
+      </div>
+    {% endfor %}
+  </section>
+
+  <section class="card">
+    <h2>Open questions for your next appointment</h2>
+    {{ open_questions_text | markdown_lite | safe }}
+  </section>
+{% endblock %}
