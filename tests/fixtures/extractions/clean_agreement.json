@@ -1,0 +1,54 @@
+{
+  "pass_a": {
+    "doc_type": "lab_report",
+    "facility": "Quest Diagnostics",
+    "collection_date": "2026-05-02",
+    "report_date": "2026-05-03",
+    "results": [
+      {
+        "name_raw": "Potassium",
+        "value": 4.1,
+        "unit_raw": "mmol/L",
+        "ref_range_raw": "3.5-5.1",
+        "page": 1,
+        "confidence": "high"
+      },
+      {
+        "name_raw": "Glucose",
+        "value": 95,
+        "unit_raw": "mg/dL",
+        "ref_range_raw": "70-99",
+        "page": 1,
+        "confidence": "high"
+      }
+    ],
+    "narrative_findings": [],
+    "illegible_regions": []
+  },
+  "pass_b": {
+    "doc_type": "lab_report",
+    "facility": "Quest Diagnostics",
+    "collection_date": "2026-05-02",
+    "report_date": "2026-05-03",
+    "results": [
+      {
+        "name_raw": "Potassium",
+        "value": 4.1,
+        "unit_raw": "mmol/L",
+        "ref_range_raw": "3.5-5.1",
+        "page": 1,
+        "confidence": "high"
+      },
+      {
+        "name_raw": "Glucose",
+        "value": 95,
+        "unit_raw": "mg/dL",
+        "ref_range_raw": "70-99",
+        "page": 1,
+        "confidence": "high"
+      }
+    ],
+    "narrative_findings": [],
+    "illegible_regions": []
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "pass_a": {
+    "doc_type": "clinical_note",
+    "facility": "Riverside Rheumatology",
+    "collection_date": null,
+    "report_date": "2026-06-10",
+    "results": [],
+    "narrative_findings": [
+      "Patient reports ongoing joint pain and fatigue; follow-up in 3 months."
+    ],
+    "illegible_regions": []
+  },
+  "pass_b": {
+    "doc_type": "clinical_note",
+    "facility": "Riverside Rheumatology",
+    "collection_date": null,
+    "report_date": "2026-06-10",
+    "results": [],
+    "narrative_findings": [
+      "Patient reports ongoing joint pain and fatigue; follow-up in 3 months."
+    ],
+    "illegible_regions": []
+  }
+}
