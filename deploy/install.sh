@@ -17,6 +17,10 @@ set -euo pipefail
 # one, and this script runs as root in every supported invocation path.
 export HOME="${HOME:-/root}"
 
+# /opt/a-doc is chowned to the adoc user while this script runs as root;
+# git refuses cross-owner repos without an explicit exception.
+git config --global --add safe.directory /opt/a-doc 2>/dev/null || true
+
 REPO_URL_BASE="github.com/dpeterka/a-doc.git"
 REPO_BRANCH="main"
 APP_DIR="/opt/a-doc"
