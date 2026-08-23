@@ -1,0 +1,125 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  a-doc instance stack: the single always-on EC2 node (SQLite + git want
+  one persistent instance — see PLAN.md "Deployment"). No SSH key pair, no
+  public ingress; reachable via SSM and Tailscale only. Imports its subnet,
+  security group, and backup bucket/key from the network and backup stacks
+  via Fn::ImportValue rather than manually threaded parameters, so deploy.yml
+  only needs to know the two stack names.
+
+Parameters:
+  NetworkStackName:
+    Type: String
+    Default: a-doc-network
+    Description: Name of the deployed network stack (for cross-stack imports).
+  BackupStackName:
+    Type: String
+    Default: a-doc-backup
+    Description: Name of the deployed backup stack (for cross-stack imports).
+  InstanceType:
+    Type: String
+    Default: t4g.small
+    Description: EC2 instance type (arm64 — t4g family per PLAN.md).
+  AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-minimal-arm64
+    Description: Latest Amazon Linux 2023 minimal arm64 AMI, resolved via SSM.
+  DataVolumeSizeGiB:
+    Type: Number
+    Default: 50
+    Description: Size of the encrypted data EBS volume (git data repo + labs.sqlite).
+
+Resources:
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: a-doc-instance-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: a-doc-backup-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: BackupBucketReadWrite
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub
+                    - "arn:aws:s3:::${BucketName}"
+                    - BucketName:
+                        Fn::ImportValue: !Sub "${BackupStackName}-BucketName"
+                  - !Sub
+                    - "arn:aws:s3:::${BucketName}/*"
+                    - BucketName:
+                        Fn::ImportValue: !Sub "${BackupStackName}-BucketName"
+              - Sid: BackupKeyUse
+                Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:Encrypt
+                  - kms:GenerateDataKey
+                Resource:
+                  Fn::ImportValue: !Sub "${BackupStackName}-KmsKeyArn"
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref InstanceRole
+
+  Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref AmiId
+      IamInstanceProfile: !Ref InstanceProfile
+      SubnetId:
+        Fn::ImportValue: !Sub "${NetworkStackName}-SubnetId"
+      SecurityGroupIds:
+        - Fn::ImportValue: !Sub "${NetworkStackName}-SecurityGroupId"
+      # No KeyName — no SSH keys (CLAUDE.md "Infrastructure": SSM + Tailscale only).
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeType: gp3
+            VolumeSize: 30
+            Encrypted: true
+        - DeviceName: /dev/xvdb
+          Ebs:
+            VolumeType: gp3
+            VolumeSize: !Ref DataVolumeSizeGiB
+            Encrypted: true
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          set -euo pipefail
+          # TODO: replace with a real Tailscale auth key delivered via SSM
+          # Parameter Store / Secrets Manager, not baked into UserData.
+          curl -fsSL https://tailscale.com/install.sh | sh
+          tailscale up --authkey="TODO-fetch-from-ssm-parameter-store" || true
+          # TODO: confirm branch/path exist at deploy time — install.sh is
+          # part of this same repo and only resolvable once it has a home
+          # on GitHub at the referenced ref.
+          curl -fsSL https://raw.githubusercontent.com/dpeterka/a-doc/main/deploy/install.sh \
+            -o /tmp/install.sh
+          bash /tmp/install.sh
+      Tags:
+        - Key: Name
+          Value: a-doc-instance
+
+Outputs:
+  InstanceId:
+    Value: !Ref Instance
+  PrivateIp:
+    Value: !GetAtt Instance.PrivateIp
