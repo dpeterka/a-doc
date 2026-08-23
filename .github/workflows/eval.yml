@@ -1,0 +1,28 @@
+name: eval
+
+# Monthly self-evaluation run against synthetic fixtures only — no PHI in
+# CI (see CLAUDE.md rule 1). `adoc eval` is a Phase-0 stub that exits 0;
+# this workflow becomes meaningful once Phase 1 implements the harness.
+
+on:
+  schedule:
+    - cron: "0 6 1 * *"
+  workflow_dispatch: {}
+
+jobs:
+  eval:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --all-extras
+
+      - name: Run eval suite
+        run: uv run adoc eval
