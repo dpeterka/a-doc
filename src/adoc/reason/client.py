@@ -23,6 +23,7 @@ no transport was injected.
 from __future__ import annotations
 
 import json
+import re
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -232,21 +233,41 @@ class OpenAIProvider:
 
         kwargs: dict[str, Any] = {
             "model": request.model,
-            "max_tokens": request.max_tokens,
             "messages": chat_messages,
         }
+        # gpt-5.x rejects 'max_tokens' in favor of 'max_completion_tokens';
+        # OpenAI-compatible hosts (Featherless) only accept 'max_tokens'.
+        if self.base_url is None:
+            kwargs["max_completion_tokens"] = request.max_tokens
+        else:
+            kwargs["max_tokens"] = request.max_tokens
         if "temperature" in request.params:
             kwargs["temperature"] = request.params["temperature"]
+        # gpt-5.x thinking depth is the 'reasoning_effort' request parameter
+        # (models.yaml params.effort), not a separate model id.
+        if self.base_url is None and "effort" in request.params:
+            kwargs["reasoning_effort"] = request.params["effort"]
 
         if request.schema is not None:
-            kwargs["response_format"] = {
-                "type": "json_schema",
-                "json_schema": {
-                    "name": request.schema.__name__,
-                    "schema": request.schema.model_json_schema(),
-                    "strict": True,
-                },
-            }
+            if self.base_url is None:
+                kwargs["response_format"] = {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": request.schema.__name__,
+                        "schema": _openai_strict_schema(request.schema.model_json_schema()),
+                        "strict": True,
+                    },
+                }
+            else:
+                # OpenAI-compatible hosts (Featherless) don't reliably support
+                # json_schema response_format; instruct JSON in the prompt and
+                # extract it from the text (reasoning models may wrap it in
+                # <think> blocks).
+                schema_json = json.dumps(request.schema.model_json_schema())
+                chat_messages[0]["content"] = (
+                    f"{request.system}\n\nRespond with ONLY a JSON object valid "
+                    f"against this JSON Schema (no prose, no code fences):\n{schema_json}"
+                )
 
         try:
             response = client.chat.completions.create(**kwargs)
@@ -259,14 +280,16 @@ class OpenAIProvider:
                 raise TransientTransportError(str(exc)) from exc
             raise LlmError(str(exc)) from exc
 
+        if not response.choices:
+            raise LlmError("openai: response contained no choices")
         choice = response.choices[0]
         text = choice.message.content or ""
 
         tool_input: dict[str, Any] | None = None
         if request.schema is not None:
             try:
-                tool_input = json.loads(text)
-            except json.JSONDecodeError as exc:
+                tool_input = json.loads(_extract_json_object(text))
+            except (json.JSONDecodeError, ValueError) as exc:
                 raise LlmError(f"openai: response was not valid JSON: {exc}") from exc
 
         usage = response.usage
@@ -276,6 +299,63 @@ class OpenAIProvider:
             input_tokens=usage.prompt_tokens if usage else 0,
             output_tokens=usage.completion_tokens if usage else 0,
         )
+
+
+def _openai_strict_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Adapt a pydantic JSON schema for OpenAI strict mode.
+
+    Strict mode requires every object node to carry
+    `additionalProperties: false` and to list every property in `required`.
+    """
+
+    def walk(node: Any) -> Any:
+        if isinstance(node, dict):
+            out = {k: walk(v) for k, v in node.items()}
+            if out.get("type") == "object" or "properties" in out:
+                out.setdefault("additionalProperties", False)
+                if "properties" in out:
+                    out["required"] = list(out["properties"].keys())
+            return out
+        if isinstance(node, list):
+            return [walk(item) for item in node]
+        return node
+
+    result: dict[str, Any] = walk(schema)
+    return result
+
+
+def _extract_json_object(text: str) -> str:
+    """Return the first top-level JSON object in `text`.
+
+    Reasoning models (DeepSeek-R1) may wrap output in <think> blocks or code
+    fences; strict-schema hosts return the bare object, which passes through
+    unchanged.
+    """
+    cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    start = cleaned.find("{")
+    if start == -1:
+        raise ValueError("no JSON object found in response text")
+    depth = 0
+    in_string = False
+    escaped = False
+    for i, ch in enumerate(cleaned[start:], start):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return cleaned[start : i + 1]
+    raise ValueError("unbalanced JSON object in response text")
 
 
 def _estimate_cost(model: str, input_tokens: int, output_tokens: int) -> float | None:
