@@ -38,6 +38,19 @@ jobs:
       # of applying it, add `--no-execute-changeset` to any of the deploy
       # commands below and review it before a follow-up execute.
 
+      # Self-hosting: apply ci.yaml first so deploy-role policy changes in git
+      # actually reach IAM before the stacks that need them (a policy change
+      # that only lives in git caused the 0.2.0 ALB rollback). The role may
+      # update its own a-doc-* IAM resources; the OIDC provider itself never
+      # changes here.
+      - name: Deploy ci stack (deploy role self-update)
+        run: |
+          aws cloudformation deploy \
+            --stack-name a-doc-ci \
+            --template-file deploy/cfn/ci.yaml \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --no-fail-on-empty-changeset
+
       - name: Deploy network stack
         run: |
           aws cloudformation deploy \
