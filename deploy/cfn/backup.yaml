@@ -1,0 +1,68 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  a-doc backup stack: a versioned, SSE-KMS-encrypted S3 bucket for nightly
+  git bundle + labs-export.jsonl + sources/ backups (see PLAN.md
+  "Deployment": "Backup: nightly git bundle ... to the S3 bucket").
+
+Resources:
+  BackupKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS key for the a-doc backup bucket.
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowAccountRootFullAccess
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+          - Sid: AllowS3ServiceUse
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+            Resource: "*"
+
+  BackupKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: alias/a-doc-backup
+      TargetKeyId: !Ref BackupKey
+
+  BackupBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref BackupKey
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireNoncurrentVersions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 365
+
+Outputs:
+  BucketName:
+    Value: !Ref BackupBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-BucketName"
+  KmsKeyArn:
+    Value: !GetAtt BackupKey.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-KmsKeyArn"
