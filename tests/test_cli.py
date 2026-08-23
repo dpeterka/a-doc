@@ -44,6 +44,25 @@ def test_init_succeeds_with_valid_env(
     assert "loaded 6 model role bindings" in out
 
 
+def test_init_creates_data_repo_and_is_idempotent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    data_dir = tmp_path / "a-doc-data"
+    monkeypatch.setenv("ADOC_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("ADOC_MODELS_FILE", str(REPO_ROOT / "models.yaml"))
+
+    first_code = main(["init"])
+    first_out = capsys.readouterr().out
+    assert first_code == 0
+    assert f"initialized data repo at {data_dir}" in first_out
+    assert (data_dir / "case" / "differential-ledger.yaml").exists()
+
+    second_code = main(["init"])
+    second_out = capsys.readouterr().out
+    assert second_code == 0
+    assert f"already initialized at {data_dir}" in second_out
+
+
 def test_init_fails_without_data_dir(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
