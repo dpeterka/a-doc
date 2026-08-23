@@ -64,8 +64,9 @@ def test_init_creates_data_repo_and_is_idempotent(
 
 
 def test_init_fails_without_data_dir(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
+    monkeypatch.chdir(tmp_path)  # hermetic: a developer .env must not leak into Settings
     monkeypatch.delenv("ADOC_DATA_DIR", raising=False)
 
     code = main(["init"])
