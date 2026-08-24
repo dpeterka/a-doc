@@ -1,0 +1,564 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  a-doc ECS Fargate stack: the EFS filesystem (replacing the EC2 instance's
+  attached EBS data volume), the web service (behind the ALB in alb.yaml),
+  and the scheduled ingest/review/backup jobs (replacing systemd timers) —
+  see ADR 0006 (EC2+install.sh -> ECS Fargate + EFS) for the full
+  rationale. Both task definitions run the same application image
+  (`ImageUri`, built and pushed to the `a-doc` ECR repository in ci.yaml by
+  .github/workflows/deploy.yml); only the command differs per invocation.
+
+# Single-writer discipline (kept as a comment, not the Description above,
+# to stay under CloudFormation's 1024-char Description limit): SQLite +
+# git-as-database want exactly one writer at a time, same as the EC2
+# design did. The web service's `DeploymentConfiguration` (MaximumPercent
+# 100 / MinimumHealthyPercent 0) means an old task is always stopped
+# before a new one starts — old and new tasks never run concurrently
+# against the same EFS-mounted data directory. `labs.sqlite`'s journal
+# mode is TRUNCATE here (not the local/dev default WAL), because WAL's
+# shared-memory index file is unsafe on NFS-family filesystems like EFS —
+# see `labs.db.LabsDb.__init__` and ADR 0006. The scheduled
+# ingest/review/backup jobs are not mutually exclusive with each other or
+# the web task at the CloudFormation/ECS level (there is no distributed
+# lock); this is an accepted, documented gap the sub-10-minute ingest
+# cadence and this being a single-patient system make low-risk in
+# practice, not a solved problem.
+
+Parameters:
+  NetworkStackName:
+    Type: String
+    Default: a-doc-network
+    Description: Name of the deployed network stack (for cross-stack imports).
+  BackupStackName:
+    Type: String
+    Default: a-doc-backup
+    Description: Name of the deployed backup stack (for cross-stack imports).
+  AlbStackName:
+    Type: String
+    Default: a-doc-alb
+    Description: Name of the deployed ALB stack (for cross-stack imports).
+  ImageUri:
+    Type: String
+    Description: >
+      Full ECR image URI with tag, e.g.
+      536726971394.dkr.ecr.us-east-2.amazonaws.com/a-doc:<git-sha>.
+
+Resources:
+  # --------------------------------------------------------------------
+  # Networking: a service SG (ALB -> tasks) and an EFS SG (tasks -> EFS).
+  # --------------------------------------------------------------------
+
+  ServiceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "a-doc ECS service SG: ingress 8080 from the ALB SG only."
+      VpcId:
+        Fn::ImportValue: !Sub "${NetworkStackName}-VpcId"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId:
+            Fn::ImportValue: !Sub "${NetworkStackName}-AlbSecurityGroupId"
+          Description: adoc-web, reachable only from the ALB.
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound (ECR pull, EFS, SSM, API calls).
+      Tags:
+        - Key: Name
+          Value: a-doc-service-sg
+
+  EfsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "a-doc EFS SG: NFS ingress from the ECS service SG only."
+      VpcId:
+        Fn::ImportValue: !Sub "${NetworkStackName}-VpcId"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !GetAtt ServiceSecurityGroup.GroupId
+          Description: NFS from a-doc ECS tasks only.
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: a-doc-efs-sg
+
+  # --------------------------------------------------------------------
+  # EFS: replaces the EC2 instance's attached /dev/xvdb data volume.
+  # --------------------------------------------------------------------
+
+  Efs:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      Encrypted: true
+      LifecyclePolicies:
+        - TransitionToIA: AFTER_30_DAYS
+      FileSystemTags:
+        - Key: Name
+          Value: a-doc-efs
+
+  EfsMountTarget1:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref Efs
+      SubnetId:
+        Fn::ImportValue: !Sub "${NetworkStackName}-SubnetId"
+      SecurityGroups:
+        - !GetAtt EfsSecurityGroup.GroupId
+
+  EfsMountTarget2:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref Efs
+      SubnetId:
+        Fn::ImportValue: !Sub "${NetworkStackName}-Subnet2Id"
+      SecurityGroups:
+        - !GetAtt EfsSecurityGroup.GroupId
+
+  EfsAccessPoint:
+    Type: AWS::EFS::AccessPoint
+    Properties:
+      FileSystemId: !Ref Efs
+      PosixUser:
+        Uid: "1000"
+        Gid: "1000"
+      RootDirectory:
+        Path: /data
+        CreationInfo:
+          OwnerUid: "1000"
+          OwnerGid: "1000"
+          Permissions: "750"
+
+  # --------------------------------------------------------------------
+  # Logs
+  # --------------------------------------------------------------------
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /a-doc/app
+      RetentionInDays: 90
+
+  # --------------------------------------------------------------------
+  # IAM: task execution role (pull image, write logs, read SSM secrets)
+  # and task role (backup S3/KMS access, EFS client access, ECS Exec).
+  # --------------------------------------------------------------------
+
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: a-doc-task-execution-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        # ECR image pull + awslogs log delivery.
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: a-doc-secrets-read
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # The ECS agent (via this role) resolves each container's
+              # `secrets[].valueFrom` SSM parameter at task launch.
+              - Sid: SsmParameterRead
+                Effect: Allow
+                Action:
+                  - ssm:GetParameters
+                Resource:
+                  - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/a-doc/*"
+              # Same default-KMS-key reasoning as the old instance role
+              # (deploy/cfn/instance.yaml): these SecureStrings use
+              # alias/aws/ssm, never a customer-managed key.
+              - Sid: SsmDefaultKmsDecrypt
+                Effect: Allow
+                Action:
+                  - kms:Decrypt
+                Resource:
+                  - !Sub "arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/aws/ssm"
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: a-doc-task-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: a-doc-backup-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: BackupBucketReadWrite
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub
+                    - "arn:aws:s3:::${BucketName}"
+                    - BucketName:
+                        Fn::ImportValue: !Sub "${BackupStackName}-BucketName"
+                  - !Sub
+                    - "arn:aws:s3:::${BucketName}/*"
+                    - BucketName:
+                        Fn::ImportValue: !Sub "${BackupStackName}-BucketName"
+              - Sid: BackupKeyUse
+                Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:Encrypt
+                  - kms:GenerateDataKey
+                Resource:
+                  Fn::ImportValue: !Sub "${BackupStackName}-KmsKeyArn"
+        - PolicyName: a-doc-efs-client-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Required for the awsvpc-mode EFS volume mount
+              # (AuthorizationConfig.IAM: ENABLED in the task definitions
+              # below) - scoped to this filesystem's specific access point.
+              - Sid: EfsClientAccess
+                Effect: Allow
+                Action:
+                  - elasticfilesystem:ClientMount
+                  - elasticfilesystem:ClientWrite
+                Resource: !GetAtt Efs.Arn
+                Condition:
+                  StringEquals:
+                    elasticfilesystem:AccessPointArn: !GetAtt EfsAccessPoint.Arn
+        - PolicyName: a-doc-ecs-exec
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # `aws ecs execute-command` (README "User provisioning") -
+              # the SSM Session Manager data channel the exec agent inside
+              # the task uses.
+              - Sid: EcsExecSsmChannel
+                Effect: Allow
+                Action:
+                  - ssmmessages:CreateControlChannel
+                  - ssmmessages:CreateDataChannel
+                  - ssmmessages:OpenControlChannel
+                  - ssmmessages:OpenDataChannel
+                Resource: "*"
+
+  # --------------------------------------------------------------------
+  # Task definitions. Both share the same image/container name/env
+  # shape; only Cpu/Memory and the invoked command differ.
+  # --------------------------------------------------------------------
+
+  WebTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: a-doc-web
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: "512"
+      Memory: "1024"
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      Volumes:
+        - Name: data
+          EFSVolumeConfiguration:
+            FilesystemId: !Ref Efs
+            TransitEncryption: ENABLED
+            AuthorizationConfig:
+              AccessPointId: !Ref EfsAccessPoint
+              IAM: ENABLED
+      ContainerDefinitions:
+        - Name: adoc
+          Image: !Ref ImageUri
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8080
+              Protocol: tcp
+          MountPoints:
+            - SourceVolume: data
+              ContainerPath: /data
+              ReadOnly: false
+          Environment:
+            - Name: ADOC_DATA_DIR
+              Value: /data/a-doc-data
+            - Name: ADOC_SQLITE_JOURNAL_MODE
+              Value: TRUNCATE
+            - Name: ADOC_BACKUP_BUCKET
+              Value:
+                Fn::ImportValue: !Sub "${BackupStackName}-BucketName"
+            - Name: ADOC_TRUST_FORWARDED_FOR
+              Value: "true"
+          Secrets:
+            - Name: ANTHROPIC_API_KEY
+              ValueFrom: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/a-doc/anthropic-api-key"
+            - Name: OPENAI_API_KEY
+              ValueFrom: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/a-doc/openai-api-key"
+            - Name: FEATHERLESS_API_KEY
+              ValueFrom: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/a-doc/featherless-api-key"
+            - Name: RCLONE_CONF
+              ValueFrom: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/a-doc/rclone-conf"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: web
+
+  JobsTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: a-doc-jobs
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: "1024"
+      Memory: "2048"
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      Volumes:
+        - Name: data
+          EFSVolumeConfiguration:
+            FilesystemId: !Ref Efs
+            TransitEncryption: ENABLED
+            AuthorizationConfig:
+              AccessPointId: !Ref EfsAccessPoint
+              IAM: ENABLED
+      ContainerDefinitions:
+        - Name: adoc
+          Image: !Ref ImageUri
+          # No PortMappings/health check - this task def is never run
+          # without a containerOverrides command (see the EventBridge
+          # rules below); it is not attached to the ALB target group.
+          Essential: true
+          MountPoints:
+            - SourceVolume: data
+              ContainerPath: /data
+              ReadOnly: false
+          Environment:
+            - Name: ADOC_DATA_DIR
+              Value: /data/a-doc-data
+            - Name: ADOC_SQLITE_JOURNAL_MODE
+              Value: TRUNCATE
+            - Name: ADOC_BACKUP_BUCKET
+              Value:
+                Fn::ImportValue: !Sub "${BackupStackName}-BucketName"
+            - Name: ADOC_TRUST_FORWARDED_FOR
+              Value: "true"
+          Secrets:
+            - Name: ANTHROPIC_API_KEY
+              ValueFrom: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/a-doc/anthropic-api-key"
+            - Name: OPENAI_API_KEY
+              ValueFrom: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/a-doc/openai-api-key"
+            - Name: FEATHERLESS_API_KEY
+              ValueFrom: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/a-doc/featherless-api-key"
+            - Name: RCLONE_CONF
+              ValueFrom: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/a-doc/rclone-conf"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: jobs
+
+  # --------------------------------------------------------------------
+  # Cluster + always-on web service.
+  # --------------------------------------------------------------------
+
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: a-doc
+
+  WebService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: a-doc-web
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref WebTaskDefinition
+      LaunchType: FARGATE
+      PlatformVersion: LATEST
+      DesiredCount: 1
+      # Single-writer discipline (see the template Description): never run
+      # two web tasks at once against the shared EFS-mounted SQLite/git
+      # data directory. MaximumPercent 100 means CloudFormation/ECS must
+      # stop the old task before starting the replacement, at the cost of
+      # a short availability gap on each deploy (acceptable for a
+      # single-patient app; not swapped for the usual 200/100 rolling
+      # pattern, which would briefly run two tasks concurrently).
+      DeploymentConfiguration:
+        MaximumPercent: 100
+        MinimumHealthyPercent: 0
+      HealthCheckGracePeriodSeconds: 120
+      # Enables `aws ecs execute-command` for one-off shells (README "User
+      # provisioning": `adoc user add`), replacing SSM Session Manager
+      # access to the EC2 instance.
+      EnableExecuteCommand: true
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          # ENABLED: network.yaml's public subnets have no NAT gateway, so
+          # tasks need a public IP for outbound-only egress (ECR pull, LLM
+          # provider APIs, SSM) - same posture the EC2 instance had.
+          AssignPublicIp: ENABLED
+          Subnets:
+            - Fn::ImportValue: !Sub "${NetworkStackName}-SubnetId"
+            - Fn::ImportValue: !Sub "${NetworkStackName}-Subnet2Id"
+          SecurityGroups:
+            - !GetAtt ServiceSecurityGroup.GroupId
+      LoadBalancers:
+        - ContainerName: adoc
+          ContainerPort: 8080
+          TargetGroupArn:
+            Fn::ImportValue: !Sub "${AlbStackName}-TargetGroupArn"
+
+  # --------------------------------------------------------------------
+  # Scheduled jobs (replace deploy/systemd/adoc-{ingest,review,backup}.timer):
+  # an EventBridge Scheduler role + one rule per job, each RunTask'ing
+  # JobsTaskDefinition with a containerOverrides command.
+  # --------------------------------------------------------------------
+
+  EventsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: a-doc-events-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: a-doc-events-run-task
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: RunJobsTask
+                Effect: Allow
+                Action:
+                  - ecs:RunTask
+                Resource: !Ref JobsTaskDefinition
+                Condition:
+                  ArnEquals:
+                    "ecs:cluster": !GetAtt Cluster.Arn
+              - Sid: PassJobsTaskRoles
+                Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource:
+                  - !GetAtt TaskExecutionRole.Arn
+                  - !GetAtt TaskRole.Arn
+
+  IngestRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: a-doc-ingest
+      Description: >
+        rclone-pull the Dropbox inbox, then `adoc ingest`
+        (deploy/container/run-ingest.sh) - replaces adoc-ingest.timer.
+      ScheduleExpression: rate(10 minutes)
+      State: ENABLED
+      Targets:
+        - Id: a-doc-ingest-target
+          Arn: !GetAtt Cluster.Arn
+          RoleArn: !GetAtt EventsRole.Arn
+          Input: |
+            {"containerOverrides": [{"name": "adoc", "command": ["/usr/local/bin/run-ingest.sh"]}]}
+          EcsParameters:
+            TaskDefinitionArn: !Ref JobsTaskDefinition
+            TaskCount: 1
+            LaunchType: FARGATE
+            PlatformVersion: LATEST
+            NetworkConfiguration:
+              AwsVpcConfiguration:
+                AssignPublicIp: ENABLED
+                Subnets:
+                  - Fn::ImportValue: !Sub "${NetworkStackName}-SubnetId"
+                  - Fn::ImportValue: !Sub "${NetworkStackName}-Subnet2Id"
+                SecurityGroups:
+                  - !GetAtt ServiceSecurityGroup.GroupId
+
+  ReviewRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: a-doc-review
+      Description: Weekly deep review (`adoc review`) - replaces adoc-review.timer.
+      ScheduleExpression: "cron(0 6 ? * SUN *)"
+      State: ENABLED
+      Targets:
+        - Id: a-doc-review-target
+          Arn: !GetAtt Cluster.Arn
+          RoleArn: !GetAtt EventsRole.Arn
+          Input: |
+            {"containerOverrides": [{"name": "adoc", "command": ["adoc", "review"]}]}
+          EcsParameters:
+            TaskDefinitionArn: !Ref JobsTaskDefinition
+            TaskCount: 1
+            LaunchType: FARGATE
+            PlatformVersion: LATEST
+            NetworkConfiguration:
+              AwsVpcConfiguration:
+                AssignPublicIp: ENABLED
+                Subnets:
+                  - Fn::ImportValue: !Sub "${NetworkStackName}-SubnetId"
+                  - Fn::ImportValue: !Sub "${NetworkStackName}-Subnet2Id"
+                SecurityGroups:
+                  - !GetAtt ServiceSecurityGroup.GroupId
+
+  BackupRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: a-doc-backup
+      Description: Nightly backup (`adoc backup`) - replaces adoc-backup.timer.
+      ScheduleExpression: "cron(0 3 * * ? *)"
+      State: ENABLED
+      Targets:
+        - Id: a-doc-backup-target
+          Arn: !GetAtt Cluster.Arn
+          RoleArn: !GetAtt EventsRole.Arn
+          Input: |
+            {"containerOverrides": [{"name": "adoc", "command": ["adoc", "backup"]}]}
+          EcsParameters:
+            TaskDefinitionArn: !Ref JobsTaskDefinition
+            TaskCount: 1
+            LaunchType: FARGATE
+            PlatformVersion: LATEST
+            NetworkConfiguration:
+              AwsVpcConfiguration:
+                AssignPublicIp: ENABLED
+                Subnets:
+                  - Fn::ImportValue: !Sub "${NetworkStackName}-SubnetId"
+                  - Fn::ImportValue: !Sub "${NetworkStackName}-Subnet2Id"
+                SecurityGroups:
+                  - !GetAtt ServiceSecurityGroup.GroupId
+
+Outputs:
+  ClusterName:
+    Value: !Ref Cluster
+    Export:
+      Name: !Sub "${AWS::StackName}-ClusterName"
+  EfsFileSystemId:
+    Value: !Ref Efs
+    Export:
+      Name: !Sub "${AWS::StackName}-EfsFileSystemId"
+  WebServiceName:
+    Value: !GetAtt WebService.Name
+    Export:
+      Name: !Sub "${AWS::StackName}-WebServiceName"

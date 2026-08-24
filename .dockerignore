@@ -1,0 +1,27 @@
+.git
+.github
+.claude
+docs
+scratch
+tests
+# deploy/ is excluded except deploy/container/, which the Dockerfile COPYs
+# (run-ingest.sh) - cfn/ and systemd/ are deploy-time only, never needed
+# inside the image.
+deploy/cfn
+deploy/systemd
+deploy/install.sh
+deploy/backup.sh
+*.md
+!README.md
+.venv
+.env
+.env.*
+work/
+logs/
+.pytest_cache
+.mypy_cache
+.ruff_cache
+**/__pycache__
+**/*.pyc
+.coverage
+htmlcov/

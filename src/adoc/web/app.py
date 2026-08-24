@@ -42,7 +42,14 @@ def create_app(
 ) -> FastAPI:
     resolved_settings = settings if settings is not None else Settings()
     resolved_repo = repo if repo is not None else DataRepo(resolved_settings.data_dir)
-    resolved_db = db if db is not None else LabsDb(resolved_settings.data_dir / "labs.sqlite")
+    resolved_db = (
+        db
+        if db is not None
+        else LabsDb(
+            resolved_settings.data_dir / "labs.sqlite",
+            journal_mode=resolved_settings.sqlite_journal_mode,
+        )
+    )
     resolved_client = client if client is not None else LlmClient.from_settings(resolved_settings)
     resolved_vision = vision if vision is not None else VisionClient(resolved_client)
     resolved_renderer = renderer if renderer is not None else pdftoppm_renderer

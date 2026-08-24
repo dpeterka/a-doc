@@ -523,6 +523,66 @@ def test_user_add_fails_without_data_dir(
     assert "configuration error" in capsys.readouterr().err
 
 
+def test_backup_fails_without_data_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("ADOC_DATA_DIR", raising=False)
+
+    code = main(["backup"])
+
+    assert code == 1
+    assert "configuration error" in capsys.readouterr().err
+
+
+def test_backup_fails_if_data_repo_not_initialized(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("ADOC_DATA_DIR", str(tmp_path / "a-doc-data"))
+
+    code = main(["backup"])
+
+    assert code == 1
+    assert "run `adoc init` first" in capsys.readouterr().err
+
+
+def test_backup_fails_without_a_bucket_configured(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from test_backup import FakeS3Client
+
+    data_dir = tmp_path / "a-doc-data"
+    DataRepo.init_at(data_dir)
+    monkeypatch.setenv("ADOC_DATA_DIR", str(data_dir))
+    monkeypatch.delenv("ADOC_BACKUP_BUCKET", raising=False)
+    monkeypatch.setattr(cli, "_build_s3_client", lambda: FakeS3Client())
+
+    code = main(["backup"])
+
+    assert code == 1
+    assert "ADOC_BACKUP_BUCKET" in capsys.readouterr().err
+
+
+def test_backup_runs_end_to_end_with_a_fake_s3_client(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from test_backup import FakeS3Client
+
+    data_dir = tmp_path / "a-doc-data"
+    DataRepo.init_at(data_dir)
+    monkeypatch.setenv("ADOC_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("ADOC_BACKUP_BUCKET", "a-doc-backup-bucket")
+    fake_s3 = FakeS3Client()
+    monkeypatch.setattr(cli, "_build_s3_client", lambda: fake_s3)
+
+    code = main(["backup"])
+
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "bundle uploaded to s3://a-doc-backup-bucket/latest/a-doc-data.bundle" in out
+    assert any(key == "latest/a-doc-data.bundle" for _, _, key in fake_s3.uploads)
+
+
 def test_unknown_subcommand_exits_nonzero() -> None:
     with pytest.raises(SystemExit) as excinfo:
         main(["not-a-real-command"])

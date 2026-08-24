@@ -28,8 +28,9 @@ a-doc is a single-patient, longitudinal medical-diagnostic assistant (Python). R
 
 ## Infrastructure
 
-- All AWS resources are CloudFormation in `deploy/cfn/` (network, instance, backup, ci). No console-created resources; changes go through PRs and change sets. Deploys run from GitHub Actions via the OIDC role.
-- The EC2 instance has no SSH keys and no direct public ingress; a shell is reachable via SSM only. The app is reached through a public ALB (`deploy/cfn/alb.yaml`) at `https://adoc.petabloc.io`, with username/password auth + in-app rate limiting in `src/adoc/web` (explicit user decision, superseding the earlier Tailscale-only design — see PLAN.md).
+- All AWS resources are CloudFormation in `deploy/cfn/` (network, backup, alb, ecs, ci). No console-created resources; changes go through PRs and change sets. Deploys run from GitHub Actions via the OIDC role, which also builds/pushes the application image to ECR.
+- The app runs as ECS Fargate tasks (`deploy/cfn/ecs.yaml`) on a shared EFS filesystem — not EC2 (see ADR 0006; this superseded the original EC2 + `install.sh` + systemd design). No direct public ingress: the service security group admits only the ALB's security group, on the app port. A shell is reachable via `aws ecs execute-command` only (`EnableExecuteCommand: true`). The app is reached through a public ALB (`deploy/cfn/alb.yaml`) at `https://adoc.petabloc.io`, with username/password auth + in-app rate limiting in `src/adoc/web` (explicit user decision, superseding the earlier Tailscale-only design — see PLAN.md).
+- `labs.sqlite`'s journal mode is `TRUNCATE` in the deployed environment (`ADOC_SQLITE_JOURNAL_MODE`, `config.Settings.sqlite_journal_mode`) because WAL is unsafe on EFS/NFS — see `labs/db.py`'s `LabsDb.__init__` docstring. The web service only ever runs one task at a time (`DeploymentConfiguration` max 100%/min 0%) — SQLite + git still want a single writer.
 
 ## Code conventions
 

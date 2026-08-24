@@ -1,9 +1,0 @@
-[Unit]
-Description=Run a-doc's weekly deep review
-
-[Timer]
-OnCalendar=Sun 06:00
-Persistent=true
-
-[Install]
-WantedBy=timers.target
