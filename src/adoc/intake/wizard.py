@@ -223,12 +223,13 @@ def _render_playback(spec: SectionSpec, data: dict[str, Any]) -> str:
 # --- approximate-date parsing (events section) -----------------------------------------
 
 
-def _parse_approx_date(text: str) -> date:
+def _parse_approx_date(text: str) -> date | None:
     """Best-effort parse of a patient-given approximate date into a `date`.
 
     Accepts a full ISO date, `YYYY-MM`, or a bare `YYYY`; falls back to the
     first 4-digit year found anywhere in the text (day/month default to the
-    1st). Raises `ValueError` if no year can be found at all.
+    1st). Returns None when no year can be found at all - undated events are
+    legitimate (patients often cannot date a hospitalization).
     """
     stripped = text.strip()
     try:
@@ -241,7 +242,10 @@ def _parse_approx_date(text: str) -> date:
     match = re.search(r"\d{4}", stripped)
     if match:
         return date(int(match.group(0)), 1, 1)
-    raise ValueError(f"cannot parse an approximate date from {text!r}")
+    # No year anywhere ("recently", "<UNKNOWN>", "as a child"): the event is
+    # real but undatable - callers record it as an undated event rather than
+    # fabricating a date or failing the confirm (real onboarding crash).
+    return None
 
 
 # --- block-replace helper for shared files (case-summary.md, medications.md) -----------
@@ -323,19 +327,37 @@ def _write_allergies(repo: DataRepo, data: AllergiesSection) -> list[str]:
     return [CASE_SUMMARY_RELPATH]
 
 
+UNDATED_EVENTS_RELPATH = "case/undated-events.md"
+
+
 def _write_events(repo: DataRepo, data: EventsSection) -> list[str]:
     written: list[str] = []
     encounters_dir = repo.root / ENCOUNTERS_RELDIR
+    undated: list[str] = []
     for event in data.events:
-        event_date = _parse_approx_date(event.date_approx)
-        frontmatter = EncounterFrontmatter(date=event_date, type="patient-report")
+        event_date = _parse_approx_date(event.date_approx) if event.date_approx else None
         summary = event.description.strip() or event.title
+        if event_date is None:
+            timing = f" (timing: {event.date_approx})" if event.date_approx else ""
+            undated.append(f"- **{event.title}**{timing}: {summary}")
+            continue
+        frontmatter = EncounterFrontmatter(date=event_date, type="patient-report")
         encounter = Encounter(frontmatter=frontmatter, summary=summary)
         # `write_encounter` names the file deterministically from
         # `(date, slug(title))`, so re-confirming the same event (same date +
         # title) overwrites the same file rather than duplicating it.
         path = write_encounter(encounters_dir, encounter, event.title)
         written.append(str(path.relative_to(repo.root)))
+    if undated:
+        repo.write(
+            UNDATED_EVENTS_RELPATH,
+            "# Medical Events Without Dates\n\n"
+            "Reported during onboarding without enough timing to place on the "
+            "timeline - worth pinning down at a future appointment.\n\n"
+            + "\n".join(undated)
+            + "\n",
+        )
+        written.append(UNDATED_EVENTS_RELPATH)
     return written
 
 

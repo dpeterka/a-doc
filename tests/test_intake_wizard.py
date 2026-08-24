@@ -627,3 +627,47 @@ def test_document_drop_still_asked_on_a_fresh_repo(tmp_path: Path) -> None:
     wizard = IntakeWizard(repo, client)
 
     assert wizard._state.sections["document_drop"].status == "pending"
+
+
+def test_undated_events_are_recorded_without_fabricating_dates(tmp_path: Path) -> None:
+    """Real onboarding crash: the extractor emitted '<UNKNOWN>'/'recently'
+    for events the patient couldn't date; confirm must record them in
+    case/undated-events.md instead of raising."""
+    from adoc.intake.sections import EventsSection, MedicalEvent
+    from adoc.intake.wizard import UNDATED_EVENTS_RELPATH, _write_events
+
+    repo = DataRepo.init_at(tmp_path / "data")
+    data = EventsSection(
+        events=[
+            MedicalEvent(
+                date_approx="<UNKNOWN>",
+                title="ER visits for thyroid failure",
+                description="Multiple ER visits, dates not specified.",
+            ),
+            MedicalEvent(
+                date_approx="recently",
+                title="Bone density loss diagnosis",
+                description="Recently diagnosed, exact date not specified.",
+            ),
+            MedicalEvent(
+                date_approx=None,
+                title="Appendectomy",
+                description="No timing given at all.",
+            ),
+            MedicalEvent(
+                date_approx="March 2023",
+                title="First TGAB evidence",
+                description="Dated event still becomes an encounter.",
+            ),
+        ]
+    )
+
+    written = _write_events(repo, data)
+
+    assert UNDATED_EVENTS_RELPATH in written
+    undated = repo.read(UNDATED_EVENTS_RELPATH)
+    assert "ER visits for thyroid failure" in undated
+    assert "timing: recently" in undated
+    assert "Appendectomy" in undated
+    dated = [w for w in written if w.startswith("case/encounters/")]
+    assert len(dated) == 1 and "2023" in dated[0]

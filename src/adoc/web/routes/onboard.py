@@ -105,6 +105,14 @@ def onboard_confirm(
     error: str | None = None
     try:
         wizard.confirm()
+    except (ValueError, KeyError) as exc:
+        # Defense in depth: a section writer choking on extracted data must
+        # never 500 the patient's onboarding (real crash: unparseable
+        # date_approx) - surface it as a revisable problem instead.
+        error = (
+            "Something in what was recorded couldn't be saved - please revise "
+            f"this section (detail: {exc})"
+        )
     except IntakeError as exc:
         error = str(exc)
 

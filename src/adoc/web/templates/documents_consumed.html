@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% block title %}Documents — a-doc{% endblock %}
+{% block content %}
+  <h1>Documents</h1>
+  <p class="muted">Every document a-doc has read so far, newest first.</p>
+
+  {% if not rows %}
+    <p>No documents yet. <a href="/upload">Add a document</a> to get started.</p>
+  {% else %}
+    <div class="table-wrap">
+      <table class="documents-table">
+        <thead>
+          <tr>
+            <th>File</th>
+            <th>Added</th>
+            <th>Type</th>
+            <th>Status</th>
+            <th>Rows</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in rows %}
+            <tr>
+              <td>
+                {% if row.is_genomic %}
+                  {{ row.filename }}
+                {% else %}
+                  <a href="/files/original/{{ row.sha256 }}">{{ row.filename }}</a>
+                {% endif %}
+              </td>
+              <td>{{ row.ingested_at | friendly_date }}</td>
+              <td>{{ row.doc_type_label }}</td>
+              <td><span class="chip chip-doc-status-{{ row.status }}">{{ row.status }}</span></td>
+              <td>
+                {% if row.is_genomic %}
+                  stored for later genomic analysis
+                {% else %}
+                  {{ row.accepted_count }} accepted / {{ row.awaiting_review_count }} awaiting review
+                {% endif %}
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  {% endif %}
+{% endblock %}

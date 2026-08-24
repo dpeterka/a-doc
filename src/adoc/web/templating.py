@@ -7,6 +7,7 @@ class/label helpers for ledger tiers/status/origin).
 
 from __future__ import annotations
 
+from datetime import date, datetime
 from pathlib import Path
 
 from fastapi.templating import Jinja2Templates
@@ -56,9 +57,16 @@ def origin_label(origin: str) -> str:
     return _ORIGIN_LABELS.get(origin, origin)
 
 
+def friendly_date(value: date | datetime) -> str:
+    """A warm, human-readable date - "August 24, 2026" - for a non-technical
+    patient, never a raw ISO timestamp."""
+    return value.strftime("%B %d, %Y")
+
+
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 templates.env.globals["disclaimer_text"] = DISCLAIMER_TEXT
 templates.env.filters["markdown_lite"] = render_markdown_lite
 templates.env.filters["tier_label"] = tier_label
 templates.env.filters["status_label"] = status_label
 templates.env.filters["origin_label"] = origin_label
+templates.env.filters["friendly_date"] = friendly_date
