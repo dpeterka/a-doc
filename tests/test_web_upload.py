@@ -65,6 +65,45 @@ def test_upload_page_loads(tmp_path: Path) -> None:
     assert "Add a document" in response.text
 
 
+def test_upload_page_states_supported_types_and_sets_accept_attribute(tmp_path: Path) -> None:
+    app, _repo, _db, _calls = build_app(tmp_path)
+    client = TestClient(app)
+    login(client)
+
+    response = client.get("/upload")
+
+    assert response.status_code == 200
+    assert 'accept=".pdf,.docx"' in response.text
+    assert "PDF and Word (.docx) files" in response.text
+    assert "lab reports" in response.text.lower()
+
+
+def test_upload_rejects_unsupported_file_type_with_friendly_message(tmp_path: Path) -> None:
+    app, repo, db, _calls = build_app(tmp_path)
+    client = TestClient(app)
+    login(client)
+
+    response = client.post(
+        "/upload",
+        files={"file": ("notes.txt", b"just some plain text notes", "text/plain")},
+    )
+
+    assert response.status_code == 200
+    body = response.text
+    assert "notes.txt" in body
+    assert ".txt" in body
+    assert "PDF and Word (.docx) files" in body
+    # A warm message, never a stack trace / exception repr.
+    assert "Traceback" not in body
+    assert "Exception" not in body
+
+    # Never archived, never left behind in the inbox — junk is discarded,
+    # not silently accumulated.
+    assert not (repo.root / "inbox" / "notes.txt").exists()
+    assert not any((repo.root / "sources").glob("*__notes.txt"))
+    assert db.list_documents() == []
+
+
 def test_upload_ingests_and_shows_the_report(tmp_path: Path) -> None:
     vision = FakeVisionClient("clean_agreement.json")
     app, repo, db, _calls = build_app(tmp_path, vision=vision, renderer=fake_page_renderer(1))  # type: ignore[arg-type]
@@ -78,5 +117,7 @@ def test_upload_ingests_and_shows_the_report(tmp_path: Path) -> None:
 
     assert response.status_code == 200
     assert "<strong>2</strong> row" in response.text  # rows_auto from the fixture
-    assert (repo.root / "inbox" / "quest-2026-05-02.pdf").exists()
+    # Post-ingest inbox hygiene: the inbox copy is deleted once ingested —
+    # the immutable sources/ archive is the authoritative copy.
+    assert not (repo.root / "inbox" / "quest-2026-05-02.pdf").exists()
     assert len(db.list_documents()) == 1

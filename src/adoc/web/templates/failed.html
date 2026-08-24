@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% block title %}Files that need attention — a-doc{% endblock %}
+{% block content %}
+  <h1>Files that need attention</h1>
+  <p class="muted">
+    These documents couldn't be added to your case file automatically. Nothing is lost — the
+    original file is kept here so you can retry it or remove it for good.
+  </p>
+
+  {% if message %}
+    <p class="banner banner-info" role="status">{{ message }}</p>
+  {% endif %}
+
+  {% if not failures %}
+    <p class="muted">Nothing here right now.</p>
+  {% else %}
+    {% for f in failures %}
+      <section class="card">
+        <h2>{{ f.record.filename }}</h2>
+        <p class="muted">
+          Failed {{ f.record.failed_at.strftime("%Y-%m-%d %H:%M") }} — {{ f.friendly_reason }}.
+        </p>
+        <div class="button-row">
+          <form method="post" action="/failed/{{ f.flat_name }}/retry">
+            <button type="submit">Retry</button>
+          </form>
+          <form method="post" action="/failed/{{ f.flat_name }}/remove"
+                onsubmit="return confirm('Remove {{ f.record.filename }} for good? This cannot be undone.');">
+            <button type="submit" class="button-danger">Remove</button>
+          </form>
+        </div>
+      </section>
+    {% endfor %}
+  {% endif %}
+{% endblock %}

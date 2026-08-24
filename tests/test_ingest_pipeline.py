@@ -22,7 +22,7 @@ from pydantic import BaseModel
 from adoc.casefile.encounters import read_encounter
 from adoc.casefile.repo import DataRepo
 from adoc.config import ModelBinding
-from adoc.ingest.pipeline import ingest_file, ingest_inbox
+from adoc.ingest.pipeline import ingest_directory, ingest_file, ingest_inbox
 from adoc.ingest.schema import ClassifyResult, DocumentExtraction
 from adoc.ingest.vision import Part, VisionClient
 from adoc.labs.db import LabsDb
@@ -245,6 +245,159 @@ def test_scan_files_is_recursive_and_skips_sync_artifacts(tmp_path: Path) -> Non
 
     # Deterministic full-path order: "Labs/LabCorp/b.pdf" sorts before "a.pdf".
     assert names == ["b.pdf", "a.pdf"]
+
+
+# --------------------------------------------------------------------------
+# Post-ingest inbox hygiene (pipeline module docstring): `ingest_inbox`
+# (and any `ingest_file` call that opts in via `inbox_root=`) deletes an
+# ingested/duplicate inbox file and moves an error'd one to `work/failed/`
+# with a `failures.jsonl` record. `ingest_directory` (the `adoc backfill
+# <external dir>` engine) never applies this - the invariant tests below
+# pin that a backfilled directory is never touched, success or failure.
+# --------------------------------------------------------------------------
+
+
+def test_ingest_inbox_deletes_the_file_once_ingested(tmp_path: Path) -> None:
+    repo = DataRepo.init_at(tmp_path / "data-repo")
+    db = LabsDb(tmp_path / "labs.sqlite")
+    inbox_file = repo.root / "inbox" / "quest.pdf"
+    inbox_file.write_bytes(TINY_PDF_BYTES)
+    vision = FakeVisionClient("clean_agreement.json")
+
+    report = ingest_inbox(
+        repo=repo, db=db, vision=vision, clock=_fixed_clock, renderer=fake_page_renderer(1)
+    )
+
+    assert report.files[0].outcome == "ingested"
+    assert not inbox_file.exists()
+    # The immutable archive copy is authoritative and untouched.
+    assert any((repo.root / "sources").glob(f"{report.files[0].sha256}__quest.pdf"))
+
+
+def test_ingest_inbox_deletes_the_file_once_duplicate(tmp_path: Path) -> None:
+    repo = DataRepo.init_at(tmp_path / "data-repo")
+    db = LabsDb(tmp_path / "labs.sqlite")
+    inbox_dir = repo.root / "inbox"
+    (inbox_dir / "first.pdf").write_bytes(TINY_PDF_BYTES)
+    vision = FakeVisionClient("clean_agreement.json")
+    ingest_inbox(
+        repo=repo, db=db, vision=vision, clock=_fixed_clock, renderer=fake_page_renderer(1)
+    )
+
+    # Identical bytes, dropped into the inbox again under a new name.
+    (inbox_dir / "second.pdf").write_bytes(TINY_PDF_BYTES)
+    report = ingest_inbox(
+        repo=repo, db=db, vision=vision, clock=_fixed_clock, renderer=fake_page_renderer(1)
+    )
+
+    assert report.files[0].outcome == "duplicate"
+    assert not (inbox_dir / "second.pdf").exists()
+
+
+def test_ingest_inbox_moves_a_failed_file_to_work_failed_with_a_record(tmp_path: Path) -> None:
+    repo = DataRepo.init_at(tmp_path / "data-repo")
+    db = LabsDb(tmp_path / "labs.sqlite")
+    inbox_dir = repo.root / "inbox"
+    bad = inbox_dir / "corrupt.pdf"
+    bad.write_bytes(b"not really a pdf")
+    vision = FakeVisionClient("clean_agreement.json")
+
+    report = ingest_inbox(
+        repo=repo, db=db, vision=vision, clock=_fixed_clock, renderer=fake_page_renderer(1)
+    )
+
+    assert report.files[0].outcome == "error"
+    assert not bad.exists()
+
+    failed_path = repo.root / "work" / "failed" / "corrupt.pdf"
+    assert failed_path.exists()
+    assert failed_path.read_bytes() == b"not really a pdf"
+
+    failures_log = repo.root / "work" / "failed" / "failures.jsonl"
+    lines = failures_log.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 1
+    record = json.loads(lines[0])
+    assert record["filename"] == "corrupt.pdf"
+    assert record["original_inbox_path"] == "corrupt.pdf"
+    assert record["reason"]
+    # Pydantic serializes a UTC datetime with a "Z" suffix rather than
+    # "+00:00" - compare the parsed values, not the raw strings.
+    assert datetime.fromisoformat(record["failed_at"]) == _fixed_clock()
+
+
+def test_ingest_inbox_flattens_nested_failed_paths(tmp_path: Path) -> None:
+    repo = DataRepo.init_at(tmp_path / "data-repo")
+    db = LabsDb(tmp_path / "labs.sqlite")
+    nested = repo.root / "inbox" / "Labs" / "LabCorp"
+    nested.mkdir(parents=True)
+    bad = nested / "b.pdf"
+    bad.write_bytes(b"still not a pdf")
+    vision = FakeVisionClient("clean_agreement.json")
+
+    ingest_inbox(
+        repo=repo, db=db, vision=vision, clock=_fixed_clock, renderer=fake_page_renderer(1)
+    )
+
+    flattened = repo.root / "work" / "failed" / "Labs__LabCorp__b.pdf"
+    assert flattened.exists()
+    record = json.loads(
+        (repo.root / "work" / "failed" / "failures.jsonl").read_text(encoding="utf-8").strip()
+    )
+    assert record["original_inbox_path"] == "Labs/LabCorp/b.pdf"
+
+
+def test_backfill_directory_never_deletes_or_moves_user_files_even_on_error(
+    tmp_path: Path,
+) -> None:
+    """`adoc backfill <external dir>` must never touch the patient's own
+    files - success or failure."""
+    repo = DataRepo.init_at(tmp_path / "data-repo")
+    db = LabsDb(tmp_path / "labs.sqlite")
+    external_dir = tmp_path / "external-photos"
+    external_dir.mkdir()
+    bad_file = external_dir / "notes.txt"
+    original_bytes = b"just some text, not a real document"
+    bad_file.write_bytes(original_bytes)
+    vision = FakeVisionClient("clean_agreement.json")
+
+    report = ingest_directory(
+        external_dir,
+        repo=repo,
+        db=db,
+        vision=vision,
+        clock=_fixed_clock,
+        renderer=fake_page_renderer(1),
+    )
+
+    assert report.files[0].outcome == "error"
+    assert bad_file.exists()
+    assert bad_file.read_bytes() == original_bytes
+    assert not (repo.root / "work" / "failed").exists()
+
+
+def test_backfill_directory_never_deletes_a_successfully_ingested_file(tmp_path: Path) -> None:
+    """Same invariant, the success path: backfilling still never deletes
+    the original file (unlike `ingest_inbox`, which does)."""
+    repo = DataRepo.init_at(tmp_path / "data-repo")
+    db = LabsDb(tmp_path / "labs.sqlite")
+    external_dir = tmp_path / "external-photos"
+    external_dir.mkdir()
+    good_file = external_dir / "quest.pdf"
+    good_file.write_bytes(TINY_PDF_BYTES)
+    vision = FakeVisionClient("clean_agreement.json")
+
+    report = ingest_directory(
+        external_dir,
+        repo=repo,
+        db=db,
+        vision=vision,
+        clock=_fixed_clock,
+        renderer=fake_page_renderer(1),
+    )
+
+    assert report.files[0].outcome == "ingested"
+    assert good_file.exists()
+    assert good_file.read_bytes() == TINY_PDF_BYTES
 
 
 # --------------------------------------------------------------------------

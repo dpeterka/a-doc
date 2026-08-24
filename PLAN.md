@@ -115,7 +115,7 @@ tests/                    # fixtures: synthetic lab PDFs + golden extractions + 
                           #   red-team transcript; test_{validate,ledger,reconcile,safety,criteria,dag,intake}.py
 ```
 
-Data repo layout (no remote, PHI-only): `case/{case-summary.md, differential-ledger.yaml, questions-open.md, family-history.md, medications.md, care-team.md, intake-state.yaml, encounters/, reviews/}`, `sources/` (immutable originals + per-page PNGs), `labs.sqlite` (gitignored) + committed `labs-export.jsonl`, `inbox/ work/ logs/` (gitignored).
+Data repo layout (no remote, PHI-only): `case/{case-summary.md, differential-ledger.yaml, questions-open.md, family-history.md, medications.md, care-team.md, intake-state.yaml, encounters/, reviews/}`, `sources/` (immutable originals + per-page PNGs), `labs.sqlite` (gitignored) + committed `labs-export.jsonl`, `inbox/ work/ logs/` (gitignored). Post-ingest inbox hygiene (`ingest.pipeline`): a file ingested/duplicated out of `inbox/` is deleted (the `sources/` archive is authoritative); one that errors is moved to `work/failed/` and logged to `work/failed/failures.jsonl` (`{filename, failed_at, reason, original_inbox_path}`), surfaced on the web `/failed` page (retry / remove). Invariant: this hygiene applies ONLY to `inbox/` — `adoc backfill <external dir>` never deletes or moves a file in the directory it's given, success or failure.
 
 ## Key schemas
 

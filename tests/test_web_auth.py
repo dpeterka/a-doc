@@ -16,7 +16,17 @@ import adoc.web.users as users_module
 from adoc.web.security import LoginRateLimiter
 from adoc.web.users import USERS_RELPATH
 
-_PROTECTED_PATHS = ["/", "/chat", "/upload", "/confirm", "/labs", "/ledger", "/reviews", "/onboard"]
+_PROTECTED_PATHS = [
+    "/",
+    "/chat",
+    "/upload",
+    "/confirm",
+    "/failed",
+    "/labs",
+    "/ledger",
+    "/reviews",
+    "/onboard",
+]
 
 
 @pytest.mark.parametrize("path", _PROTECTED_PATHS)

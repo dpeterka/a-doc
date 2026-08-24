@@ -3,8 +3,12 @@
 {% block content %}
   <h1>Add a document</h1>
   <p class="muted">
-    Add a lab report, a doctor's note, or an imaging report (PDF or photo). a-doc will read it
+    Add a lab report, a doctor's note, or an imaging report. a-doc will read it
     and add anything it finds to your case file — some rows may need your confirmation.
+  </p>
+  <p class="muted">
+    Supported files: PDF and Word (.docx) files — lab reports, doctor letters, imaging reports,
+    health summaries.
   </p>
 
   {% if error %}
@@ -13,7 +17,7 @@
 
   <form method="post" action="/upload" enctype="multipart/form-data">
     <label for="upload-file">Choose a file</label>
-    <input id="upload-file" type="file" name="file" required>
+    <input id="upload-file" type="file" name="file" accept=".pdf,.docx" required>
     <div class="button-row">
       <button type="submit">Add to my case file</button>
     </div>

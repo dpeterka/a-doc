@@ -19,6 +19,14 @@
     </div>
   {% endif %}
 
+  {% if failed_count > 0 %}
+    <div class="banner banner-warning">
+      <strong>{{ failed_count }}</strong> document{{ "s" if failed_count != 1 else "" }}
+      couldn't be processed.
+      <a href="/failed">See what happened &rarr;</a>
+    </div>
+  {% endif %}
+
   {% if whats_new %}
     <section class="card">
       <h2>What's new since your last visit</h2>
