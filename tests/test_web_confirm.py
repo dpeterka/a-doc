@@ -973,3 +973,69 @@ def test_confirm_queue_omits_twin_sweep_note_when_last_sweep_rejected_nothing(
 
     assert response.status_code == 200
     assert "auto-resolved" not in response.text
+
+
+def test_resolve_pass_converging_on_existing_row_rejects_as_duplicate(tmp_path: Path) -> None:
+    """'Use reading B' whose name/specimen already exists for the same
+    document+date must reject the queue item as that row's duplicate, not
+    500 on the UNIQUE constraint (real review-session crash)."""
+    app, repo, db, _calls = build_app(tmp_path)
+    doc_sha = "d" * 64
+    db.upsert_document(
+        LabDocument(
+            sha256=doc_sha,
+            filename="panel.pdf",
+            doc_type="lab_report",
+            doc_date=date(2024, 7, 18),
+            page_count=1,
+            status=DocumentStatus.COMPLETE,
+        )
+    )
+    # the already-existing row the resolution will converge onto
+    db.insert_results(
+        [
+            LabResult(
+                date=date(2024, 7, 18),
+                name="E. CHAFFEENSIS AB IGG",
+                name_raw="E. CHAFFEENSIS AB IGG",
+                value_text="<1:64",
+                source_doc=doc_sha,
+                source_page=1,
+                extraction_status=ExtractionStatus.CONFIRMED,
+                raw_json="{}",
+            )
+        ]
+    )
+    # the disagreement row whose pass-b name matches the existing row
+    raw = json.dumps(
+        {
+            "reasons": ["value_text_mismatch: '<1:64' vs '<1:20'"],
+            "pass_a": {"name_raw": "CHAFFEENSIS AB (IGG)", "value_text": "<1:20", "page": 1},
+            "pass_b": {"name_raw": "E. CHAFFEENSIS AB IGG", "value_text": "<1:64", "page": 1},
+        }
+    )
+    (row_id,) = db.insert_results(
+        [
+            LabResult(
+                date=date(2024, 7, 18),
+                name="chaffeensis ab (igg)",
+                name_raw="CHAFFEENSIS AB (IGG)",
+                value_text="<1:20",
+                source_doc=doc_sha,
+                source_page=1,
+                extraction_status=ExtractionStatus.PENDING,
+                raw_json=raw,
+            )
+        ]
+    )
+    assert row_id is not None
+
+    client = TestClient(app)
+    login(client)
+    response = client.post(f"/confirm/{row_id}/resolve-pass/b")
+
+    assert response.status_code == 200
+    assert "marked as its duplicate" in response.text
+    row = db.get_row(row_id)
+    assert row is not None and row.extraction_status is ExtractionStatus.REJECTED
+    assert row.raw_payload()["auto_rejected_twin_of"] is not None

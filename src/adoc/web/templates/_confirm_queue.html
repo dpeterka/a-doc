@@ -1,4 +1,7 @@
 <div id="confirm-queue">
+  {% if notice %}
+    <p class="notice" role="status">{{ notice }}</p>
+  {% endif %}
   {% if error %}
     <p class="error" role="alert">{{ error }}</p>
   {% endif %}
