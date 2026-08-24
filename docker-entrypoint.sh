@@ -25,16 +25,20 @@ fi
 
 # --- First-run data-repo bring-up. EFS (or a local bind mount for dev) is
 # expected to already exist and be writable by uid 1000 (the EFS
-# AccessPoint's PosixUser in deploy/cfn/ecs.yaml); if it's empty, `adoc
-# init` creates the case-file layout so the very first task to start
-# (typically the web service) doesn't crash looking for files that don't
-# exist yet. This is NOT a restore path - restoring from the S3 backup
-# bucket onto a freshly created EFS filesystem is a manual, documented
-# step (see README.md), not something this entrypoint guesses at doing
-# automatically on every container start. ---
+# AccessPoint's PosixUser in deploy/cfn/ecs.yaml). If it's missing/empty,
+# delegate the decide-and-run logic to `adoc bootstrap-data` (kept in
+# Python, not shell, so it's unit-tested in tests/test_cli.py): it
+# restores from ADOC_BACKUP_BUCKET when one is set and actually has a
+# backup, falling back to `adoc init` only when the bucket genuinely has
+# nothing to restore yet; a real restore error (bad creds, network,
+# corrupt bundle) fails the container start loudly rather than silently
+# initializing an empty case file over it. This is how a freshly created
+# EFS filesystem gets seeded automatically now (see README.md's restore
+# drill / seed-from-local sections) - no manual restore step needed for
+# the common case. ---
 if [ ! -d "$DATA_DIR" ] || [ -z "$(ls -A "$DATA_DIR" 2>/dev/null)" ]; then
-  echo "docker-entrypoint: $DATA_DIR is missing or empty; running 'adoc init'"
-  adoc init
+  echo "docker-entrypoint: $DATA_DIR is missing or empty; running 'adoc bootstrap-data'"
+  adoc bootstrap-data
 fi
 
 exec "$@"

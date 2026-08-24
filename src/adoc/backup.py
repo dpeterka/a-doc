@@ -1,5 +1,9 @@
 """`adoc backup`: git-bundle the PHI data repo and ship it, plus
 `labs-export.jsonl` and `sources/`, to `s3://$ADOC_BACKUP_BUCKET/latest/`.
+`restore_from_bucket` is the inverse: it seeds a fresh, uninitialized
+`data_dir` from those same `latest/` keys (approved design: local curated
+onboarding -> `adoc backup` -> remote adopts via restore; see PLAN.md
+"State" and the restore-drill section of README.md).
 
 This replaces the old EC2 `deploy/backup.sh` + `adoc-backup.timer` (see
 deploy/cfn/ecs.yaml's `backup` scheduled task, which runs `adoc backup` on
@@ -17,11 +21,16 @@ place `boto3` is imported.
 
 from __future__ import annotations
 
+import json
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
 from git import Repo
+
+from adoc.casefile.repo import DataRepo
+from adoc.labs.db import LabsDb
 
 BUNDLE_KEY = "latest/a-doc-data.bundle"
 JSONL_KEY = "latest/labs-export.jsonl"
@@ -32,8 +41,25 @@ class BackupError(Exception):
     """Raised when `run_backup` cannot proceed (e.g. no bucket configured)."""
 
 
+class RestoreError(Exception):
+    """Raised when `restore_from_bucket` cannot proceed: `data_dir` already
+    holds an initialized data repo (never clobbered — no `--force` is
+    offered), the bucket isn't configured, or (see `NoBackupError`) the
+    bucket has no backup to restore from."""
+
+
+class NoBackupError(RestoreError):
+    """The bucket is reachable but has no backup at `BUNDLE_KEY`.
+
+    A distinct subclass (rather than a plain `RestoreError`) so a caller
+    like `adoc bootstrap-data` can tell "nothing to restore yet - fall
+    back to `adoc init`" apart from every other `RestoreError`/exception,
+    which must fail loudly instead (see that command's docstring)."""
+
+
 class S3Client(Protocol):
-    """The subset of boto3's S3 client surface `run_backup` needs.
+    """The subset of boto3's S3 client surface `run_backup`/
+    `restore_from_bucket` need.
 
     Matches boto3's real `S3.Client` method signatures/keyword args exactly,
     so a real `boto3.client("s3")` satisfies this protocol structurally with
@@ -42,7 +68,11 @@ class S3Client(Protocol):
 
     def upload_file(self, Filename: str, Bucket: str, Key: str) -> None: ...
 
-    def list_objects_v2(self, Bucket: str, Prefix: str) -> dict[str, Any]: ...
+    def download_file(self, Bucket: str, Key: str, Filename: str) -> None: ...
+
+    def list_objects_v2(
+        self, Bucket: str, Prefix: str, ContinuationToken: str | None = None
+    ) -> dict[str, Any]: ...
 
 
 @dataclass(frozen=True)
@@ -137,4 +167,211 @@ def run_backup(data_dir: Path, bucket: str, s3: S3Client) -> BackupReport:
         jsonl_uploaded=jsonl_uploaded,
         sources_uploaded=sources_uploaded,
         sources_skipped=sources_skipped,
+    )
+
+
+# --------------------------------------------------------------------------
+# Restore (the inverse of run_backup — seeds an uninitialized data_dir)
+# --------------------------------------------------------------------------
+
+# Operational dirs `casefile.repo.DataRepo` gitignores (never present in the
+# bundle's git history) but that the app expects to exist.
+_OPERATIONAL_DIRS = ("inbox", "work", "logs")
+
+
+@dataclass(frozen=True)
+class RestoreReport:
+    bucket: str
+    data_dir: Path
+    bundle_commit_sha: str
+    sources_restored: int
+    lab_rows_rebuilt: int
+    warnings: list[str]
+
+
+def _object_exists(s3: S3Client, bucket: str, key: str) -> bool:
+    response = s3.list_objects_v2(Bucket=bucket, Prefix=key)
+    return any(obj["Key"] == key for obj in response.get("Contents", []))
+
+
+def _list_source_keys(s3: S3Client, bucket: str) -> list[str]:
+    """Every object key under `SOURCES_PREFIX`, following
+    `NextContinuationToken` until `IsTruncated` is false — unlike
+    `run_backup`'s `_remote_source_sizes` (a single, unpaginated call,
+    fine for this single-patient corpus today), restore is the one path
+    the task spec asks to paginate explicitly, so a corpus that outgrows
+    one `list_objects_v2` page still restores completely.
+    """
+    keys: list[str] = []
+    token: str | None = None
+    while True:
+        response = s3.list_objects_v2(Bucket=bucket, Prefix=SOURCES_PREFIX, ContinuationToken=token)
+        keys.extend(obj["Key"] for obj in response.get("Contents", []))
+        if not response.get("IsTruncated"):
+            return keys
+        token = response.get("NextContinuationToken")
+        if token is None:
+            return keys
+
+
+def _clone_bundle(bundle_path: Path, data_dir: Path) -> Repo:
+    """Clone `bundle_path` into `data_dir` on the bundle's own HEAD branch,
+    then strip the `origin` remote the clone wires up (pointing at the
+    now-deleted local bundle file) — the restored repo must satisfy the
+    same no-remote invariant as any other data repo (CLAUDE.md rule 1,
+    `casefile.repo.DataRepo`'s module docstring).
+    """
+    repo = Repo.clone_from(str(bundle_path), str(data_dir))
+    if repo.head.is_detached:
+        # Defensive fallback: `git bundle create --all` records HEAD, so
+        # `clone_from` normally checks out a real branch already (verified
+        # against a real bundle) — this only guards a bundle that somehow
+        # didn't carry a HEAD symref.
+        if not repo.heads:
+            raise RestoreError("restored bundle has no branches to check out")
+        repo.heads[0].checkout()
+    for remote in list(repo.remotes):
+        repo.delete_remote(remote)
+    return repo
+
+
+def _restore_sources(s3: S3Client, bucket: str, data_dir: Path) -> int:
+    """Download every object under `SOURCES_PREFIX` into `<data_dir>/sources/`.
+
+    `sources/` is also tracked in the data repo's git history (not
+    gitignored), so the clone already populated it from the bundle; this
+    re-downloads from S3 anyway to restore the third `latest/` leg
+    `run_backup` writes, exactly mirroring its layout. Both copies are the
+    same immutable, sha256-addressed originals, so re-writing them is
+    idempotent — never a destructive overwrite of different content.
+    """
+    sources_dir = data_dir / "sources"
+    restored = 0
+    for key in _list_source_keys(s3, bucket):
+        rel = key[len(SOURCES_PREFIX) :]
+        if not rel:
+            continue
+        dest = sources_dir / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        s3.download_file(Bucket=bucket, Key=key, Filename=str(dest))
+        restored += 1
+    return restored
+
+
+def _restore_jsonl(
+    s3: S3Client, bucket: str, data_dir: Path, scratch_dir: Path, warnings: list[str]
+) -> Path | None:
+    """Reconcile `<data_dir>/labs-export.jsonl` (already present from the
+    clone — it's a committed file, per `labs.db`'s module docstring)
+    against the S3 copy `run_backup` also uploads.
+
+    The cloned copy is preferred: git history is this app's source of
+    truth. The S3 copy is only a consistency cross-check — a byte mismatch
+    is appended to `warnings` (e.g. the S3 copy could legitimately lag by
+    one backup cycle) rather than raised. Returns the path to rebuild
+    `labs.sqlite` from, or `None` if neither copy exists (e.g. restoring a
+    case file that was backed up before any document was ever ingested).
+    """
+    jsonl_path = data_dir / "labs-export.jsonl"
+    if not _object_exists(s3, bucket, JSONL_KEY):
+        return jsonl_path if jsonl_path.is_file() else None
+
+    remote_copy = scratch_dir / "labs-export.jsonl.s3-check"
+    s3.download_file(Bucket=bucket, Key=JSONL_KEY, Filename=str(remote_copy))
+
+    if not jsonl_path.is_file():
+        # Shouldn't normally happen (the bundle should carry it), but
+        # don't lose lab data just because the git copy is missing.
+        remote_copy.replace(jsonl_path)
+        return jsonl_path
+
+    if jsonl_path.read_bytes() != remote_copy.read_bytes():
+        warnings.append(
+            "labs-export.jsonl in the git bundle differs from the S3 copy at "
+            f"s3://{bucket}/{JSONL_KEY} - using the git bundle's committed copy "
+            "(git history is the source of truth)."
+        )
+    return jsonl_path
+
+
+def _count_lab_rows(jsonl_path: Path) -> int:
+    count = 0
+    with jsonl_path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if line and json.loads(line)["table"] == "lab":
+                count += 1
+    return count
+
+
+def restore_from_bucket(
+    bucket: str,
+    data_dir: Path,
+    *,
+    s3_client: S3Client | None = None,
+    sqlite_journal_mode: str = "WAL",
+) -> RestoreReport:
+    """Seed `data_dir` from `s3://{bucket}/latest/` — the inverse of
+    `run_backup`, and the remote-adoption half of the approved
+    local-curated-onboarding -> backup -> restore design (PLAN.md "State").
+
+    Preconditions (both enforced before anything is written):
+    - `data_dir` must NOT already hold an initialized data repo
+      (`DataRepo.is_initialized`) — this never clobbers existing data, and
+      deliberately offers no `--force` escape hatch.
+    - the bucket must actually contain a bundle at `BUNDLE_KEY`.
+
+    Steps: download+clone the git bundle (full history, checked out on its
+    own HEAD branch, remote stripped); restore `sources/`; reconcile
+    `labs-export.jsonl` (git copy preferred, S3 copy cross-checked);
+    rebuild `labs.sqlite` from that jsonl (`LabsDb.rebuild_from_jsonl`);
+    recreate the gitignored operational dirs (`inbox/`, `work/`, `logs/`).
+    """
+    if not bucket:
+        raise RestoreError("ADOC_BACKUP_BUCKET is not set")
+    if DataRepo(data_dir).is_initialized:
+        raise RestoreError(
+            f"{data_dir} already contains an initialized data repo - "
+            "restore_from_bucket refuses to run over existing data (no "
+            "--force is offered; move or remove it by hand first if you "
+            "really intend to replace it)."
+        )
+
+    s3 = s3_client if s3_client is not None else build_s3_client()
+
+    if not _object_exists(s3, bucket, BUNDLE_KEY):
+        raise NoBackupError(f"no backup found at s3://{bucket}/{BUNDLE_KEY} - nothing to restore")
+
+    warnings: list[str] = []
+    with tempfile.TemporaryDirectory(prefix="adoc-restore-") as scratch:
+        scratch_dir = Path(scratch)
+        bundle_path = scratch_dir / "a-doc-data.bundle"
+        s3.download_file(Bucket=bucket, Key=BUNDLE_KEY, Filename=str(bundle_path))
+
+        repo = _clone_bundle(bundle_path, data_dir)
+        bundle_commit_sha = repo.head.commit.hexsha
+
+        sources_restored = _restore_sources(s3, bucket, data_dir)
+        jsonl_path = _restore_jsonl(s3, bucket, data_dir, scratch_dir, warnings)
+
+    for relpath in _OPERATIONAL_DIRS:
+        (data_dir / relpath).mkdir(parents=True, exist_ok=True)
+
+    lab_rows_rebuilt = 0
+    if jsonl_path is not None:
+        with LabsDb(data_dir / "labs.sqlite", journal_mode=sqlite_journal_mode) as db:
+            db.rebuild_from_jsonl(jsonl_path)
+            lab_rows_rebuilt = _count_lab_rows(jsonl_path)
+    else:
+        warnings.append(
+            "no labs-export.jsonl found in the bundle or the S3 backup; labs.sqlite was not rebuilt"
+        )
+
+    return RestoreReport(
+        bucket=bucket,
+        data_dir=data_dir,
+        bundle_commit_sha=bundle_commit_sha,
+        sources_restored=sources_restored,
+        lab_rows_rebuilt=lab_rows_rebuilt,
+        warnings=warnings,
     )
