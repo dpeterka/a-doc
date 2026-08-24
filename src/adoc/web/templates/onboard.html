@@ -3,23 +3,24 @@
 {% block content %}
   <h1>Let's build your case file</h1>
   <p class="muted">
-    Answer in your own words — a-doc will play back what it recorded so you can confirm or fix it.
+    Talk it through in your own words — a-doc asks focused follow-ups, cross-checks what's
+    already on file, and you can correct anything at any time, during or after onboarding.
   </p>
+  <p><a href="/onboard/review">Review everything recorded so far &rarr;</a></p>
 
-  <div class="onboard-layout">
-    <nav class="section-list" aria-label="Onboarding sections">
-      <ol>
-        {% for section in sections %}
-          <li class="{{ 'current' if section.is_current else '' }} status-{{ section.status }}">
-            <a href="/onboard/section/{{ section.key }}">
-              {% if section.status == "complete" %}&check;{% endif %}
-              {{ section.title }}
-            </a>
-          </li>
-        {% endfor %}
-      </ol>
-    </nav>
+  {% include "_onboard_panel.html" %}
 
-    {% include "_onboard_panel.html" %}
-  </div>
+  <script>
+    (function () {
+      var params = new URLSearchParams(window.location.search);
+      var prefill = params.get("prefill");
+      if (prefill) {
+        var textarea = document.getElementById("onboard-text");
+        if (textarea) {
+          textarea.value = prefill;
+          textarea.focus();
+        }
+      }
+    })();
+  </script>
 {% endblock %}

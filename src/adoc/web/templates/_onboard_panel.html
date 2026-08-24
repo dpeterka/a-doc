@@ -1,31 +1,56 @@
+{% import "_chat_macros.html" as chat_macros %}
 <div id="onboard-panel">
-  <p class="muted">Section {{ progress[0] }} of {{ progress[1] }} complete.</p>
-  <progress value="{{ progress[0] }}" max="{{ progress[1] }}"></progress>
+  <div class="onboard-layout">
+    <nav class="section-list" aria-label="Onboarding sections">
+      <p class="muted">Section {{ progress[0] }} of {{ progress[1] }} complete.</p>
+      <progress value="{{ progress[0] }}" max="{{ progress[1] }}"></progress>
+      <ol>
+        {% for section in sections %}
+          <li class="{{ 'current' if section.is_current else '' }} status-{{ section.status }}">
+            {% if section.status == "complete" %}&check;{% endif %}
+            {{ section.title }}
+            {% if section.open_items %}
+              <span class="badge badge-open-items">{{ section.open_items }} open</span>
+            {% endif %}
+            {% if not section.is_current %}
+              <form hx-post="/onboard/send" hx-target="#onboard-panel" hx-swap="outerHTML"
+                class="revisit-form">
+                <input type="hidden" name="text"
+                  value="I'd like to revisit {{ section.title }}.">
+                <button type="submit" class="link-button">Revisit</button>
+              </form>
+            {% endif %}
+          </li>
+        {% endfor %}
+      </ol>
+    </nav>
 
-  {% if error %}
-    <p class="error" role="alert">{{ error }}</p>
-  {% endif %}
+    <div class="onboard-chat">
+      {% if not baseline_incomplete %}
+        <p class="banner">
+          Onboarding complete — you can still correct or add details here.
+        </p>
+      {% endif %}
 
-  {% if section_key %}
-    <div class="onboard-prompt">{{ prompt_text }}</div>
+      {% if error %}
+        <p class="error" role="alert">{{ error }}</p>
+      {% endif %}
 
-    <form hx-post="/onboard/submit" hx-target="#onboard-panel" hx-swap="outerHTML">
-      <label for="onboard-text" class="sr-only">Your answer</label>
-      <textarea id="onboard-text" name="text" rows="4"
-        placeholder="Type your answer here, in your own words..."></textarea>
-      <div class="button-row">
-        <button type="submit">
-          {% if status == "awaiting_confirmation" %}Revise{% else %}Send{% endif %}
-        </button>
+      <div id="onboard-transcript" class="chat-transcript">
+        {% for entry in transcript %}
+          {{ chat_macros.bubble(entry) }}
+        {% endfor %}
       </div>
-    </form>
 
-    {% if status == "awaiting_confirmation" %}
-      <form hx-post="/onboard/confirm" hx-target="#onboard-panel" hx-swap="outerHTML">
-        <button type="submit" class="button-primary">Confirm — this looks right</button>
+      <form hx-post="/onboard/send" hx-target="#onboard-panel" hx-swap="outerHTML"
+        hx-on--after-request="this.reset()">
+        <label for="onboard-text" class="sr-only">Your answer</label>
+        <textarea id="onboard-text" name="text" rows="4"
+          placeholder="Type your answer here, in your own words..."></textarea>
+        <div class="button-row">
+          <button type="submit">Send</button>
+        </div>
       </form>
-    {% endif %}
-  {% else %}
-    <p>Onboarding is complete — every section has been recorded and committed.</p>
-  {% endif %}
+    </div>
+  </div>
 </div>

@@ -111,19 +111,49 @@ def make_challenger_transport(
     return transport
 
 
-def build_fake_client(primary_transport: Transport, challenger_transport: Transport) -> LlmClient:
+def build_fake_client(
+    primary_transport: Transport,
+    challenger_transport: Transport,
+    *,
+    intake_agent_transport: Transport | None = None,
+) -> LlmClient:
     """`primary_reasoner`/`classifier` -> anthropic; `challenger` -> openai —
-    same role/provider layout as `tests/test_stages.py`."""
+    same role/provider layout as `tests/test_stages.py`. `intake_agent`
+    also binds to the anthropic provider, defaulting to `primary_transport`
+    so any test not exercising onboarding never has to think about it."""
     bindings: dict[str, list[ModelBinding]] = {
         "primary_reasoner": [ModelBinding(provider="anthropic", model="fake-primary")],
         "challenger": [ModelBinding(provider="openai", model="fake-challenger")],
         "classifier": [ModelBinding(provider="anthropic", model="fake-primary")],
+        "intake_agent": [ModelBinding(provider="anthropic", model="fake-intake-agent")],
     }
     providers = {
-        "anthropic": AnthropicProvider(api_key=None, transport=primary_transport),
+        "anthropic": AnthropicProvider(
+            api_key=None,
+            transport=_dispatching_anthropic_transport(
+                primary_transport, intake_agent_transport or primary_transport
+            ),
+        ),
         "openai": OpenAIProvider(api_key=None, transport=challenger_transport),
     }
     return LlmClient(bindings, providers)
+
+
+def _dispatching_anthropic_transport(
+    primary_transport: Transport, intake_agent_transport: Transport
+) -> Transport:
+    """`primary_reasoner`/`classifier` and `intake_agent` share the
+    anthropic provider slot in this test double; dispatch by schema name
+    (`IntakeTurnResult`) so onboarding tests can inject their own transport
+    independently of whatever `primary_transport` a given test already set
+    up for chat/ledger schemas."""
+
+    def transport(request: TransportRequest) -> TransportResponse:
+        if request.schema is not None and request.schema.__name__ == "IntakeTurnResult":
+            return intake_agent_transport(request)
+        return primary_transport(request)
+
+    return transport
 
 
 def build_app(
@@ -135,6 +165,7 @@ def build_app(
     max_upload_mb: int | None = None,
     primary_transport: Transport | None = None,
     challenger_transport: Transport | None = None,
+    intake_agent_transport: Transport | None = None,
     vision: VisionClient | None = None,
     renderer: PageRenderer | None = None,
 ) -> tuple[FastAPI, DataRepo, LabsDb, list[TransportRequest]]:
@@ -146,7 +177,7 @@ def build_app(
     calls: list[TransportRequest] = []
     primary = primary_transport or exploding_transport(calls)
     challenger = challenger_transport or exploding_transport(calls)
-    client = build_fake_client(primary, challenger)
+    client = build_fake_client(primary, challenger, intake_agent_transport=intake_agent_transport)
 
     data_dir = tmp_path / "data"
     repo = DataRepo.init_at(data_dir)

@@ -49,7 +49,7 @@ A single-user interactive diagnostic-support agent, designed for the common shap
 
 ## Onboarding & end-user experience
 
-**First run = a guided intake wizard** (chat-shaped, but driven by a predefined state machine in `intake/`, not free conversation). Sections, in order, each backed by a Pydantic schema:
+**First run = conversational, agentic onboarding** (ADR 0011, `feature/conversational-onboarding`): a genuine turn-by-turn conversation, not one-shot-per-section submission. The `intake_agent` model role (new `models.yaml` binding, same model as `primary_reasoner`) probes indistinct answers ("my dad has allergies" → which allergens, what reactions, how severe, dad's age), establishes timing for every event/diagnosis once (recording `precision=unknown_after_probe` rather than nagging twice when the patient doesn't know), classifies a stated condition's attribution (doctor-diagnosed, with who/when, vs. the patient's own conclusion, with their reasoning — never conflating the two), and cross-references already-ingested documents/encounters via a deterministic digest ("I have a record of an ER note dated 2024-03-02 — is that this visit, or a different one?"). Every patient statement becomes a typed `IntakeFact` (`intake/facts.py`) applied by plain deterministic code, never written to the case file directly by the model. **Deterministic completion gates** (`section_completion_blockers`, unit-tested, the core safety mechanism of this feature) are the only thing that may close a section — a vague, undated, or unattributed fact left open blocks the close and the reply names what's still missing, exactly the way a ledger invariant outranks the Ledger-Maintainer's proposed diff (CLAUDE.md rule 3, same shape applied to intake). Facts are editable at any time, during or after onboarding — a correction to an already-closed section regenerates that section's case file immediately. The original form-style state-machine wizard (`intake/wizard.py`, described below) is retained as `adoc onboard --legacy-wizard` and as the shared output layer: `intake/convert.py` maps active facts onto the exact same per-section schemas the wizard already writes through, so both onboarding paths produce identical case-file artifacts. The sections below (still driven by a predefined state machine when `--legacy-wizard` is passed, chat-shaped but not free conversation) describe that retained fallback path and the section registry both paths share.
 1. Basics — age, sex at birth, height/weight, occupation/exposures
 2. Current symptoms — free narrative, model extracts a structured symptom list (→ seeds the Phase-2 HPO profile) and asks targeted follow-ups (onset, frequency, triggers)
 3. Major medical event history — timeline walk ("earliest first"); each event becomes an `encounters/` file
@@ -117,8 +117,14 @@ src/adoc/
                           #   (non-LLM genomic archive + `case/genomics-inventory.md`), schema.py (extraction
                           #   Pydantic models), failures.py (inbox failure log + `/failed` page);
                           #   apple_health.py planned for phase 4 (FHIR zip importer)
-  intake/                 # onboarding state machine: sections.py (schemas), wizard.py (playback confirm
-                          #   loop, document-drop auto-skip on seeded deployments), cli.py (terminal loop)
+  intake/                 # onboarding (ADR 0011): facts.py (IntakeFact store + typed ops +
+                          #   deterministic section_completion_blockers gates), agent.py (conversational
+                          #   engine: intake_agent model call, doc-digest cross-referencing, transcript),
+                          #   convert.py (facts_to_section_data — maps facts onto the wizard's section
+                          #   schemas), sections.py (schemas), wizard.py (legacy state machine: playback
+                          #   confirm loop, document-drop auto-skip on seeded deployments, section writers
+                          #   both onboarding paths share via `write_section`), cli.py (conversational REPL
+                          #   default + `--legacy-wizard` escape hatch)
   reason/                 # client.py (provider adapter: scrub+audit+bindings), dag.py (typed DAG runner +
                           #   node contracts), context.py (deterministic context packs), stages.py,
                           #   tools.py, safety.py, review.py (weekly-review DAG), prompts.py (versioned
