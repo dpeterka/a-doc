@@ -20,6 +20,15 @@ constraint of "scrypt, stdlib".
 Timing: `verify_user` does the same amount of scrypt+compare work whether
 or not `username` exists, so an attacker cannot use response timing to
 enumerate valid usernames.
+
+Session binding: `load_fingerprints`/`get_fingerprint` derive a short,
+non-secret fingerprint (`sha256(salt || hash)[:16]`) per stored credential
+record. `web.security` signs this fingerprint into every session cookie
+alongside the username, and re-checks it against the current store on
+every request — removing a user or resetting their password rewrites (or
+deletes) their record, which changes (or removes) the fingerprint and
+invalidates every outstanding session for that user immediately, rather
+than waiting out the 30-day cookie lifetime.
 """
 
 from __future__ import annotations
@@ -112,6 +121,26 @@ def verify_user(path: Path, username: str, password: str) -> bool:
     expected = bytes.fromhex(match["hash"])
     submitted = _scrypt(password, salt)
     return hmac.compare_digest(submitted, expected)
+
+
+def _fingerprint(salt_hex: str, hash_hex: str) -> str:
+    """First 16 hex chars of sha256(salt || hash) - see module docstring
+    'Session binding'. Deterministic and non-secret (it's a fingerprint of
+    already-stored, salted material, never the password itself), but
+    changes whenever the record does: a password reset generates a new
+    salt and hash, so the fingerprint always rotates on password change."""
+    return hashlib.sha256(bytes.fromhex(salt_hex) + bytes.fromhex(hash_hex)).hexdigest()[:16]
+
+
+def load_fingerprints(path: Path) -> dict[str, str]:
+    """username -> credential fingerprint for every stored user."""
+    return {u["username"]: _fingerprint(u["salt"], u["hash"]) for u in _load(path)}
+
+
+def get_fingerprint(path: Path, username: str) -> str | None:
+    """Convenience single-user lookup over `load_fingerprints`; `None` if
+    no such user (used by `web.security` to bind and re-verify sessions)."""
+    return load_fingerprints(path).get(username)
 
 
 def list_users(path: Path) -> list[str]:

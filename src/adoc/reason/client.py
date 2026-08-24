@@ -38,14 +38,37 @@ from adoc.privacy import Scrubber
 
 FEATHERLESS_BASE_URL = "https://api.featherless.ai/v1"
 
+# The app owns the only retry policy - `LlmClient._call_with_retry`'s bounded
+# backoff over a handful of attempts (default 3). Without these, each SDK
+# client retries its own transient failures internally (default
+# max_retries=2, each attempt allowed up to its own timeout) *underneath*
+# that loop, so one app-level "attempt" can silently balloon into minutes
+# of SDK-internal retrying - stacking retries on retries. `max_retries=0`
+# disables the SDK's own retry loop; the explicit finite `timeout` (rather
+# than the SDK default) bounds how long a single attempt can hang.
+_ANTHROPIC_MAX_RETRIES = 0
+_ANTHROPIC_TIMEOUT_SECONDS = 300.0
+_OPENAI_MAX_RETRIES = 0
+_OPENAI_TIMEOUT_SECONDS = 300.0
+
 # Rough $/1M-token pricing for cost estimation, keyed by exact model id.
 # Best-effort only: an unrecognized model id yields `cost_estimate=None`
-# rather than a guess. Update alongside `models.yaml` role bindings.
+# rather than a guess. Update alongside `models.yaml` role bindings - every
+# model bound to a role in `models.yaml` should have an entry here.
 _PRICING_PER_MILLION: dict[str, tuple[float, float]] = {
     "claude-opus-5": (5.00, 25.00),
-    "claude-sonnet-5": (3.00, 15.00),
+    # TODO: verify against Anthropic's published rates - models.yaml carries
+    # no price comments to check against, so this is a placeholder.
+    "claude-sonnet-5": (1.00, 5.00),
     "claude-haiku-4-5": (1.00, 5.00),
-    "claude-haiku-4-5-20251001": (1.00, 5.00),
+    # TODO: verify against Anthropic's published rates (placeholder, as above).
+    "claude-haiku-4-5-20251001": (0.25, 1.25),
+    # TODO-verify: gpt-5.2 pricing not yet confirmed against OpenAI's
+    # published rates.
+    "gpt-5.2": (1.25, 10.00),
+    # Featherless flat-rate plan (PLAN.md "Model strategy") - a $/mo flat
+    # fee, not per-token billing, so the per-call token cost is $0.
+    "deepseek-ai/DeepSeek-R1-0528": (0.0, 0.0),
 }
 
 
@@ -145,7 +168,11 @@ class AnthropicProvider:
         except ImportError as exc:  # pragma: no cover - dependency is pinned
             raise LlmError("the 'anthropic' package is not installed") from exc
 
-        client = anthropic.Anthropic(api_key=self._api_key)
+        client = anthropic.Anthropic(
+            api_key=self._api_key,
+            max_retries=_ANTHROPIC_MAX_RETRIES,
+            timeout=_ANTHROPIC_TIMEOUT_SECONDS,
+        )
 
         kwargs: dict[str, Any] = {
             "model": request.model,
@@ -226,7 +253,12 @@ class OpenAIProvider:
         except ImportError as exc:  # pragma: no cover - dependency is pinned
             raise LlmError("the 'openai' package is not installed") from exc
 
-        client = openai.OpenAI(api_key=self._api_key, base_url=self.base_url)
+        client = openai.OpenAI(
+            api_key=self._api_key,
+            base_url=self.base_url,
+            max_retries=_OPENAI_MAX_RETRIES,
+            timeout=_OPENAI_TIMEOUT_SECONDS,
+        )
 
         chat_messages: list[dict[str, Any]] = [{"role": "system", "content": request.system}]
         chat_messages += [m.model_dump() for m in request.messages]
