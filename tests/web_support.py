@@ -132,6 +132,7 @@ def build_app(
     username: str = DEFAULT_USERNAME,
     password: str = DEFAULT_PASSWORD,
     trust_forwarded_for: bool = False,
+    max_upload_mb: int | None = None,
     primary_transport: Transport | None = None,
     challenger_transport: Transport | None = None,
     vision: VisionClient | None = None,
@@ -151,7 +152,13 @@ def build_app(
     repo = DataRepo.init_at(data_dir)
     add_user(repo.root / USERS_RELPATH, username, password)
     db = LabsDb(":memory:")
-    settings = Settings(data_dir=data_dir, trust_forwarded_for=trust_forwarded_for)
+    settings_kwargs: dict[str, Any] = {
+        "data_dir": data_dir,
+        "trust_forwarded_for": trust_forwarded_for,
+    }
+    if max_upload_mb is not None:
+        settings_kwargs["max_upload_mb"] = max_upload_mb
+    settings = Settings(**settings_kwargs)
 
     app = create_app(settings, repo=repo, db=db, client=client, vision=vision, renderer=renderer)
     return app, repo, db, calls

@@ -14,7 +14,7 @@ from web_support import DEFAULT_PASSWORD, DEFAULT_USERNAME, build_app, login
 
 import adoc.web.users as users_module
 from adoc.web.security import LoginRateLimiter
-from adoc.web.users import USERS_RELPATH
+from adoc.web.users import USERS_RELPATH, add_user, remove_user
 
 _PROTECTED_PATHS = [
     "/",
@@ -175,8 +175,12 @@ def test_unknown_username_pays_the_same_scrypt_cost_as_a_known_one(
     assert scrypt_calls == ["wrong-password"]
 
 
-def test_secure_cookie_flag_set_only_when_forwarded_proto_is_https(tmp_path: Path) -> None:
-    app, _repo, _db, _calls = build_app(tmp_path)
+def test_secure_cookie_flag_set_when_forwarded_proto_is_https_and_trusted(tmp_path: Path) -> None:
+    """`trust_forwarded_for=True` (the deployed ECS setting - every request
+    has actually passed through the ALB) is what makes `X-Forwarded-Proto`
+    trustworthy at all - see `test_secure_cookie_flag_ignores_forwarded_proto_when_not_trusted`
+    for the untrusted case (W3)."""
+    app, _repo, _db, _calls = build_app(tmp_path, trust_forwarded_for=True)
     client = TestClient(app)
 
     plain_response = client.post(
@@ -193,6 +197,25 @@ def test_secure_cookie_flag_set_only_when_forwarded_proto_is_https(tmp_path: Pat
         follow_redirects=False,
     )
     assert "Secure" in https_response.headers["set-cookie"]
+
+
+def test_secure_cookie_flag_ignores_forwarded_proto_when_not_trusted(tmp_path: Path) -> None:
+    """W3: a client-supplied `X-Forwarded-Proto: https` must NOT force a
+    `Secure` cookie onto what (without `trust_forwarded_for`) is only ever
+    a plain-HTTP test/local-dev connection - the header is untrustworthy
+    unless the deployment guarantees every request passed through the ALB
+    first (`Settings.trust_forwarded_for`, same flag `client_ip` gates
+    `X-Forwarded-For` on)."""
+    app, _repo, _db, _calls = build_app(tmp_path, trust_forwarded_for=False)
+    client = TestClient(app)
+
+    spoofed_response = client.post(
+        "/login",
+        data={"username": DEFAULT_USERNAME, "password": DEFAULT_PASSWORD},
+        headers={"X-Forwarded-Proto": "https"},
+        follow_redirects=False,
+    )
+    assert "Secure" not in spoofed_response.headers.get("set-cookie", "")
 
 
 def test_lockout_after_five_username_failures_returns_429(tmp_path: Path) -> None:
@@ -326,3 +349,52 @@ def test_client_ip_falls_back_to_socket_peer_without_the_header() -> None:
     request = Request(scope)
 
     assert client_ip(request, trust_forwarded_for=True) == "9.9.9.9"
+
+
+def test_session_dies_immediately_when_the_user_is_removed(tmp_path: Path) -> None:
+    """W1: a 30-day session cookie must not keep working after the user it
+    was issued for no longer exists - removing a user must revoke their
+    outstanding sessions on their very next request, not after 30 days."""
+    app, repo, _db, _calls = build_app(tmp_path)
+    client = TestClient(app)
+    login(client)
+    assert client.get("/").status_code == 200
+
+    removed = remove_user(repo.root / USERS_RELPATH, DEFAULT_USERNAME)
+    assert removed is True
+
+    response = client.get("/", follow_redirects=False)
+    assert response.status_code == 303
+    assert response.headers["location"] == "/login"
+
+
+def test_session_dies_immediately_when_the_password_changes(tmp_path: Path) -> None:
+    """W1: a password reset (which rewrites salt+hash, rotating the
+    fingerprint) must invalidate sessions issued under the old password
+    immediately, not just block future logins with the old password."""
+    app, repo, _db, _calls = build_app(tmp_path)
+    client = TestClient(app)
+    login(client)
+    assert client.get("/").status_code == 200
+
+    add_user(repo.root / USERS_RELPATH, DEFAULT_USERNAME, "a-brand-new-password")
+
+    response = client.get("/", follow_redirects=False)
+    assert response.status_code == 303
+    assert response.headers["location"] == "/login"
+
+
+def test_session_still_valid_for_an_unrelated_user_after_another_users_password_changes(
+    tmp_path: Path,
+) -> None:
+    """The identity binding is per-user - rotating one user's credential
+    record must not revoke a different, still-valid session."""
+    app, repo, _db, _calls = build_app(tmp_path)
+    add_user(repo.root / USERS_RELPATH, "second-user", "second-password")
+    client = TestClient(app)
+    login(client)
+    assert client.get("/").status_code == 200
+
+    add_user(repo.root / USERS_RELPATH, "second-user", "rotated-password")
+
+    assert client.get("/").status_code == 200

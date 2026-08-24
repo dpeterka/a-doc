@@ -2,10 +2,25 @@
 plus in-app login rate limiting.
 
 `itsdangerous` is deliberately not a dependency (task constraint) — a
-session token is `<issued_at>.<hex hmac-sha256 signature>`, verified with
-`hmac.compare_digest` (constant-time). The signing secret is 32 random
-bytes persisted at `<data_dir>/work/session-secret` (created on first use,
-never committed — `work/` is gitignored per `casefile.repo`).
+session token is `<issued_at>.<username>.<fingerprint>.<hex hmac-sha256
+signature>`, verified with `hmac.compare_digest` (constant-time). The
+signing secret is 32 random bytes persisted at
+`<data_dir>/work/session-secret` (created on first use, never committed —
+`work/` is gitignored per `casefile.repo`).
+
+Session binding (identity, not just time): the token carries the username
+and a fingerprint of that user's *current* credential record at issuance
+(`web.users.get_fingerprint` — `sha256(salt || hash)[:16]`), and the HMAC
+signs all three fields together so neither can be forged without the
+secret. On every request, `is_authenticated` re-derives the *current*
+fingerprint from the user store (`work/users.yaml`) and rejects the
+session if the user no longer exists or the fingerprint has changed (a
+password reset rewrites salt+hash). This closes the gap where a 30-day
+cookie signed only over `issued_at` would keep working after the user was
+removed or their password changed — sessions of a removed/changed user die
+on their very next request, not after 30 days. The user store is tiny
+(single-digit users), so re-reading it per request is cheap; `_UserStoreCache`
+still avoids re-parsing the YAML when the file's mtime hasn't changed.
 
 Login itself (username/password) is verified by `web.users.verify_user`.
 This module owns everything *around* that check: the rate limiter that
@@ -27,6 +42,8 @@ from starlette.requests import Request
 from starlette.responses import RedirectResponse, Response
 
 from adoc.casefile.repo import DataRepo
+from adoc.web import users as users_module
+from adoc.web.users import USERS_RELPATH
 
 SESSION_COOKIE_NAME = "adoc_session"
 SESSION_MAX_AGE_SECONDS = 30 * 24 * 3600  # 30 days
@@ -59,29 +76,113 @@ def load_or_create_session_secret(repo: DataRepo) -> bytes:
     return secret
 
 
-def make_session_token(secret: bytes, *, issued_at: int | None = None) -> str:
-    """Build a signed session token: `<issued_at>.<hmac-sha256 hex digest>`."""
+def _signing_payload(issued_str: str, username: str, fingerprint: str) -> bytes:
+    return f"{issued_str}.{username}.{fingerprint}".encode()
+
+
+def make_session_token(
+    secret: bytes, *, username: str, fingerprint: str, issued_at: int | None = None
+) -> str:
+    """Build a signed session token:
+    `<issued_at>.<username>.<fingerprint>.<hmac-sha256 hex digest>`.
+
+    The HMAC covers `issued_at`, `username`, and `fingerprint` together, so
+    none of the three can be altered without invalidating the signature.
+    """
     issued = issued_at if issued_at is not None else int(time.time())
     issued_str = str(issued)
-    signature = hmac.new(secret, issued_str.encode("ascii"), hashlib.sha256).hexdigest()
-    return f"{issued_str}.{signature}"
+    signature = hmac.new(
+        secret, _signing_payload(issued_str, username, fingerprint), hashlib.sha256
+    ).hexdigest()
+    return f"{issued_str}.{username}.{fingerprint}.{signature}"
+
+
+def _parse_session_token(token: str) -> tuple[str, str, str, str] | None:
+    """Split a token into `(issued_str, username, fingerprint, signature)`.
+
+    Usernames are operator-chosen (`adoc user add`) and may themselves
+    contain `.`, so parsing anchors on the fixed-position fields instead of
+    a plain `split(".")`: `issued_at` is always first, the hmac signature
+    and the 16-hex-char fingerprint are always last, and everything in
+    between is the username.
+    """
+    parts = token.split(".")
+    if len(parts) < 4:
+        return None
+    issued_str = parts[0]
+    signature = parts[-1]
+    fingerprint = parts[-2]
+    username = ".".join(parts[1:-2])
+    if not issued_str or not username or not fingerprint or not signature:
+        return None
+    return issued_str, username, fingerprint, signature
 
 
 def verify_session_token(
-    secret: bytes, token: str, *, max_age_seconds: int = SESSION_MAX_AGE_SECONDS
+    secret: bytes,
+    token: str,
+    *,
+    fingerprint_lookup: Callable[[str], str | None],
+    max_age_seconds: int = SESSION_MAX_AGE_SECONDS,
 ) -> bool:
-    """Verify a session token's signature (constant-time) and freshness."""
-    issued_str, _, signature = token.partition(".")
-    if not issued_str or not signature:
+    """Verify a session token's signature (constant-time), freshness, and
+    that its embedded fingerprint still matches `fingerprint_lookup`'s
+    *current* answer for that username — the identity-binding check (see
+    module docstring). `fingerprint_lookup` returns `None` for a user who
+    no longer exists.
+    """
+    parsed = _parse_session_token(token)
+    if parsed is None:
         return False
-    expected = hmac.new(secret, issued_str.encode("ascii"), hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(signature, expected):
+    issued_str, username, fingerprint, signature = parsed
+
+    expected_signature = hmac.new(
+        secret, _signing_payload(issued_str, username, fingerprint), hashlib.sha256
+    ).hexdigest()
+    if not hmac.compare_digest(signature, expected_signature):
         return False
+
     try:
         issued = int(issued_str)
     except ValueError:
         return False
-    return 0 <= (time.time() - issued) < max_age_seconds
+    if not (0 <= (time.time() - issued) < max_age_seconds):
+        return False
+
+    current_fingerprint = fingerprint_lookup(username)
+    if current_fingerprint is None:
+        return False
+    return hmac.compare_digest(fingerprint, current_fingerprint)
+
+
+class _UserStoreCache:
+    """Per-process, mtime-gated cache of `work/users.yaml`'s fingerprints.
+
+    The store is small (single-digit users) so re-parsing it on every
+    request would already be fine; this just avoids doing that when
+    nothing has changed. Never serves stale data across a real edit: a
+    write from `adoc user add/remove` rewrites the file, which bumps its
+    mtime and forces a reload on the next lookup.
+    """
+
+    def __init__(self) -> None:
+        self._cache: dict[Path, tuple[float, dict[str, str]]] = {}
+
+    def fingerprints(self, path: Path) -> dict[str, str]:
+        try:
+            mtime = path.stat().st_mtime
+        except FileNotFoundError:
+            self._cache.pop(path, None)
+            return {}
+        cached = self._cache.get(path)
+        if cached is not None and cached[0] == mtime:
+            return cached[1]
+        fingerprints = users_module.load_fingerprints(path)
+        self._cache[path] = (mtime, fingerprints)
+        return fingerprints
+
+
+_user_store_cache = _UserStoreCache()
 
 
 def is_authenticated(request: Request) -> bool:
@@ -89,7 +190,10 @@ def is_authenticated(request: Request) -> bool:
     token = request.cookies.get(SESSION_COOKIE_NAME)
     if not token:
         return False
-    return verify_session_token(secret, token)
+    users_path = request.app.state.settings.data_dir / USERS_RELPATH
+    return verify_session_token(
+        secret, token, fingerprint_lookup=_user_store_cache.fingerprints(users_path).get
+    )
 
 
 class SessionAuthMiddleware(BaseHTTPMiddleware):
@@ -115,12 +219,14 @@ class SessionAuthMiddleware(BaseHTTPMiddleware):
         return RedirectResponse(url=LOGIN_PATH, status_code=303)
 
 
-def set_session_cookie(response: Response, secret: bytes, *, secure: bool) -> None:
+def set_session_cookie(
+    response: Response, secret: bytes, *, username: str, fingerprint: str, secure: bool
+) -> None:
     """`secure` should be true whenever the request arrived over HTTPS.
-    Callers derive that from `X-Forwarded-Proto` (set by the ALB) rather
-    than `request.url.scheme`, since uvicorn itself only ever sees plain
-    HTTP behind the load balancer."""
-    token = make_session_token(secret)
+    Callers derive that from `resolve_secure_cookie_flag` (`X-Forwarded-Proto`,
+    set by the ALB) rather than `request.url.scheme` directly, since
+    uvicorn itself only ever sees plain HTTP behind the load balancer."""
+    token = make_session_token(secret, username=username, fingerprint=fingerprint)
     response.set_cookie(
         SESSION_COOKIE_NAME,
         token,
@@ -133,6 +239,23 @@ def set_session_cookie(response: Response, secret: bytes, *, secure: bool) -> No
 
 def clear_session_cookie(response: Response) -> None:
     response.delete_cookie(SESSION_COOKIE_NAME)
+
+
+def resolve_secure_cookie_flag(request: Request, *, trust_forwarded_for: bool) -> bool:
+    """Whether the login session cookie should carry the `Secure` flag.
+
+    `X-Forwarded-Proto` is attacker-controllable on any request that
+    doesn't actually pass through the ALB, so it is trusted only under the
+    same condition `client_ip` trusts `X-Forwarded-For` under:
+    `trust_forwarded_for` is true only when every request that can reach
+    this process has already passed through the ALB (see that flag's
+    docstring below). When untrusted (local dev, tests), fall back to the
+    request's own scheme — correct locally, and never lets a spoofed
+    header force a `Secure` cookie onto a plain-HTTP connection.
+    """
+    if trust_forwarded_for:
+        return request.headers.get("x-forwarded-proto") == "https"
+    return request.url.scheme == "https"
 
 
 def client_ip(request: Request, *, trust_forwarded_for: bool) -> str:
