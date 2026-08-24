@@ -547,6 +547,145 @@ def test_labs_dedupe_twins_runs_end_to_end_and_commits(
     assert "rejected 0" in second_out
 
 
+# --------------------------------------------------------------------------
+# labs-reclassify (feature/semantic-compare)
+# --------------------------------------------------------------------------
+
+
+def test_labs_reclassify_fails_without_data_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("ADOC_DATA_DIR", raising=False)
+
+    code = main(["labs-reclassify"])
+
+    assert code == 1
+    assert "configuration error" in capsys.readouterr().err
+
+
+def test_labs_reclassify_fails_if_data_repo_not_initialized(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("ADOC_DATA_DIR", str(tmp_path / "a-doc-data"))
+    monkeypatch.setenv("ADOC_MODELS_FILE", str(REPO_ROOT / "models.yaml"))
+
+    code = main(["labs-reclassify"])
+
+    assert code == 1
+    assert "run `adoc init` first" in capsys.readouterr().err
+
+
+def _seed_false_ref_range_mismatch(data_dir: Path) -> tuple[DataRepo, int]:
+    """A PENDING row that queued under the old literal ref-range comparison
+    ("<20" vs "<20 Units") - a comparator false positive under the new
+    semantic comparators."""
+    sha = "a" * 64
+    repo = DataRepo.init_at(data_dir)
+    with LabsDb(data_dir / "labs.sqlite") as db:
+        db.upsert_document(
+            LabDocument(
+                sha256=sha,
+                filename="doc.pdf",
+                doc_type="lab_report",
+                page_count=1,
+                ingested_at=datetime(2026, 5, 3, 12, 0, 0),
+                status=DocumentStatus.COMPLETE,
+            )
+        )
+        pass_a = {
+            "name_raw": "Potassium",
+            "value": 4.1,
+            "value_text": None,
+            "unit_raw": "mmol/L",
+            "ref_range_raw": "<20",
+            "flag_raw": None,
+            "specimen": "unknown",
+            "page": 1,
+            "confidence": "high",
+        }
+        pass_b = {**pass_a, "ref_range_raw": "<20 Units"}
+        (pending_id,) = db.insert_results(
+            [
+                LabResult(
+                    date=date(2026, 5, 2),
+                    name="potassium",
+                    name_raw="Potassium",
+                    value=4.1,
+                    ucum_unit="mmol/L",
+                    source_doc=sha,
+                    extraction_status=ExtractionStatus.PENDING,
+                    raw_json=json.dumps(
+                        {
+                            "pass_a": pass_a,
+                            "pass_b": pass_b,
+                            "reasons": ["ref_range_mismatch: '<20' vs '<20 Units'"],
+                        }
+                    ),
+                )
+            ]
+        )
+        db.export_jsonl(data_dir / "labs-export.jsonl")
+    repo.commit("seed false ref-range mismatch", paths=["labs-export.jsonl"])
+    assert pending_id is not None
+    return repo, pending_id
+
+
+def test_labs_reclassify_dry_run_reports_and_mutates_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    data_dir = tmp_path / "a-doc-data"
+    monkeypatch.setenv("ADOC_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("ADOC_MODELS_FILE", str(REPO_ROOT / "models.yaml"))
+    _repo, pending_id = _seed_false_ref_range_mismatch(data_dir)
+
+    code = main(["labs-reclassify", "--dry-run"])
+
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "dry-run" in out
+    assert "would auto-flip 1" in out
+
+    with LabsDb(data_dir / "labs.sqlite") as db:
+        row = db.get_row(pending_id)
+        assert row is not None
+        assert row.extraction_status == ExtractionStatus.PENDING
+
+
+def test_labs_reclassify_runs_end_to_end_and_commits(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    data_dir = tmp_path / "a-doc-data"
+    monkeypatch.setenv("ADOC_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("ADOC_MODELS_FILE", str(REPO_ROOT / "models.yaml"))
+    repo, pending_id = _seed_false_ref_range_mismatch(data_dir)
+    git_repo = GitRepo(repo.root)
+    commits_before = len(list(git_repo.iter_commits()))
+
+    code = main(["labs-reclassify"])
+
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "auto-flipped 1" in out
+
+    with LabsDb(data_dir / "labs.sqlite") as db:
+        row = db.get_row(pending_id)
+        assert row is not None
+        assert row.extraction_status == ExtractionStatus.AUTO
+        payload = row.raw_payload()
+        assert payload["reasons"] == []
+        assert "reclassified_at" in payload
+
+    commits_after = len(list(git_repo.iter_commits()))
+    assert commits_after == commits_before + 1
+
+    # idempotent: a second run finds nothing left to flip
+    second_code = main(["labs-reclassify"])
+    assert second_code == 0
+    second_out = capsys.readouterr().out
+    assert "auto-flipped 0" in second_out
+
+
 def test_eval_runs_offline_with_out_dir(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     out_dir = tmp_path / "eval-out"
 

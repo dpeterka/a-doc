@@ -52,6 +52,7 @@ from adoc.ingest.vision import VisionClient
 from adoc.intake.cli import run_onboarding_session
 from adoc.intake.wizard import IntakeWizard
 from adoc.labs.db import LabsDb
+from adoc.labs.reclassify import reclassify_pending
 from adoc.labs.specimen import infer_unknown_specimens
 from adoc.labs.twins import sweep_twins, write_sweep_summary
 from adoc.privacy import Scrubber
@@ -471,6 +472,61 @@ def _cmd_labs_dedupe_twins(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_labs_reclassify(args: argparse.Namespace) -> int:
+    """Deterministic maintenance pass (`labs/reclassify.py`; NO LLM calls):
+    recompute every still-PENDING matched-pair row's reasons under the
+    current semantic comparators (`ingest.reconcile`'s
+    `ref_ranges_equivalent`/`units_equivalent`/`flags_equivalent`) and the
+    current `labs.sqlite`/`ANALYTE_SPECS` - flips a row whose reasons all
+    turn out to be comparator false positives to `auto`, and rewrites
+    still-PENDING rows' reason lists so confirm-queue bucketing reflects
+    the current comparators. Idempotent - see `reclassify_pending`'s
+    docstring.
+    """
+    try:
+        settings = Settings()
+    except Exception as exc:  # noqa: BLE001 - surface any config error to the user
+        print(f"labs-reclassify: configuration error: {exc}", file=sys.stderr)
+        return 1
+
+    repo = DataRepo(settings.data_dir)
+    if not repo.is_initialized:
+        print(
+            f"labs-reclassify: data repo not initialized at {settings.data_dir} "
+            "- run `adoc init` first",
+            file=sys.stderr,
+        )
+        return 1
+
+    db_path = settings.data_dir / "labs.sqlite"
+    with LabsDb(db_path, journal_mode=settings.sqlite_journal_mode) as db:
+        report = reclassify_pending(db, dry_run=args.dry_run)
+
+        if args.dry_run:
+            print(f"labs-reclassify: dry-run - checked {report.checked} row(s)")
+            print(
+                f"labs-reclassify: dry-run - would auto-flip {report.auto_flipped}, "
+                f"re-bucket {report.rebucketed_agreed} agreed, "
+                f"leave {report.still_disagreed} disagreed"
+            )
+            return 0
+
+        if report.rewritten:
+            db.export_jsonl(repo.root / "labs-export.jsonl")
+            repo.commit(
+                f"labs: reclassified {report.rewritten} pending row(s) under the current "
+                f"comparators (auto={report.auto_flipped}, agreed={report.rebucketed_agreed}, "
+                f"disagreed={report.still_disagreed})",
+                paths=["labs-export.jsonl"],
+            )
+
+    print(f"labs-reclassify: checked {report.checked} row(s)")
+    print(f"labs-reclassify: auto-flipped {report.auto_flipped}")
+    print(f"labs-reclassify: re-bucketed agreed {report.rebucketed_agreed}")
+    print(f"labs-reclassify: still disagreed {report.still_disagreed}")
+    return 0
+
+
 def _cmd_review(_args: argparse.Namespace) -> int:
     try:
         settings = Settings()
@@ -633,6 +689,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="report what the sweep would do without mutating anything",
     )
     labs_dedupe_twins_parser.set_defaults(func=_cmd_labs_dedupe_twins)
+    labs_reclassify_parser = subparsers.add_parser(
+        "labs-reclassify",
+        help=(
+            "recompute still-PENDING rows' reasons under the current semantic reconcile "
+            "comparators, flipping comparator false-positive mismatches to auto (no LLM calls)"
+        ),
+    )
+    labs_reclassify_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="report what the sweep would do without mutating anything",
+    )
+    labs_reclassify_parser.set_defaults(func=_cmd_labs_reclassify)
     subparsers.add_parser(
         "backup",
         help="git-bundle the data repo and upload it (+ sources/, labs-export.jsonl) to S3",

@@ -14,10 +14,20 @@ A row is **AUTO** only if ALL of the following gates pass (otherwise it is
      exists in only one pass is PENDING, reason `single_pass`).
   2. value    - numeric `value` is exactly equal between passes (and
      `value_text` is equal after case/whitespace normalization).
-  3. unit     - `unit_raw` is equal after case/whitespace normalization.
-  4. ref      - `ref_range_raw` is equal after case/whitespace
-     normalization.
-  5. flag     - `flag_raw` is equal after case/whitespace normalization.
+  3. unit     - `unit_raw` is semantically equivalent between passes
+     (`units_equivalent`: case/whitespace-normalized equality, or both a
+     member of the same `labs.validate.UNIT_SYNONYMS` spelling family, e.g.
+     "Million/uL" vs. "M/uL").
+  4. ref      - `ref_range_raw` is semantically equivalent between passes
+     (`ref_ranges_equivalent`: unicode-dash-unified/whitespace/case
+     normalized, a trailing unit token stripped, then compared as a parsed
+     numeric range/threshold/titer-threshold/qualitative-word shape rather
+     than as literal text - e.g. `"<20"` vs. `"<20 Units"`).
+  5. flag     - `flag_raw` is semantically equivalent between passes
+     (`flags_equivalent`: absent/`""`/`"N"`/`"normal"` are all "unflagged"
+     and equivalent to each other; word forms like `"high"` equal their
+     letter codes - but absent is NEVER equivalent to an actual abnormal
+     code, that stays a real disagreement).
   6. specimen - both passes agree on `specimen` (otherwise reason
      `specimen_mismatch`) - this is what keeps a urinalysis GLUCOSE
      "NEGATIVE" reading from ever being silently merged with a serum
@@ -81,7 +91,9 @@ import json
 import re
 from collections import defaultdict
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import date
+from fractions import Fraction
 from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, Field
@@ -90,6 +102,8 @@ from adoc.ingest.schema import DocumentExtraction, ExtractedResult
 from adoc.labs.models import LabFlag, LabResult, Specimen
 from adoc.labs.validate import (
     DECIMAL_SIGNATURE_RATIO,
+    UNIT_SYNONYMS,
+    canonical_unit,
     canonicalize,
     trend_deviation,
     trend_outlier,
@@ -156,6 +170,208 @@ def _normalize_str(value: str | None) -> str | None:
         return None
     normalized = re.sub(r"\s+", " ", value.strip().lower())
     return normalized or None
+
+
+# --------------------------------------------------------------------------
+# Semantic comparators (feature/semantic-compare): real-corpus reconcile
+# false-"disagreements" turned out to be the SAME printed reading, just
+# transcribed with cosmetic differences one pass's extractor happened to
+# introduce - a trailing unit token on a reference range, a unicode dash vs.
+# a hyphen, "None" vs. "" for an unflagged result. `_reconcile_matched_pair`
+# uses these in place of the old literal (`_normalize_str`-only) comparisons
+# for ref_range/unit/flag; value/value_text/specimen/confidence are
+# unchanged - those three fields never showed a false-mismatch pattern in
+# the real corpus, and loosening them would risk masking a genuine
+# extraction disagreement.
+# --------------------------------------------------------------------------
+
+_UNIT_SYNONYM_MEMBERS: tuple[str, ...] = tuple(
+    member for family in UNIT_SYNONYMS for member in family
+)
+
+# Unicode dash variants (en dash, em dash, minus sign, ...) an extractor
+# pass might print instead of a plain hyphen-minus in a numeric range.
+_DASH_CHARS = "‐‑‒–—―−"
+_DASH_TRANSLATION = str.maketrans({c: "-" for c in _DASH_CHARS})
+
+_RANGE_PATTERN = re.compile(r"^([0-9]*\.?[0-9]+)\s*-\s*([0-9]*\.?[0-9]+)$")
+_THRESHOLD_PATTERN = re.compile(r"^(<=|>=|<|>)\s*(.+)$")
+_TITER_VALUE_PATTERN = re.compile(r"^(\d+)\s*:\s*(\d+)$")
+_NUMERIC_PATTERN = re.compile(r"^[0-9]*\.?[0-9]+$")
+
+# Single qualitative words/phrases treated as equivalent to one another when
+# they appear as an entire (normalized) reference range - e.g. one pass
+# transcribes a qualitative result's reference range as "negative", another
+# as "none seen" or "not detected".
+_QUALITATIVE_RANGE_GROUPS: tuple[tuple[str, ...], ...] = (
+    ("negative", "none seen", "not detected", "none detected"),
+)
+_QUALITATIVE_RANGE_INDEX: dict[str, str] = {
+    word: group[0] for group in _QUALITATIVE_RANGE_GROUPS for word in group
+}
+
+
+def _normalize_range_text(text: str) -> str:
+    """Unicode-dash-unify, collapse whitespace, casefold - the first
+    normalization pass `ref_ranges_equivalent` applies before trying to
+    strip a trailing unit token or parse the result's semantics."""
+    unified = text.translate(_DASH_TRANSLATION)
+    return re.sub(r"\s+", " ", unified.strip()).casefold()
+
+
+def _normalize_unit_token(text: str) -> str:
+    return re.sub(r"\s+", "", text.strip()).casefold()
+
+
+def _strip_trailing_unit(normalized_text: str, *units: str | None) -> str:
+    """Strip a trailing unit token from an already-`_normalize_range_text`-ed
+    string, when that token matches one of `units` (either pass's own
+    printed unit) or any known `UNIT_SYNONYMS` spelling - e.g. `"<20 units"`
+    -> `"<20"`, `"3.80 - 5.10 million/ul"` -> `"3.80 - 5.10"`. Tried
+    longest-candidate-first so a multi-word unit isn't left partially
+    stripped. A no-match is a no-op."""
+    candidates = {_normalize_unit_token(u) for u in units if u} | {
+        _normalize_unit_token(u) for u in _UNIT_SYNONYM_MEMBERS
+    }
+    for candidate in sorted((c for c in candidates if c), key=len, reverse=True):
+        suffix = f" {candidate}"
+        if normalized_text.endswith(suffix):
+            return normalized_text[: -len(suffix)].strip()
+    return normalized_text
+
+
+def _parse_number_or_titer(text: str) -> float | Fraction | None:
+    text = text.strip()
+    titer_match = _TITER_VALUE_PATTERN.match(text)
+    if titer_match:
+        return Fraction(int(titer_match.group(1)), int(titer_match.group(2)))
+    if _NUMERIC_PATTERN.match(text):
+        return float(text)
+    return None
+
+
+def _parse_ref_semantics(normalized_text: str) -> tuple[object, ...] | None:
+    """Parse an already-normalized (dash-unified/casefolded/unit-stripped)
+    reference-range string into a semantic shape, or `None` if it doesn't
+    match any recognized form - a numeric range, a threshold (`<20`,
+    `<=20`, `>59`, a titer threshold like `>=1:80`), or a single
+    qualitative word/phrase equivalence class."""
+    if not normalized_text:
+        return None
+    if normalized_text in _QUALITATIVE_RANGE_INDEX:
+        return ("qual", _QUALITATIVE_RANGE_INDEX[normalized_text])
+    threshold_match = _THRESHOLD_PATTERN.match(normalized_text)
+    if threshold_match:
+        op, raw_value = threshold_match.groups()
+        value = _parse_number_or_titer(raw_value)
+        if value is None:
+            return None
+        return ("threshold", op, value)
+    range_match = _RANGE_PATTERN.match(normalized_text)
+    if range_match:
+        return ("range", float(range_match.group(1)), float(range_match.group(2)))
+    return None
+
+
+def ref_ranges_equivalent(
+    a_raw: str | None,
+    b_raw: str | None,
+    *,
+    a_unit: str | None = None,
+    b_unit: str | None = None,
+) -> bool:
+    """Semantic equivalence of two printed reference ranges (feature/
+    semantic-compare) - the ref_range_mismatch false-positive family (real
+    corpus: 783 of 1159 queued rows), e.g. `"<20"` vs. `"<20 Units"`, or
+    `"3.80-5.10"` vs. `"3.80 - 5.10 Million/uL"`.
+
+    Both None/empty -> equivalent (nothing printed by either pass). Exactly
+    one side empty -> NOT equivalent (a real omission difference - still
+    worth a human look, so it keeps queueing). Otherwise: normalize both
+    (unicode dashes -> '-', collapse whitespace, casefold, strip a trailing
+    unit token that matches either pass's own unit or a known synonym), then
+    parse each side's semantics (numeric range / threshold / titer-threshold
+    / qualitative word). Equivalent iff both parse and their parsed
+    semantics are equal (numeric tolerance 0) - ONLY when BOTH sides fail to
+    parse does this fall back to normalized-string equality; one side
+    parsing and the other not is treated as a real difference.
+    """
+    a_empty = a_raw is None or not a_raw.strip()
+    b_empty = b_raw is None or not b_raw.strip()
+    if a_empty and b_empty:
+        return True
+    if a_empty != b_empty:
+        return False
+
+    assert a_raw is not None and b_raw is not None  # both non-empty, per the checks above
+    a_norm = _strip_trailing_unit(_normalize_range_text(a_raw), a_unit, b_unit)
+    b_norm = _strip_trailing_unit(_normalize_range_text(b_raw), a_unit, b_unit)
+
+    a_parsed = _parse_ref_semantics(a_norm)
+    b_parsed = _parse_ref_semantics(b_norm)
+    if a_parsed is not None and b_parsed is not None:
+        return a_parsed == b_parsed
+    if a_parsed is None and b_parsed is None:
+        return a_norm == b_norm
+    return False
+
+
+def units_equivalent(a_raw: str | None, b_raw: str | None) -> bool:
+    """Semantic equivalence of two printed units (feature/semantic-compare):
+    equal once casefold/whitespace-normalized, or both members of the same
+    `labs.validate.UNIT_SYNONYMS` spelling family (e.g. "Million/uL" vs.
+    "M/uL", or the TSH "mIU/L"/"uIU/mL" family)."""
+    a_norm = _normalize_str(a_raw)
+    b_norm = _normalize_str(b_raw)
+    if a_norm == b_norm:
+        return True
+    if a_norm is None or b_norm is None:
+        return False
+    a_canon = canonical_unit(a_raw)
+    b_canon = canonical_unit(b_raw)
+    return a_canon is not None and a_canon == b_canon
+
+
+_FLAG_WORD_TO_CODE: dict[str, str] = {
+    "high": "H",
+    "h": "H",
+    "low": "L",
+    "l": "L",
+    "abnormal": "A",
+    "a": "A",
+    "critical high": "HH",
+    "hh": "HH",
+    "critical low": "LL",
+    "ll": "LL",
+}
+# Explicitly-unflagged spellings - equivalent to "absent" (module docstring's
+# flags_equivalent note), never to an abnormal code.
+_UNFLAGGED_WORDS = frozenset({"n", "normal"})
+
+
+def _resolve_flag_token(raw: str | None) -> str:
+    """`raw`'s canonical flag code, `""` for absent/unflagged, or the
+    (casefolded) raw token itself if unrecognized - so two unrecognized-but-
+    identical spellings still compare equal without silently treating them
+    as unflagged."""
+    if raw is None:
+        return ""
+    text = re.sub(r"\s+", " ", raw.strip()).casefold()
+    if not text or text in _UNFLAGGED_WORDS:
+        return ""
+    return _FLAG_WORD_TO_CODE.get(text, text)
+
+
+def flags_equivalent(a_raw: str | None, b_raw: str | None) -> bool:
+    """Semantic equivalence of two printed abnormal-value flags (feature/
+    semantic-compare): `None`/`""`/whitespace-only and the words `"N"`/
+    `"normal"` are all "absent" and equivalent to EACH OTHER; word forms
+    (`"high"`, `"low"`, `"abnormal"`, `"critical high"`, `"critical low"`)
+    are equivalent to their letter codes, case-insensitively. Absent vs. an
+    actual abnormal code (H/L/A/HH/LL) is deliberately NOT equivalent - one
+    pass saw an abnormal flag the other pass missed entirely, and that stays
+    a real, human-reviewable disagreement."""
+    return _resolve_flag_token(a_raw) == _resolve_flag_token(b_raw)
 
 
 # Trailing sentence-fragment tokens `clean_result_name` strips (module
@@ -486,16 +702,42 @@ def _reconcile_single_pass(
     )
 
 
-def _reconcile_matched_pair(
+@dataclass(frozen=True)
+class _PairEvaluation:
+    """The full outcome of comparing one matched A/B pair (`_evaluate_pair`):
+    the reason list (for `raw_json`/audit - includes non-blocking
+    annotations like a sub-decimal-signature trend spike) plus the
+    AUTO/PENDING gate boolean, which needs a little more than "reasons is
+    empty" (an annotation-only trend spike on an otherwise-fully-agreeing
+    pair still AUTOs - see `reconcile.py`'s module docstring)."""
+
+    reasons: list[str]
+    gates_pass: bool
+
+
+def _evaluate_pair(
     a: ExtractedResult, b: ExtractedResult, *, doc_date: date, missing_date: bool, db: LabsDb
-) -> ReconciledRow:
+) -> _PairEvaluation:
+    """Shared core of `_reconcile_matched_pair` (real-time ingest) and
+    `labs.reclassify.reclassify_pending` (retro-reclassification of
+    already-PENDING rows under the current comparators/specs) - see
+    `compute_pair_reasons`, the pure `-> list[str]` wrapper reclassify
+    calls directly.
+
+    ref_range/unit/flag comparisons use the semantic comparators above
+    (`ref_ranges_equivalent`/`units_equivalent`/`flags_equivalent`) in place
+    of literal (`_normalize_str`-only) equality - value/value_text/specimen/
+    confidence are unchanged, per those comparators' own docstrings.
+    """
     reasons: list[str] = ["missing_date"] if missing_date else []
 
     value_match = a.value == b.value
     value_text_match = _normalize_str(a.value_text) == _normalize_str(b.value_text)
-    unit_match = _normalize_str(a.unit_raw) == _normalize_str(b.unit_raw)
-    ref_match = _normalize_str(a.ref_range_raw) == _normalize_str(b.ref_range_raw)
-    flag_match = _normalize_str(a.flag_raw) == _normalize_str(b.flag_raw)
+    unit_match = units_equivalent(a.unit_raw, b.unit_raw)
+    ref_match = ref_ranges_equivalent(
+        a.ref_range_raw, b.ref_range_raw, a_unit=a.unit_raw, b_unit=b.unit_raw
+    )
+    flag_match = flags_equivalent(a.flag_raw, b.flag_raw)
     specimen_match = a.specimen == b.specimen
     confidence_ok = a.confidence == "high" and b.confidence == "high"
 
@@ -555,12 +797,34 @@ def _reconcile_matched_pair(
         and not issues
         and not decimal_signature
     )
+    return _PairEvaluation(reasons=reasons, gates_pass=gates_pass)
+
+
+def compute_pair_reasons(
+    a: ExtractedResult, b: ExtractedResult, *, doc_date: date, missing_date: bool, db: LabsDb
+) -> list[str]:
+    """Pure reason-list computation for one matched A/B pair, shared by
+    real-time reconciliation (`_reconcile_matched_pair`) and
+    `labs.reclassify.reclassify_pending`'s retro-reclassification of
+    already-PENDING rows - see `_evaluate_pair`, which this wraps. Always
+    recomputed against the CURRENT semantic comparators, `ANALYTE_SPECS`,
+    and (via `db`) this patient's current trend history - never a
+    duplicated copy of `_reconcile_matched_pair`'s logic.
+    """
+    return _evaluate_pair(a, b, doc_date=doc_date, missing_date=missing_date, db=db).reasons
+
+
+def _reconcile_matched_pair(
+    a: ExtractedResult, b: ExtractedResult, *, doc_date: date, missing_date: bool, db: LabsDb
+) -> ReconciledRow:
+    evaluation = _evaluate_pair(a, b, doc_date=doc_date, missing_date=missing_date, db=db)
+    canonical = canonicalize(a.name_raw) or canonicalize(b.name_raw)
 
     raw_json = json.dumps(
         {
             "pass_a": a.model_dump(mode="json"),
             "pass_b": b.model_dump(mode="json"),
-            "reasons": reasons,
+            "reasons": evaluation.reasons,
         }
     )
     # Both passes agreeing on specimen is the common case, and that agreed
@@ -579,8 +843,8 @@ def _reconcile_matched_pair(
         flag_raw=a.flag_raw,
         specimen=a.specimen,
         source_page=a.page,
-        status="auto" if gates_pass else "pending",
-        reasons=reasons,
+        status="auto" if evaluation.gates_pass else "pending",
+        reasons=evaluation.reasons,
         raw_json=raw_json,
     )
 
