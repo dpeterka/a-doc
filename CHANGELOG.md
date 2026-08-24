@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-08-24
+
+### Security & Safety (code-review remediation)
+- Treatment gate rewritten: clause-window verb-to-drug matching blocks natural phrasings ("stop taking your prednisone"); doctor-referral clauses allowlisted; red-team fixture expanded.
+- Sessions bound to user identity + password fingerprint (removal/rotation revokes immediately); upload size cap; X-Forwarded-Proto trust gated.
+- Chat surfaces safety-check withholding instead of a 500; challenge notes need substance and recency; review postconditions reject trivial/copy-stamped notes; blind-panel blindness is a content-aware DAG contract.
+
+### Fixed
+- Re-extraction after rejection revives to the queue instead of silently dropping; specimen inference skips serum-panel analytes and mixed panels; twin-sweep rule path exact-match only; zero-overlap rescue pairs need eyes; SDK transports own retries/timeouts; vision cost auditing real; rclone source path corrected (dropbox:a-doc/a-doc-inbox); docs/ADR sync (ADRs 0009/0010).
+
+
+## [0.4.4] - 2026-08-24
+
+### Fixed
+- ECS health-check grace period raised 120s → 900s so a first-boot
+  `adoc bootstrap-data` restore (git clone + `sources/`/JSONL sync +
+  `labs.sqlite` rebuild) has time to finish before the ALB starts
+  health-checking the task.
+
+## [0.4.3] - 2026-08-24
+
+### Fixed
+- `adoc restore`: boto3 `list_objects_v2` pagination (previously only the
+  first page of `sources/` objects was considered), atomic staging (the
+  full restore is assembled in a sibling `.restore-staging` directory and
+  only moved into place once every step succeeds), and a fail-fast
+  `docker-entrypoint.sh` (a real restore error now fails the container
+  instead of silently falling through to `adoc init`).
+
+## [0.4.2] - 2026-08-24
+
+### Added
+- Document-drop intake section auto-completes when `sources/` is already
+  non-empty (a seeded/curated deployment) instead of prompting the patient
+  to upload documents that are already on file.
+
+## [0.4.1] - 2026-08-24
+
+### Changed
+- Onboarding basics-section intro copy: dropped the exposures example
+  (user request).
+
 ## [0.4.0] - 2026-08-24
 
 ### Added
@@ -32,6 +74,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - Live-verified model bindings and provider protocol quirks across all three families.
 
+
+## [0.1.0] - 2026-08-23
 
 ### Added
 

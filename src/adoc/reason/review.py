@@ -8,17 +8,29 @@ contracts below are enforced by code, not hoped for by a prompt):
     -> staleness_scan -> ops_metrics -> render_report
 
 Contracts:
-  - every `blind_panel_i` node's precondition is `forbid_context_key("ledger")`
-    (ADR 0002's "blind-reviewer rule") — the ledger is never loaded into the
-    DAG's run context until *after* every blind panel member has produced its
-    de novo differential, so there is nothing for the contract to catch in a
-    correct run; a caller who sneaks a `"ledger"` key into `initial` (the
-    negative test in `tests/test_review.py`) trips it immediately.
+  - every `blind_panel_i` node carries TWO blindness preconditions (ADR 0002's
+    "blind-reviewer rule", amended): `forbid_context_key("ledger")` — the
+    ledger is never loaded into the DAG's run context until *after* every
+    blind panel member has produced its de novo differential, so a caller
+    who sneaks a `"ledger"` key into `initial` (the negative test in
+    `tests/test_review.py`) trips it immediately — and
+    `edge_payload_lacks_section("ledger")`, which inspects the panel node's
+    actual validated input (the `ContextPack` under `"blind_context_pack"`)
+    for a ledger section. The two checks are not redundant:
+    `forbid_context_key` only ever sees the run-context *dict keys*, so it
+    would NOT catch a real regression where `blind_context_pack` itself was
+    built with `include_ledger=True` (that ledger content never becomes a
+    `ctx["ledger"]` entry) — `edge_payload_lacks_section` is the
+    content-aware check that does catch it (see `tests/test_review.py`'s
+    dedicated regression test).
   - `adjudication`'s postcondition (`adjudication_covers_every_divergence`)
-    requires an explicit accept/reject decision for every divergence the
-    deterministic diff produced (PLAN.md "Anti-anchoring").
+    requires an explicit accept/reject decision, with a substantive
+    rationale (>= `MIN_SUBSTANTIVE_LENGTH` chars, not identical across every
+    divergence), for every divergence the deterministic diff produced
+    (PLAN.md "Anti-anchoring").
   - `challenge_sweep`'s postcondition (`challenge_sweep_covers_every_active_hypothesis`)
-    requires a substantive note for every currently-active hypothesis.
+    requires a substantive note (same length/non-identical bar) for every
+    currently-active hypothesis.
   - `apply_review_diff`'s postcondition requires the ledger version to have
     incremented.
 
@@ -62,7 +74,15 @@ from adoc.labs.queries import abnormal_summary
 from adoc.labs.validate import trend_outlier
 from adoc.reason.client import LlmClient, Message
 from adoc.reason.context import ContextPack, build_context
-from adoc.reason.dag import Contract, Ctx, Dag, Node, forbid_context_key, run
+from adoc.reason.dag import (
+    Contract,
+    Ctx,
+    Dag,
+    Node,
+    edge_payload_lacks_section,
+    forbid_context_key,
+    run,
+)
 from adoc.reason.prompts import load_prompt
 
 # --------------------------------------------------------------------------
@@ -718,6 +738,16 @@ def render_review_markdown(
 # --------------------------------------------------------------------------
 
 
+# S4 remediation: both completeness postconditions below previously accepted
+# ANY non-empty string ("." satisfied them) as a covering note/rationale — a
+# model (or a bug) that stamps the same placeholder sentence across every
+# hypothesis/divergence sailed straight through. Both now require SUBSTANCE:
+# at least this many characters after stripping, AND not identical across
+# every item being covered (a single repeated sentence is not a substantive,
+# per-item review even if it happens to be long enough).
+MIN_SUBSTANTIVE_LENGTH = 20
+
+
 def _adjudication_completeness_contract() -> Contract:
     def predicate(ctx: Ctx, value: BaseModel | None) -> str | None:
         divergence_set = ctx.get("divergence_diff")
@@ -725,10 +755,29 @@ def _adjudication_completeness_contract() -> Contract:
             return "divergence_diff missing from context"
         assert isinstance(value, AdjudicationResult)
         expected = {d.id for d in divergence_set.divergences}
-        got = {d.divergence for d in value.decisions}
-        missing = expected - got
+        by_id = {d.divergence: d for d in value.decisions}
+
+        missing = expected - set(by_id)
         if missing:
             return f"missing adjudication decision(s) for divergence id(s): {sorted(missing)}"
+
+        insubstantial = sorted(
+            div_id
+            for div_id in expected
+            if len(by_id[div_id].rationale.strip()) < MIN_SUBSTANTIVE_LENGTH
+        )
+        if insubstantial:
+            return (
+                f"adjudication rationale too short (< {MIN_SUBSTANTIVE_LENGTH} chars after "
+                f"stripping) for divergence id(s): {insubstantial}"
+            )
+
+        rationales = [by_id[div_id].rationale.strip() for div_id in expected]
+        if len(rationales) > 1 and len(set(rationales)) == 1:
+            return (
+                "adjudication rationale is identical across every divergence — not a "
+                "substantive, per-divergence adjudication"
+            )
         return None
 
     return Contract(name="adjudication_covers_every_divergence", predicate=predicate)
@@ -741,10 +790,28 @@ def _challenge_sweep_completeness_contract() -> Contract:
             return "current_ledger missing from context"
         assert isinstance(value, ChallengeSweepResult)
         active_ids = {h.id for h in ledger.hypotheses if h.status in ACTIVE_STATUSES}
+        by_id = {n.id: n for n in value.notes}
+
         noted_ids = {n.id for n in value.notes if n.note.strip()}
         missing = active_ids - noted_ids
         if missing:
             return f"missing challenge-sweep note(s) for active hypothesis id(s): {sorted(missing)}"
+
+        insubstantial = sorted(
+            hid for hid in active_ids if len(by_id[hid].note.strip()) < MIN_SUBSTANTIVE_LENGTH
+        )
+        if insubstantial:
+            return (
+                f"challenge-sweep note too short (< {MIN_SUBSTANTIVE_LENGTH} chars after "
+                f"stripping) for active hypothesis id(s): {insubstantial}"
+            )
+
+        notes = [by_id[hid].note.strip() for hid in active_ids]
+        if len(notes) > 1 and len(set(notes)) == 1:
+            return (
+                "challenge-sweep note is identical across every active hypothesis — not a "
+                "substantive, per-hypothesis review"
+            )
         return None
 
     return Contract(name="challenge_sweep_covers_every_active_hypothesis", predicate=predicate)
@@ -1038,7 +1105,10 @@ def build_review_dag(
                 input_model=ContextPack,
                 output_model=BlindDifferential,
                 depends_on="blind_context_pack",
-                preconditions=[forbid_context_key("ledger")],
+                preconditions=[
+                    forbid_context_key("ledger"),
+                    edge_payload_lacks_section("ledger"),
+                ],
             )
         )
         prior_name = node_name

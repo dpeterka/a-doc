@@ -349,14 +349,20 @@ def test_labs_infer_specimen_runs_end_to_end_and_commits(
         )
         db.insert_results(
             [
+                # "specific gravity" (not in ANALYTE_SPECS at all - a pure
+                # urinalysis-only analyte, D2) rather than "glucose": a
+                # urine "GLUCOSE" reading canonicalizes to the same name as
+                # a serum glucose reading and must stay "unknown" even in
+                # an otherwise-pure urinalysis document (see
+                # test_labs_specimen.py's guard-1 regression test) - this
+                # end-to-end CLI test exercises the case that SHOULD apply.
                 LabResult(
                     date=date(2026, 5, 2),
-                    name="glucose",
-                    name_raw="GLUCOSE",
-                    value=None,
-                    value_text="NEGATIVE",
+                    name="specific gravity",
+                    name_raw="Specific Gravity",
+                    value=1.02,
                     source_doc=sha_urine,
-                    raw_json=json.dumps({"name_raw": "GLUCOSE"}),
+                    raw_json=json.dumps({"name_raw": "Specific Gravity"}),
                 ),
                 LabResult(
                     date=date(2026, 5, 2),
@@ -381,8 +387,8 @@ def test_labs_infer_specimen_runs_end_to_end_and_commits(
     assert "1 row(s) remain unknown" in out
 
     with LabsDb(data_dir / "labs.sqlite") as db:
-        rows = {row.name: row for row in db.series("glucose") + db.series("sodium")}
-        assert rows["glucose"].specimen == "urine"
+        rows = {row.name: row for row in db.series("specific gravity") + db.series("sodium")}
+        assert rows["specific gravity"].specimen == "urine"
         assert rows["sodium"].specimen == "unknown"
 
     export_text = (data_dir / "labs-export.jsonl").read_text(encoding="utf-8")
@@ -438,7 +444,14 @@ def test_labs_dedupe_twins_fails_if_data_repo_not_initialized(
 
 def _seed_twin_pair(data_dir: Path) -> tuple[str, int]:
     """One AUTO row and its rule-path twin PENDING single_pass row, same
-    document/page/value - returns `(sha256, pending_row_id)`."""
+    document/page/value - returns `(sha256, pending_row_id)`.
+
+    D3: the rule path decides an EXACT match only (after
+    `clean_result_name` + casefold) - a trailing-sentence-fragment variant
+    of the same name still qualifies, unlike a token-subset pair (e.g.
+    "T-Score" vs "LEFT HIP femoral neck T-Score"), which now requires the
+    LLM path instead.
+    """
     sha = "a" * 64
     repo = DataRepo.init_at(data_dir)
     with LabsDb(data_dir / "labs.sqlite") as db:
@@ -456,8 +469,8 @@ def _seed_twin_pair(data_dir: Path) -> tuple[str, int]:
             [
                 LabResult(
                     date=date(2026, 5, 2),
-                    name="t-score",
-                    name_raw="LEFT HIP femoral neck T-Score",
+                    name="frax",
+                    name_raw="FRAX 10-year probability of hip fracture",
                     value=-1.2,
                     source_doc=sha,
                     source_page=5,
@@ -469,8 +482,8 @@ def _seed_twin_pair(data_dir: Path) -> tuple[str, int]:
             [
                 LabResult(
                     date=date(2026, 5, 2),
-                    name="t-score-2",
-                    name_raw="T-Score",
+                    name="frax-2",
+                    name_raw="frax 10-year probability of hip fracture is",
                     value=-1.2,
                     source_doc=sha,
                     source_page=5,

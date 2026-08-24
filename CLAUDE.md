@@ -8,7 +8,7 @@ a-doc is a single-patient, longitudinal medical-diagnostic assistant (Python). R
 - Test: `uv run pytest` (coverage gate enforced in CI)
 - Lint/format: `uv run ruff check --fix . && uv run ruff format .`
 - Types: `uv run mypy src`
-- App CLI: `uv run adoc <init|onboard|ingest|review|serve|backfill|eval|user>`
+- App CLI: `uv run adoc <init|onboard|ingest|review|serve|backfill|eval|user|backup|restore|bootstrap-data|labs-infer-specimen|labs-dedupe-twins|labs-reclassify>` (14 subcommands; `user` has `add`/`list`/`remove`)
 
 ## Hard rules
 
@@ -37,3 +37,10 @@ a-doc is a single-patient, longitudinal medical-diagnostic assistant (Python). R
 - Python ≥3.12, `src/` layout, Pydantic v2 models for every cross-boundary payload (extraction schemas, ledger diffs, DAG artifacts).
 - Deterministic logic (validation, ledger invariants, citation checking, safety gates) is plain code with unit tests — never delegated to a model.
 - Every persisted LLM-derived artifact carries provenance: `{app_version, prompt_template_version, model_id, dag_node, timestamp}`.
+
+### Prompt versioning
+
+Two versioning conventions coexist, both required to keep provenance stamps accurate — bump the version on every semantic edit (wording that changes model behavior), not on typo-only fixes:
+
+- **DAG-stage system prompts** (`src/adoc/reason/prompts/*.md`): each file starts with a mandatory `<!-- version: N -->` header, parsed and hashed by `reason/prompts.py`'s `load_prompt`. `reason/stages.py` reads the parsed version to stamp `Provenance.prompt_template_version` on every artifact that stage produces.
+- **Inline prompts elsewhere** (e.g. `labs/twins.py`'s `TWIN_CLASSIFY_PROMPT_VERSION`, `ingest/pipeline.py`'s `CLASSIFY_PROMPT_VERSION`/`DOCX_CLASSIFY_PROMPT_VERSION`): a module-level `*_PROMPT_VERSION` string constant embedded directly into the prompt text it labels, read the same way at the call site to stamp provenance.

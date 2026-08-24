@@ -617,6 +617,59 @@ def _longer_name(name_a: str, name_b: str) -> str:
     return name_a if len(name_a) >= len(name_b) else name_b
 
 
+# D5: a rescued pair's residual risk is two genuinely DIFFERENT analytes
+# that happen to print the identical value on the same page (module
+# docstring's accepted-risk note) - rescue still pairs them (never leaves
+# them stranded as twin single_pass rows), but a pair whose names share NO
+# meaningful token gets a different, disagreement-bucketed reason so a
+# human actually looks instead of it being bulk-OK'd alongside genuine
+# same-measurement name variants.
+_NAME_OVERLAP_STOPWORDS: frozenset[str] = frozenset(
+    {
+        # generic English function words
+        "the",
+        "and",
+        "for",
+        "with",
+        "from",
+        "this",
+        "that",
+        "were",
+        "was",
+        "are",
+        "not",
+        # generic lab-report filler nouns - shared ONLY because both names
+        # happen to be a "<analyte> <filler>" shape, not because the
+        # analytes are related (e.g. "Iron Test" vs "Copper Test")
+        "test",
+        "tests",
+        "level",
+        "levels",
+        "count",
+        "counts",
+        "panel",
+        "result",
+        "results",
+        "value",
+        "values",
+    }
+)
+
+
+def _meaningful_name_tokens(name: str) -> set[str]:
+    """Tokens of `name` (casefolded alnum runs) long enough and common
+    enough to be a "meaningful" overlap signal (D5): longer than 2
+    characters and not a generic English stopword - short/filler tokens
+    like "of"/"is"/"the" would manufacture a false shared-token match
+    between two genuinely unrelated analyte names."""
+    tokens = re.findall(r"[a-z0-9]+", name.casefold())
+    return {t for t in tokens if len(t) > 2 and t not in _NAME_OVERLAP_STOPWORDS}
+
+
+def _names_share_a_meaningful_token(name_a: str, name_b: str) -> bool:
+    return bool(_meaningful_name_tokens(name_a) & _meaningful_name_tokens(name_b))
+
+
 def _reconcile_rescued_pair(
     a: ExtractedResult, b: ExtractedResult, *, doc_date: date, missing_date: bool, db: LabsDb
 ) -> ReconciledRow:
@@ -628,12 +681,21 @@ def _reconcile_rescued_pair(
     covers value/unit/specimen with its own, looser definitions, and
     ref_range/flag/confidence were never part of it, so comparing them
     here would manufacture disagreement reasons (`ref_range_mismatch`,
-    ...) for two readings the rescue pass itself judged compatible. This
-    always queues PENDING with `name_variant` first, plus whatever
-    `validate_row`/`trend_outlier` find on the representative reading
-    (the same single-source annotations `_reconcile_single_pass` would
-    add) - never a `DISAGREEMENT_REASON_PREFIXES` reason - so it always
-    lands in the confirm queue's "agreed" bucket. Field values (value/
+    ...) for two readings the rescue pass itself judged compatible.
+
+    The first reason is `name_variant` when the two names share at least
+    one meaningful token (`_names_share_a_meaningful_token`) - the common
+    case, "the same result, just worded differently" - staying out of
+    `DISAGREEMENT_REASON_PREFIXES` so it lands in the confirm queue's
+    "agreed" bucket, same as before. When the names share NO token at all
+    (D5: the module docstring's accepted residual risk - two different
+    analytes coincidentally sharing a value/page), the reason is
+    `name_variant_unverified` instead - IN `DISAGREEMENT_REASON_PREFIXES`,
+    so it needs a real human look rather than a bulk OK - the pair is still
+    rescued (never left stranded as twin single_pass rows), just bucketed
+    honestly. Either way, whatever `validate_row`/`trend_outlier` find on
+    the representative reading is appended after (the same single-source
+    annotations `_reconcile_single_pass` would add). Field values (value/
     unit/ref range/flag/specimen/page) are taken from whichever of the
     two readings carries the LONGER/more specific name - the same
     reading the stored `name_raw` comes from; the other reading's full
@@ -643,7 +705,12 @@ def _reconcile_rescued_pair(
     representative = a if chosen_name == a.name_raw else b
     canonical = canonicalize(a.name_raw) or canonicalize(b.name_raw)
 
-    reasons: list[str] = ["name_variant"]
+    first_reason = (
+        "name_variant"
+        if _names_share_a_meaningful_token(a.name_raw, b.name_raw)
+        else "name_variant_unverified"
+    )
+    reasons: list[str] = [first_reason]
     if missing_date:
         reasons.append("missing_date")
 
@@ -937,12 +1004,17 @@ DISAGREEMENT_REASON_PREFIXES: tuple[str, ...] = (
     "single_pass",
     "pass_a_confidence:",
     "pass_b_confidence:",
+    "name_variant_unverified",
 )
 """Reason prefixes (see the module docstring's gate list) that reflect a
 genuine cross-pass disagreement, or a pass that couldn't even be
 compared against the other - as opposed to a single-source
 validation/dating issue that both passes' readings share (unknown
 analyte, missing date, an out-of-bounds value, a trend outlier, ...).
+`name_variant_unverified` (D5) is the RESCUE pass's zero-name-overlap
+case: still paired (never left as stranded twins), but with no shared
+token between the two names to back up "same result, different wording",
+so it needs a real look rather than the bulk-OK `name_variant` bucket.
 
 The confirm-queue UI (`web.routes.confirm`) buckets PENDING rows on this
 distinction: a row with none of these prefixes among its reasons only

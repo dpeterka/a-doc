@@ -166,6 +166,52 @@ def test_upload_archives_a_genomic_text_file_with_zero_llm_calls(tmp_path: Path)
     assert list((repo.root / "case" / "encounters").glob("*.md")) == []
 
 
+def test_upload_rejects_a_file_one_byte_over_the_configured_cap(tmp_path: Path) -> None:
+    app, repo, db, _calls = build_app(tmp_path, max_upload_mb=1)
+    client = TestClient(app)
+    login(client)
+    one_mb = 1024 * 1024
+    oversized = b"0" * (one_mb + 1)
+
+    response = client.post(
+        "/upload",
+        files={"file": ("big.pdf", oversized, "application/pdf")},
+    )
+
+    assert response.status_code == 200
+    body = response.text
+    assert "big.pdf" in body
+    assert "larger than the 1 mb" in body.lower()
+    assert "Traceback" not in body
+    # Never left behind, never handed to the ingestion pipeline.
+    assert not (repo.root / "inbox" / "big.pdf").exists()
+    assert db.list_documents() == []
+
+
+def test_upload_accepts_a_file_exactly_at_the_configured_cap(tmp_path: Path) -> None:
+    """At exactly the boundary the size gate must pass the file through —
+    it lands on the (separate) unsupported-file-type rejection instead of
+    the oversized-file message, proving the gate didn't trip early."""
+    app, repo, db, _calls = build_app(tmp_path, max_upload_mb=1)
+    client = TestClient(app)
+    login(client)
+    one_mb = 1024 * 1024
+    at_boundary = b"\x89PNG\r\n\x1a\n" + b"0" * (one_mb - 8)
+    assert len(at_boundary) == one_mb
+
+    response = client.post(
+        "/upload",
+        files={"file": ("boundary.png", at_boundary, "image/png")},
+    )
+
+    assert response.status_code == 200
+    body = response.text
+    assert "larger than" not in body.lower()
+    assert "boundary.png" in body
+    assert not (repo.root / "inbox" / "boundary.png").exists()
+    assert db.list_documents() == []
+
+
 def test_upload_expands_a_zip_and_ingests_its_pdf_member(tmp_path: Path) -> None:
     import io
     import zipfile

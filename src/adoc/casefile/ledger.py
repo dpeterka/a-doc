@@ -201,6 +201,20 @@ def apply_diff(ledger: Ledger, diff: LedgerDiff) -> Ledger:
                         "most-likely: it must be substantively challenged "
                         "(RecordChallenge) in an earlier diff first"
                     )
+                # S3 remediation: a challenge from long ago must not license a
+                # promotion today — the challenge must still be RECENT, not
+                # merely non-None. Same staleness horizon as invariant (c).
+                if (
+                    original.last_challenged_version is None
+                    or original.last_challenged_version < new_version - STALENESS_HORIZON
+                ):
+                    raise LedgerInvariantError(
+                        f"cannot promote patient-origin hypothesis {op.id!r} to "
+                        "most-likely: its last substantive challenge is stale "
+                        f"(last_challenged_version={original.last_challenged_version!r}, "
+                        f"new_version={new_version}, horizon={STALENESS_HORIZON}); it must be "
+                        "re-challenged before promotion"
+                    )
 
             if op.probability is not None and op.probability != hyp.probability:
                 hyp.prior_probability = hyp.probability
