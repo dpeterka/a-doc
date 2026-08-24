@@ -221,6 +221,19 @@ each other or from the web task by any lock — this is an accepted gap
 (cadence and single-patient scale make a collision low-probability, not
 impossible), not a solved problem.
 
+**Expect a brief 503 window on every web-service deploy.** Because
+`MaximumPercent: 100`/`MinimumHealthyPercent: 0` always stops the old task
+before starting its replacement (above), the ALB has zero healthy targets
+for the new task's cold-start + health-check time — requests during that
+window get a 503 from the ALB, not from the app. `HealthCheckGracePeriodSeconds`
+is `900` (`deploy/cfn/ecs.yaml`'s `WebService`), sized generously so a
+first-boot `adoc bootstrap-data` restore (git clone + `sources/`/JSONL sync
++ `labs.sqlite` rebuild from S3) has time to finish before ECS starts
+health-checking; a plain code deploy against an already-seeded EFS
+finishes in well under that. This is an accepted tradeoff for a
+single-patient app in exchange for never risking two writers, not a bug —
+plan deploys for a moment when a brief outage is acceptable.
+
 ### Seeding a deployment from local onboarding
 
 The approved onboarding flow is: run `adoc onboard` (and any initial
@@ -279,6 +292,17 @@ environment):
    creating a new empty case file.
 4. Confirm `https://adoc.petabloc.io/healthz` returns `ok` and the ALB
    target group shows the task healthy (below).
+5. **Re-provision logins.** `<data_dir>/work/users.yaml` (the web login
+   credential store — see "User provisioning" above) lives under the
+   gitignored `work/` directory, which `adoc backup`/`restore` deliberately
+   never ships to or from S3 (`backup.py`'s `_OPERATIONAL_DIRS` are
+   recreated empty on restore, not populated from any backed-up content —
+   see ADR 0009). A restore therefore always comes back with **zero** web
+   logins, even though every other piece of state (case file, ledger,
+   labs, sources) is fully restored. Every restore drill must re-run the
+   ECS Exec `adoc user add <username>` step (see "User provisioning") before
+   declaring the drill complete — a restored deployment nobody can log
+   into is not a passing drill.
 
 ### How the patient reaches the UI
 
@@ -317,6 +341,69 @@ after the data on EFS has been confirmed current (e.g. via a manual
 direct one-time copy) — the EC2 instance's `/data` EBS volume and the new
 EFS filesystem start out as two independent, unsynchronized copies of the
 data repo.
+
+## Lab maintenance commands
+
+Three `no-new-LLM-call` maintenance sweeps clean up rows already in
+`labs.sqlite` under the *current* validation/reconcile logic — run them
+after a reconcile-comparator or validation change to retroactively fix up
+rows that queued under older, stricter rules, or periodically as ordinary
+housekeeping:
+
+- **`adoc labs-reclassify [--dry-run]`** (`labs/reclassify.py`) — recomputes
+  every still-`PENDING` row's disagreement reasons under the current
+  semantic ref-range/unit/flag comparators (`ingest/reconcile.py`) and the
+  current trend history. A row whose only "disagreement" was a comparator
+  false positive (a cosmetic unit spelling, a unicode dash, `None` vs.
+  `""`) flips to `auto`; a row with a real disagreement stays queued but
+  its stored reasons are refreshed. Use this after any change to
+  `reconcile.py`'s comparators or `labs/validate.py`'s analyte specs, to
+  drain the confirm queue of stale false positives without re-extracting
+  anything.
+- **`adoc labs-dedupe-twins [--dry-run]`** (`labs/twins.py`) — sweeps
+  legacy single-pass `PENDING` rows for a duplicate already-resolved row in
+  the same document (deterministic candidate gate on value/page/unit/
+  specimen, then a rule-based name match, falling back to exactly one
+  `classifier`-role LLM call only when the rule can't decide) and
+  auto-rejects the duplicate half. Use this once after upgrading past the
+  RESCUE-pass reconcile fix, or periodically if single-pass extraction
+  rows are still trickling in.
+- **`adoc labs-infer-specimen`** (`labs/specimen.py`) — deterministically
+  back-fills `specimen` (serum/plasma/urine/etc.) for existing rows still
+  carrying the pre-migration `unknown` default, from their source
+  document's filename/`doc_type` keywords only. Use this once after
+  upgrading past the specimen-dimension migration, so older rows join the
+  correct per-specimen trend series instead of being excluded from trend
+  comparison.
+
+All three are read-modify-write passes over already-extracted data — none
+of them makes a new extraction or classification call beyond the single
+narrow LLM fallback in `labs-dedupe-twins`, and `--dry-run` on the latter
+two reports what would change without mutating anything.
+
+## Genomic data
+
+Raw genotype files (a 23andMe-style raw text export, per-chromosome
+imputed `.bcf`/`.vcf` files, BAM/FASTQ) are a supported intake kind
+(`ingest/filetypes.py` sniffs content, not filename) but are handled
+completely differently from documents: they are archived byte-for-byte
+under `sources/genomics/` (gitignored — `.gitignore` excludes it from the
+data repo's git history so a patient's raw genotype files never bloat the
+git bundle) and folded into one regenerated `case/genomics-inventory.md`
+summary table, never a per-file encounter. **A genomic file's content
+never reaches any model** — no vision call, no text-extraction call is
+ever made against it; this is a CRITICAL DESIGN RULE (`ingest/genomics.py`),
+not just a default. `sources/genomics/` is still backed up: `adoc backup`
+syncs the whole `sources/` tree on disk to S3 regardless of what git
+tracks, so the bytes are safe even though they're not in git history. See
+ADR 0010.
+
+## Currently deployed
+
+The deployed version is always the latest `v*` git tag on `main` — check
+`git tag -l --sort=-v:refname | head -1` (or the ECS task definition's
+image tag) rather than assuming any version mentioned elsewhere in this
+document is still current.
 
 ## Phase status
 
