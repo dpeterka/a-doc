@@ -33,6 +33,7 @@ DEFAULT_RECENT_ENCOUNTERS = 5
 
 LEDGER_SECTION_KEY = "ledger"
 PATIENT_THEORIES_SECTION_KEY = "patient_theories"
+GENOMICS_INVENTORY_RELPATH = "case/genomics-inventory.md"
 
 
 class ContextSection(BaseModel):
@@ -159,8 +160,9 @@ def build_context(
       2. patient theories (`case/patient-theories.md`), only if that file exists
       3. recent encounters (last `recent_encounters_limit`)
       4. abnormal labs summary + latest panel
-      5. open questions (`case/questions-open.md`)
-      6. differential-ledger.yaml, ONLY when `include_ledger=True`
+      5. genomics inventory (`case/genomics-inventory.md`), only if present
+      6. open questions (`case/questions-open.md`)
+      7. differential-ledger.yaml, ONLY when `include_ledger=True`
 
     A blind-review caller passes `include_ledger=False`, which both omits
     the ledger section from `.render()`'s text and keeps `"ledger"` out of
@@ -184,6 +186,15 @@ def build_context(
 
     sections.append(_recent_encounters_section(repo, recent_encounters_limit))
     sections.append(_labs_section(db))
+
+    if (repo.root / GENOMICS_INVENTORY_RELPATH).exists():
+        sections.append(
+            ContextSection(
+                key="genomics_inventory",
+                title="Genomic Data On File",
+                content=repo.read(GENOMICS_INVENTORY_RELPATH),
+            )
+        )
 
     open_questions = _read_or_placeholder(repo, OPEN_QUESTIONS_RELPATH, "_None yet._")
     sections.append(
