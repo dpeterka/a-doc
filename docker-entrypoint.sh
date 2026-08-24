@@ -38,7 +38,10 @@ fi
 # the common case. ---
 if [ ! -d "$DATA_DIR" ] || [ -z "$(ls -A "$DATA_DIR" 2>/dev/null)" ]; then
   echo "docker-entrypoint: $DATA_DIR is missing or empty; running 'adoc bootstrap-data'"
-  adoc bootstrap-data
+  if ! adoc bootstrap-data; then
+    echo "docker-entrypoint: bootstrap-data FAILED - refusing to start over an unseeded/partial data dir" >&2
+    exit 1
+  fi
 fi
 
 exec "$@"
