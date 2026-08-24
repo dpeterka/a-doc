@@ -48,7 +48,13 @@ from pydantic import BaseModel, Field
 
 from adoc.ingest.schema import DocumentExtraction, ExtractedResult
 from adoc.labs.models import LabFlag, LabResult
-from adoc.labs.validate import canonicalize, trend_outlier, validate_row
+from adoc.labs.validate import (
+    DECIMAL_SIGNATURE_RATIO,
+    canonicalize,
+    trend_deviation,
+    trend_outlier,
+    validate_row,
+)
 
 if TYPE_CHECKING:
     from adoc.labs.db import LabsDb
@@ -265,6 +271,18 @@ def _reconcile_matched_pair(
     ]
     reasons.extend(outlier.message for outlier in outliers)
 
+    # Trend spikes on a cross-pass-AGREED value are treated as real
+    # physiology (this patient spikes frequently; agreement is the stronger
+    # extraction-correctness signal) — they annotate the row but do not
+    # block AUTO. The one exception: a >=10x-class shift, the decimal-
+    # misread signature both passes could plausibly share, still queues.
+    deviations = [
+        d
+        for d in (trend_deviation(db, candidate_a), trend_deviation(db, candidate_b))
+        if d is not None
+    ]
+    decimal_signature = any(d >= DECIMAL_SIGNATURE_RATIO for d in deviations)
+
     gates_pass = (
         not missing_date
         and value_match
@@ -274,7 +292,7 @@ def _reconcile_matched_pair(
         and flag_match
         and confidence_ok
         and not issues
-        and not outliers
+        and not decimal_signature
     )
 
     raw_json = json.dumps(
