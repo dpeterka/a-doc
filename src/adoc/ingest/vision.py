@@ -43,7 +43,12 @@ from typing import Any, Protocol, TypeVar
 
 from pydantic import BaseModel
 
-from adoc.reason.client import LlmClient, TransientTransportError, _unwrap_tool_input
+from adoc.reason.client import (
+    LlmClient,
+    TransientTransportError,
+    _openai_strict_schema,
+    _unwrap_tool_input,
+)
 
 # --------------------------------------------------------------------------
 # Document/image content parts
@@ -270,7 +275,10 @@ class OpenAIVisionProvider:
 
         kwargs: dict[str, Any] = {
             "model": request.model,
-            "max_tokens": request.max_tokens,
+            # gpt-5.x rejects 'max_tokens'; this pass-B provider is
+            # OpenAI-proper only (never Featherless), so use the new name
+            # unconditionally — parity with reason.client's OpenAIProvider.
+            "max_completion_tokens": request.max_tokens,
             "messages": [
                 {"role": "system", "content": request.system},
                 {"role": "user", "content": content},
@@ -279,7 +287,9 @@ class OpenAIVisionProvider:
                 "type": "json_schema",
                 "json_schema": {
                     "name": request.schema.__name__,
-                    "schema": request.schema.model_json_schema(),
+                    # Strict mode requires additionalProperties/required on
+                    # every object node — same adaptation as reason.client.
+                    "schema": _openai_strict_schema(request.schema.model_json_schema()),
                     "strict": True,
                 },
             },
