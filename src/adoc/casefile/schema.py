@@ -38,7 +38,12 @@ EvidenceStrength = Literal["strong", "moderate", "weak"]
 #   patient-report:<YYYY-MM-DD>
 
 _DATE_RE = r"\d{4}-\d{2}-\d{2}"
-_SLUG_RE = r"[a-z0-9]+(?:-[a-z0-9]+)*"
+# Slugs are model-generated from real analyte names, which include %, ., (),
+# / and other punctuation ("% SATURATION", "B. MIYAMOTOI AB (IGG)") - a live
+# challenger verdict died on 'labs:%-saturation:...'. Accept any run of
+# non-colon, non-whitespace characters; the slug's SEMANTIC resolution
+# against the labs table is Phase 2's citation checker, not this regex.
+_SLUG_RE = r"[^\s:]+"
 _FILENAME_RE = r"[^\s#]+"
 
 SOURCE_REF_PATTERN = re.compile(
