@@ -33,7 +33,8 @@ from __future__ import annotations
 
 import re
 from collections.abc import Sequence
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import date, datetime
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
@@ -68,6 +69,12 @@ Precision = Literal["exact", "approx", "unknown_after_probe", "unasked"]
 Attribution = Literal["doctor_diagnosed", "patient_reported", "patient_assumption"]
 ClarificationStatus = Literal["needs_probe", "resolved"]
 FactStatus = Literal["active", "retracted"]
+Corroboration = Literal["corroborated", "contradicted", "unverified"]
+"""Set only by `intake.corroborate.corroborate_facts` (deterministic code,
+never the `intake_agent` model) — see `docs/adr/0013-fact-corroboration.md`.
+Defaults to `"unverified"` so old facts files without this field (and any
+fact kind corroboration deliberately never touches, e.g. medications) load
+and stay unverified rather than erroring."""
 
 FieldValue = str | int | float | bool | None
 
@@ -113,6 +120,21 @@ class IntakeFact(BaseModel):
     attribution: Attribution = "patient_reported"
     clarification_status: ClarificationStatus = "resolved"
     status: FactStatus = "active"
+    corroboration: Corroboration = "unverified"
+    corroboration_source: str | None = None
+    """A source ref reusing the casefile grammar (`casefile.schema.
+    SOURCE_REF_PATTERN`, minus `pmid:`/`patient-report:` which don't apply
+    here): `doc:<file>#p<int>` | `labs:<slug>:<date>` | `encounter:<file>`.
+    Set only alongside `corroboration="corroborated"`."""
+    corroboration_note: str | None = None
+    """A short deterministic explanation of the corroboration state (e.g.
+    "ER note dated 2024-03-02 within 45 days of reported timing"), or the
+    reason a `"contradicted"` state was reached. `None` for `"unverified"`."""
+    reported_on: date | None = None
+    """The date this fact was created or last touched by a patient turn
+    (intake or a later visit) — stamped by `IntakeFactsStore.apply_ops` from
+    the applying `Provenance.timestamp`, never by the model. `None` only for
+    facts written before this field existed (backward compat)."""
     provenance: Provenance
     history: list[FactRevision] = Field(default_factory=list)
 
@@ -283,6 +305,7 @@ class IntakeFactsStore:
                     attribution=op.fact.attribution,
                     clarification_status=op.fact.clarification_status,
                     status="active",
+                    reported_on=provenance.timestamp.date(),
                     provenance=provenance,
                     history=[],
                 )
@@ -313,6 +336,7 @@ class IntakeFactsStore:
                     data["attribution"] = op.attribution
                 if op.clarification_status is not None:
                     data["clarification_status"] = op.clarification_status
+                data["reported_on"] = provenance.timestamp.date()
                 data["provenance"] = provenance
                 data["history"] = [*current.history, revision]
                 working[index] = IntakeFact.model_validate(data)
@@ -338,8 +362,74 @@ class IntakeFactsStore:
         self._facts = working
         return result
 
+    def apply_corroboration(
+        self, updates: Sequence[CorroborationUpdate], *, at: datetime
+    ) -> list[str]:
+        """Apply `intake.corroborate.corroborate_facts`' computed updates.
+
+        Unlike `apply_ops`, this never restamps `provenance` — corroboration
+        is deterministic code re-evaluating already-captured facts against
+        already-ingested documentation, not a new LLM-derived artifact (see
+        `docs/adr/0013-fact-corroboration.md`), so the fact's original
+        `provenance` (from whichever turn actually captured/last touched it)
+        is left untouched. A `FactRevision` is still appended so the change
+        is visible in `history`, and `corroboration_source is None`/
+        `corroboration_note is None`. `reported_on` is also left untouched —
+        corroboration is not a patient statement. Skips (silently) any
+        `fact_id` no longer present (e.g. retracted since the sweep was
+        computed) and any update whose target state already matches the
+        fact's current one (idempotent — matches `corroborate_facts`'
+        own "returns updates only where the computed state differs"
+        contract, but re-checked here too since `updates` may be stale by
+        the time it's applied). Returns the ids actually touched.
+        """
+        working = [fact.model_copy(deep=True) for fact in self._facts]
+        by_id = {fact.id: index for index, fact in enumerate(working)}
+        touched: list[str] = []
+
+        for update in updates:
+            index = by_id.get(update.fact_id)
+            if index is None:
+                continue
+            current = working[index]
+            if (
+                current.corroboration == update.corroboration
+                and current.corroboration_source == update.corroboration_source
+                and current.corroboration_note == update.corroboration_note
+            ):
+                continue
+
+            change = f"corroboration: {current.corroboration} -> {update.corroboration}"
+            if update.corroboration_note:
+                change = f"{change} ({update.corroboration_note})"
+            revision = FactRevision(timestamp=at, change=change, prior_statement=current.statement)
+            data = current.model_dump()
+            data["corroboration"] = update.corroboration
+            data["corroboration_source"] = update.corroboration_source
+            data["corroboration_note"] = update.corroboration_note
+            data["history"] = [*current.history, revision]
+            working[index] = IntakeFact.model_validate(data)
+            touched.append(update.fact_id)
+
+        self._facts = working
+        return touched
+
     def save(self) -> None:
         save_intake_facts(self._path, self._facts)
+
+
+@dataclass(frozen=True)
+class CorroborationUpdate:
+    """One fact's newly-computed corroboration state
+    (`intake.corroborate.corroborate_facts`), applied via
+    `IntakeFactsStore.apply_corroboration`. Defined here (not in
+    `intake.corroborate`) so that module can import `IntakeFact`/
+    `Corroboration` from this one without a circular import."""
+
+    fact_id: str
+    corroboration: Corroboration
+    corroboration_source: str | None = None
+    corroboration_note: str | None = None
 
 
 # --- deterministic completion gates (THE core safety of this feature) ---------------

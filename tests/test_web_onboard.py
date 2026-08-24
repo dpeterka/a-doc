@@ -147,6 +147,117 @@ def test_review_page_correct_this_prefills_the_chat_page(tmp_path: Path) -> None
     assert '"/chat?prefill="' in response.text
 
 
+def test_review_page_omits_since_last_visit_strip_when_nothing_recent(tmp_path: Path) -> None:
+    app, _repo, _db, _calls = build_app(tmp_path)
+    client = TestClient(app)
+    login(client)
+
+    response = client.get("/onboard/review")
+
+    assert response.status_code == 200
+    assert "Since last visit" not in response.text
+
+
+def test_review_page_shows_since_last_visit_strip_for_recently_reported_facts(
+    tmp_path: Path,
+) -> None:
+    """`docs/adr/0013-fact-corroboration.md`: every fact gets a `reported_on`
+    stamp, and a fact reported within the last 14 days shows up in the
+    "Since last visit" strip."""
+    intake_transport = _intake_transport(
+        [
+            {
+                "message": "Noted.",
+                "ops": [
+                    {
+                        "op": "add_fact",
+                        "fact": {
+                            "id": "recent-symptom",
+                            "section": "symptoms",
+                            "kind": "symptom",
+                            "statement": "New joint pain reported this visit.",
+                        },
+                    }
+                ],
+                "topics_covered": [],
+                "intake_complete": False,
+            }
+        ]
+    )
+    app, _repo, _db, _calls = build_app(tmp_path, intake_agent_transport=intake_transport)
+    client = TestClient(app)
+    login(client)
+
+    client.post("/chat/send", data={"text": "New joint pain."})
+
+    response = client.get("/onboard/review")
+
+    assert response.status_code == 200
+    assert "Since last visit" in response.text
+    assert "New joint pain reported this visit." in response.text
+
+
+def test_review_page_shows_corroboration_badges_and_sorts_contradicted_first(
+    tmp_path: Path,
+) -> None:
+    """A diagnosis with a future `fields.year` is auto-contradicted by
+    `run_intake_turn`'s own corroboration sweep (`intake.corroborate`); an
+    ordinary one with no matching documentation stays unverified. The
+    contradicted fact must sort before its topic-mate."""
+    intake_transport = _intake_transport(
+        [
+            {
+                "message": "Noted.",
+                "ops": [
+                    {
+                        "op": "add_fact",
+                        "fact": {
+                            "id": "first-added",
+                            "section": "prior_diagnoses",
+                            "kind": "diagnosis",
+                            "statement": "Diagnosed with hypothyroidism.",
+                            "attribution": "doctor_diagnosed",
+                            "fields": {"year": 2015, "by_whom": "Dr. Ray"},
+                        },
+                    },
+                    {
+                        "op": "add_fact",
+                        "fact": {
+                            "id": "future-dx",
+                            "section": "prior_diagnoses",
+                            "kind": "diagnosis",
+                            "statement": "Diagnosed with lupus in 2099.",
+                            "attribution": "doctor_diagnosed",
+                            "fields": {"year": 2099, "by_whom": "Dr. Lee"},
+                        },
+                    },
+                ],
+                "topics_covered": [],
+                "intake_complete": False,
+            }
+        ]
+    )
+    app, _repo, _db, _calls = build_app(tmp_path, intake_agent_transport=intake_transport)
+    client = TestClient(app)
+    login(client)
+
+    client.post("/chat/send", data={"text": "Two diagnoses to record."})
+
+    response = client.get("/onboard/review")
+
+    assert response.status_code == 200
+    body = response.text
+    assert "Contradicted" in body
+    assert "Unverified" in body
+    # Both facts were reported today, so they also both appear (in insertion
+    # order) in the unsorted "Since last visit" strip above the topic
+    # sections -- `rindex` finds each statement's LAST occurrence, i.e. its
+    # position within the (corroboration-sorted) "prior_diagnoses" section.
+    assert body.rindex("Diagnosed with lupus in 2099.") < body.rindex(
+        "Diagnosed with hypothyroidism."
+    )
+
+
 def test_onboard_review_stays_reachable_and_shows_amend_banner_after_completion(
     tmp_path: Path,
 ) -> None:

@@ -22,6 +22,15 @@ rendered into a fresh `GET /chat` when the transcript is empty and intake
 is incomplete, and is written into that transcript on the first patient
 turn so later renders (and the intake engine's own context) see coherent
 history.
+
+**Interval history** (`docs/adr/0013-fact-corroboration.md`): once intake is
+complete, every successful informational/diagnostic turn also runs
+`intake.agent.run_visit_capture` — a silent pass that may add or update
+`IntakeFact`s from the patient's message, never touching the DAG or its
+contracts. Skipped entirely on a red-flag/urgent, withheld, or error
+outcome (only a turn that actually reached the patient is worth capturing
+from); failures inside `run_visit_capture` itself are swallowed there, so
+this route never needs to handle them.
 """
 
 from __future__ import annotations
@@ -36,7 +45,12 @@ from starlette.responses import HTMLResponse, Response
 
 from adoc.casefile.ledger import LedgerInvariantError
 from adoc.casefile.repo import LEDGER_RELPATH, DataRepo
-from adoc.intake.agent import INTAKE_OPENER_MESSAGE, intake_is_complete, run_intake_turn
+from adoc.intake.agent import (
+    INTAKE_OPENER_MESSAGE,
+    intake_is_complete,
+    run_intake_turn,
+    run_visit_capture,
+)
 from adoc.labs.db import LabsDb
 from adoc.reason.client import LlmClient, LlmError, LlmResult
 from adoc.reason.dag import ContractViolation
@@ -130,6 +144,7 @@ def _handle_turn(text: str, *, client: LlmClient, repo: DataRepo, db: LabsDb) ->
             return {"kind": "withheld", "text": _LEDGER_INVARIANT_MESSAGE, "tests_to_request": []}
         if isinstance(outcome, RedFlagResult):
             return {"kind": "urgent", "text": outcome.message or "", "tests_to_request": []}
+        run_visit_capture(client, repo, db, text)
         return {"kind": "informational", "text": outcome.text, "tests_to_request": []}
 
     try:
@@ -148,6 +163,7 @@ def _handle_turn(text: str, *, client: LlmClient, repo: DataRepo, db: LabsDb) ->
         return {"kind": "withheld", "text": _LEDGER_INVARIANT_MESSAGE, "tests_to_request": []}
     if isinstance(outcome, RedFlagResult):
         return {"kind": "urgent", "text": outcome.message or "", "tests_to_request": []}
+    run_visit_capture(client, repo, db, text)
     return {
         "kind": "diagnostic",
         "text": outcome.tiers_rendered,

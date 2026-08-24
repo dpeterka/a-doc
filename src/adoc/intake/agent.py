@@ -29,6 +29,7 @@ deterministic checks this module needs, and both are plain function calls.
 from __future__ import annotations
 
 import json
+import logging
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
@@ -41,6 +42,7 @@ from adoc.casefile.repo import DataRepo
 from adoc.casefile.schema import Provenance
 from adoc.ingest.genomics import GENOMIC_DOC_TYPE
 from adoc.intake.convert import facts_to_section_data
+from adoc.intake.corroborate import corroborate_facts
 from adoc.intake.coverage import (
     INTAKE_STATE_RELPATH,
     CoverageState,
@@ -51,6 +53,7 @@ from adoc.intake.coverage import (
 from adoc.intake.facts import (
     INTAKE_FACTS_RELPATH,
     SECTION_KEYS,
+    AppliedResult,
     IntakeError,
     IntakeFactOp,
     IntakeFactsStore,
@@ -62,7 +65,9 @@ from adoc.labs.db import LabsDb
 from adoc.reason.client import LlmClient, LlmError, Message
 from adoc.reason.safety import red_flag_screen, treatment_gate
 
-INTAKE_AGENT_PROMPT_VERSION = "2"
+logger = logging.getLogger(__name__)
+
+INTAKE_AGENT_PROMPT_VERSION = "3"
 INTAKE_TRANSCRIPT_RELPATH = "case/intake-transcript.jsonl"
 
 DOC_DIGEST_MAX_LINES = 60
@@ -199,6 +204,17 @@ test that plausibly matches one of these (similar date, similar description), sa
 explicitly and ask them to confirm or distinguish it -- e.g. "I have a record of an ER
 note dated 2024-03-02 -- is that this visit, or a different one?" Use their answer to
 either note the match in the fact's `statement` or keep the two as distinct events.
+
+FACT CORROBORATION (system-computed -- read-only to you):
+Each active fact listed below carries a `corroboration` status computed by deterministic code
+from documents/labs/encounters already on file -- you never set this yourself, and it has
+nothing to do with anything you say. When a fact you are currently discussing is marked
+`corroboration: contradicted`, raise the discrepancy conversationally EXACTLY ONCE, in plain
+language ("the record shows X -- can you help me reconcile that?"), then record whatever the
+patient says in reply with an `update_fact` op and a substantive note. Never argue with the
+patient about it, never raise the same contradiction a second time once it's been asked about,
+and never say the words "corroboration," "contradicted," or any other internal label out loud --
+describe the actual discrepancy instead.
 
 CORRECTIONS, AT ANY TIME:
 The patient may correct or add to ANY previously recorded fact at any point, including
@@ -444,6 +460,9 @@ def _render_active_facts(facts_store: IntakeFactsStore) -> str:
         lines.append(f"    precision: {fact.precision}")
         lines.append(f"    attribution: {fact.attribution}")
         lines.append(f"    clarification_status: {fact.clarification_status}")
+        lines.append(f"    corroboration: {fact.corroboration}")
+        if fact.corroboration == "contradicted" and fact.corroboration_note:
+            lines.append(f"    corroboration_note: {fact.corroboration_note!r}")
         if fact.fields:
             fields_str = ", ".join(f"{k}: {v}" for k, v in fact.fields.items())
             lines.append(f"    fields: {{{fields_str}}}")
@@ -591,6 +610,14 @@ def run_intake_turn(client: LlmClient, repo: DataRepo, db: LabsDb, text: str) ->
         else IntakeOutcome(kind="withheld", text=_WITHHELD_MESSAGE)
     )
 
+    # Corroboration sweep (deterministic, no LLM call): re-check every fact
+    # this turn added or updated against already-ingested documentation.
+    # Skipped on a pure-retract turn (nothing new to corroborate) —
+    # `docs/adr/0013-fact-corroboration.md`.
+    if applied.added or applied.updated:
+        corroboration_updates = corroborate_facts(facts_store.facts, db, repo)
+        facts_store.apply_corroboration(corroboration_updates, at=now)
+
     # Persist only on full success (IntakeError/LlmError above already
     # returned before any of this — nothing is written for those turns).
     facts_store.save()
@@ -606,3 +633,139 @@ def run_intake_turn(client: LlmClient, repo: DataRepo, db: LabsDb, text: str) ->
     repo.commit("feat(intake): conversational turn", paths=paths)
 
     return outcome
+
+
+# --------------------------------------------------------------------------
+# Interval history: silent post-intake visit capture
+# (docs/adr/0013-fact-corroboration.md, "visits grow the record")
+# --------------------------------------------------------------------------
+
+VISIT_CAPTURE_PROMPT_VERSION = "1"
+
+_VISIT_CAPTURE_SYSTEM_PROMPT = f"""[visit-capture-v{VISIT_CAPTURE_PROMPT_VERSION}]
+You are a silent background process for a-doc, a single-patient longitudinal medical case-file
+tool. The patient is in an ORDINARY follow-up chat turn -- their initial visit is already
+complete, and a separate diagnostic assistant is handling (or has already handled) this message
+conversationally. Your only job is to notice whether this one message contains genuinely NEW or
+CHANGED patient-reported information worth adding to the permanent case file: a new or worsening
+symptom, a new medical event, a medication or supplement change, a new diagnosis or suspicion
+reported from an outside doctor, a new allergy, a new family-history detail, and so on.
+
+You never reply to the patient -- there is no `message` field in your output, and nothing you
+produce is ever shown to them. Emitting NO ops at all is the correct, expected result for MOST
+turns: a question, small talk, a request for information, or discussion of an already-recorded
+symptom with no new detail all deserve zero ops. Over-capturing -- recording something already on
+file, or promoting routine conversation into a spurious "new" fact -- is worse than
+under-capturing. When in doubt, emit nothing.
+
+When you do emit ops, use the exact same `add_fact`/`update_fact`/`retract_fact` shapes, internal
+topic keys, `kind` values, and `fields` conventions the initial-visit engine uses (basics,
+symptoms, events, prior_diagnoses, family_history, medications, supplements, allergies,
+care_team, document_drop). Check the active facts already on file below before adding anything --
+if this message updates something already recorded, emit `update_fact` (never a duplicate
+`add_fact`) with a substantive note. Never diagnose, never give treatment or dosing advice, and
+never invent or embellish a detail the patient did not actually state.
+
+Respond only with the structured result (`ops`) -- never free text, never anything addressed to
+the patient.
+"""
+
+
+class VisitCaptureResult(BaseModel):
+    """What the `intake_agent` model returns for one silent visit-capture
+    pass. No `message` field: this pass is silent, the patient never sees
+    it (see module docstring)."""
+
+    ops: list[IntakeFactOp] = Field(default_factory=list)
+
+
+class CaptureResult(BaseModel):
+    """What `run_visit_capture` did for one post-intake chat turn."""
+
+    applied: AppliedResult = Field(default_factory=AppliedResult)
+    error: str | None = None
+
+
+def _build_capture_context(db: LabsDb, repo: DataRepo, facts_store: IntakeFactsStore) -> str:
+    return (
+        f"## Active facts on file\n\n{_render_active_facts(facts_store)}\n\n"
+        f"## Documents & encounters already on file\n\n{build_doc_digest(db, repo)}\n"
+    )
+
+
+def run_visit_capture(client: LlmClient, repo: DataRepo, db: LabsDb, text: str) -> CaptureResult:
+    """A silent, best-effort capture pass run after an ordinary (post-intake)
+    chat turn completes successfully — the "weekly visit" reality: patient
+    statements keep accumulating structured facts on every visit, not just
+    during onboarding. Uses the `intake_agent` model role with its own,
+    dedicated, silent prompt (never the initial-visit conversation prompt —
+    this pass never talks to the patient). Applies any resulting ops, the
+    same corroboration sweep as an intake turn, and the same
+    already-covered-topic artifact regeneration — exactly like
+    `run_intake_turn`, just with `dag_node="visit-capture"` in the stamped
+    provenance and no reply/coverage/wrap-up handling (there is nothing left
+    to onboard).
+
+    Deliberately fails soft: an `LlmError` from the client call, or an
+    `IntakeError` applying the model's ops, is caught, logged, and reported
+    back via `CaptureResult.error` — it must NEVER raise and break the
+    calling chat turn, whose diagnostic/informational reply has already
+    succeeded by the time this runs (`web.routes.chat`). Persists (and
+    commits) only when at least one op actually changed the store — the
+    common case (a turn with nothing new to capture) touches disk not at
+    all.
+    """
+    facts_store = IntakeFactsStore(repo.root)
+    user_content = (
+        f"{_build_capture_context(db, repo, facts_store)}\n\n## Patient message\n\n{text}\n"
+    )
+
+    try:
+        result = client.complete(
+            "intake_agent",
+            system=_VISIT_CAPTURE_SYSTEM_PROMPT,
+            messages=[Message(role="user", content=user_content)],
+            schema=VisitCaptureResult,
+        )
+    except LlmError as exc:
+        logger.warning("visit-capture: LLM call failed, skipping this turn's capture: %s", exc)
+        return CaptureResult(error=str(exc))
+
+    turn = result.parsed
+    assert isinstance(turn, VisitCaptureResult)
+    if not turn.ops:
+        return CaptureResult()
+
+    now = datetime.now(UTC)
+    provenance = Provenance(
+        app_version=__version__,
+        prompt_template_version=VISIT_CAPTURE_PROMPT_VERSION,
+        model_id=result.model_id,
+        dag_node="visit-capture",
+        timestamp=now,
+    )
+
+    try:
+        applied = facts_store.apply_ops(turn.ops, provenance)
+    except IntakeError as exc:
+        logger.warning("visit-capture: ops failed to apply, skipping this turn's capture: %s", exc)
+        return CaptureResult(error=str(exc))
+
+    coverage = load_coverage_state(repo.root / INTAKE_STATE_RELPATH)
+    touched_ids = [*applied.added, *applied.updated, *applied.retracted]
+    touched_topics = {
+        fact.section for fact_id in touched_ids if (fact := facts_store.get(fact_id)) is not None
+    }
+    artifacts: list[str] = []
+    for topic_key in touched_topics:
+        if _is_covered(coverage, topic_key):
+            artifacts.extend(_write_section_from_facts(repo, facts_store, topic_key))
+
+    corroboration_updates = corroborate_facts(facts_store.facts, db, repo)
+    facts_store.apply_corroboration(corroboration_updates, at=now)
+
+    facts_store.save()
+    paths = [INTAKE_FACTS_RELPATH, *sorted(set(artifacts))]
+    repo.commit("feat(intake): visit-capture pass", paths=paths)
+
+    return CaptureResult(applied=applied)

@@ -8,10 +8,13 @@ pattern as `test_intake_wizard.py`.
 from __future__ import annotations
 
 import json
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
+import pytest
+
+import adoc.intake.agent as agent_module
 from adoc.casefile.repo import DataRepo
 from adoc.config import ModelBinding
 from adoc.ingest.genomics import GENOMIC_DOC_TYPE
@@ -692,3 +695,101 @@ def test_doc_digest_handles_no_documents_or_labs(tmp_path: Path) -> None:
 
     assert "none yet" in digest
     assert "no lab results recorded yet" in digest
+
+
+# --- corroboration sweep runs automatically at the end of a turn -----------------------
+# (docs/adr/0013-fact-corroboration.md)
+
+
+def test_turn_that_adds_a_fact_runs_the_corroboration_sweep(tmp_path: Path) -> None:
+    """A future-year diagnosis is a hard conflict `intake.corroborate` can
+    detect on its own terms -- the turn that adds it should come out
+    already `contradicted`, with a FactRevision recording the change and
+    `provenance` left exactly as the turn itself stamped it (corroboration
+    never re-stamps provenance)."""
+    repo = DataRepo.init_at(tmp_path / "data")
+    db = LabsDb(":memory:")
+
+    client, _t = _make_client(
+        [
+            _turn(
+                "Got it.",
+                [
+                    {
+                        "op": "add_fact",
+                        "fact": {
+                            "id": "future-dx",
+                            "section": "prior_diagnoses",
+                            "kind": "diagnosis",
+                            "statement": "A doctor diagnosed lupus in 2099.",
+                            "attribution": "doctor_diagnosed",
+                            "fields": {"year": 2099, "by_whom": "Dr. Lee"},
+                        },
+                    }
+                ],
+            )
+        ]
+    )
+
+    run_intake_turn(client, repo, db, "A doctor diagnosed me with lupus in 2099.")
+
+    store = IntakeFactsStore(repo.root)
+    fact = store.get("future-dx")
+    assert fact is not None
+    assert fact.corroboration == "contradicted"
+    assert fact.corroboration_note is not None
+    assert "future" in fact.corroboration_note
+    assert fact.provenance.model_id == "claude-opus-5"  # untouched by corroboration
+    assert len(fact.history) == 1
+    assert "corroboration" in fact.history[0].change
+
+
+def test_turn_with_no_ops_never_runs_the_corroboration_sweep(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pure discussion turn (no add/update ops) skips the sweep entirely
+    -- nothing to re-check, and no wasted work."""
+
+    def _exploding_corroborate_facts(*_args: object, **_kwargs: object) -> list[object]:
+        raise AssertionError("corroborate_facts must not run for a no-op turn")
+
+    monkeypatch.setattr(agent_module, "corroborate_facts", _exploding_corroborate_facts)
+
+    repo = DataRepo.init_at(tmp_path / "data")
+    db = LabsDb(":memory:")
+    client, _t = _make_client([_turn("Just chatting, nothing new to record.")])
+
+    outcome = run_intake_turn(client, repo, db, "Just saying hi.")
+
+    assert outcome.kind == "reply"
+
+
+def test_new_fact_gets_reported_on_stamped_to_todays_date(tmp_path: Path) -> None:
+    repo = DataRepo.init_at(tmp_path / "data")
+    db = LabsDb(":memory:")
+    client, _t = _make_client(
+        [
+            _turn(
+                "Noted.",
+                [
+                    {
+                        "op": "add_fact",
+                        "fact": {
+                            "id": "basic-age",
+                            "section": "basics",
+                            "kind": "basic",
+                            "statement": "Patient is 41.",
+                            "fields": {"age": 41},
+                        },
+                    }
+                ],
+            )
+        ]
+    )
+
+    run_intake_turn(client, repo, db, "I'm 41.")
+
+    store = IntakeFactsStore(repo.root)
+    fact = store.get("basic-age")
+    assert fact is not None
+    assert fact.reported_on == datetime.now(UTC).date()

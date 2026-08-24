@@ -112,16 +112,29 @@ def make_challenger_transport(
     return transport
 
 
+def default_visit_capture_transport(request: TransportRequest) -> TransportResponse:
+    """Default `VisitCaptureResult` transport: empty ops, so a test that
+    doesn't care about interval-history capture (most chat tests) never has
+    to script one — every post-intake successful turn now also triggers
+    `intake.agent.run_visit_capture` (`docs/adr/0013-fact-corroboration.md`),
+    and this keeps that pass a silent no-op by default."""
+    return TransportResponse(text="", tool_input={"ops": []}, input_tokens=1, output_tokens=1)
+
+
 def build_fake_client(
     primary_transport: Transport,
     challenger_transport: Transport,
     *,
     intake_agent_transport: Transport | None = None,
+    visit_capture_transport: Transport | None = None,
 ) -> LlmClient:
     """`primary_reasoner`/`classifier` -> anthropic; `challenger` -> openai —
     same role/provider layout as `tests/test_stages.py`. `intake_agent`
     also binds to the anthropic provider, defaulting to `primary_transport`
-    so any test not exercising onboarding never has to think about it."""
+    so any test not exercising onboarding never has to think about it;
+    `visit_capture_transport` defaults to `default_visit_capture_transport`
+    (empty ops) so a test not exercising interval-history capture never has
+    to think about it either."""
     bindings: dict[str, list[ModelBinding]] = {
         "primary_reasoner": [ModelBinding(provider="anthropic", model="fake-primary")],
         "challenger": [ModelBinding(provider="openai", model="fake-challenger")],
@@ -132,7 +145,9 @@ def build_fake_client(
         "anthropic": AnthropicProvider(
             api_key=None,
             transport=_dispatching_anthropic_transport(
-                primary_transport, intake_agent_transport or primary_transport
+                primary_transport,
+                intake_agent_transport or primary_transport,
+                visit_capture_transport or default_visit_capture_transport,
             ),
         ),
         "openai": OpenAIProvider(api_key=None, transport=challenger_transport),
@@ -141,17 +156,24 @@ def build_fake_client(
 
 
 def _dispatching_anthropic_transport(
-    primary_transport: Transport, intake_agent_transport: Transport
+    primary_transport: Transport,
+    intake_agent_transport: Transport,
+    visit_capture_transport: Transport,
 ) -> Transport:
-    """`primary_reasoner`/`classifier` and `intake_agent` share the
-    anthropic provider slot in this test double; dispatch by schema name
-    (`IntakeTurnResult`) so onboarding tests can inject their own transport
-    independently of whatever `primary_transport` a given test already set
-    up for chat/ledger schemas."""
+    """`primary_reasoner`/`classifier`, `intake_agent`, and the interval-
+    history visit-capture pass all share the anthropic provider slot in this
+    test double; dispatch by schema name (`IntakeTurnResult`/
+    `VisitCaptureResult`) so onboarding/capture tests can inject their own
+    transport independently of whatever `primary_transport` a given test
+    already set up for chat/ledger schemas."""
 
     def transport(request: TransportRequest) -> TransportResponse:
-        if request.schema is not None and request.schema.__name__ == "IntakeTurnResult":
-            return intake_agent_transport(request)
+        if request.schema is not None:
+            name = request.schema.__name__
+            if name == "IntakeTurnResult":
+                return intake_agent_transport(request)
+            if name == "VisitCaptureResult":
+                return visit_capture_transport(request)
         return primary_transport(request)
 
     return transport
@@ -167,6 +189,7 @@ def build_app(
     primary_transport: Transport | None = None,
     challenger_transport: Transport | None = None,
     intake_agent_transport: Transport | None = None,
+    visit_capture_transport: Transport | None = None,
     vision: VisionClient | None = None,
     renderer: PageRenderer | None = None,
 ) -> tuple[FastAPI, DataRepo, LabsDb, list[TransportRequest]]:
@@ -178,7 +201,12 @@ def build_app(
     calls: list[TransportRequest] = []
     primary = primary_transport or exploding_transport(calls)
     challenger = challenger_transport or exploding_transport(calls)
-    client = build_fake_client(primary, challenger, intake_agent_transport=intake_agent_transport)
+    client = build_fake_client(
+        primary,
+        challenger,
+        intake_agent_transport=intake_agent_transport,
+        visit_capture_transport=visit_capture_transport,
+    )
 
     data_dir = tmp_path / "data"
     repo = DataRepo.init_at(data_dir)

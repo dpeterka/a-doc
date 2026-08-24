@@ -50,6 +50,8 @@ from adoc.ingest.archive import PageRenderer, pdftoppm_renderer
 from adoc.ingest.pipeline import IngestReport, ingest_directory, ingest_inbox
 from adoc.ingest.vision import VisionClient
 from adoc.intake.cli import run_conversational_onboarding_session, run_onboarding_session
+from adoc.intake.corroborate import corroborate_facts
+from adoc.intake.facts import INTAKE_FACTS_RELPATH, IntakeFactsStore
 from adoc.intake.wizard import IntakeWizard
 from adoc.labs.db import LabsDb
 from adoc.labs.recanonicalize import recanonicalize_rows
@@ -608,6 +610,65 @@ def _cmd_labs_recanonicalize(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_intake_corroborate(args: argparse.Namespace) -> int:
+    """Deterministic maintenance pass (`intake/corroborate.py`; NO LLM
+    calls): sweep every active `IntakeFact` and recompute its
+    `corroboration` state against currently-ingested documents/labs/
+    encounters (`docs/adr/0013-fact-corroboration.md`) — the same sweep
+    `intake.agent.run_intake_turn`/`run_visit_capture` already run
+    automatically after a turn that adds or changes facts, exposed here so
+    corroboration can also be refreshed on demand (e.g. after a backfill
+    added a batch of historical documents, mirroring the `labs-*`
+    maintenance command pattern). `--dry-run` computes and reports the same
+    counts without mutating anything - no store mutation, no export, no
+    commit.
+    """
+    try:
+        settings = Settings()
+    except Exception as exc:  # noqa: BLE001 - surface any config error to the user
+        print(f"intake-corroborate: configuration error: {exc}", file=sys.stderr)
+        return 1
+
+    repo = DataRepo(settings.data_dir)
+    if not repo.is_initialized:
+        print(
+            f"intake-corroborate: data repo not initialized at {settings.data_dir} "
+            "- run `adoc init` first",
+            file=sys.stderr,
+        )
+        return 1
+
+    db_path = settings.data_dir / "labs.sqlite"
+    with LabsDb(db_path, journal_mode=settings.sqlite_journal_mode) as db:
+        store = IntakeFactsStore(repo.root)
+        updates = corroborate_facts(store.facts, db, repo)
+        counts: dict[str, int] = {}
+        for update in updates:
+            counts[update.corroboration] = counts.get(update.corroboration, 0) + 1
+
+        if args.dry_run:
+            print(f"intake-corroborate: dry-run - checked {len(store.facts)} fact(s)")
+            print(f"intake-corroborate: dry-run - would update {len(updates)} fact(s)")
+            for state, count in sorted(counts.items()):
+                print(f"  - {state}: {count}")
+            return 0
+
+        touched = store.apply_corroboration(updates, at=datetime.now(UTC))
+        if touched:
+            store.save()
+            breakdown = ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
+            repo.commit(
+                f"intake: recorded corroboration updates for {len(touched)} fact(s) ({breakdown})",
+                paths=[INTAKE_FACTS_RELPATH],
+            )
+
+    print(f"intake-corroborate: checked {len(store.facts)} fact(s)")
+    print(f"intake-corroborate: updated {len(touched)} fact(s)")
+    for state, count in sorted(counts.items()):
+        print(f"  - {state}: {count}")
+    return 0
+
+
 def _cmd_review(_args: argparse.Namespace) -> int:
     try:
         settings = Settings()
@@ -805,6 +866,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="report what the sweep would do without mutating anything",
     )
     labs_recanonicalize_parser.set_defaults(func=_cmd_labs_recanonicalize)
+    intake_corroborate_parser = subparsers.add_parser(
+        "intake-corroborate",
+        help=(
+            "sweep active intake facts and recompute their corroboration state against "
+            "currently-ingested documents/labs/encounters (no LLM calls)"
+        ),
+    )
+    intake_corroborate_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="report what the sweep would do without mutating anything",
+    )
+    intake_corroborate_parser.set_defaults(func=_cmd_intake_corroborate)
     subparsers.add_parser(
         "backup",
         help="git-bundle the data repo and upload it (+ sources/, labs-export.jsonl) to S3",

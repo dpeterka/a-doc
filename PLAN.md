@@ -67,6 +67,8 @@ The `intake_agent` model role (`models.yaml`, same model as `primary_reasoner`) 
 
 Mechanics: fully resumable (coverage state in the data repo); every turn = one git commit. Until intake is complete, diagnostic answers carry a visible "baseline incomplete — these leads may shift" banner (home screen), and every chat turn routes through the intake engine rather than the diagnostic pipeline. Correctable any time afterward through the same one chat surface ("update my medications").
 
+**The record keeps growing after the initial visit, and is checked against what's already on file (ADR 0013).** The initial visit is not the only place structured facts get captured — a real patient sees doctors repeatedly, so every post-intake chat turn that completes successfully (not a red-flag/urgent, withheld, or error turn) also runs a silent `intake.agent.run_visit_capture` pass: a second, dedicated `intake_agent`-role call that emits fact ops only for genuinely new or changed patient-reported information, with no reply of its own (the patient never sees this pass; a bad/failed call is caught and swallowed, never breaking the chat turn whose real reply already succeeded). Every `IntakeFact` — from the initial visit or a later capture — also carries `reported_on` (the date it was created/last touched) and a deterministic `corroboration` state (`intake/corroborate.py`, no LLM): checked against already-ingested document dates, encounter files, and lab rows on the same turn that adds/changes it, and re-sweepable on demand via `adoc intake-corroborate`. Corroboration is conservative by design — absence of a match is `"unverified"`, never `"contradicted"`; `"contradicted"` is reserved for a fact whose stated timing is flatly impossible (e.g. a diagnosis year in the future). The Intake record page shows each fact's corroboration badge and a "Since last visit" strip of recently-reported facts; the `intake_agent` prompt is told a fact's corroboration status and raises a contradiction with the patient conversationally, once, rather than silently overwriting or ignoring it.
+
 **Steady state UX**: home screen = current three-tier differential + "what changed since you last looked" + open questions for the next appointment; chat for anything; upload/confirm queue when documents arrive; trend charts per analyte; weekly review readable as a report. Everything phrased as leads and preparation for doctors, with source links back to the patient's own documents.
 
 ## Engineering practice (this is a GitHub software project)
@@ -105,7 +107,8 @@ docs/adr/                 # architecture decision records
 src/adoc/
   config.py cli.py        # pydantic-settings; `adoc <init|onboard|ingest|review|serve|backfill|eval|user|
                           #   backup|restore|bootstrap-data|labs-infer-specimen|labs-dedupe-twins|
-                          #   labs-reclassify>` (14 subcommands; `user` has add/list/remove)
+                          #   labs-reclassify|labs-recanonicalize|intake-corroborate>` (16 subcommands;
+                          #   `user` has add/list/remove)
   privacy.py              # identifier scrub hook applied in the API client wrapper
   backup.py               # `adoc backup`/`adoc restore`/`bootstrap-data`: git-bundle + labs-export.jsonl +
                           #   sources/ <-> S3 (see ADR 0009)
@@ -121,19 +124,24 @@ src/adoc/
                           #   (non-LLM genomic archive + `case/genomics-inventory.md`), schema.py (extraction
                           #   Pydantic models), failures.py (inbox failure log + `/failed` page);
                           #   apple_health.py planned for phase 4 (FHIR zip importer)
-  intake/                 # onboarding (ADR 0011 fact model/gates, ADR 0012 conversation shape):
-                          #   facts.py (IntakeFact store + typed ops + deterministic
-                          #   section_completion_blockers gates), coverage.py (per-topic coverage map +
+  intake/                 # onboarding (ADR 0011 fact model/gates, ADR 0012 conversation shape) + fact
+                          #   corroboration/interval history (ADR 0013): facts.py (IntakeFact store +
+                          #   typed ops + deterministic section_completion_blockers gates +
+                          #   corroboration/corroboration_source/corroboration_note/reported_on fields +
+                          #   apply_corroboration), corroborate.py (`corroborate_facts` — deterministic
+                          #   period/series corroboration against ingested documents/labs/encounters, no
+                          #   LLM; `adoc intake-corroborate`), coverage.py (per-topic coverage map +
                           #   monotonic intake_complete flag, replacing the cursor/per-section status
                           #   machine; migrates an old-style state file on read), agent.py (the initial-visit
                           #   engine: intake_agent model call, topics_covered/intake_complete gating,
                           #   INTAKE_OPENER_MESSAGE constant, doc-digest cross-referencing, own audit
-                          #   transcript), convert.py (facts_to_section_data — maps facts onto the wizard's
-                          #   section schemas), sections.py (schemas — internal topic registry, never
-                          #   patient-facing), wizard.py (legacy state machine: playback confirm loop,
-                          #   document-drop auto-skip on seeded deployments, section writers every onboarding
-                          #   path shares via `write_section`), cli.py (conversational REPL default +
-                          #   `--legacy-wizard` escape hatch)
+                          #   transcript; plus `run_visit_capture` — a silent post-intake pass that grows
+                          #   the record on ordinary chat turns), convert.py (facts_to_section_data — maps
+                          #   facts onto the wizard's section schemas), sections.py (schemas — internal
+                          #   topic registry, never patient-facing), wizard.py (legacy state machine:
+                          #   playback confirm loop, document-drop auto-skip on seeded deployments, section
+                          #   writers every onboarding path shares via `write_section`), cli.py
+                          #   (conversational REPL default + `--legacy-wizard` escape hatch)
   reason/                 # client.py (provider adapter: scrub+audit+bindings), dag.py (typed DAG runner +
                           #   node contracts), context.py (deterministic context packs), stages.py,
                           #   tools.py, safety.py, review.py (weekly-review DAG), prompts.py (versioned
@@ -202,7 +210,7 @@ Estimated spend: $1–3/document ingest, $0.20–1/diagnostic turn, $8–20/deep
 
 **Phase 2 — Grounding & anti-hallucination hardening (~30–45 h, dedicated):** contracts and verification that make fabrication structurally difficult, layered on the Phase-1 pipeline:
 - **Deterministic citation checker**: every evidence claim's source ref (grammar above) is resolved by code — `labs:` refs must match an actual row (value quoted in the claim must equal the stored value exactly), `doc:`/`encounter:` refs must resolve to the file/page, `pmid:` refs must exist via E-utilities. Unresolvable or mismatched refs reject the ledger diff (DAG contract), not just warn.
-- **Claim-level entailment verifier node**: a separate cross-family model receives (claim, cited source text) pairs and must judge entailment; non-entailed claims bounce the diff back to the Ledger-Maintainer with the verifier's objection. Composer output gets the same pass on quantitative statements ("your CRP doubled") against `labs.sqlite`.
+- **Claim-level entailment verifier node**: a separate cross-family model receives (claim, cited source text) pairs and must judge entailment; non-entailed claims bounce the diff back to the Ledger-Maintainer with the verifier's objection. Composer output gets the same pass on quantitative statements ("your CRP doubled") against `labs.sqlite`. Same node also verifies patient-reported intake facts against document TEXT (entailment), upgrading `intake/corroborate.py`'s Phase-1 deterministic period/series corroboration (ADR 0013) — metadata-only date/series matching — to genuine content-corroboration ("this document actually says X," not just "a document exists from around then").
 - **Abstention calibration**: prompts + contracts require "insufficient evidence" as a first-class output; eval probes measure whether the system says so when the case file genuinely lacks support.
 - **Hallucination eval suite** added to `adoc eval` and CI: planted-fact probes (does a fabricated lab value survive to output?), fabricated-citation detection rate, entailment-verifier precision/recall on a labeled fixture set, abstention rate on unanswerable probes.
 *Acceptance:* zero unresolvable source refs can reach the committed ledger (enforced + tested); planted-fact and fabricated-citation probes pass at 100% in CI; every quantitative claim in patient-facing output is machine-checked against the labs DB.
