@@ -22,6 +22,8 @@ place `boto3` is imported.
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -205,7 +207,13 @@ def _list_source_keys(s3: S3Client, bucket: str) -> list[str]:
     keys: list[str] = []
     token: str | None = None
     while True:
-        response = s3.list_objects_v2(Bucket=bucket, Prefix=SOURCES_PREFIX, ContinuationToken=token)
+        # boto3 rejects ContinuationToken=None (the parameter must be
+        # OMITTED on the first call) - found by the first real restore;
+        # the test fake must mirror this rejection.
+        kwargs: dict[str, str] = {"Bucket": bucket, "Prefix": SOURCES_PREFIX}
+        if token is not None:
+            kwargs["ContinuationToken"] = token
+        response = s3.list_objects_v2(**kwargs)
         keys.extend(obj["Key"] for obj in response.get("Contents", []))
         if not response.get("IsTruncated"):
             return keys
@@ -343,29 +351,46 @@ def restore_from_bucket(
         raise NoBackupError(f"no backup found at s3://{bucket}/{BUNDLE_KEY} - nothing to restore")
 
     warnings: list[str] = []
-    with tempfile.TemporaryDirectory(prefix="adoc-restore-") as scratch:
-        scratch_dir = Path(scratch)
-        bundle_path = scratch_dir / "a-doc-data.bundle"
-        s3.download_file(Bucket=bucket, Key=BUNDLE_KEY, Filename=str(bundle_path))
+    # Stage the entire restore in a sibling directory and move it into
+    # place only once EVERYTHING succeeded - a partial restore must never
+    # occupy data_dir, or the next boot's is-empty check would skip
+    # bootstrap and serve a half-restored case file (found by the first
+    # real restore, which failed mid-way and left a bare clone behind).
+    staging_dir = data_dir.parent / (data_dir.name + ".restore-staging")
+    if staging_dir.exists():
+        shutil.rmtree(staging_dir)
+    try:
+        with tempfile.TemporaryDirectory(prefix="adoc-restore-") as scratch:
+            scratch_dir = Path(scratch)
+            bundle_path = scratch_dir / "a-doc-data.bundle"
+            s3.download_file(Bucket=bucket, Key=BUNDLE_KEY, Filename=str(bundle_path))
 
-        repo = _clone_bundle(bundle_path, data_dir)
-        bundle_commit_sha = repo.head.commit.hexsha
+            repo = _clone_bundle(bundle_path, staging_dir)
+            bundle_commit_sha = repo.head.commit.hexsha
 
-        sources_restored = _restore_sources(s3, bucket, data_dir)
-        jsonl_path = _restore_jsonl(s3, bucket, data_dir, scratch_dir, warnings)
+            sources_restored = _restore_sources(s3, bucket, staging_dir)
+            jsonl_path = _restore_jsonl(s3, bucket, staging_dir, scratch_dir, warnings)
 
-    for relpath in _OPERATIONAL_DIRS:
-        (data_dir / relpath).mkdir(parents=True, exist_ok=True)
+        for relpath in _OPERATIONAL_DIRS:
+            (staging_dir / relpath).mkdir(parents=True, exist_ok=True)
 
-    lab_rows_rebuilt = 0
-    if jsonl_path is not None:
-        with LabsDb(data_dir / "labs.sqlite", journal_mode=sqlite_journal_mode) as db:
-            db.rebuild_from_jsonl(jsonl_path)
-            lab_rows_rebuilt = _count_lab_rows(jsonl_path)
-    else:
-        warnings.append(
-            "no labs-export.jsonl found in the bundle or the S3 backup; labs.sqlite was not rebuilt"
-        )
+        lab_rows_rebuilt = 0
+        if jsonl_path is not None:
+            with LabsDb(staging_dir / "labs.sqlite", journal_mode=sqlite_journal_mode) as db:
+                db.rebuild_from_jsonl(jsonl_path)
+                lab_rows_rebuilt = _count_lab_rows(jsonl_path)
+        else:
+            warnings.append(
+                "no labs-export.jsonl found in the bundle or the S3 backup; "
+                "labs.sqlite was not rebuilt"
+            )
+
+        if data_dir.exists() and not any(data_dir.iterdir()):
+            data_dir.rmdir()  # an empty mount-point dir; os.rename needs it gone
+        os.rename(staging_dir, data_dir)
+    except BaseException:
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        raise
 
     return RestoreReport(
         bucket=bucket,

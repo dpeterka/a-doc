@@ -26,6 +26,8 @@ from adoc.casefile.repo import DataRepo
 from adoc.labs.db import LabsDb
 from adoc.labs.models import LabDocument, LabResult
 
+_OMITTED: Any = object()  # sentinel: parameter not passed at all
+
 
 class FakeS3Client:
     """Records uploads/downloads; `list_objects_v2` reflects what has been
@@ -56,8 +58,18 @@ class FakeS3Client:
         Path(Filename).write_bytes(self._contents[Key])
 
     def list_objects_v2(
-        self, Bucket: str, Prefix: str, ContinuationToken: str | None = None
+        self, Bucket: str, Prefix: str, ContinuationToken: str | None = _OMITTED
     ) -> dict[str, Any]:
+        # Mirror real boto3: passing ContinuationToken=None explicitly is a
+        # ParamValidationError - callers must OMIT it on the first page
+        # (found by the first real restore against live S3).
+        if ContinuationToken is None:
+            raise ValueError(
+                "Parameter validation failed: Invalid type for parameter "
+                "ContinuationToken, value: None"
+            )
+        if ContinuationToken is _OMITTED:
+            ContinuationToken = None
         matching = sorted(key for key in self._contents if key.startswith(Prefix))
         if self._page_size is None:
             page = matching
@@ -354,3 +366,30 @@ def test_restore_skips_an_s3_directory_marker_key(tmp_path: Path) -> None:
     report = restore_from_bucket("bucket", dst, s3_client=s3)
 
     assert report.sources_restored == 3  # the placeholder key itself is not counted
+
+
+def test_failed_restore_leaves_data_dir_absent(tmp_path: Path) -> None:
+    """A partial restore must never occupy data_dir (real incident: a
+    mid-restore failure left a bare clone that the next boot's is-empty
+    check then skipped, serving a half-restored case file)."""
+    src_dir = tmp_path / "source-repo"
+    DataRepo.init_at(src_dir)
+    _seed_with_labs(src_dir)
+    s3 = FakeS3Client()
+    run_backup(src_dir, "bkt", s3)
+
+    real_download = s3.download_file
+
+    def _boom(Bucket: str, Key: str, Filename: str) -> None:
+        if "sources/" in Key:
+            raise RuntimeError("network died mid-sources")
+        return real_download(Bucket=Bucket, Key=Key, Filename=Filename)
+
+    s3.download_file = _boom  # type: ignore[method-assign]
+    dest = tmp_path / "restored"
+
+    with pytest.raises(RuntimeError, match="mid-sources"):
+        restore_from_bucket("bkt", dest, s3_client=s3)
+
+    assert not dest.exists()
+    assert not (tmp_path / "restored.restore-staging").exists()
