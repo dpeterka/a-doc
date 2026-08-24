@@ -52,6 +52,7 @@ from adoc.ingest.vision import VisionClient
 from adoc.intake.cli import run_onboarding_session
 from adoc.intake.wizard import IntakeWizard
 from adoc.labs.db import LabsDb
+from adoc.labs.recanonicalize import recanonicalize_rows
 from adoc.labs.reclassify import reclassify_pending
 from adoc.labs.specimen import infer_unknown_specimens
 from adoc.labs.twins import sweep_twins, write_sweep_summary
@@ -532,6 +533,63 @@ def _cmd_labs_reclassify(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_labs_recanonicalize(args: argparse.Namespace) -> int:
+    """Deterministic maintenance pass (`labs/recanonicalize.py`; NO LLM
+    calls): re-run `labs.validate.canonicalize` against every non-rejected
+    row's current spec table (`ANALYTE_SPECS` has grown well past what
+    existed when many rows were first ingested) and update `name` wherever
+    it now resolves differently - renaming outright, merging an exact-
+    reading duplicate, or queuing a differing-reading collision for human
+    review. `--dry-run` computes and reports the same counts without
+    mutating anything - no renames, no rejects, no export, no commit.
+    """
+    try:
+        settings = Settings()
+    except Exception as exc:  # noqa: BLE001 - surface any config error to the user
+        print(f"labs-recanonicalize: configuration error: {exc}", file=sys.stderr)
+        return 1
+
+    repo = DataRepo(settings.data_dir)
+    if not repo.is_initialized:
+        print(
+            f"labs-recanonicalize: data repo not initialized at {settings.data_dir} "
+            "- run `adoc init` first",
+            file=sys.stderr,
+        )
+        return 1
+
+    db_path = settings.data_dir / "labs.sqlite"
+    with LabsDb(db_path, journal_mode=settings.sqlite_journal_mode) as db:
+        report = recanonicalize_rows(db, dry_run=args.dry_run)
+
+        if args.dry_run:
+            print(f"labs-recanonicalize: dry-run - checked {report.checked} row(s)")
+            print(
+                f"labs-recanonicalize: dry-run - would rename {report.renamed}, "
+                f"merge {report.merged_duplicates} duplicate(s), "
+                f"queue {report.conflicts_queued} conflict(s), "
+                f"leave {report.untouched} untouched"
+            )
+            return 0
+
+        changed = report.renamed + report.merged_duplicates + report.conflicts_queued
+        if changed:
+            db.export_jsonl(repo.root / "labs-export.jsonl")
+            repo.commit(
+                f"labs: recanonicalized {changed} row(s) "
+                f"(renamed={report.renamed}, merged={report.merged_duplicates}, "
+                f"conflicts_queued={report.conflicts_queued})",
+                paths=["labs-export.jsonl"],
+            )
+
+    print(f"labs-recanonicalize: checked {report.checked} row(s)")
+    print(f"labs-recanonicalize: renamed {report.renamed}")
+    print(f"labs-recanonicalize: merged {report.merged_duplicates} duplicate(s)")
+    print(f"labs-recanonicalize: queued {report.conflicts_queued} conflict(s)")
+    print(f"labs-recanonicalize: left {report.untouched} untouched")
+    return 0
+
+
 def _cmd_review(_args: argparse.Namespace) -> int:
     try:
         settings = Settings()
@@ -707,6 +765,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="report what the sweep would do without mutating anything",
     )
     labs_reclassify_parser.set_defaults(func=_cmd_labs_reclassify)
+    labs_recanonicalize_parser = subparsers.add_parser(
+        "labs-recanonicalize",
+        help=(
+            "re-run canonicalize() against every non-rejected row's current spec table, "
+            "renaming/merging/queuing rows whose canonical name has changed (no LLM calls)"
+        ),
+    )
+    labs_recanonicalize_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="report what the sweep would do without mutating anything",
+    )
+    labs_recanonicalize_parser.set_defaults(func=_cmd_labs_recanonicalize)
     subparsers.add_parser(
         "backup",
         help="git-bundle the data repo and upload it (+ sources/, labs-export.jsonl) to S3",

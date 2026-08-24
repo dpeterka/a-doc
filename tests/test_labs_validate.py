@@ -394,6 +394,162 @@ def test_trend_outlier_unknown_specimen_row_compares_against_unknown_priors_only
     assert issue.code is IssueCode.TREND_OUTLIER
 
 
+# ----------------------------------------------------------------
+# lab-taxonomy layer: empty `allowed_units` means "no unit whitelist"
+# ----------------------------------------------------------------
+
+
+def test_empty_allowed_units_never_flags_unknown_unit() -> None:
+    """A curation-only spec (`allowed_units=()`, no curated unit knowledge)
+    must never manufacture a new UNKNOWN_UNIT issue - this is the
+    critical semantics the lab-taxonomy layer's many panel-only additions
+    depend on to avoid re-queuing thousands of already-accepted rows."""
+    spec = ANALYTE_SPECS["Chloride"]
+    assert spec.allowed_units == ()
+    for unit in (None, "mmol/L", "some bogus unit", "%"):
+        row = _lab(name="Chloride", value=100.0, ucum_unit=unit, ref_low=None, ref_high=None)
+        issues = validate_row(row)
+        assert not any(i.code is IssueCode.UNKNOWN_UNIT for i in issues), unit
+
+
+def test_empty_allowed_units_still_enforced_for_score_kind() -> None:
+    """`kind="score"`'s empty-`allowed_units` semantics are unchanged: a
+    score is unitless BY NATURE, so any actually-printed unit is still
+    flagged (unlike the new numeric-kind "no whitelist" meaning above)."""
+    row = _lab(name="T-score", value=-1.0, ucum_unit="mg/dL", ref_low=None, ref_high=None)
+    issues = validate_row(row)
+    assert any(i.code is IssueCode.UNKNOWN_UNIT for i in issues)
+
+
+def test_nonempty_allowed_units_still_enforced() -> None:
+    """A curated whitelist (existing specs, unchanged) still rejects an
+    unrecognized unit - only an EMPTY whitelist means "don't check"."""
+    row = _lab(name="potassium", ucum_unit="not-a-real-unit")
+    issues = validate_row(row)
+    assert any(i.code is IssueCode.UNKNOWN_UNIT for i in issues)
+
+
+# ----------------------------------------------------------------
+# lab-taxonomy layer: explicit spelling-variant merges
+# ----------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "raw",
+    ["% SATURATION", "TSAT", "transferrin saturation", "IRON SATURATION"],
+)
+def test_transferrin_saturation_variants_merge_onto_tsat(raw: str) -> None:
+    assert canonicalize(raw) == "TSAT"
+
+
+@pytest.mark.parametrize("raw", ["ACTH,PLASMA", "ACTH, Plasma", "ACTH"])
+def test_acth_variants_merge(raw: str) -> None:
+    assert canonicalize(raw) == "ACTH"
+
+
+@pytest.mark.parametrize(
+    "raw", ["ALKALINE PHOSPHATASE", "Alkaline Phosphatase", "Alkaline Phosphatase, S"]
+)
+def test_alkaline_phosphatase_variants_merge(raw: str) -> None:
+    assert canonicalize(raw) == "Alkaline Phosphatase"
+
+
+@pytest.mark.parametrize("raw", ["BILIRUBIN", "BILIRUBIN, TOTAL", "Bilirubin, Total"])
+def test_bilirubin_total_variants_merge(raw: str) -> None:
+    assert canonicalize(raw) == "Bilirubin, Total"
+
+
+@pytest.mark.parametrize("raw", ["C-PEPTIDE, LC/MS/MS", "C-Peptide, Serum", "C-Peptide"])
+def test_c_peptide_variants_merge(raw: str) -> None:
+    assert canonicalize(raw) == "C-Peptide"
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "ANTI-MULLERIAN HORMONE",
+        "ANTI-MULLERIAN HORMONE (AMH), FEMALE",
+        "Anti-Mullerian Hormone (AMH)",
+    ],
+)
+def test_amh_variants_merge(raw: str) -> None:
+    assert canonicalize(raw) == "AMH"
+
+
+@pytest.mark.parametrize(
+    "raw", ["ANA Direct", "ANA SCREEN, IFA", "ANA SCREEN, IMMUNOASSAY", "ANACHOICE SCREEN"]
+)
+def test_ana_screen_variants_merge_and_stay_separate_from_ana_titer(raw: str) -> None:
+    assert canonicalize(raw) == "ANA Screen"
+    assert canonicalize(raw) != "ANA titer"
+
+
+@pytest.mark.parametrize(
+    "raw", ["Babesia microti IgG", "BABESIA MICROTI AB (IGG)", "BABESIA MICROTI AB (IGG), SCREEN"]
+)
+def test_babesia_microti_igg_labcorp_vs_quest_spellings_merge(raw: str) -> None:
+    assert canonicalize(raw) == "Babesia microti Antibody IgG"
+
+
+@pytest.mark.parametrize("raw", ["CRP", "C-Reactive Protein", "C-Reactive Protein, Quant"])
+def test_crp_variants_merge(raw: str) -> None:
+    assert canonicalize(raw) == "CRP"
+
+
+def test_hs_crp_is_not_merged_into_crp() -> None:
+    """hs-CRP is a distinct, more-sensitive assay - never merged with
+    ordinary CRP even though the names look similar."""
+    assert canonicalize("HS CRP") == "hs-CRP"
+    assert canonicalize("HS CRP") != "CRP"
+
+
+# ----------------------------------------------------------------
+# lab-taxonomy layer: generic specimen/method suffix-strip rule
+# ----------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("Chloride, Serum", "Chloride"),
+        ("Alkaline Phosphatase, S", "Alkaline Phosphatase"),
+        ("Copper, Serum or Plasma", "Copper"),
+        ("17-OH-PROGESTERONE,LCMSMS", "17-Hydroxyprogesterone"),
+    ],
+)
+def test_suffix_strip_rule_resolves_specimen_and_method_suffixes(raw: str, expected: str) -> None:
+    assert canonicalize(raw) == expected
+
+
+def test_suffix_strip_rule_does_not_collapse_a_clinically_distinct_specimen() -> None:
+    """RBC magnesium is a different assay from serum magnesium - the
+    suffix-strip rule must never merge them (this is why "RBC" isn't in
+    the curated suffix list)."""
+    assert canonicalize("Magnesium, RBC") == "Magnesium, RBC"
+    assert canonicalize("Magnesium, Plasma") == "Magnesium"
+    assert canonicalize("Magnesium, RBC") != canonicalize("Magnesium, Plasma")
+
+
+# ----------------------------------------------------------------
+# lab-taxonomy layer: panel/derived_from metadata
+# ----------------------------------------------------------------
+
+
+def test_panel_field_is_set_for_curated_panel_members() -> None:
+    assert ANALYTE_SPECS["WBC"].panel == "CBC"
+    assert ANALYTE_SPECS["TSH"].panel == "Thyroid"
+    assert ANALYTE_SPECS["TSAT"].panel == "Iron Studies"
+
+
+def test_panel_field_defaults_to_none_for_unpanelled_analytes() -> None:
+    assert ANALYTE_SPECS["Tryptase"].panel is None
+
+
+def test_derived_from_recorded_for_tsat_and_ag_ratio() -> None:
+    assert set(ANALYTE_SPECS["TSAT"].derived_from) == {"Iron", "TIBC"}
+    assert set(ANALYTE_SPECS["A/G Ratio"].derived_from) == {"albumin", "Globulin"}
+
+
 def test_labcorp_long_form_unit_spellings_are_accepted() -> None:
     """LabCorp prints 'Million/uL'/'Thousand/uL' (real-corpus finding); these
     are the same units as M/uL / K/uL and must not queue. Comparison is

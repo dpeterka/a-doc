@@ -955,6 +955,99 @@ class LabsDb:
         ).fetchall()
         return [_row_to_lab(row) for row in rows]
 
+    def all_non_rejected_rows(self) -> list[LabResult]:
+        """Every lab row (any date/analyte) whose `extraction_status` isn't
+        `rejected`, ordered by id - the working set for `adoc
+        labs-recanonicalize` (`labs/recanonicalize.py`)."""
+        rows = self._conn.execute(
+            "SELECT * FROM labs WHERE extraction_status != ? ORDER BY id",
+            (ExtractionStatus.REJECTED.value,),
+        ).fetchall()
+        return [_row_to_lab(row) for row in rows]
+
+    def rename_for_recanonicalization(self, row_id: int, new_name: str) -> None:
+        """Set `row_id`'s `name` to `new_name` directly, without touching
+        `extraction_status` (mirrors `update_specimen` - a deterministic
+        maintenance rewrite, not a human correction) - `adoc
+        labs-recanonicalize`'s plain-rename case (no collision at the new
+        key)."""
+        self._conn.execute("UPDATE labs SET name = ? WHERE id = ?", (new_name, row_id))
+        self._conn.commit()
+
+    def reject_row_as_recanonicalization_duplicate(self, row_id: int, *, kept_id: int) -> None:
+        """Reject `row_id` (status -> REJECTED) as an exact-reading
+        duplicate of `kept_id`, discovered when both rows would
+        canonicalize to the same `(date, name, specimen, source_doc)` key
+        (`adoc labs-recanonicalize`). Same status change as `reject_row`,
+        plus an audit note merged into `row_id`'s own `raw_json` recording
+        which row survived - `row_id`'s own fields/reading are left
+        intact for audit, only `extraction_status`/`raw_json` change."""
+        row = self.get_row(row_id)
+        if row is None:
+            raise ValueError(f"reject_row_as_recanonicalization_duplicate: no such row {row_id}")
+        payload = row.raw_payload()
+        payload["recanonicalization_duplicate_of"] = kept_id
+        self._conn.execute(
+            "UPDATE labs SET extraction_status = ?, raw_json = ? WHERE id = ?",
+            (ExtractionStatus.REJECTED.value, json.dumps(payload), row_id),
+        )
+        self._conn.commit()
+
+    def flip_to_pending_for_recanonicalization_conflict(
+        self, row_id: int, *, conflicting: LabResult
+    ) -> None:
+        """Flip `row_id` (the row already occupying the target canonical
+        key) to PENDING and merge `conflicting`'s full reading into its
+        `raw_json` under `"recanonicalize_conflict"` - `adoc
+        labs-recanonicalize`'s differing-reading collision case (module
+        docstring). `row_id`'s own fields are left untouched (mirrors
+        `_flip_to_pending_with_conflict`'s re-extraction-conflict case);
+        only its status and `raw_json` change, so a human resolves the
+        disagreement via the confirm queue."""
+        row = self.get_row(row_id)
+        if row is None:
+            raise ValueError(
+                f"flip_to_pending_for_recanonicalization_conflict: no such row {row_id}"
+            )
+        payload = row.raw_payload()
+        payload["recanonicalize_conflict"] = conflicting.raw_payload()
+        reasons = list(payload.get("reasons", []))
+        reason = (
+            f"recanonicalize_conflict: existing={_reading_display(row)!r} "
+            f"vs other={_reading_display(conflicting)!r}"
+        )
+        if reason not in reasons:
+            reasons.insert(0, reason)
+        payload["reasons"] = reasons
+        self._conn.execute(
+            "UPDATE labs SET extraction_status = ?, raw_json = ? WHERE id = ?",
+            (ExtractionStatus.PENDING.value, json.dumps(payload), row_id),
+        )
+        self._conn.commit()
+
+    def reject_row_as_superseded_by_recanonicalize_conflict(
+        self, row_id: int, *, survivor_id: int
+    ) -> None:
+        """Reject `row_id` (status -> REJECTED) whose DIFFERING reading was
+        just merged into `survivor_id`'s `raw_json` by
+        `flip_to_pending_for_recanonicalization_conflict` - `row_id` is
+        never renamed (that would collide with `survivor_id`'s key), so it
+        would otherwise dangle forever under its old, un-canonical name;
+        its full reading survives in `survivor_id`'s payload for a human
+        to resolve via the confirm queue."""
+        row = self.get_row(row_id)
+        if row is None:
+            raise ValueError(
+                f"reject_row_as_superseded_by_recanonicalize_conflict: no such row {row_id}"
+            )
+        payload = row.raw_payload()
+        payload["superseded_by_recanonicalize_conflict"] = survivor_id
+        self._conn.execute(
+            "UPDATE labs SET extraction_status = ?, raw_json = ? WHERE id = ?",
+            (ExtractionStatus.REJECTED.value, json.dumps(payload), row_id),
+        )
+        self._conn.commit()
+
     def rows_with_unknown_specimen(self) -> list[LabResult]:
         """Every row (any `extraction_status`) whose `specimen` is still
         `"unknown"` — the working set for `adoc labs-infer-specimen`

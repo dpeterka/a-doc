@@ -3,6 +3,12 @@
 {% block content %}
   <h1>{{ name }}</h1>
   <p class="muted"><a href="/labs">&larr; back to all labs</a></p>
+  {% if panel and panel != other_panel %}
+    <p class="muted">Panel: {{ panel }}</p>
+  {% endif %}
+  {% if derived_from_note %}
+    <p class="muted">{{ derived_from_note }}</p>
+  {% endif %}
   {% if is_score %}
     <p class="muted">Calculated score — no reference range applies.</p>
   {% endif %}
