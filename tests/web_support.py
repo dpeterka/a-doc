@@ -20,6 +20,7 @@ from adoc.casefile.repo import DataRepo
 from adoc.config import ModelBinding, Settings
 from adoc.ingest.archive import PageRenderer
 from adoc.ingest.vision import VisionClient
+from adoc.intake.coverage import INTAKE_STATE_RELPATH, CoverageState, save_coverage_state
 from adoc.labs.db import LabsDb
 from adoc.reason.client import (
     AnthropicProvider,
@@ -193,6 +194,19 @@ def build_app(
 
     app = create_app(settings, repo=repo, db=db, client=client, vision=vision, renderer=renderer)
     return app, repo, db, calls
+
+
+def mark_intake_complete(repo: DataRepo) -> None:
+    """Test helper: seed `case/intake-state.yaml` as already-complete
+    (`docs/adr/0012-initial-visit-conversation.md`) so a test can exercise
+    the diagnostic/informational chat pipeline directly, without also
+    scripting an `intake_agent` transport through a full initial-visit
+    conversation first. Real completion only ever happens through
+    `intake.agent.run_intake_turn`'s deterministic wrap-up gate — this
+    helper exists only because most chat tests are about what happens
+    *after* onboarding, not onboarding itself."""
+    save_coverage_state(repo.root / INTAKE_STATE_RELPATH, CoverageState(intake_complete=True))
+    repo.commit("chore: seed intake-complete state for test")
 
 
 def login(

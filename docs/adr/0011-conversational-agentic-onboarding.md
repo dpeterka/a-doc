@@ -1,6 +1,6 @@
 # 0011. Conversational, agentic onboarding replaces the form-style wizard
 
-Status: Accepted
+Status: Accepted (conversation structure superseded by 0012)
 
 ## Context
 

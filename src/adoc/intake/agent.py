@@ -1,21 +1,28 @@
-"""The conversational intake engine (`docs/adr/0011-conversational-agentic-onboarding.md`).
+"""The conversational intake engine — a single "initial visit" conversation
+(`docs/adr/0012-initial-visit-conversation.md`, superseding 0011's sectioned
+stepping while keeping its fact model, deterministic gates, and writer
+reuse). Every patient message is screened
+(`reason.safety.red_flag_screen`, CLAUDE.md rule 2/5), then handed with the
+current onboarding context to the `intake_agent` model role, which
+proposes typed `intake.facts` ops plus, optionally, `topics_covered` and
+`intake_complete` — never writes a case file directly and never decides,
+on its own say-so, that a topic or the whole intake is "done."
 
-Replaces the form-style, one-shot-per-section flow the patient otherwise
-gets from `intake.wizard.IntakeWizard` with an agentic chat: every patient
-message is screened (`reason.safety.red_flag_screen`, CLAUDE.md rule 2/5),
-then handed with the current onboarding context to the `intake_agent`
-model role, which proposes typed `intake.facts` ops — never writes a case
-file directly. Those ops are applied by `IntakeFactsStore.apply_ops`
-(plain code), and `intake.facts.section_completion_blockers` (also plain
-code) is the ONLY thing that may close a section: the model can request a
-close (`IntakeTurnResult.section_complete`), but the deterministic gate
-gets the final word, exactly the way `casefile.ledger`'s invariants get
-the final word over an LLM-proposed `LedgerDiff`.
+There is no UI stepper and no "current topic": the internal topic keys
+(`intake.sections.SECTIONS`) still exist because the same schemas/writers
+they drive (`intake.convert.facts_to_section_data`, `intake.wizard.write_section`)
+are reused verbatim for case-file output, but nothing patient-facing ever
+names, numbers, lists, or steps through them. `intake.facts.
+section_completion_blockers` (plain code) is the ONLY thing that may mark a
+topic covered — the model can propose a topic is covered, or that the whole
+intake is complete, but the deterministic gate gets the final word, exactly
+the way `casefile.ledger`'s invariants get the final word over an
+LLM-proposed `LedgerDiff`.
 
 `run_intake_turn` is deliberately not a `reason.dag.Dag` — it is one model
 call per turn (no Ledger-Maintainer/Challenger split), so the DAG runner's
 machinery (contracts across multiple nodes) has nothing to add here; the
-completion gate and the treatment-gate check below are the two
+coverage/wrap-up gates and the treatment-gate check below are the
 deterministic checks this module needs, and both are plain function calls.
 """
 
@@ -34,6 +41,13 @@ from adoc.casefile.repo import DataRepo
 from adoc.casefile.schema import Provenance
 from adoc.ingest.genomics import GENOMIC_DOC_TYPE
 from adoc.intake.convert import facts_to_section_data
+from adoc.intake.coverage import (
+    INTAKE_STATE_RELPATH,
+    CoverageState,
+    TopicCoverage,
+    load_coverage_state,
+    save_coverage_state,
+)
 from adoc.intake.facts import (
     INTAKE_FACTS_RELPATH,
     SECTION_KEYS,
@@ -43,25 +57,31 @@ from adoc.intake.facts import (
     section_completion_blockers,
 )
 from adoc.intake.sections import SECTIONS, SectionSpec
-from adoc.intake.wizard import (
-    INTAKE_STATE_RELPATH,
-    IntakeState,
-    SectionState,
-    load_intake_state,
-    save_intake_state,
-    write_section,
-)
+from adoc.intake.wizard import write_section
 from adoc.labs.db import LabsDb
 from adoc.reason.client import LlmClient, LlmError, Message
 from adoc.reason.safety import red_flag_screen, treatment_gate
 
-INTAKE_AGENT_PROMPT_VERSION = "1"
+INTAKE_AGENT_PROMPT_VERSION = "2"
 INTAKE_TRANSCRIPT_RELPATH = "case/intake-transcript.jsonl"
 
 DOC_DIGEST_MAX_LINES = 60
 TRANSCRIPT_CONTEXT_TURNS = 20
 
 _SPEC_BY_KEY: dict[str, SectionSpec] = {spec.key: spec for spec in SECTIONS}
+
+# The very first assistant message of a patient's initial visit — a
+# constant, never an LLM call, per the product redesign: greet, explain in
+# one sentence that this conversation builds the case file, then hand the
+# floor to the patient. `web.routes.chat` renders this into the page when
+# the shared chat transcript is empty and intake is incomplete, and writes
+# it into that transcript on the first patient turn so history stays
+# coherent; `intake.cli`'s REPL prints the same constant at session start.
+INTAKE_OPENER_MESSAGE = (
+    "Hi — I'm glad you're here. This first conversation is how we build your case "
+    "file together, so anything you share becomes part of the record you and your "
+    "doctors can rely on. What's been going on? Start wherever you like."
+)
 
 _WITHHELD_MESSAGE = (
     "I recorded what you told me, but I withheld my reply because it failed one of "
@@ -70,11 +90,42 @@ _WITHHELD_MESSAGE = (
     "wrong with your case file. Please try rephrasing, and we'll pick this back up."
 )
 
+# Human phrasing for each internal topic key — used ONLY in the
+# deterministic wrap-up steering line (never shown as a list/checklist;
+# folded into one conversational sentence). Never expose the bare key
+# itself to the patient.
+_TOPIC_PHRASES: dict[str, str] = {
+    "basics": "a few basics about you",
+    "symptoms": "what you've been experiencing",
+    "events": "the major medical events in your history",
+    "prior_diagnoses": "any diagnoses or suspicions you or a doctor have raised",
+    "family_history": "your family's health history",
+    "medications": "the medications you're taking",
+    "supplements": "any supplements you take",
+    "allergies": "your allergies or reactions",
+    "care_team": "who's on your care team",
+    "document_drop": "getting your existing records on file",
+}
+
 _INTAKE_AGENT_SYSTEM_PROMPT = f"""[intake-agent-v{INTAKE_AGENT_PROMPT_VERSION}]
-You are the intake assistant for a single-patient longitudinal medical case-file tool
-(a-doc). You conduct onboarding as a natural conversation, one section at a time, and
-you are the only thing standing between a vague answer and a case file quietly full of
-guesses.
+You are conducting a patient's first visit for a-doc, a single-patient longitudinal
+medical case-file tool -- the way an experienced clinician runs an initial intake
+conversation, not a form. There is no fixed order to get through and no checklist to
+show the patient. Follow the patient's own narrative: let them start wherever they
+want, follow what they bring up, and only when a thread has genuinely wound down do
+you gently steer toward something you haven't heard about yet, with a natural bridge
+("you mentioned your knee surgery -- that reminds me, has anything like that run in
+your family?" / "before we move on, can I ask about any medications you're taking?").
+Never mention "sections," "topics," "categories," a checklist, a percentage, or how
+much is "left to cover" -- the patient should experience one continuous conversation,
+never a form with a progress bar.
+
+This case file quietly organizes what you capture under a fixed set of internal
+bookkeeping topics (never named to the patient): basics, symptoms, events,
+prior_diagnoses, family_history, medications, supplements, allergies, care_team,
+document_drop. Capture facts for WHATEVER topic the patient's message actually
+touches, in whatever order they bring it up -- never wait for "the right time" to
+record something, and never refuse information volunteered early or out of order.
 
 SAFETY (non-negotiable):
 - Never diagnose. Never suggest, name, or imply a diagnosis of your own.
@@ -84,16 +135,30 @@ SAFETY (non-negotiable):
   embellish a detail the patient did not say.
 
 WHAT YOU DO EACH TURN:
-1. Read the patient's message, the section checklist, the current section's open
-   items, the active facts already on file, the documents/encounters already on file,
-   and the recent conversation (all supplied below).
+1. Read the patient's message, the topic coverage map, what's currently blocking each
+   uncovered topic, the active facts already on file, the documents/encounters already
+   on file, and the recent conversation (all supplied below -- for your own
+   bookkeeping, never to relay to the patient).
 2. Decide what fact ops (add_fact / update_fact / retract_fact) this message
    justifies. Every fact you add or touch must be traceable to something the patient
    actually said this turn or earlier in the conversation.
-3. Write a short `message`: an acknowledgment of what you just recorded, plus AT MOST
-   TWO focused follow-up questions. Never pile on more than two questions in one turn
-   -- this is a conversation, not an interrogation. Zero questions (a plain
-   acknowledgment) is fine when nothing needs asking.
+3. Write a short `message`: a natural acknowledgment of what you just heard, plus AT
+   MOST TWO focused follow-up questions -- asked the way a clinician actually talks,
+   never as a numbered list. Zero questions (a plain acknowledgment, or a closing
+   summary) is fine when nothing needs asking.
+4. When a topic feels genuinely explored -- including when the patient explicitly says
+   there's nothing to report ("no autoimmune stuff in my family that I know of" is
+   real, complete coverage of family history) -- list its internal key in
+   `topics_covered`. You do not need to verify this yourself; the system quietly holds
+   back any topic that still has something unresolved and keeps it open for a later
+   turn, without ever telling the patient why.
+5. Once you judge EVERY topic genuinely covered -- every thread you can think of has
+   been explored, nothing feels left hanging -- set `intake_complete=true` and write a
+   warm closing `message` the way a clinician wraps up a first visit: summarize that
+   you now have a good picture (no clinical judgment, no diagnosis, no hint at what you
+   think is going on), and invite them to send over any records they have or ask
+   anything on their mind. If the system finds something still open, it quietly holds
+   the close and steers you back -- just keep talking naturally when that happens.
 
 PROBING VAGUENESS:
 A generic term ("allergies", "stomach issues", "a while ago", "some medications") gets
@@ -121,10 +186,11 @@ do not take it at face value silently -- ask (one of your two questions): "was t
 diagnosed by a clinician -- who, and roughly when?" If a clinician confirmed it: record
 `kind="diagnosis"`, `attribution="doctor_diagnosed"`, and capture `fields.by_whom` and
 `fields.year` from the answer. If it is the patient's own conclusion (no clinician
-involved, or they're not sure one ever said it): record `attribution="patient_assumption"`
-and ask, non-judgmentally, "that's worth tracking -- what makes you think that?",
-capturing their answer in `fields.reasoning`. Never treat a patient assumption as if it
-were confirmed, and never argue with it -- just record it accurately and move on.
+involved, or they're not sure one ever said it): record
+`attribution="patient_assumption"` and ask, non-judgmentally, "that's worth tracking --
+what makes you think that?", capturing their answer in `fields.reasoning`. Never treat
+a patient assumption as if it were confirmed, and never argue with it -- just record it
+accurately and move on.
 
 CROSS-REFERENCING DOCUMENTS ALREADY ON FILE:
 The "Documents & encounters already on file" section below lists what has already been
@@ -136,39 +202,28 @@ either note the match in the fact's `statement` or keep the two as distinct even
 
 CORRECTIONS, AT ANY TIME:
 The patient may correct or add to ANY previously recorded fact at any point, including
-facts in sections that are already closed. When they do, find the matching fact by id
-in the "Active facts on file" list below and emit an `update_fact` op for it (never a
-duplicate `add_fact`) with a substantive `note` explaining the change. Always restate in
-your `message` what you changed ("Got it -- updated your penicillin allergy to say
-hives, not a rash."). To remove something the patient says is wrong or no longer
+facts belonging to a topic you've already moved past. When they do, find the matching
+fact by id in the "Active facts on file" list below and emit an `update_fact` op for it
+(never a duplicate `add_fact`) with a substantive `note` explaining the change. Always
+restate in your `message` what you changed ("Got it -- updated your penicillin allergy
+to say hives, not a rash."). To remove something the patient says is wrong or no longer
 applies, use `retract_fact` with a `reason` -- never silently drop it (it stays in
 history, marked retracted).
 
-SECTIONS AND OUT-OF-ORDER INFORMATION:
-Onboarding covers one section at a time (see the checklist below), but never refuse
-information the patient volunteers early or out of order -- file it to the RIGHT
-section via its own fact ops and continue the current section's conversation. Set
-`wants_section` only when the patient explicitly wants to jump to, or come back to, a
-different section right now ("let's talk about my medications", "can we go back to my
-allergies"). Set `section_complete=true` only when you judge the CURRENT section's
-conversation genuinely done. You do not have to check the completion gate yourself --
-the system will refuse the close and tell the patient what's still open if a vague,
-undated, or unattributed fact is left in the section; when that happens, ask about
-exactly what it names next turn.
-
 FACT FIELDS CONVENTIONS:
 `fields` is a flat set of key/value pairs -- use plain keys matching what the case file
-expects for that section (symptoms: onset/frequency/triggers/severity; diagnoses:
-by_whom/year/reasoning/status; relatives: relation/conditions/age_at_onset/deceased/
-age_at_death; medications & supplements: name/dose/frequency/still_taking/notes;
-allergies: allergen/reaction/severity; providers: name/specialty/org; care team:
+expects for that internal topic (symptoms: onset/frequency/triggers/severity;
+diagnoses: by_whom/year/reasoning/status; relatives: relation/conditions/age_at_onset/
+deceased/age_at_death; medications & supplements: name/dose/frequency/still_taking/
+notes; allergies: allergen/reaction/severity; providers: name/specialty/org; care team:
 insurer). Where a field is naturally a list (e.g. a relative's conditions), write it as
 one comma-separated string. Every `id` you invent must be a short, stable, lowercase
 slug with no spaces or colons (e.g. `father-allergy`, `2019-er-chest-pain`) -- reuse the
 exact same id every time you touch the same fact again.
 
-Respond only with the structured result (message, ops, section_complete, wants_section)
--- never free text outside that schema.
+Respond only with the structured result (message, ops, topics_covered, intake_complete)
+-- never free text outside that schema, and never a word to the patient about
+"sections," "topics," gates, or what's left to cover.
 """
 
 
@@ -177,18 +232,16 @@ class IntakeTurnResult(BaseModel):
 
     message: str
     ops: list[IntakeFactOp] = Field(default_factory=list)
-    section_complete: bool = False
-    wants_section: str | None = None
+    topics_covered: list[str] = Field(default_factory=list)
+    intake_complete: bool = False
 
 
 class IntakeOutcome(BaseModel):
-    """What `run_intake_turn` returns to a caller (CLI REPL or the web route)."""
+    """What `run_intake_turn` returns to a caller (CLI REPL or the web
+    chat route)."""
 
     kind: Literal["urgent", "reply", "withheld", "error"]
     text: str
-    section_key: str | None = None
-    """The section the conversation is on after this turn (`None` once every
-    section is complete)."""
 
 
 # --------------------------------------------------------------------------
@@ -262,7 +315,9 @@ def build_doc_digest(db: LabsDb, repo: DataRepo) -> str:
 
 
 # --------------------------------------------------------------------------
-# Transcript persistence
+# Transcript persistence (intake's own audit log — see module docstring;
+# `web.routes.chat` separately persists into the shared patient-facing chat
+# transcript so the patient sees one continuous conversation)
 # --------------------------------------------------------------------------
 
 
@@ -311,43 +366,67 @@ def _render_transcript(entries: list[dict]) -> str:
 
 
 # --------------------------------------------------------------------------
-# Context assembly (deterministic)
+# Coverage helpers
 # --------------------------------------------------------------------------
 
 
 def _spec_by_key(key: str) -> SectionSpec:
     spec = _SPEC_BY_KEY.get(key)
     if spec is None:
-        raise IntakeError(f"no such intake section: {key!r}")
+        raise IntakeError(f"no such intake topic: {key!r}")
     return spec
 
 
-def _first_incomplete_key(state: IntakeState) -> str | None:
-    for spec in SECTIONS:
-        if state.sections.get(spec.key, SectionState()).status != "complete":
-            return spec.key
-    return None
+def _is_covered(coverage: CoverageState, key: str) -> bool:
+    return coverage.topics.get(key, TopicCoverage()).covered
 
 
-def _render_section_checklist(state: IntakeState) -> str:
+def _mark_covered(coverage: CoverageState, key: str, *, when: datetime) -> None:
+    coverage.topics[key] = TopicCoverage(covered=True, covered_at=when)
+
+
+def _auto_cover_document_drop(repo: DataRepo, coverage: CoverageState, *, when: datetime) -> None:
+    """Mirrors `intake.wizard`'s document-drop auto-skip: when documents
+    are already on file (a seeded/curated deployment: `sources/` is
+    non-empty), there is nothing to ask about getting records on file —
+    mark the topic covered automatically instead of prompting the patient
+    to upload what's already there. A genuinely fresh, empty data repo
+    still gets asked in the normal course of conversation."""
+    if _is_covered(coverage, "document_drop"):
+        return
+    sources = repo.root / "sources"
+    has_documents = sources.is_dir() and any(
+        entry.name != ".gitkeep" for entry in sources.iterdir()
+    )
+    if has_documents:
+        _mark_covered(coverage, "document_drop", when=when)
+
+
+def intake_is_complete(repo: DataRepo) -> bool:
+    """Whether the initial-visit conversation has been marked complete
+    (`CoverageState.intake_complete`) — the trigger that unlocks the
+    diagnostic chat pipeline (`web.routes.chat`) and ends the CLI REPL."""
+    return load_coverage_state(repo.root / INTAKE_STATE_RELPATH).intake_complete
+
+
+def _render_coverage_map(coverage: CoverageState) -> str:
     lines = []
     for spec in SECTIONS:
-        section_state = state.sections.get(spec.key, SectionState())
-        marker = "x" if section_state.status == "complete" else " "
-        current = " <- current" if spec.key == state.cursor else ""
-        lines.append(
-            f"- [{marker}] {spec.title} ({spec.key}), status={section_state.status}{current}"
-        )
+        marker = "covered" if _is_covered(coverage, spec.key) else "not yet covered"
+        lines.append(f"- {spec.title} ({spec.key}): {marker}")
     return "\n".join(lines)
 
 
-def _render_open_items(facts_store: IntakeFactsStore, current_key: str | None) -> str:
-    if current_key is None:
-        return "(onboarding is complete; the patient may still correct or add facts to any section)"
-    blockers = section_completion_blockers(facts_store.facts, current_key)
-    if not blockers:
-        return "(none - this section is clear to close whenever the conversation is done)"
-    return "\n".join(f"- {b}" for b in blockers)
+def _render_gate_status(facts_store: IntakeFactsStore, coverage: CoverageState) -> str:
+    lines: list[str] = []
+    for spec in SECTIONS:
+        if _is_covered(coverage, spec.key):
+            continue
+        blockers = section_completion_blockers(facts_store.facts, spec.key)
+        if blockers:
+            lines.append(f"- {spec.title} ({spec.key}):")
+            lines.extend(f"    - {b}" for b in blockers)
+    return "\n".join(lines) if lines else "(nothing currently blocked)"
 
 
 def _render_active_facts(facts_store: IntakeFactsStore) -> str:
@@ -357,7 +436,7 @@ def _render_active_facts(facts_store: IntakeFactsStore) -> str:
     lines = ["facts:"]
     for fact in facts:
         lines.append(f"  - id: {fact.id}")
-        lines.append(f"    section: {fact.section}")
+        lines.append(f"    topic: {fact.section}")
         lines.append(f"    kind: {fact.kind}")
         lines.append(f"    statement: {fact.statement!r}")
         if fact.date_approx:
@@ -374,28 +453,31 @@ def _render_active_facts(facts_store: IntakeFactsStore) -> str:
 def _build_turn_context(
     repo: DataRepo,
     db: LabsDb,
-    state: IntakeState,
+    coverage: CoverageState,
     facts_store: IntakeFactsStore,
-    current_key: str | None,
 ) -> str:
-    current_title = (
-        _spec_by_key(current_key).title if current_key else "(none - onboarding complete)"
-    )
     transcript = _render_transcript(read_intake_transcript(repo, limit=TRANSCRIPT_CONTEXT_TURNS))
     return (
-        f"## Section checklist\n\n{_render_section_checklist(state)}\n\n"
-        f"## Current section: {current_title}\n\n"
-        f"## Open items blocking this section's close\n\n"
-        f"{_render_open_items(facts_store, current_key)}\n\n"
+        "## Topic coverage so far (internal bookkeeping only — never mention topics, "
+        "sections, or checklists to the patient)\n\n"
+        f"{_render_coverage_map(coverage)}\n\n"
+        "## What's currently blocking an uncovered topic (internal only)\n\n"
+        f"{_render_gate_status(facts_store, coverage)}\n\n"
         f"## Active facts on file\n\n{_render_active_facts(facts_store)}\n\n"
         f"## Documents & encounters already on file\n\n{build_doc_digest(db, repo)}\n\n"
         f"## Recent conversation\n\n{transcript}\n"
     )
 
 
-def _render_blocker_followup(blockers: list[str]) -> str:
-    lines = ["Before I can close this section out, a few things still need pinning down:"]
-    lines.extend(f"- {b}" for b in blockers)
+def _render_wrapup_refusal(coverage: CoverageState, blockers_anywhere: list[str]) -> str:
+    uncovered_keys = [spec.key for spec in SECTIONS if not _is_covered(coverage, spec.key)]
+    lines: list[str] = []
+    if uncovered_keys:
+        phrases = ", ".join(_TOPIC_PHRASES.get(key, key) for key in uncovered_keys)
+        lines.append(f"Before I can wrap up, I'd still like to hear about {phrases}.")
+    if blockers_anywhere:
+        lines.append("A couple of things could use a bit more detail:")
+        lines.extend(f"- {b}" for b in blockers_anywhere)
     return "\n".join(lines)
 
 
@@ -422,16 +504,14 @@ def run_intake_turn(client: LlmClient, repo: DataRepo, db: LabsDb, text: str) ->
     """
     screen = red_flag_screen(text)
     if screen.flagged:
-        state = load_intake_state(repo.root / INTAKE_STATE_RELPATH)
-        return IntakeOutcome(kind="urgent", text=screen.message or "", section_key=state.cursor)
+        return IntakeOutcome(kind="urgent", text=screen.message or "")
 
-    state = load_intake_state(repo.root / INTAKE_STATE_RELPATH)
-    for spec in SECTIONS:
-        state.sections.setdefault(spec.key, SectionState())
+    now = datetime.now(UTC)
+    coverage = load_coverage_state(repo.root / INTAKE_STATE_RELPATH)
+    _auto_cover_document_drop(repo, coverage, when=now)
     facts_store = IntakeFactsStore(repo.root)
-    original_key = state.cursor
 
-    context = _build_turn_context(repo, db, state, facts_store, original_key)
+    context = _build_turn_context(repo, db, coverage, facts_store)
     user_content = f"{context}\n\n## Patient message\n\n{text}\n"
 
     try:
@@ -442,11 +522,7 @@ def run_intake_turn(client: LlmClient, repo: DataRepo, db: LabsDb, text: str) ->
             schema=IntakeTurnResult,
         )
     except LlmError as exc:
-        return IntakeOutcome(
-            kind="error",
-            text=f"Sorry, I couldn't process that: {exc}",
-            section_key=original_key,
-        )
+        return IntakeOutcome(kind="error", text=f"Sorry, I couldn't process that: {exc}")
 
     turn = result.parsed
     assert isinstance(turn, IntakeTurnResult)
@@ -456,7 +532,7 @@ def run_intake_turn(client: LlmClient, repo: DataRepo, db: LabsDb, text: str) ->
         prompt_template_version=INTAKE_AGENT_PROMPT_VERSION,
         model_id=result.model_id,
         dag_node="intake-agent",
-        timestamp=datetime.now(UTC),
+        timestamp=now,
     )
 
     try:
@@ -465,62 +541,60 @@ def run_intake_turn(client: LlmClient, repo: DataRepo, db: LabsDb, text: str) ->
         return IntakeOutcome(
             kind="error",
             text=f"Sorry, something in that update didn't apply cleanly: {exc}",
-            section_key=original_key,
         )
 
     touched_ids = [*applied.added, *applied.updated, *applied.retracted]
-    touched_sections = {
+    touched_topics = {
         fact.section for fact_id in touched_ids if (fact := facts_store.get(fact_id)) is not None
     }
 
     artifacts: list[str] = []
 
-    # Amend mode: a correction/addition to an already-closed section
-    # regenerates that section's case-file artifact(s) immediately, even
-    # though this turn isn't closing anything (requirement: facts are
-    # editable at any time, during AND after onboarding).
-    for section_key in touched_sections:
-        section_state = state.sections.setdefault(section_key, SectionState())
-        if section_state.status == "complete":
-            artifacts.extend(_write_section_from_facts(repo, facts_store, section_key))
-        elif section_state.status == "pending":
-            section_state.status = "awaiting_confirmation"
+    # Amend mode: a correction/addition to an already-covered topic
+    # regenerates that topic's case-file artifact(s) immediately, even
+    # though this turn isn't newly covering anything (facts are editable
+    # at any time, during AND after the initial visit).
+    for topic_key in touched_topics:
+        if _is_covered(coverage, topic_key):
+            artifacts.extend(_write_section_from_facts(repo, facts_store, topic_key))
 
-    blocker_note = ""
-    if turn.section_complete and original_key is not None:
-        blockers = section_completion_blockers(facts_store.facts, original_key)
-        if blockers:
-            blocker_note = "\n\n" + _render_blocker_followup(blockers)
+    # --- deterministic topic-coverage veto: code, not the model, decides ---
+    for topic_key in turn.topics_covered:
+        if topic_key not in SECTION_KEYS or _is_covered(coverage, topic_key):
+            continue
+        if section_completion_blockers(facts_store.facts, topic_key):
+            continue  # vetoed silently — routine turns never surface gate mechanics
+        artifacts.extend(_write_section_from_facts(repo, facts_store, topic_key))
+        _mark_covered(coverage, topic_key, when=now)
+
+    # --- wrap-up: intake_complete is accepted only when every topic is
+    # covered and no blocker remains anywhere; a refused proposal appends
+    # ONE deterministic, conversationally-phrased steering line ---
+    wrapup_note = ""
+    if turn.intake_complete and not coverage.intake_complete:
+        blockers_anywhere = [
+            blocker
+            for spec in SECTIONS
+            for blocker in section_completion_blockers(facts_store.facts, spec.key)
+        ]
+        all_covered = all(_is_covered(coverage, spec.key) for spec in SECTIONS)
+        if all_covered and not blockers_anywhere:
+            coverage.intake_complete = True
         else:
-            artifacts.extend(_write_section_from_facts(repo, facts_store, original_key))
-            section_state = state.sections[original_key]
-            section_state.status = "complete"
-            section_state.completed_at = datetime.now(UTC)
-            state.cursor = _first_incomplete_key(state)
+            wrapup_note = "\n\n" + _render_wrapup_refusal(coverage, blockers_anywhere)
 
-    wants_valid_section = turn.wants_section and turn.wants_section in SECTION_KEYS
-    if wants_valid_section and turn.wants_section != state.cursor:
-        target_key = turn.wants_section
-        assert target_key is not None
-        target_state = state.sections.setdefault(target_key, SectionState())
-        if target_state.status == "complete":
-            has_facts = bool(facts_store.active_facts(target_key))
-            target_state.status = "awaiting_confirmation" if has_facts else "pending"
-            target_state.completed_at = None
-        state.cursor = target_key
-
-    reply_text = turn.message + blocker_note
+    reply_text = turn.message + wrapup_note
     gate = treatment_gate(reply_text)
     outcome = (
-        IntakeOutcome(kind="reply", text=reply_text, section_key=state.cursor)
+        IntakeOutcome(kind="reply", text=reply_text)
         if gate.passed
-        else IntakeOutcome(kind="withheld", text=_WITHHELD_MESSAGE, section_key=state.cursor)
+        else IntakeOutcome(kind="withheld", text=_WITHHELD_MESSAGE)
     )
 
     # Persist only on full success (IntakeError/LlmError above already
     # returned before any of this — nothing is written for those turns).
     facts_store.save()
-    save_intake_state(repo.root / INTAKE_STATE_RELPATH, state)
+    save_coverage_state(repo.root / INTAKE_STATE_RELPATH, coverage)
     _append_transcript_turn(repo, text, outcome)
 
     paths = [
@@ -529,7 +603,6 @@ def run_intake_turn(client: LlmClient, repo: DataRepo, db: LabsDb, text: str) ->
         INTAKE_TRANSCRIPT_RELPATH,
         *sorted(set(artifacts)),
     ]
-    commit_label = original_key or "post-completion correction"
-    repo.commit(f"feat(intake): conversational turn ({commit_label})", paths=paths)
+    repo.commit("feat(intake): conversational turn", paths=paths)
 
     return outcome

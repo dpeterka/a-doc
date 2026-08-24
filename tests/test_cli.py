@@ -243,8 +243,11 @@ def test_onboard_default_runs_the_conversational_engine_against_an_initialized_r
 
     assert code == 0
     out = capsys.readouterr().out
-    assert "Let's talk about basics." in out
+    assert "This first conversation is how we build your case file together" in out
     assert "resume anytime with `adoc onboard`" in out
+    # docs/adr/0012-initial-visit-conversation.md: no section display at all.
+    assert "Basics" not in out
+    assert "[1/10]" not in out
 
 
 def _empty_review_fake_client() -> LlmClient:

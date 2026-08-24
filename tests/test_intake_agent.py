@@ -1,4 +1,5 @@
-"""Tests for adoc.intake.agent: the conversational onboarding engine.
+"""Tests for adoc.intake.agent: the conversational initial-visit engine
+(`docs/adr/0012-initial-visit-conversation.md`).
 
 No network: every `LlmClient` here is built with a scripted transport, same
 pattern as `test_intake_wizard.py`.
@@ -16,21 +17,27 @@ from adoc.config import ModelBinding
 from adoc.ingest.genomics import GENOMIC_DOC_TYPE
 from adoc.intake.agent import (
     INTAKE_AGENT_PROMPT_VERSION,
+    INTAKE_OPENER_MESSAGE,
     INTAKE_TRANSCRIPT_RELPATH,
     IntakeTurnResult,
     build_doc_digest,
+    intake_is_complete,
     read_intake_transcript,
     run_intake_turn,
 )
-from adoc.intake.facts import INTAKE_FACTS_RELPATH, IntakeFactsStore
-from adoc.intake.wizard import (
+from adoc.intake.coverage import (
     INTAKE_STATE_RELPATH,
-    load_intake_state,
-    save_intake_state,
+    CoverageState,
+    TopicCoverage,
+    load_coverage_state,
 )
+from adoc.intake.facts import INTAKE_FACTS_RELPATH, IntakeFactsStore
+from adoc.intake.sections import SECTIONS
 from adoc.labs.db import LabsDb
 from adoc.labs.models import DocumentStatus, ExtractionStatus, LabDocument, LabResult
 from adoc.reason.client import AnthropicProvider, LlmClient, TransportRequest, TransportResponse
+
+ALL_TOPIC_KEYS = [spec.key for spec in SECTIONS]
 
 
 class ScriptedTransport:
@@ -69,11 +76,33 @@ def _exploding_client() -> LlmClient:
     )
 
 
-def _seed_cursor(repo: DataRepo, key: str) -> None:
-    state = load_intake_state(repo.root / INTAKE_STATE_RELPATH)
-    state.cursor = key
-    save_intake_state(repo.root / INTAKE_STATE_RELPATH, state)
-    repo.commit("chore: seed cursor for test")
+def _seed_all_topics_covered_except(repo: DataRepo, *uncovered_keys: str) -> None:
+    from adoc.intake.coverage import save_coverage_state
+
+    topics = {
+        key: TopicCoverage(
+            covered=key not in uncovered_keys,
+            covered_at=datetime.now() if key not in uncovered_keys else None,
+        )
+        for key in ALL_TOPIC_KEYS
+    }
+    save_coverage_state(repo.root / INTAKE_STATE_RELPATH, CoverageState(topics=topics))
+    repo.commit("chore: seed coverage for test")
+
+
+def _turn(
+    message: str,
+    ops: list[dict[str, Any]] | None = None,
+    *,
+    topics_covered: list[str] | None = None,
+    intake_complete: bool = False,
+) -> dict[str, Any]:
+    return {
+        "message": message,
+        "ops": ops or [],
+        "topics_covered": topics_covered or [],
+        "intake_complete": intake_complete,
+    }
 
 
 # --- red-flag screen: zero client calls ------------------------------------------------
@@ -100,9 +129,9 @@ def test_ops_are_applied_and_persisted_with_stamped_provenance(tmp_path: Path) -
     db = LabsDb(":memory:")
     client, transport = _make_client(
         [
-            {
-                "message": "Got it, 41 years old. What's your sex at birth and occupation?",
-                "ops": [
+            _turn(
+                "Got it, 41 years old. What's your sex at birth and occupation?",
+                [
                     {
                         "op": "add_fact",
                         "fact": {
@@ -114,9 +143,7 @@ def test_ops_are_applied_and_persisted_with_stamped_provenance(tmp_path: Path) -
                         },
                     }
                 ],
-                "section_complete": False,
-                "wants_section": None,
-            }
+            )
         ]
     )
 
@@ -138,22 +165,84 @@ def test_ops_are_applied_and_persisted_with_stamped_provenance(tmp_path: Path) -
     assert transcript[0]["role"] == "patient"
     assert transcript[1]["role"] == "assistant"
 
+    assert intake_is_complete(repo) is False
 
-# --- section_complete: honored only when gates pass ------------------------------------
+
+# --- topics_covered: vetoed by each blocker rule, honored once clear -------------------
 
 
-def test_section_complete_refused_when_gate_blocks_and_appends_deterministic_line(
-    tmp_path: Path,
-) -> None:
+def test_topics_covered_vetoed_when_a_fact_still_needs_a_probe(tmp_path: Path) -> None:
     repo = DataRepo.init_at(tmp_path / "data")
     db = LabsDb(":memory:")
-    _seed_cursor(repo, "prior_diagnoses")
 
-    client, _transport = _make_client(
+    client, _t = _make_client(
         [
-            {
-                "message": "Noted.",
-                "ops": [
+            _turn(
+                "Noted — I'll ask more about that later.",
+                [
+                    {
+                        "op": "add_fact",
+                        "fact": {
+                            "id": "father-allergy",
+                            "section": "family_history",
+                            "kind": "relative",
+                            "statement": "Patient's dad has allergies.",
+                            "clarification_status": "needs_probe",
+                        },
+                    }
+                ],
+                topics_covered=["family_history"],
+            )
+        ]
+    )
+
+    run_intake_turn(client, repo, db, "My dad has allergies.")
+
+    state = load_coverage_state(repo.root / INTAKE_STATE_RELPATH)
+    assert state.topics.get("family_history", TopicCoverage()).covered is False
+
+
+def test_topics_covered_vetoed_when_doctor_diagnosed_missing_who_and_year(tmp_path: Path) -> None:
+    repo = DataRepo.init_at(tmp_path / "data")
+    db = LabsDb(":memory:")
+
+    client, _t = _make_client(
+        [
+            _turn(
+                "Got it.",
+                [
+                    {
+                        "op": "add_fact",
+                        "fact": {
+                            "id": "lupus-dx",
+                            "section": "prior_diagnoses",
+                            "kind": "diagnosis",
+                            "statement": "A doctor diagnosed the patient with lupus.",
+                            "attribution": "doctor_diagnosed",
+                            "precision": "unknown_after_probe",
+                        },
+                    }
+                ],
+                topics_covered=["prior_diagnoses"],
+            )
+        ]
+    )
+
+    run_intake_turn(client, repo, db, "A doctor said I have lupus.")
+
+    state = load_coverage_state(repo.root / INTAKE_STATE_RELPATH)
+    assert state.topics.get("prior_diagnoses", TopicCoverage()).covered is False
+
+
+def test_topics_covered_vetoed_when_patient_assumption_missing_reasoning(tmp_path: Path) -> None:
+    repo = DataRepo.init_at(tmp_path / "data")
+    db = LabsDb(":memory:")
+
+    client, _t = _make_client(
+        [
+            _turn(
+                "Noted.",
+                [
                     {
                         "op": "add_fact",
                         "fact": {
@@ -166,33 +255,56 @@ def test_section_complete_refused_when_gate_blocks_and_appends_deterministic_lin
                         },
                     }
                 ],
-                "section_complete": True,
-                "wants_section": None,
-            }
+                topics_covered=["prior_diagnoses"],
+            )
         ]
     )
 
-    outcome = run_intake_turn(client, repo, db, "I have cancer.")
+    run_intake_turn(client, repo, db, "I have cancer.")
 
-    assert outcome.kind == "reply"
-    assert outcome.section_key == "prior_diagnoses"  # not advanced
-    assert "still need pinning down" in outcome.text
-    assert "reasoning" in outcome.text
-
-    state = load_intake_state(repo.root / INTAKE_STATE_RELPATH)
-    assert state.sections["prior_diagnoses"].status != "complete"
+    state = load_coverage_state(repo.root / INTAKE_STATE_RELPATH)
+    assert state.topics.get("prior_diagnoses", TopicCoverage()).covered is False
 
 
-def test_section_complete_honored_once_gate_clears(tmp_path: Path) -> None:
+def test_topics_covered_vetoed_when_timing_never_asked(tmp_path: Path) -> None:
     repo = DataRepo.init_at(tmp_path / "data")
     db = LabsDb(":memory:")
-    _seed_cursor(repo, "allergies")
 
-    client, _transport = _make_client(
+    client, _t = _make_client(
         [
-            {
-                "message": "Noted — penicillin allergy with hives, moderate severity.",
-                "ops": [
+            _turn(
+                "Noted — an ER visit.",
+                [
+                    {
+                        "op": "add_fact",
+                        "fact": {
+                            "id": "er-visit",
+                            "section": "events",
+                            "kind": "event",
+                            "statement": "Patient had an ER visit.",
+                        },
+                    }
+                ],
+                topics_covered=["events"],
+            )
+        ]
+    )
+
+    run_intake_turn(client, repo, db, "I had an ER visit once.")
+
+    state = load_coverage_state(repo.root / INTAKE_STATE_RELPATH)
+    assert state.topics.get("events", TopicCoverage()).covered is False
+
+
+def test_topics_covered_honored_once_gate_clears(tmp_path: Path) -> None:
+    repo = DataRepo.init_at(tmp_path / "data")
+    db = LabsDb(":memory:")
+
+    client, _t = _make_client(
+        [
+            _turn(
+                "Noted — penicillin allergy with hives, moderate severity.",
+                [
                     {
                         "op": "add_fact",
                         "fact": {
@@ -208,22 +320,135 @@ def test_section_complete_honored_once_gate_clears(tmp_path: Path) -> None:
                         },
                     }
                 ],
-                "section_complete": True,
-                "wants_section": None,
-            }
+                topics_covered=["allergies"],
+            )
         ]
     )
 
     outcome = run_intake_turn(client, repo, db, "I'm allergic to penicillin, hives, moderate.")
 
     assert outcome.kind == "reply"
-    assert outcome.section_key != "allergies"  # advanced past it
-
-    state = load_intake_state(repo.root / INTAKE_STATE_RELPATH)
-    assert state.sections["allergies"].status == "complete"
+    state = load_coverage_state(repo.root / INTAKE_STATE_RELPATH)
+    assert state.topics["allergies"].covered is True
 
     case_summary = repo.read("case/case-summary.md")
     assert "penicillin" in case_summary
+
+
+def test_nothing_to_report_is_legitimate_coverage_of_a_topic(tmp_path: Path) -> None:
+    """No active facts filed to a topic means no blockers -- explicitly
+    stating "nothing to report" is a real, complete way to cover it."""
+    repo = DataRepo.init_at(tmp_path / "data")
+    db = LabsDb(":memory:")
+
+    client, _t = _make_client(
+        [
+            _turn(
+                "Good to know -- no family history of anything autoimmune.",
+                ops=[],
+                topics_covered=["family_history"],
+            )
+        ]
+    )
+
+    run_intake_turn(client, repo, db, "No autoimmune stuff in my family that I know of.")
+
+    state = load_coverage_state(repo.root / INTAKE_STATE_RELPATH)
+    assert state.topics["family_history"].covered is True
+
+
+# --- wrap-up: intake_complete honored only when every topic is clear ------------------
+
+
+def test_intake_complete_refused_when_topics_remain_uncovered(tmp_path: Path) -> None:
+    repo = DataRepo.init_at(tmp_path / "data")
+    db = LabsDb(":memory:")
+    _seed_all_topics_covered_except(repo, "medications", "allergies")
+
+    client, _t = _make_client([_turn("I think that's everything!", intake_complete=True)])
+
+    outcome = run_intake_turn(client, repo, db, "That's everything I can think of.")
+
+    assert outcome.kind == "reply"
+    assert "still like to hear about" in outcome.text
+    assert "medications" in outcome.text or "medications you're taking" in outcome.text
+    assert intake_is_complete(repo) is False
+
+
+def test_intake_complete_refused_when_a_blocker_remains_even_if_all_topics_marked_covered(
+    tmp_path: Path,
+) -> None:
+    """A topic can be marked `covered` from an earlier turn and later
+    reopened by a blocking edit (e.g. a correction that reintroduces a
+    `needs_probe` fact) -- wrap-up must re-check every blocker, not just
+    the coverage map, before accepting `intake_complete`."""
+    repo = DataRepo.init_at(tmp_path / "data")
+    db = LabsDb(":memory:")
+    _seed_all_topics_covered_except(repo)  # every topic already covered
+
+    client, _t = _make_client(
+        [
+            _turn(
+                "Got it, noted.",
+                [
+                    {
+                        "op": "add_fact",
+                        "fact": {
+                            "id": "mystery-symptom",
+                            "section": "symptoms",
+                            "kind": "symptom",
+                            "statement": "Patient mentions a new, vague symptom.",
+                            "clarification_status": "needs_probe",
+                        },
+                    }
+                ],
+                intake_complete=True,
+            )
+        ]
+    )
+
+    outcome = run_intake_turn(client, repo, db, "Oh also, I've been feeling off lately.")
+
+    assert outcome.kind == "reply"
+    assert "still needs a follow-up" in outcome.text
+    assert intake_is_complete(repo) is False
+
+
+def test_intake_complete_honored_once_every_topic_is_clear(tmp_path: Path) -> None:
+    repo = DataRepo.init_at(tmp_path / "data")
+    db = LabsDb(":memory:")
+    _seed_all_topics_covered_except(repo)  # every topic already covered
+
+    client, _t = _make_client(
+        [
+            _turn(
+                "Thank you -- I have a good picture of your history now. Feel free to send "
+                "over any records you have, or ask me anything.",
+                intake_complete=True,
+            )
+        ]
+    )
+
+    outcome = run_intake_turn(client, repo, db, "I think that covers everything.")
+
+    assert outcome.kind == "reply"
+    assert "good picture" in outcome.text
+    assert intake_is_complete(repo) is True
+
+
+# --- document_drop auto-coverage --------------------------------------------------------
+
+
+def test_document_drop_auto_covers_when_sources_already_has_documents(tmp_path: Path) -> None:
+    repo = DataRepo.init_at(tmp_path / "data")
+    db = LabsDb(":memory:")
+    (repo.root / "sources" / "somefile.pdf").write_bytes(b"%PDF-1.4")
+
+    client, _t = _make_client([_turn("Got it, 41 years old.")])
+    run_intake_turn(client, repo, db, "I'm 41.")
+
+    state = load_coverage_state(repo.root / INTAKE_STATE_RELPATH)
+    assert state.topics.get("document_drop", TopicCoverage()).covered is True
 
 
 # --- treatment_gate violation withholds -------------------------------------------------
@@ -235,11 +460,11 @@ def test_treatment_gate_violation_withholds_reply_but_still_persists_facts(
     repo = DataRepo.init_at(tmp_path / "data")
     db = LabsDb(":memory:")
 
-    client, _transport = _make_client(
+    client, _t = _make_client(
         [
-            {
-                "message": "You should start taking 20 mg prednisone daily.",
-                "ops": [
+            _turn(
+                "You should start taking 20 mg prednisone daily.",
+                [
                     {
                         "op": "add_fact",
                         "fact": {
@@ -251,9 +476,7 @@ def test_treatment_gate_violation_withholds_reply_but_still_persists_facts(
                         },
                     }
                 ],
-                "section_complete": False,
-                "wants_section": None,
-            }
+            )
         ]
     )
 
@@ -270,20 +493,18 @@ def test_treatment_gate_violation_withholds_reply_but_still_persists_facts(
     assert transcript[-1]["kind"] == "withheld"
 
 
-# --- corrections to a completed section regenerate its case file ----------------------
+# --- corrections to a covered topic regenerate its case file ---------------------------
 
 
-def test_correction_to_completed_section_regenerates_case_file(tmp_path: Path) -> None:
+def test_correction_to_a_covered_topic_regenerates_case_file(tmp_path: Path) -> None:
     repo = DataRepo.init_at(tmp_path / "data")
     db = LabsDb(":memory:")
 
-    # Complete the allergies section first.
-    _seed_cursor(repo, "allergies")
     client, _t1 = _make_client(
         [
-            {
-                "message": "Noted.",
-                "ops": [
+            _turn(
+                "Noted.",
+                [
                     {
                         "op": "add_fact",
                         "fact": {
@@ -295,20 +516,20 @@ def test_correction_to_completed_section_regenerates_case_file(tmp_path: Path) -
                         },
                     }
                 ],
-                "section_complete": True,
-                "wants_section": None,
-            }
+                topics_covered=["allergies"],
+            )
         ]
     )
     run_intake_turn(client, repo, db, "I'm allergic to penicillin, rash.")
     assert "rash" in repo.read("case/case-summary.md")
 
-    # Now correct it, in a later turn, without reopening via wants_section.
+    # Now correct it, in a later turn -- no "wants_section"/re-open concept
+    # needed anymore, just an update_fact op against an already-covered topic.
     client2, _t2 = _make_client(
         [
-            {
-                "message": "Got it — updated to hives, not a rash.",
-                "ops": [
+            _turn(
+                "Got it — updated to hives, not a rash.",
+                [
                     {
                         "op": "update_fact",
                         "id": "allergy-penicillin",
@@ -316,9 +537,7 @@ def test_correction_to_completed_section_regenerates_case_file(tmp_path: Path) -
                         "note": "patient corrected the reaction type after review",
                     }
                 ],
-                "section_complete": False,
-                "wants_section": None,
-            }
+            )
         ]
     )
     outcome = run_intake_turn(client2, repo, db, "Actually it was hives, not a rash.")
@@ -326,7 +545,6 @@ def test_correction_to_completed_section_regenerates_case_file(tmp_path: Path) -
     assert outcome.kind == "reply"
     updated_case_summary = repo.read("case/case-summary.md")
     assert "hives" in updated_case_summary
-    assert "rash" not in updated_case_summary.split("## Allergies")[-1].split("hives")[0] or True
 
 
 # --- error paths: nothing persisted -----------------------------------------------------
@@ -371,18 +589,8 @@ def test_duplicate_fact_id_op_error_persists_nothing(tmp_path: Path) -> None:
     }
     client, _transport = _make_client(
         [
-            {
-                "message": "Noted.",
-                "ops": [add_op],
-                "section_complete": False,
-                "wants_section": None,
-            },
-            {
-                "message": "Noted again.",
-                "ops": [add_op],
-                "section_complete": False,
-                "wants_section": None,
-            },
+            _turn("Noted.", [add_op]),
+            _turn("Noted again.", [add_op]),
         ]
     )
 
@@ -394,6 +602,13 @@ def test_duplicate_fact_id_op_error_persists_nothing(tmp_path: Path) -> None:
     assert second.kind == "error"
     after = (repo.root / INTAKE_FACTS_RELPATH).read_text(encoding="utf-8")
     assert before == after  # nothing changed on the failed turn
+
+
+# --- the deterministic opener is a constant, not model output --------------------------
+
+
+def test_opener_message_is_a_plain_constant() -> None:
+    assert "What's been going on? Start wherever you like." in INTAKE_OPENER_MESSAGE
 
 
 # --- doc digest ---------------------------------------------------------------------------
