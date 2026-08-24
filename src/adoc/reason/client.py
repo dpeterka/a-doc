@@ -343,6 +343,14 @@ def _openai_strict_schema(schema: dict[str, Any]) -> dict[str, Any]:
     def walk(node: Any) -> Any:
         if isinstance(node, dict):
             out = {k: walk(v) for k, v in node.items()}
+            # Strict mode forbids oneOf (pydantic emits it for discriminated
+            # unions, e.g. LedgerDiff's op union inside ChallengerVerdict —
+            # found live: every challenger call 400'd) and the discriminator
+            # keyword. anyOf is accepted and equivalent for our purposes:
+            # the response is re-validated by pydantic afterwards anyway.
+            if "oneOf" in out:
+                out["anyOf"] = out.pop("oneOf")
+            out.pop("discriminator", None)
             if out.get("type") == "object" or "properties" in out:
                 out.setdefault("additionalProperties", False)
                 if "properties" in out:
