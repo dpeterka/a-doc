@@ -15,7 +15,15 @@ from pathlib import Path
 
 import pytest
 
-from adoc.ingest.reconcile import clean_result_name, reconcile, row_is_agreed
+from adoc.ingest.reconcile import (
+    clean_result_name,
+    compute_pair_reasons,
+    flags_equivalent,
+    reconcile,
+    ref_ranges_equivalent,
+    row_is_agreed,
+    units_equivalent,
+)
 from adoc.ingest.schema import DocumentExtraction, ExtractedResult
 from adoc.labs.db import LabsDb
 from adoc.labs.models import DocumentStatus, ExtractionStatus, LabDocument, LabResult
@@ -458,6 +466,213 @@ def test_rescue_never_pairs_across_a_real_unit_mismatch(tmp_path: Path) -> None:
     assert len(rows) == 2
     assert all(row.status == "pending" for row in rows)
     assert all("single_pass" in row.reasons for row in rows)
+
+
+# --------------------------------------------------------------------------
+# Semantic comparators (feature/semantic-compare): real-corpus false-
+# "disagreement" families, each with an equivalent pair and a non-
+# equivalent guard.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "a_raw,b_raw,expected",
+    [
+        # real corpus: trailing embedded unit
+        ("<20", "<20 Units", True),
+        ("3.80-5.10", "3.80 - 5.10 Million/uL", True),
+        # unicode dash variants
+        ("3.5–5.1", "3.5-5.1", True),  # en dash
+        ("3.5‒5.1", "3.5 - 5.1", True),  # figure dash + spacing
+        # threshold forms
+        ("<20", "< 20", True),
+        (">=1:80", ">= 1:80", True),
+        ("<1:80", "<1:80", True),
+        # qualitative equivalence set
+        ("negative", "none seen", True),
+        ("Not Detected", "NEGATIVE", True),
+        # both None/empty
+        (None, None, True),
+        (None, "", True),
+        # guards: genuinely different thresholds/ranges
+        ("<20", "<30", False),
+        ("3.5-5.1", "3.5-5.2", False),
+        (">=1:80", ">=1:160", False),
+        # guard: one side missing is a real difference, not equivalence
+        ("<20", None, False),
+        ("<20", "", False),
+        # guard: unparseable and different -> normalized-string fallback
+        ("see comment", "positive", False),
+    ],
+)
+def test_ref_ranges_equivalent_matrix(a_raw: str | None, b_raw: str | None, expected: bool) -> None:
+    assert ref_ranges_equivalent(a_raw, b_raw) is expected
+
+
+def test_ref_ranges_equivalent_both_unparseable_and_equal_falls_back_to_string_equality() -> None:
+    assert ref_ranges_equivalent("see comment", "see comment") is True
+
+
+@pytest.mark.parametrize(
+    "a_raw,b_raw,expected",
+    [
+        # real corpus: RBC spelling family
+        ("Million/uL", "M/uL", True),
+        ("x10^6/uL", "10*6/uL", True),
+        ("x10E6/uL", "M/uL", True),
+        # WBC/platelet spelling family
+        ("Thousand/uL", "K/uL", True),
+        # TSH: numerically equivalent reporting units
+        ("mIU/L", "uIU/mL", True),
+        # bare case/whitespace differences
+        ("mmol/L", "mmol/l", True),
+        ("  mg/dL ", "mg/dl", True),
+        # guards: genuinely different units
+        ("mg/dL", "g/dL", False),
+        ("IU/mL", "U/mL", False),  # kept separate on purpose
+        ("umol/L", "mg/dL", False),
+    ],
+)
+def test_units_equivalent_matrix(a_raw: str, b_raw: str, expected: bool) -> None:
+    assert units_equivalent(a_raw, b_raw) is expected
+
+
+@pytest.mark.parametrize(
+    "a_raw,b_raw,expected",
+    [
+        # real corpus: None vs "" (both unflagged)
+        (None, "", True),
+        (None, "N", True),
+        (None, "Normal", True),
+        ("", "normal", True),
+        # case-insensitive word vs letter code
+        ("H", "high", True),
+        ("l", "LOW", True),
+        ("HH", "critical high", True),
+        ("LL", "Critical Low", True),
+        ("A", "Abnormal", True),
+        # guards: absent vs an actual abnormal code stays a real mismatch
+        (None, "H", False),
+        (None, "A", False),
+        ("", "L", False),
+        ("H", "L", False),
+    ],
+)
+def test_flags_equivalent_matrix(a_raw: str | None, b_raw: str | None, expected: bool) -> None:
+    assert flags_equivalent(a_raw, b_raw) is expected
+
+
+# --------------------------------------------------------------------------
+# End-to-end: real-corpus false-mismatch pairs now reconcile to AUTO with no
+# reasons at all - not just "not blocking", genuinely no false disagreement
+# recorded.
+# --------------------------------------------------------------------------
+
+
+def test_ref_range_trailing_unit_token_no_longer_forces_pending(tmp_path: Path) -> None:
+    pass_a = _doc([_result(ref_range_raw="<20")])
+    pass_b = _doc([_result(ref_range_raw="<20 Units")])
+
+    rows = reconcile(pass_a, pass_b, _empty_db(tmp_path))
+
+    assert len(rows) == 1
+    assert rows[0].status == "auto"
+    assert rows[0].reasons == []
+
+
+def test_ref_range_and_unit_synonym_combo_no_longer_forces_pending(tmp_path: Path) -> None:
+    """The real corpus's RBC case: an embedded-unit reference range AND a
+    unit spelling difference on the SAME pair, both resolved."""
+    pass_a = _doc([_result(name_raw="RBC", value=4.5, unit_raw="M/uL", ref_range_raw="3.80-5.10")])
+    pass_b = _doc(
+        [
+            _result(
+                name_raw="RBC",
+                value=4.5,
+                unit_raw="Million/uL",
+                ref_range_raw="3.80 - 5.10 Million/uL",
+            )
+        ]
+    )
+
+    rows = reconcile(pass_a, pass_b, _empty_db(tmp_path))
+
+    assert len(rows) == 1
+    assert rows[0].status == "auto"
+    assert rows[0].reasons == []
+
+
+def test_flag_none_vs_empty_string_no_longer_forces_pending(tmp_path: Path) -> None:
+    pass_a = _doc([_result(flag_raw=None)])
+    pass_b = _doc([_result(flag_raw="")])
+
+    rows = reconcile(pass_a, pass_b, _empty_db(tmp_path))
+
+    assert len(rows) == 1
+    assert rows[0].status == "auto"
+    assert rows[0].reasons == []
+
+
+def test_flag_absent_vs_normal_word_no_longer_forces_pending(tmp_path: Path) -> None:
+    pass_a = _doc([_result(flag_raw="N")])
+    pass_b = _doc([_result(flag_raw=None)])
+
+    rows = reconcile(pass_a, pass_b, _empty_db(tmp_path))
+
+    assert len(rows) == 1
+    assert rows[0].status == "auto"
+    assert rows[0].reasons == []
+
+
+def test_flag_absent_vs_abnormal_code_still_forces_pending(tmp_path: Path) -> None:
+    """The guard case: an omitted flag is NOT equivalent to an actual
+    abnormal code - one pass genuinely saw something the other missed."""
+    pass_a = _doc([_result(flag_raw=None)])
+    pass_b = _doc([_result(flag_raw="H")])
+
+    rows = reconcile(pass_a, pass_b, _empty_db(tmp_path))
+
+    assert len(rows) == 1
+    assert rows[0].status == "pending"
+    assert any("flag_mismatch" in reason for reason in rows[0].reasons)
+
+
+def test_unit_synonym_tsh_no_longer_forces_pending(tmp_path: Path) -> None:
+    pass_a = _doc([_result(name_raw="TSH", value=2.5, unit_raw="mIU/L", ref_range_raw="0.4-4.0")])
+    pass_b = _doc([_result(name_raw="TSH", value=2.5, unit_raw="uIU/mL", ref_range_raw="0.4-4.0")])
+
+    rows = reconcile(pass_a, pass_b, _empty_db(tmp_path))
+
+    assert len(rows) == 1
+    assert rows[0].status == "auto"
+    assert rows[0].reasons == []
+
+
+# --------------------------------------------------------------------------
+# compute_pair_reasons: the pure function shared with `labs.reclassify`.
+# --------------------------------------------------------------------------
+
+
+def test_compute_pair_reasons_matches_reconcile_for_an_equivalent_pair(tmp_path: Path) -> None:
+    a = _result(ref_range_raw="<20")
+    b = _result(ref_range_raw="<20 Units")
+
+    reasons = compute_pair_reasons(
+        a, b, doc_date=date(2026, 5, 2), missing_date=False, db=_empty_db(tmp_path)
+    )
+
+    assert reasons == []
+
+
+def test_compute_pair_reasons_reports_a_genuine_mismatch(tmp_path: Path) -> None:
+    a = _result(value=8.0)
+    b = _result(value=9.0)
+
+    reasons = compute_pair_reasons(
+        a, b, doc_date=date(2026, 5, 2), missing_date=False, db=_empty_db(tmp_path)
+    )
+
+    assert any("value_mismatch" in reason for reason in reasons)
 
 
 def test_rescue_accepts_residual_risk_when_units_are_compatible(tmp_path: Path) -> None:

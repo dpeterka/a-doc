@@ -17,7 +17,7 @@ import re
 import sqlite3
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from types import TracebackType
 from typing import Any, Literal
@@ -610,6 +610,32 @@ class LabsDb:
         self._conn.execute(
             "UPDATE labs SET raw_json = ? WHERE id = ?",
             (json.dumps(payload), row_id),
+        )
+        self._conn.commit()
+
+    def reclassify_row(self, row_id: int, *, reasons: list[str], auto: bool, at: datetime) -> None:
+        """Apply `labs.reclassify.reclassify_pending`'s recomputed reason
+        list to a still-PENDING row: `auto=True` flips `extraction_status`
+        to `AUTO` (every reason the old literal comparators manufactured
+        turned out to be a false positive); `auto=False` leaves it PENDING
+        but rewrites `raw_json["reasons"]` so the confirm queue's agreed-
+        vs-disagreed bucketing (`row_is_agreed`) reflects the current
+        comparators. The original reason list is preserved as
+        `previous_reasons` for audit, alongside a `reclassified_at`
+        timestamp - every other key in `raw_json` (both passes' full
+        payloads) is left untouched.
+        """
+        row = self.get_row(row_id)
+        if row is None:
+            raise ValueError(f"reclassify_row: no such row {row_id}")
+        payload = row.raw_payload()
+        payload["previous_reasons"] = payload.get("reasons", [])
+        payload["reasons"] = reasons
+        payload["reclassified_at"] = at.isoformat()
+        status = ExtractionStatus.AUTO.value if auto else ExtractionStatus.PENDING.value
+        self._conn.execute(
+            "UPDATE labs SET extraction_status = ?, raw_json = ? WHERE id = ?",
+            (status, json.dumps(payload), row_id),
         )
         self._conn.commit()
 

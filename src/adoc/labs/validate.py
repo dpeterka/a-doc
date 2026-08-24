@@ -81,6 +81,71 @@ def _normalize(text: str) -> str:
 
 _TITER_PATTERN = re.compile(r"^1\s*:\s*\d+$")
 
+# Unit spelling families (feature/semantic-compare): real-corpus reconcile
+# false-positives showed extraction passes printing the SAME unit in
+# different, equally-valid spellings (e.g. "Million/uL" vs "M/uL" vs
+# "x10^6/uL"). Each inner tuple is one family of interchangeable spellings,
+# pre-normalized (casefold, no internal whitespace - see `_normalize_unit_text`).
+# Deliberately does NOT merge families a clinician would NOT treat as
+# interchangeable even though they look similar: "IU/mL" and "U/mL" stay
+# separate (different assay standardization), and "units"/"U" (a bare,
+# unit-less flag on some printed ranges) stays its own family too.
+UNIT_SYNONYMS: tuple[tuple[str, ...], ...] = (
+    ("10*6/ul", "x10^6/ul", "m/ul", "million/ul", "x10e6/ul"),
+    ("10*3/ul", "x10^3/ul", "k/ul", "thousand/ul", "x10e3/ul"),
+    ("mg/dl",),
+    ("g/dl",),
+    ("mmol/l",),
+    ("mcg/dl", "ug/dl", "µg/dl"),
+    ("miu/l", "uiu/ml"),  # numerically equivalent for TSH reporting
+    ("ng/ml",),
+    ("pg/ml",),
+    ("%",),
+    ("mm/hr", "mm/h"),
+    ("iu/ml",),  # kept separate from U/mL - not assumed equal
+    ("u/ml",),
+    ("units", "u"),
+)
+
+
+def _normalize_unit_text(text: str) -> str:
+    """Case/whitespace-insensitive key for `UNIT_SYNONYMS`/`canonical_unit`
+    lookup. Internal whitespace is removed entirely (not just collapsed) -
+    unit spellings never carry semantically meaningful spaces."""
+    return re.sub(r"\s+", "", text.strip().casefold())
+
+
+_UNIT_SYNONYM_INDEX: dict[str, str] = {
+    _normalize_unit_text(member): family[0] for family in UNIT_SYNONYMS for member in family
+}
+
+
+def canonical_unit(raw: str | None) -> str | None:
+    """The canonical family token for `raw` (module docstring), or `None`
+    if `raw` doesn't match any known spelling family - never a guess."""
+    if raw is None:
+        return None
+    normalized = _normalize_unit_text(raw)
+    if not normalized:
+        return None
+    return _UNIT_SYNONYM_INDEX.get(normalized)
+
+
+def _unit_in_whitelist(unit: str | None, allowed: tuple[str, ...]) -> bool:
+    """`unit` matches one of `allowed`'s printed spellings, or shares its
+    `canonical_unit` family (feature/semantic-compare: `validate_row`'s
+    whitelist accepts any synonym of a whitelisted unit, not just the exact
+    spellings enumerated in `AnalyteSpec.allowed_units`)."""
+    if unit is None:
+        return False
+    unit_key = canonical_unit(unit) or _normalize_unit_text(unit)
+    for allowed_unit in allowed:
+        allowed_key = canonical_unit(allowed_unit) or _normalize_unit_text(allowed_unit)
+        if unit_key == allowed_key:
+            return True
+    return False
+
+
 # ~25 analytes common to autoimmune workups: CBC, CMP, inflammation, thyroid,
 # autoimmune serology, and iron/vitamin panels frequently ordered alongside
 # them. Bounds are hard *plausibility* limits (beyond which a value is almost
@@ -397,8 +462,7 @@ def validate_row(row: LabResult) -> list[ValidationIssue]:
         return issues
 
     if spec.kind == "numeric":
-        allowed = {u.lower() for u in spec.allowed_units}
-        if row.ucum_unit is None or row.ucum_unit.lower() not in allowed:
+        if not _unit_in_whitelist(row.ucum_unit, spec.allowed_units):
             issues.append(
                 ValidationIssue(
                     IssueCode.UNKNOWN_UNIT,
@@ -436,8 +500,7 @@ def validate_row(row: LabResult) -> list[ValidationIssue]:
         # "numeric", where a missing unit itself IS the complaint); only
         # an actually-printed, non-whitelisted unit does. No reference
         # range is ever expected for a score, so nothing here checks one.
-        allowed = {u.lower() for u in spec.allowed_units}
-        if row.ucum_unit is not None and row.ucum_unit.lower() not in allowed:
+        if row.ucum_unit is not None and not _unit_in_whitelist(row.ucum_unit, spec.allowed_units):
             issues.append(
                 ValidationIssue(
                     IssueCode.UNKNOWN_UNIT,
