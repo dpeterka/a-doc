@@ -22,7 +22,7 @@ from pathlib import Path
 from types import TracebackType
 from typing import Any
 
-from adoc.labs.models import ExtractionStatus, LabDocument, LabFlag, LabResult
+from adoc.labs.models import ExtractionStatus, LabDocument, LabFlag, LabResult, Specimen
 
 
 @dataclass(frozen=True)
@@ -103,6 +103,82 @@ _MIGRATIONS: list[str] = [
         INSERT INTO labs_fts(rowid, name, name_raw) VALUES (new.id, new.name, new.name_raw);
     END;
     """,
+    # Migration 2: add the `specimen` dimension (real finding: urinalysis
+    # GLUCOSE "NEGATIVE" and a serum glucose mg/dL reading canonicalized to
+    # the same `name` and so shared one trend series). SQLite can't
+    # ALTER a UNIQUE constraint or add a CHECK'd column with a plain
+    # `ALTER TABLE ADD COLUMN`, so this follows sqlite.org's 12-step
+    # table-rebuild recipe: build the new table, copy rows across
+    # (defaulting every existing row's `specimen` to 'unknown' - it is
+    # unknown, not a guess), drop the old table (which also drops its
+    # triggers and `labs_by_analyte` index), rename the new table into
+    # place, then recreate the index, the FTS5 external-content table, and
+    # its sync triggers - the FTS table's `content_rowid` ties it to
+    # `labs.id`, which is preserved by the copy (`INSERT ... SELECT id,
+    # ...`), so search behavior over the same rows is unaffected once
+    # repopulated.
+    """
+    CREATE TABLE labs_new (
+        id INTEGER PRIMARY KEY,
+        date TEXT NOT NULL,
+        loinc_code TEXT,
+        name TEXT NOT NULL,
+        name_raw TEXT NOT NULL,
+        value REAL,
+        value_text TEXT,
+        ucum_unit TEXT,
+        ref_low REAL,
+        ref_high REAL,
+        ref_text TEXT,
+        flag TEXT CHECK(flag IN ('H', 'L', 'HH', 'LL', 'A') OR flag IS NULL),
+        specimen TEXT NOT NULL DEFAULT 'unknown'
+            CHECK(specimen IN ('serum', 'plasma', 'whole_blood', 'urine', 'stool', 'csf',
+                                'saliva', 'other', 'unknown')),
+        source_doc TEXT NOT NULL REFERENCES documents(sha256),
+        source_page INTEGER,
+        extraction_status TEXT NOT NULL DEFAULT 'auto'
+            CHECK(extraction_status IN ('auto', 'confirmed', 'corrected', 'pending', 'rejected')),
+        raw_json TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        UNIQUE(date, name, specimen, source_doc)
+    );
+
+    INSERT INTO labs_new (
+        id, date, loinc_code, name, name_raw, value, value_text, ucum_unit,
+        ref_low, ref_high, ref_text, flag, specimen, source_doc, source_page,
+        extraction_status, raw_json, created_at
+    )
+    SELECT id, date, loinc_code, name, name_raw, value, value_text, ucum_unit,
+           ref_low, ref_high, ref_text, flag, 'unknown', source_doc, source_page,
+           extraction_status, raw_json, created_at
+    FROM labs;
+
+    DROP TABLE labs_fts;
+    DROP TABLE labs;
+    ALTER TABLE labs_new RENAME TO labs;
+
+    CREATE INDEX labs_by_analyte ON labs(name, date);
+
+    CREATE VIRTUAL TABLE labs_fts USING fts5(
+        name, name_raw, content='labs', content_rowid='id'
+    );
+    INSERT INTO labs_fts(rowid, name, name_raw) SELECT id, name, name_raw FROM labs;
+
+    CREATE TRIGGER labs_ai AFTER INSERT ON labs BEGIN
+        INSERT INTO labs_fts(rowid, name, name_raw) VALUES (new.id, new.name, new.name_raw);
+    END;
+
+    CREATE TRIGGER labs_ad AFTER DELETE ON labs BEGIN
+        INSERT INTO labs_fts(labs_fts, rowid, name, name_raw)
+        VALUES('delete', old.id, old.name, old.name_raw);
+    END;
+
+    CREATE TRIGGER labs_au AFTER UPDATE ON labs BEGIN
+        INSERT INTO labs_fts(labs_fts, rowid, name, name_raw)
+        VALUES('delete', old.id, old.name, old.name_raw);
+        INSERT INTO labs_fts(rowid, name, name_raw) VALUES (new.id, new.name, new.name_raw);
+    END;
+    """,
 ]
 
 _CORRECTABLE_FIELDS = {
@@ -117,6 +193,7 @@ _CORRECTABLE_FIELDS = {
     "ref_high",
     "ref_text",
     "flag",
+    "specimen",
     "source_page",
 }
 
@@ -154,6 +231,7 @@ def _lab_params(row: LabResult) -> tuple[Any, ...]:
         row.ref_high,
         row.ref_text,
         row.flag.value if row.flag else None,
+        row.specimen,
         row.source_doc,
         row.source_page,
         row.extraction_status.value,
@@ -286,10 +364,10 @@ class LabsDb:
                 """
                 INSERT INTO labs (
                     date, loinc_code, name, name_raw, value, value_text, ucum_unit,
-                    ref_low, ref_high, ref_text, flag, source_doc, source_page,
+                    ref_low, ref_high, ref_text, flag, specimen, source_doc, source_page,
                     extraction_status, raw_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(date, name, source_doc) DO NOTHING
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(date, name, specimen, source_doc) DO NOTHING
                 """,
                 _lab_params(row),
             )
@@ -428,43 +506,89 @@ class LabsDb:
     # Read side
     # ----------------------------------------------------------------
 
-    def series(self, name: str, *, include_rejected: bool = False) -> list[LabResult]:
-        """Time-ordered trend series for one canonical analyte name."""
-        if include_rejected:
-            rows = self._conn.execute(
-                "SELECT * FROM labs WHERE name = ? ORDER BY date, id", (name,)
-            ).fetchall()
-        else:
-            rows = self._conn.execute(
-                "SELECT * FROM labs WHERE name = ? AND extraction_status != ? ORDER BY date, id",
-                (name, ExtractionStatus.REJECTED.value),
-            ).fetchall()
+    def series(
+        self, name: str, specimen: Specimen | None = None, *, include_rejected: bool = False
+    ) -> list[LabResult]:
+        """Time-ordered trend series for one canonical analyte name.
+
+        `specimen=None` (the default) means "all specimens" — back-compat
+        with callers that don't yet care about the dimension (and with
+        pre-migration data, which is all `"unknown"`). Passing a specimen
+        scopes the series to just that one, so e.g. a serum glucose trend
+        never includes a urinalysis GLUCOSE "NEGATIVE" reading that happens
+        to canonicalize to the same `name` (see `labs/models.py`'s
+        `Specimen` docstring for the finding that motivated this).
+        """
+        clauses = ["name = ?"]
+        params: list[Any] = [name]
+        if specimen is not None:
+            clauses.append("specimen = ?")
+            params.append(specimen)
+        if not include_rejected:
+            clauses.append("extraction_status != ?")
+            params.append(ExtractionStatus.REJECTED.value)
+        where = " AND ".join(clauses)
+        rows = self._conn.execute(
+            f"SELECT * FROM labs WHERE {where} ORDER BY date, id", params
+        ).fetchall()
         return [_row_to_lab(row) for row in rows]
 
     def latest_panel(self) -> list[LabResult]:
-        """Most recent non-rejected row per distinct analyte name."""
+        """Most recent non-rejected row per distinct (analyte name, specimen).
+
+        Grouping includes `specimen` (not just `name`) so that, e.g., a
+        serum glucose reading and a urinalysis GLUCOSE reading — both
+        canonicalized to `name = "glucose"` but different specimens — each
+        surface as their own "latest" row instead of one silently hiding
+        the other's.
+        """
         rows = self._conn.execute(
             """
             SELECT l.* FROM labs l
             JOIN (
-                SELECT name, MAX(date) AS max_date FROM labs
+                SELECT name, specimen, MAX(date) AS max_date FROM labs
                 WHERE extraction_status != ?
-                GROUP BY name
-            ) latest ON latest.name = l.name AND latest.max_date = l.date
+                GROUP BY name, specimen
+            ) latest ON latest.name = l.name AND latest.specimen = l.specimen
+                AND latest.max_date = l.date
             WHERE l.extraction_status != ?
-            ORDER BY l.name
+            ORDER BY l.name, l.specimen
             """,
             (ExtractionStatus.REJECTED.value, ExtractionStatus.REJECTED.value),
         ).fetchall()
         return [_row_to_lab(row) for row in rows]
 
     def abnormal_since(self, since: date) -> list[LabResult]:
+        """Flagged rows on/after `since`, most recent first.
+
+        `specimen` is carried through for free: this already selects full
+        rows (`SELECT *`), so each row's `specimen` is populated exactly as
+        stored — nothing to filter here, `abnormal_summary` callers that
+        care about specimen read it straight off each returned `LabResult`.
+        """
         rows = self._conn.execute(
             "SELECT * FROM labs WHERE date >= ? AND flag IS NOT NULL "
             "AND extraction_status != ? ORDER BY date DESC, id DESC",
             (since.isoformat(), ExtractionStatus.REJECTED.value),
         ).fetchall()
         return [_row_to_lab(row) for row in rows]
+
+    def rows_with_unknown_specimen(self) -> list[LabResult]:
+        """Every row (any `extraction_status`) whose `specimen` is still
+        `"unknown"` — the working set for `adoc labs-infer-specimen`
+        (`labs/specimen.py`)."""
+        rows = self._conn.execute(
+            "SELECT * FROM labs WHERE specimen = 'unknown' ORDER BY id"
+        ).fetchall()
+        return [_row_to_lab(row) for row in rows]
+
+    def update_specimen(self, row_id: int, specimen: Specimen) -> None:
+        """Set `row_id`'s `specimen` directly, without touching
+        `extraction_status` — used by `adoc labs-infer-specimen`'s
+        deterministic maintenance pass, as opposed to `correct_row` (a
+        human review action that also marks the row `corrected`)."""
+        self._conn.execute("UPDATE labs SET specimen = ? WHERE id = ?", (specimen, row_id))
+        self._conn.commit()
 
     def search(self, text: str) -> list[LabResult]:
         """Full-text search over `name`/`name_raw` via the FTS5 index."""
@@ -544,9 +668,9 @@ class LabsDb:
             """
             INSERT INTO labs (
                 id, date, loinc_code, name, name_raw, value, value_text, ucum_unit,
-                ref_low, ref_high, ref_text, flag, source_doc, source_page,
+                ref_low, ref_high, ref_text, flag, specimen, source_doc, source_page,
                 extraction_status, raw_json, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (row.id, *_lab_params(row)),
         )

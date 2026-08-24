@@ -542,6 +542,127 @@ def test_original_document_404s_for_an_unknown_sha(tmp_path: Path) -> None:
 _DOCX_SHA = "e" * 64
 
 
+# --------------------------------------------------------------------------
+# Specimen: chip rendering, correction, and the specimen_mismatch
+# disagreement bucket
+# --------------------------------------------------------------------------
+
+
+def test_confirm_row_shows_specimen_chip_when_not_unknown(tmp_path: Path) -> None:
+    app, repo, db, _calls = build_app(tmp_path)
+    _seed_document(repo, db, sha=SHA, filename="doc.pdf")
+    [row_id] = db.insert_results(
+        [
+            LabResult(
+                date=date(2026, 5, 2),
+                name="glucose",
+                name_raw="GLUCOSE",
+                value=None,
+                value_text="NEGATIVE",
+                source_doc=SHA,
+                source_page=1,
+                extraction_status=ExtractionStatus.PENDING,
+                specimen="urine",
+                raw_json=json.dumps({"reasons": ["missing_date"]}),
+            )
+        ]
+    )
+    assert row_id is not None
+    client = TestClient(app)
+    login(client)
+
+    response = client.get("/confirm")
+
+    assert response.status_code == 200
+    assert 'class="chip chip-specimen"' in response.text
+    assert ">urine<" in response.text
+
+
+def test_confirm_row_shows_no_specimen_chip_when_unknown(tmp_path: Path) -> None:
+    app, repo, db, _calls = build_app(tmp_path)
+    row_id = _seed_pending_row(repo, db)
+    client = TestClient(app)
+    login(client)
+
+    response = client.get("/confirm")
+
+    assert response.status_code == 200
+    assert row_id  # seeded row present, specimen defaults "unknown"
+    assert "chip-specimen" not in response.text
+
+
+def test_correct_action_can_change_specimen(tmp_path: Path) -> None:
+    app, repo, db, _calls = build_app(tmp_path)
+    row_id = _seed_pending_row(repo, db)
+    client = TestClient(app)
+    login(client)
+
+    response = client.post(
+        f"/confirm/{row_id}/correct",
+        data={
+            "value": "",
+            "date": "",
+            "name": "",
+            "value_text": "",
+            "ucum_unit": "",
+            "ref_low": "",
+            "ref_high": "",
+            "flag": "",
+            "specimen": "serum",
+        },
+    )
+
+    assert response.status_code == 200
+    row = db.get_row(row_id)
+    assert row is not None
+    assert row.specimen == "serum"
+    assert row.extraction_status == ExtractionStatus.CORRECTED
+
+
+def test_specimen_mismatch_pending_row_lands_in_disagreement_bucket(tmp_path: Path) -> None:
+    app, repo, db, _calls = build_app(tmp_path)
+    _seed_document(repo, db, sha=SHA, filename="doc.pdf")
+    _seed_pending_with_raw(
+        db,
+        sha=SHA,
+        name="glucose",
+        reasons=["specimen_mismatch: 'serum' vs 'urine'"],
+        pass_a={
+            "name_raw": "GLUCOSE",
+            "value": 92.0,
+            "unit_raw": "mg/dL",
+            "ref_range_raw": None,
+            "flag_raw": None,
+            "specimen": "serum",
+            "page": 1,
+            "confidence": "high",
+        },
+        pass_b={
+            "name_raw": "GLUCOSE",
+            "value": 92.0,
+            "unit_raw": "mg/dL",
+            "ref_range_raw": None,
+            "flag_raw": None,
+            "specimen": "urine",
+            "page": 1,
+            "confidence": "high",
+        },
+    )
+    client = TestClient(app)
+    login(client)
+
+    response = client.get("/confirm")
+
+    assert response.status_code == 200
+    assert "Models disagreed" in response.text
+    assert "serum" in response.text
+    assert "urine" in response.text
+
+
+def test_specimen_mismatch_is_classified_as_a_disagreement() -> None:
+    assert row_is_agreed(["specimen_mismatch: 'serum' vs 'urine'"]) is False
+
+
 def test_confirm_queue_shows_text_fallback_when_no_page_image_exists(tmp_path: Path) -> None:
     """A docx-sourced pending row has no rendered pages; the row must show
     the text-document fallback instead of a broken <img> (ported onto the

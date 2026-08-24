@@ -211,6 +211,7 @@ def _to_lab_result(row: ReconciledRow, *, source_doc: str) -> LabResult:
         ref_high=ref_high,
         ref_text=row.ref_range_raw,
         flag=parse_flag(row.flag_raw),
+        specimen=row.specimen,
         source_doc=source_doc,
         source_page=row.source_page,
         extraction_status=status,

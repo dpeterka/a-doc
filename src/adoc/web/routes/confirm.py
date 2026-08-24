@@ -59,6 +59,7 @@ _REASON_TO_DIFF_FIELD: dict[str, str] = {
     "unit_mismatch": "unit_raw",
     "ref_range_mismatch": "ref_range_raw",
     "flag_mismatch": "flag_raw",
+    "specimen_mismatch": "specimen",
 }
 
 _COMPARE_FIELDS: tuple[tuple[str, str], ...] = (
@@ -66,6 +67,7 @@ _COMPARE_FIELDS: tuple[tuple[str, str], ...] = (
     ("unit_raw", "Unit"),
     ("ref_range_raw", "Reference range"),
     ("flag_raw", "Flag"),
+    ("specimen", "Specimen"),
 )
 
 
@@ -308,6 +310,7 @@ def _parse_correction_fields(
     ref_low: str | None,
     ref_high: str | None,
     flag: str | None,
+    specimen: str | None,
 ) -> dict[str, Any]:
     """Build the `LabsDb.correct_row(**fields)` kwargs from the confirm form's
     (all-optional) inputs, skipping any left blank."""
@@ -328,6 +331,8 @@ def _parse_correction_fields(
         fields["ref_high"] = float(ref_high)
     if flag:
         fields["flag"] = LabFlag(flag)
+    if specimen:
+        fields["specimen"] = specimen
     return fields
 
 
@@ -345,6 +350,7 @@ def correct_row(
     ref_low: str = Form(""),
     ref_high: str = Form(""),
     flag: str = Form(""),
+    specimen: str = Form(""),
 ) -> Response:
     error: str | None = None
     try:
@@ -357,6 +363,7 @@ def correct_row(
             ref_low=ref_low or None,
             ref_high=ref_high or None,
             flag=flag or None,
+            specimen=specimen or None,
         )
         if not fields:
             error = "Change at least one field before saving a correction."

@@ -12,8 +12,10 @@ docstring calls out) so no real provider/network call ever happens.
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +27,8 @@ from adoc.casefile.repo import DataRepo
 from adoc.cli import main
 from adoc.config import ModelBinding
 from adoc.ingest.schema import ClassifyResult, DocumentExtraction
+from adoc.labs.db import LabsDb
+from adoc.labs.models import DocumentStatus, LabDocument, LabResult
 from adoc.reason.client import AnthropicProvider, LlmClient, TransportRequest, TransportResponse
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -285,6 +289,109 @@ def test_review_runs_end_to_end_with_a_fake_client(
     out = capsys.readouterr().out
     assert "ledger 0 -> 1" in out
     assert "tagged review-" in out
+
+
+def test_labs_infer_specimen_fails_without_data_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("ADOC_DATA_DIR", raising=False)
+
+    code = main(["labs-infer-specimen"])
+
+    assert code == 1
+    assert "configuration error" in capsys.readouterr().err
+
+
+def test_labs_infer_specimen_fails_if_data_repo_not_initialized(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("ADOC_DATA_DIR", str(tmp_path / "a-doc-data"))
+    monkeypatch.setenv("ADOC_MODELS_FILE", str(REPO_ROOT / "models.yaml"))
+
+    code = main(["labs-infer-specimen"])
+
+    assert code == 1
+    assert "run `adoc init` first" in capsys.readouterr().err
+
+
+def test_labs_infer_specimen_runs_end_to_end_and_commits(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    data_dir = tmp_path / "a-doc-data"
+    repo = DataRepo.init_at(data_dir)
+    monkeypatch.setenv("ADOC_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("ADOC_MODELS_FILE", str(REPO_ROOT / "models.yaml"))
+
+    sha_urine = "a" * 64
+    sha_other = "b" * 64
+    with LabsDb(data_dir / "labs.sqlite") as db:
+        db.upsert_document(
+            LabDocument(
+                sha256=sha_urine,
+                filename="urinalysis-2026-05-02.pdf",
+                doc_type="lab_report",
+                page_count=1,
+                ingested_at=datetime(2026, 5, 3, 12, 0, 0),
+                status=DocumentStatus.COMPLETE,
+            )
+        )
+        db.upsert_document(
+            LabDocument(
+                sha256=sha_other,
+                filename="labcorp-cmp-2026-05-02.pdf",
+                doc_type="lab_report",
+                page_count=1,
+                ingested_at=datetime(2026, 5, 3, 12, 0, 0),
+                status=DocumentStatus.COMPLETE,
+            )
+        )
+        db.insert_results(
+            [
+                LabResult(
+                    date=date(2026, 5, 2),
+                    name="glucose",
+                    name_raw="GLUCOSE",
+                    value=None,
+                    value_text="NEGATIVE",
+                    source_doc=sha_urine,
+                    raw_json=json.dumps({"name_raw": "GLUCOSE"}),
+                ),
+                LabResult(
+                    date=date(2026, 5, 2),
+                    name="sodium",
+                    name_raw="Sodium",
+                    value=140.0,
+                    ucum_unit="mmol/L",
+                    source_doc=sha_other,
+                    raw_json=json.dumps({"name_raw": "Sodium"}),
+                ),
+            ]
+        )
+        db.export_jsonl(data_dir / "labs-export.jsonl")
+    repo.commit("seed labs data", paths=["labs-export.jsonl"])
+
+    code = main(["labs-infer-specimen"])
+
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "updated 1 row(s)" in out
+    assert "urine: 1" in out
+    assert "1 row(s) remain unknown" in out
+
+    with LabsDb(data_dir / "labs.sqlite") as db:
+        rows = {row.name: row for row in db.series("glucose") + db.series("sodium")}
+        assert rows["glucose"].specimen == "urine"
+        assert rows["sodium"].specimen == "unknown"
+
+    export_text = (data_dir / "labs-export.jsonl").read_text(encoding="utf-8")
+    assert '"specimen": "urine"' in export_text
+
+    # idempotent: a second run finds nothing left to update
+    second_code = main(["labs-infer-specimen"])
+    assert second_code == 0
+    second_out = capsys.readouterr().out
+    assert "updated 0 row(s)" in second_out
 
 
 def test_eval_runs_offline_with_out_dir(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

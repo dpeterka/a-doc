@@ -9,7 +9,10 @@
       {% for item in analytes %}
         <li class="labs-list-row">
           <a href="/labs/{{ item.url_name }}" class="labs-list-link">
-            <span class="labs-name">{{ item.name }}</span>
+            <span class="labs-name">
+              {{ item.name }}
+              {% if item.specimen != "unknown" %}<span class="chip chip-specimen">{{ item.specimen }}</span>{% endif %}
+            </span>
             <span class="labs-sparkline">{{ item.sparkline_svg | safe }}</span>
             <span class="labs-latest">
               {{ item.latest.value if item.latest.value is not none else item.latest.value_text }}

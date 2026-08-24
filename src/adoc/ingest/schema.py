@@ -14,6 +14,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from adoc.labs.models import Specimen
+
 Confidence = Literal["high", "medium", "low"]
 DocType = Literal["lab_report", "clinical_note", "imaging_report", "other"]
 
@@ -22,10 +24,13 @@ class ExtractedResult(BaseModel):
     """One discrete result row transcribed from a document page.
 
     Mirrors PLAN.md's `results[]` shape: `(name_raw, value|value_text,
-    unit_raw, ref_range_raw, flag_raw, page, confidence)`. Exactly what the
-    extractor transcribed — no canonicalization, unit conversion, or
-    validation happens here (that is `labs.validate`'s job, applied in
-    `ingest/reconcile.py`).
+    unit_raw, ref_range_raw, flag_raw, specimen, page, confidence)`. Exactly
+    what the extractor transcribed — no canonicalization, unit conversion,
+    or validation happens here (that is `labs.validate`'s job, applied in
+    `ingest/reconcile.py`). `specimen` defaults to `"unknown"` — the
+    extractor only ever records a specimen it can actually read off the
+    report's own section headers/labels (e.g. "URINALYSIS", "Stool"), never
+    a guess.
     """
 
     name_raw: str
@@ -34,6 +39,7 @@ class ExtractedResult(BaseModel):
     unit_raw: str | None = None
     ref_range_raw: str | None = None
     flag_raw: str | None = None
+    specimen: Specimen = "unknown"
     page: int = Field(ge=1)
     confidence: Confidence
 
