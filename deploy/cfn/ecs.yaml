@@ -406,7 +406,12 @@ Resources:
       DeploymentConfiguration:
         MaximumPercent: 100
         MinimumHealthyPercent: 0
-      HealthCheckGracePeriodSeconds: 120
+      # 900s, not the ALB-typical 120: a FIRST boot on empty EFS restores
+      # the full backup (bundle + sources incl. ~430MB genomics) before
+      # uvicorn starts, and the grace window must cover it — a real cutover
+      # saw the restore succeed and the task get killed anyway by a stale
+      # unhealthy verdict from the 120s window.
+      HealthCheckGracePeriodSeconds: 900
       # Enables `aws ecs execute-command` for one-off shells (README "User
       # provisioning": `adoc user add`), replacing SSM Session Manager
       # access to the EC2 instance.
