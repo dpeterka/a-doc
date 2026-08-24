@@ -44,7 +44,9 @@ Resources:
   Alb:
     Type: AWS::ElasticLoadBalancingV2::LoadBalancer
     Properties:
-      Name: a-doc-alb
+      # No explicit Name: named ELB resources cannot be replaced in place
+      # (the new resource collides with the old one's name). Identity comes
+      # from stack outputs/exports, not the physical name.
       Type: application
       Scheme: internet-facing
       Subnets:
@@ -59,7 +61,6 @@ Resources:
   TargetGroup:
     Type: AWS::ElasticLoadBalancingV2::TargetGroup
     Properties:
-      Name: a-doc-tg
       VpcId:
         Fn::ImportValue: !Sub "${NetworkStackName}-VpcId"
       Port: 8080
