@@ -300,6 +300,50 @@ def _reconcile_matched_pair(
     )
 
 
+DISAGREEMENT_REASON_PREFIXES: tuple[str, ...] = (
+    "value_mismatch",
+    "value_text_mismatch",
+    "unit_mismatch",
+    "ref_range_mismatch",
+    "flag_mismatch",
+    "single_pass",
+    "pass_a_confidence:",
+    "pass_b_confidence:",
+)
+"""Reason prefixes (see the module docstring's gate list) that reflect a
+genuine cross-pass disagreement, or a pass that couldn't even be
+compared against the other - as opposed to a single-source
+validation/dating issue that both passes' readings share (unknown
+analyte, missing date, an out-of-bounds value, a trend outlier, ...).
+
+The confirm-queue UI (`web.routes.confirm`) buckets PENDING rows on this
+distinction: a row with none of these prefixes among its reasons only
+needs a quick human OK ("models agreed"); a row with any of them needs a
+real look ("models disagreed") - see `row_is_agreed`.
+"""
+
+
+def is_disagreement_reason(reason: str) -> bool:
+    """True if `reason` (one entry of a `ReconciledRow`/pending row's
+    `reasons`) reflects a cross-pass disagreement rather than a
+    single-source issue - see `DISAGREEMENT_REASON_PREFIXES`."""
+    return reason.startswith(DISAGREEMENT_REASON_PREFIXES)
+
+
+def row_is_agreed(reasons: Sequence[str]) -> bool:
+    """True iff none of `reasons` reflect a cross-pass disagreement.
+
+    An "agreed" PENDING row only failed a single-source deterministic
+    check that both extraction passes' readings shared - unknown
+    analyte, missing date, an out-of-bounds value, a trend outlier, and
+    so on - so a quick human OK is enough. Anything else (a value/unit/
+    reference-range/flag mismatch between the two passes, a row only one
+    pass could read at all, or either pass reporting low confidence)
+    needs genuine cross-model reconciliation by a human.
+    """
+    return not any(is_disagreement_reason(r) for r in reasons)
+
+
 def reconcile(
     pass_a: DocumentExtraction, pass_b: DocumentExtraction, db: LabsDb
 ) -> list[ReconciledRow]:

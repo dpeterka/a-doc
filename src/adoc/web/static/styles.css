@@ -384,10 +384,156 @@ button.button-danger {
   gap: 0.75rem;
 }
 
-.confirm-source-image img {
+.confirm-source-caption {
+  margin: 0 0 0.4rem;
+}
+
+.confirm-page-image {
+  display: block;
+  width: 100%;
   max-width: 100%;
+  max-height: 480px;
+  object-fit: contain;
   border-radius: 6px;
   border: 1px solid var(--color-border);
+  background: var(--color-bg);
+  cursor: zoom-in;
+}
+
+.confirm-bucket {
+  margin: 1.5rem 0;
+}
+
+.confirm-bucket-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin-bottom: 0.75rem;
+}
+
+.confirm-bucket-header form {
+  margin: 0;
+}
+
+.confirm-doc-group {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  margin: 0.75rem 0;
+  padding: 0.25rem 1rem 1rem;
+}
+
+.confirm-doc-summary {
+  cursor: pointer;
+  padding: 0.75rem 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem 0.75rem;
+  align-items: baseline;
+}
+
+.confirm-doc-title {
+  font-weight: 700;
+}
+
+.confirm-doc-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.75rem;
+  margin: 0.25rem 0 0.75rem;
+}
+
+.confirm-doc-actions form {
+  margin: 0;
+}
+
+.confirm-pass-compare-wrap {
+  overflow-x: auto;
+  margin: 0.5rem 0;
+}
+
+.confirm-pass-compare {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.95rem;
+}
+
+.confirm-pass-compare th,
+.confirm-pass-compare td {
+  padding: 0.4rem 0.6rem;
+  border-bottom: 1px solid var(--color-border);
+  text-align: left;
+}
+
+.confirm-pass-compare tr.diff-field {
+  background: var(--color-warning-bg);
+}
+
+.confirm-pass-compare tr.diff-field th {
+  color: var(--color-danger);
+}
+
+.confirm-why {
+  font-style: italic;
+}
+
+.lightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  background: rgba(20, 20, 18, 0.85);
+}
+
+.lightbox.open {
+  display: flex;
+}
+
+.lightbox-viewport {
+  max-width: 95vw;
+  max-height: 90vh;
+  overflow: auto;
+}
+
+.lightbox-img {
+  display: block;
+}
+
+.lightbox-img.fit-width {
+  width: min(95vw, 900px);
+  height: auto;
+  cursor: zoom-in;
+}
+
+.lightbox-img.full-res {
+  width: 1275px;
+  max-width: none;
+  cursor: grab;
+}
+
+.lightbox-close {
+  position: fixed;
+  top: 1rem;
+  right: 1.25rem;
+  z-index: 1001;
+  background: rgba(0, 0, 0, 0.5);
+  border: none;
+  color: white;
+  font-size: 1.6rem;
+  line-height: 1;
+  width: 2.2rem;
+  height: 2.2rem;
+  border-radius: 50%;
+  cursor: pointer;
+}
+
+body.lightbox-active {
+  overflow: hidden;
 }
 
 .labs-list {
