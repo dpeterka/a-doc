@@ -38,6 +38,13 @@ from adoc.privacy import Scrubber
 
 FEATHERLESS_BASE_URL = "https://api.featherless.ai/v1"
 
+# Default completion budget. Reasoning models (gpt-5.x with reasoning_effort,
+# Claude adaptive thinking) spend REASONING tokens from this same budget -
+# 4096 was fully consumed by gpt-5.2's internal reasoning over a large
+# context, leaving EMPTY content (live challenger failure). Stages that
+# expect small outputs may pass less explicitly.
+REASONING_MAX_TOKENS = 32768
+
 # The app owns the only retry policy - `LlmClient._call_with_retry`'s bounded
 # backoff over a handful of attempts (default 3). Without these, each SDK
 # client retries its own transient failures internally (default
@@ -217,6 +224,11 @@ class AnthropicProvider:
         if request.schema is not None and tool_input is None:
             raise LlmError("anthropic: expected an emit_result tool call, none returned")
 
+        if request.schema is not None and response.stop_reason == "max_tokens":
+            raise LlmError(
+                f"model {request.model!r}: output hit the token limit before "
+                "completing the structured result - raise max_tokens"
+            )
         return TransportResponse(
             text="".join(text_parts),
             tool_input=tool_input,
@@ -316,6 +328,12 @@ class OpenAIProvider:
             raise LlmError("openai: response contained no choices")
         choice = response.choices[0]
         text = choice.message.content or ""
+        if request.schema is not None and (choice.finish_reason == "length" or not text.strip()):
+            raise LlmError(
+                f"model {request.model!r}: no structured content returned "
+                f"(finish_reason={choice.finish_reason!r}) - reasoning tokens "
+                "likely consumed the completion budget; raise max_tokens"
+            )
 
         tool_input: dict[str, Any] | None = None
         if request.schema is not None:
@@ -343,6 +361,14 @@ def _openai_strict_schema(schema: dict[str, Any]) -> dict[str, Any]:
     def walk(node: Any) -> Any:
         if isinstance(node, dict):
             out = {k: walk(v) for k, v in node.items()}
+            # Strict mode forbids oneOf (pydantic emits it for discriminated
+            # unions, e.g. LedgerDiff's op union inside ChallengerVerdict —
+            # found live: every challenger call 400'd) and the discriminator
+            # keyword. anyOf is accepted and equivalent for our purposes:
+            # the response is re-validated by pydantic afterwards anyway.
+            if "oneOf" in out:
+                out["anyOf"] = out.pop("oneOf")
+            out.pop("discriminator", None)
             if out.get("type") == "object" or "properties" in out:
                 out.setdefault("additionalProperties", False)
                 if "properties" in out:
@@ -548,7 +574,7 @@ class LlmClient:
         messages: Sequence[Message],
         schema: type[BaseModel] | None = None,
         binding_index: int = 0,
-        max_tokens: int = 4096,
+        max_tokens: int = REASONING_MAX_TOKENS,
     ) -> LlmResult:
         binding = self._resolve_binding(role, binding_index)
         provider = self._providers.get(binding.provider)

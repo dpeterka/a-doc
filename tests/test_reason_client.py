@@ -392,3 +392,27 @@ def test_structured_output_unwraps_single_key_nesting() -> None:
     assert _unwrap_tool_input({"parameters": {"a": 1}}) == {"a": 1}
     assert _unwrap_tool_input({"a": 1, "b": 2}) == {"a": 1, "b": 2}
     assert _unwrap_tool_input({"a": 1}) == {"a": 1}
+
+
+def test_openai_strict_schema_rejects_no_oneof_or_discriminator() -> None:
+    """Live failure: pydantic discriminated unions emit oneOf/discriminator,
+    which OpenAI strict mode 400s — the real ChallengerVerdict schema must
+    adapt cleanly."""
+    import json as _json
+
+    from adoc.reason.client import _openai_strict_schema
+    from adoc.reason.stages import ChallengerVerdict
+
+    adapted = _json.dumps(_openai_strict_schema(ChallengerVerdict.model_json_schema()))
+    assert '"oneOf"' not in adapted
+    assert '"discriminator"' not in adapted
+    assert '"anyOf"' in adapted
+
+
+def test_openai_empty_structured_content_raises_clear_error() -> None:
+    """Live failure: gpt-5.2's reasoning consumed the whole completion
+    budget, returning empty content with the schema unfulfilled — must be a
+    clear error, not 'not valid JSON'."""
+    from adoc.reason.client import REASONING_MAX_TOKENS
+
+    assert REASONING_MAX_TOKENS >= 32768
