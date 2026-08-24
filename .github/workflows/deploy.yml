@@ -1,6 +1,10 @@
 name: deploy
 
-# Deploys the network, backup, and instance CloudFormation stacks in order.
+# Builds the application image, pushes it to ECR, and deploys the
+# CloudFormation stacks in order: ci -> network -> backup -> alb -> ecs.
+# (See ADR 0006: EC2+install.sh -> ECS Fargate + EFS - this replaced the
+# old network -> backup -> instance -> alb order, which no longer has an
+# instance stack in it at all.)
 #
 # NOTE — bootstrap chicken-and-egg: `deploy/cfn/ci.yaml` creates the OIDC
 # IAM role that *this workflow* assumes below. That means ci.yaml itself
@@ -20,6 +24,10 @@ permissions:
   id-token: write
   contents: read
 
+env:
+  AWS_ACCOUNT_ID: "536726971394"
+  ECR_REPOSITORY: a-doc
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
@@ -38,18 +46,31 @@ jobs:
       # of applying it, add `--no-execute-changeset` to any of the deploy
       # commands below and review it before a follow-up execute.
 
-      # Self-hosting: apply ci.yaml first so deploy-role policy changes in git
-      # actually reach IAM before the stacks that need them (a policy change
-      # that only lives in git caused the 0.2.0 ALB rollback). The role may
-      # update its own a-doc-* IAM resources; the OIDC provider itself never
-      # changes here.
-      - name: Deploy ci stack (deploy role self-update)
+      # Self-hosting: apply ci.yaml first so deploy-role policy changes and
+      # the ECR repository itself exist before anything that needs to push
+      # to it or assume the widened permissions.
+      - name: Deploy ci stack (deploy role + ECR repository)
         run: |
           aws cloudformation deploy \
             --stack-name a-doc-ci \
             --template-file deploy/cfn/ci.yaml \
             --capabilities CAPABILITY_NAMED_IAM \
             --no-fail-on-empty-changeset
+
+      - name: Log in to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push the application image
+        env:
+          IMAGE_URI: ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ vars.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}
+        run: |
+          docker build \
+            --platform linux/amd64 \
+            -t "$IMAGE_URI:${{ github.sha }}" \
+            -t "$IMAGE_URI:latest" \
+            .
+          docker push "$IMAGE_URI:${{ github.sha }}"
+          docker push "$IMAGE_URI:latest"
 
       - name: Deploy network stack
         run: |
@@ -67,23 +88,8 @@ jobs:
             --capabilities CAPABILITY_IAM \
             --no-fail-on-empty-changeset
 
-      - name: Deploy instance stack
-        run: |
-          aws cloudformation deploy \
-            --stack-name a-doc-instance \
-            --template-file deploy/cfn/instance.yaml \
-            --parameter-overrides \
-              NetworkStackName=a-doc-network \
-              BackupStackName=a-doc-backup \
-              AmiId=/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64 \
-            --capabilities CAPABILITY_NAMED_IAM \
-            --no-fail-on-empty-changeset
-
-      # Must come after the instance stack: alb.yaml imports the instance's
-      # InstanceId export to register it as the target group's target.
-      # Parameters are passed explicitly (not left to the template's
-      # defaults) because parameter defaults never reach an already-deployed
-      # stack on update — only the values `deploy` actually sends do.
+      # No InstanceStackName any more - the target group is TargetType "ip",
+      # registered/deregistered by the ECS service in the ecs stack below.
       - name: Deploy ALB stack
         run: |
           aws cloudformation deploy \
@@ -91,7 +97,23 @@ jobs:
             --template-file deploy/cfn/alb.yaml \
             --parameter-overrides \
               NetworkStackName=a-doc-network \
-              InstanceStackName=a-doc-instance \
               DomainName=adoc.petabloc.io \
               HostedZoneId=Z009458513KFY2WNUS7C0 \
+            --no-fail-on-empty-changeset
+
+      # Must come after network/backup/alb: ecs.yaml imports their exports
+      # (VPC/subnets/SGs, backup bucket+key, the ALB target group).
+      - name: Deploy ECS stack
+        env:
+          IMAGE_URI: ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ vars.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+        run: |
+          aws cloudformation deploy \
+            --stack-name a-doc-ecs \
+            --template-file deploy/cfn/ecs.yaml \
+            --parameter-overrides \
+              NetworkStackName=a-doc-network \
+              BackupStackName=a-doc-backup \
+              AlbStackName=a-doc-alb \
+              ImageUri="$IMAGE_URI" \
+            --capabilities CAPABILITY_NAMED_IAM \
             --no-fail-on-empty-changeset

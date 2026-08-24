@@ -41,6 +41,20 @@ class Settings(BaseSettings):
     models_file: Path = _DEFAULT_MODELS_FILE
     dropbox_folder: str = "Dropbox/a-doc-inbox"
 
+    # SQLite journal mode for `labs.sqlite` (see `labs.db.LabsDb.__init__`'s
+    # docstring for the full rationale): "WAL" is the fast local/dev/test
+    # default; the deployed ECS/Fargate tasks set
+    # `ADOC_SQLITE_JOURNAL_MODE=TRUNCATE` because the data directory is an
+    # EFS mount and WAL is unsafe on NFS-family filesystems.
+    sqlite_journal_mode: str = "WAL"
+
+    # S3 bucket `adoc backup` uploads the git bundle + labs-export.jsonl +
+    # sources/ to (see `adoc.backup`). Set by the ECS task definitions
+    # (`deploy/cfn/ecs.yaml`) from the backup stack's bucket name; unset for
+    # local dev, where `adoc backup` fails fast with a clear error instead
+    # of silently no-op'ing.
+    backup_bucket: str | None = None
+
     anthropic_api_key: SecretStr | None = Field(
         default=None, validation_alias=AliasChoices("ANTHROPIC_API_KEY")
     )
@@ -57,12 +71,12 @@ class Settings(BaseSettings):
     session_passphrase: SecretStr | None = None
 
     # True iff the process is only ever reachable through the ALB (see
-    # `deploy/cfn/network.yaml`'s InstanceSecurityGroup, which admits
-    # inbound 8080 from the ALB's security group only): when true, the
-    # login rate limiter and secure-cookie logic trust the last hop of
+    # `deploy/cfn/ecs.yaml`'s ServiceSecurityGroup, which admits inbound
+    # 8080 from the ALB's security group only): when true, the login rate
+    # limiter and secure-cookie logic trust the last hop of
     # `X-Forwarded-For`/`X-Forwarded-Proto`. Defaults to false so a local
     # `adoc serve` or a test run never trusts a client-supplied header;
-    # `deploy/install.sh` sets `ADOC_TRUST_FORWARDED_FOR=true` in the
+    # the ECS task definitions set `ADOC_TRUST_FORWARDED_FOR=true` in the
     # deployed environment.
     trust_forwarded_for: bool = False
 

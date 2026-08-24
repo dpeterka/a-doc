@@ -157,7 +157,27 @@ def _fts_query(text: str) -> str:
 class LabsDb:
     """Sqlite-backed store for the `documents`/`labs` tables (stdlib sqlite3)."""
 
-    def __init__(self, path: str | Path) -> None:
+    def __init__(self, path: str | Path, *, journal_mode: str = "WAL") -> None:
+        """
+        `journal_mode` (default `"WAL"`) is deliberately a constructor
+        parameter, not a hardcoded pragma: WAL relies on a shared-memory
+        index file (`-wal`/`-shm`) coordinated via `mmap` + POSIX advisory
+        (`fcntl`) locks between writers, and both NFS and EFS (its AWS
+        equivalent) have historically unreliable/non-atomic advisory-lock
+        and mmap write-back semantics across clients — SQLite's own docs
+        warn WAL must not be used on a network filesystem, where it can
+        silently corrupt the database. WAL is safe and fast for local/dev/
+        test runs (the default here), but the ECS Fargate deployment mounts
+        the data directory from EFS (see `deploy/cfn/ecs.yaml`) and sets
+        `ADOC_SQLITE_JOURNAL_MODE=TRUNCATE` (via `config.Settings.
+        sqlite_journal_mode`) so the deployed app never uses WAL against
+        EFS. TRUNCATE keeps ordinary rollback-journal semantics (a single
+        journal file, no shared-memory index) and is safe on NFS/EFS,
+        provided there is still only ever one writer — see the single-writer
+        discipline note in `deploy/cfn/ecs.yaml`'s web service (desired
+        count 1, `MaximumPercent: 100`/`MinimumHealthyPercent: 0` deployment
+        so old and new tasks never run concurrently) and ADR 0006.
+        """
         self._path = path
         if str(path) != ":memory:":
             Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -170,7 +190,7 @@ class LabsDb:
         # otherwise reject.
         self._conn = sqlite3.connect(str(path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute(f"PRAGMA journal_mode={journal_mode}")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._migrate()
 

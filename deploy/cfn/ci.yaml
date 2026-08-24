@@ -1,8 +1,10 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
-  a-doc CI stack: an OIDC identity provider trust for GitHub Actions and a
-  deploy role it can assume, scoped to this repo's main branch (see PLAN.md
-  "Deployment": "ci.yaml (OIDC role for GitHub Actions deploys)").
+  a-doc CI stack: an OIDC identity provider trust for GitHub Actions, a
+  deploy role it can assume (scoped to this repo's main branch), and the
+  ECR repository the deploy workflow builds/pushes the application image
+  into (see PLAN.md "Deployment" and ADR 0006: EC2+install.sh -> ECS
+  Fargate + EFS).
 
   Bootstrap note (chicken-and-egg): this stack creates the very role that
   .github/workflows/deploy.yml assumes to deploy CloudFormation stacks —
@@ -48,6 +50,32 @@ Conditions:
   CreateOidcProvider: !Equals [!Ref OidcProviderArn, ""]
 
 Resources:
+  # ECR repository for the a-doc application image (deploy.yml builds and
+  # pushes here, tagged with the git sha + latest; deploy/cfn/ecs.yaml's
+  # ImageUri parameter references an image in this repo). See ADR 0006.
+  EcrRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: a-doc
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep only the last 10 images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 10
+                },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+
   GitHubOidcProvider:
     Type: AWS::IAM::OIDCProvider
     Condition: CreateOidcProvider
@@ -95,12 +123,17 @@ Resources:
                   - cloudformation:*
                 Resource:
                   - !Sub "arn:aws:cloudformation:*:${AWS::AccountId}:stack/a-doc-*/*"
-              - Sid: PassInstanceRole
+              # Widened from role/a-doc-instance-role (the sole EC2 role) to
+              # role/a-doc-* so the deploy role can also pass the ECS task
+              # execution/task roles and the EventBridge Scheduler role that
+              # ecs.yaml creates (a-doc-task-execution-role, a-doc-task-role,
+              # a-doc-events-role) — see ADR 0006.
+              - Sid: PassAppRoles
                 Effect: Allow
                 Action:
                   - iam:PassRole
                 Resource:
-                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/a-doc-instance-role"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/a-doc-*"
               - Sid: Ec2Broad
                 Effect: Allow
                 Action:
@@ -197,6 +230,74 @@ Resources:
                 Action:
                   - route53:GetChange
                 Resource: "arn:aws:route53:::change/*"
+              # deploy.yml's docker-build-and-push job authenticates to ECR
+              # with `aws ecr get-login-password`, which calls this
+              # account-wide (non resource-scopable) action.
+              - Sid: EcrAuth
+                Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                Resource: "*"
+              # Push/pull + lifecycle-policy management, scoped to the one
+              # a-doc ECR repository this stack creates above.
+              - Sid: EcrRepositoryPushPull
+                Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:PutImage
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:DescribeRepositories
+                  - ecr:DescribeImages
+                  - ecr:ListImages
+                  - ecr:TagResource
+                  - ecr:PutLifecyclePolicy
+                  - ecr:GetLifecyclePolicy
+                  - ecr:SetRepositoryPolicy
+                Resource:
+                  - !Sub "arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/a-doc"
+              # deploy/cfn/ecs.yaml: cluster, service, task definitions,
+              # scheduled-task RunTask wiring.
+              - Sid: EcsDeployBroad
+                Effect: Allow
+                Action:
+                  - ecs:*
+                Resource: "*"
+                # TODO: scope down to a-doc-* clusters/services/task-def
+                # families once ECS's resource-level permission model
+                # (task definition ARNs are versioned and don't exist
+                # until register-time) is worth the added complexity here.
+              # deploy/cfn/ecs.yaml: the EFS filesystem, mount targets, and
+              # access point backing the ECS tasks' /data mount.
+              - Sid: EfsBroad
+                Effect: Allow
+                Action:
+                  - elasticfilesystem:*
+                Resource: "*"
+                # TODO: scope to the specific a-doc EFS filesystem/access-
+                # point ARNs once they are stable across redeploys.
+              # deploy/cfn/ecs.yaml: EventBridge rules + targets for the
+              # scheduled ingest/review/backup ECS tasks.
+              - Sid: EventsSchedulingBroad
+                Effect: Allow
+                Action:
+                  - events:*
+                Resource: "*"
+                # TODO: scope to the specific a-doc-* rule ARNs once
+                # ecs.yaml's scheduled-task rules stabilize.
+              # CloudWatch Logs for the a-doc application/task log group
+              # (deploy/cfn/ecs.yaml's LogGroup) — scoped to /a-doc/* rather
+              # than account-wide.
+              - Sid: AppLogGroups
+                Effect: Allow
+                Action:
+                  - logs:*
+                Resource:
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/a-doc/*"
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/a-doc/*:*"
 
 Outputs:
   DeployRoleArn:
@@ -204,3 +305,6 @@ Outputs:
       Copy this value into the AWS_DEPLOY_ROLE_ARN GitHub repository
       variable after the first (manual) deploy of this stack.
     Value: !GetAtt DeployRole.Arn
+  EcrRepositoryUri:
+    Description: Push/pull URI for the a-doc application image.
+    Value: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EcrRepository}"

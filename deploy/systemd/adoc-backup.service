@@ -1,9 +1,0 @@
-[Unit]
-Description=a-doc nightly backup (git bundle + sources/ + labs export -> S3)
-
-[Service]
-Type=oneshot
-User=adoc
-WorkingDirectory=/opt/a-doc
-EnvironmentFile=/etc/adoc/env
-ExecStart=/usr/bin/bash /opt/a-doc/deploy/backup.sh
