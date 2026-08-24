@@ -411,3 +411,106 @@ def test_build_diagnostic_dag_has_the_four_expected_nodes(repo: DataRepo) -> Non
         "apply",
         "composer",
     ]
+
+
+# --- composer treatment-gate rewrite loop -----------------------------------------------------
+
+
+def _make_primary_transport_with_reply_sequence(
+    ledger_ops: list[dict[str, Any]],
+    patient_replies: list[dict[str, Any]],
+    calls: list[TransportRequest],
+):
+    """Like `_make_primary_transport`, but each PatientReply request pops the
+    next reply from `patient_replies` - lets a test script "first draft trips
+    the gate, rewrite passes" (composer_stage's gate-guided retry)."""
+    remaining = list(patient_replies)
+
+    def transport(request: TransportRequest) -> TransportResponse:
+        calls.append(request)
+        assert request.schema is not None
+        name = request.schema.__name__
+        if name == "_LedgerDiffPayload":
+            tool_input: dict[str, Any] = {"rationale": "proposed diff", "ops": ledger_ops}
+        elif name == "PatientReply":
+            assert remaining, "composer requested more replies than scripted"
+            tool_input = remaining.pop(0)
+        else:  # pragma: no cover - defensive
+            raise AssertionError(f"unexpected schema for primary transport: {name}")
+        return TransportResponse(text="", tool_input=tool_input, input_tokens=10, output_tokens=10)
+
+    return transport
+
+
+_GATED_REPLY = {
+    # "5000 IU" trips the dosage detector: restating a dose the patient
+    # already takes - the exact live failure the rewrite loop was added for.
+    "tiers_rendered": (
+        "Most Likely: a lupus-like presentation. Your vitamin D remains low "
+        "despite the 5000 IU you take daily - discuss with your doctor."
+    ),
+    "tests_to_request": [],
+    "framing_ack": True,
+}
+
+_CLEAN_REPLY = {
+    "tiers_rendered": (
+        "Most Likely: a lupus-like presentation. Your vitamin D remains low "
+        "despite your current supplement - a lead to discuss with your doctor."
+    ),
+    "tests_to_request": [],
+    "framing_ack": True,
+}
+
+
+def test_composer_gate_failure_is_rewritten_once_and_succeeds(repo: DataRepo, db: LabsDb) -> None:
+    calls: list[TransportRequest] = []
+    primary_transport = _make_primary_transport_with_reply_sequence(
+        [_SLE_MOST_LIKELY_OP, _PE_CANT_MISS_OP], [_GATED_REPLY, _CLEAN_REPLY], calls
+    )
+    challenger_transport = _make_challenger_transport(
+        counter_arguments=[
+            {"hypothesis_id": "sle-01", "argument": "Anti-dsDNA has not been checked yet."}
+        ],
+        additional_ops=[],
+        calls=calls,
+    )
+    client = _build_client(primary_transport, challenger_transport)
+
+    result = run_diagnostic_turn(
+        client, repo, db, repo.root / LEDGER_RELPATH, "My joints ache and I'm exhausted."
+    )
+
+    assert isinstance(result, PatientReply)
+    assert "5000" not in result.tiers_rendered
+    # ledger_maintainer, challenger, composer draft, composer rewrite.
+    assert len(calls) == 4
+    rewrite_request = calls[-1]
+    feedback = rewrite_request.messages[-1].content
+    assert "5000 IU" in feedback  # the offending span is named to the model
+    assert "Rewrite this response" in feedback  # GateResult.rewrite_instruction
+
+
+def test_composer_still_gated_after_rewrite_raises_contract_violation(
+    repo: DataRepo, db: LabsDb
+) -> None:
+    calls: list[TransportRequest] = []
+    primary_transport = _make_primary_transport_with_reply_sequence(
+        [_SLE_MOST_LIKELY_OP, _PE_CANT_MISS_OP], [_GATED_REPLY, _GATED_REPLY], calls
+    )
+    challenger_transport = _make_challenger_transport(
+        counter_arguments=[
+            {"hypothesis_id": "sle-01", "argument": "Anti-dsDNA has not been checked yet."}
+        ],
+        additional_ops=[],
+        calls=calls,
+    )
+    client = _build_client(primary_transport, challenger_transport)
+
+    with pytest.raises(ContractViolation) as excinfo:
+        run_diagnostic_turn(
+            client, repo, db, repo.root / LEDGER_RELPATH, "My joints ache and I'm exhausted."
+        )
+
+    assert excinfo.value.contract_name == "treatment_gate"
+    assert len(calls) == 4  # exactly one rewrite attempt - never an unbounded loop
