@@ -10,13 +10,26 @@ from __future__ import annotations
 import json
 from datetime import UTC, date, datetime
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 def _utcnow() -> datetime:
     return datetime.now(UTC)
+
+
+Specimen = Literal[
+    "serum", "plasma", "whole_blood", "urine", "stool", "csf", "saliva", "other", "unknown"
+]
+"""The bodily specimen a result was drawn from — mirrors the `labs.specimen`
+CHECK constraint (`db.py`). Added because one real report's urinalysis
+GLUCOSE ("NEGATIVE") and a serum glucose (mg/dL) reading were both being
+canonicalized to the same `name` ("glucose") and so shared one trend
+series — see `labs/queries.py`/`labs/validate.py` for how `specimen` scopes
+series/trend lookups apart again. `"unknown"` is the default: extraction
+never blocks or guesses a specimen it can't read from the report's section
+headers/labels."""
 
 
 class DocumentStatus(StrEnum):
@@ -91,6 +104,7 @@ class LabResult(BaseModel):
     ref_high: float | None = None
     ref_text: str | None = None
     flag: LabFlag | None = None
+    specimen: Specimen = "unknown"
     source_doc: str = Field(min_length=64, max_length=64)
     source_page: int | None = None
     extraction_status: ExtractionStatus = ExtractionStatus.AUTO

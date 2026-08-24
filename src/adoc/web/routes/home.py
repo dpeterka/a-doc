@@ -13,6 +13,7 @@ from starlette.responses import Response
 from adoc.casefile.ledger import load_ledger
 from adoc.casefile.repo import LEDGER_RELPATH, DataRepo
 from adoc.casefile.schema import Hypothesis, Ledger, Tier
+from adoc.ingest.failures import read_failures
 from adoc.intake.wizard import IntakeWizard
 from adoc.labs.db import LabsDb
 from adoc.reason.client import LlmClient
@@ -59,6 +60,7 @@ def home(
 
     pending_count = len(db.pending())
     open_questions_html = _open_questions_text(repo)
+    failed_count = len(read_failures(repo))
 
     return templates.TemplateResponse(
         request,
@@ -68,6 +70,7 @@ def home(
             "whats_new": whats_new,
             "open_questions_text": open_questions_html,
             "pending_count": pending_count,
+            "failed_count": failed_count,
             "baseline_incomplete": baseline_incomplete,
             "intake_progress": (completed, total),
             "ledger_version": ledger.version,

@@ -1,0 +1,28 @@
+<details class="confirm-doc-group" open>
+  <summary class="confirm-doc-summary">
+    <span class="confirm-doc-title">{{ group.filename }}</span>
+    <span class="confirm-doc-meta muted">
+      {{ group.doc_date.isoformat() if group.doc_date else "date unknown" }}
+      · {{ group.doc_type }}
+      · {{ group.page_count }} page{{ "s" if group.page_count != 1 else "" }}
+      · {{ group.pending_count }} pending / {{ group.done_count }} done
+    </span>
+  </summary>
+
+  <div class="confirm-doc-actions">
+    <a class="confirm-original-link" href="/files/original/{{ group.sha }}" target="_blank" rel="noopener">
+      View original PDF
+    </a>
+    {% if bucket == "agreed" and group.pending_count %}
+      <form hx-post="/confirm/documents/{{ group.sha }}/bulk-confirm-agreed"
+            hx-target="#confirm-queue" hx-swap="outerHTML"
+            hx-confirm="Confirm all {{ group.pending_count }} agreed row{{ 's' if group.pending_count != 1 else '' }} in {{ group.filename }}? This marks them confirmed, exactly as extracted.">
+        <button type="submit">Confirm all agreed rows in this document ({{ group.pending_count }})</button>
+      </form>
+    {% endif %}
+  </div>
+
+  {% for item in group.rows %}
+    {% include "_confirm_row.html" %}
+  {% endfor %}
+</details>

@@ -1,0 +1,148 @@
+<article class="confirm-row card">
+  <div class="confirm-row-body">
+    <div class="confirm-source-image">
+      <p class="confirm-source-caption muted">
+        {{ group.filename }} · {{ group.doc_date.isoformat() if group.doc_date else "date unknown" }}
+        · page {{ item.row.source_page if item.row.source_page is not none else "?" }}
+      </p>
+      {% if item.image_url %}
+        <img src="{{ item.image_url }}" alt="Source document page for {{ item.row.name }}"
+             class="confirm-page-image" loading="lazy">
+      {% else %}
+        <div class="confirm-no-image" role="note">
+          <p class="muted">
+            Text document — no page image; review the values against the
+            extracted text in the original document.
+          </p>
+        </div>
+      {% endif %}
+    </div>
+
+    <div class="confirm-fields">
+      <h3>
+        {{ item.row.name }}
+        {% if item.row.specimen != "unknown" %}<span class="chip chip-specimen">{{ item.row.specimen }}</span>{% endif %}
+        <span class="muted">({{ item.row.date.isoformat() }})</span>
+      </h3>
+      <p class="muted">As read from the document: {{ item.row.name_raw }}</p>
+
+      {% if item.agreed %}
+        <p>
+          Value:
+          <strong>{{ item.row.value if item.row.value is not none else item.row.value_text }}</strong>
+          {% if item.row.ucum_unit %}{{ item.row.ucum_unit }}{% endif %}
+          {% if item.row.flag %}<span class="chip chip-flag">{{ item.row.flag.value }}</span>{% endif %}
+        </p>
+        {% if item.is_score %}
+          <p class="muted">Calculated score — no reference range applies.</p>
+        {% elif item.row.ref_text %}
+          <p class="muted">Reference range: {{ item.row.ref_text }}</p>
+        {% endif %}
+        {% if item.friendly_reason %}
+          <p class="muted confirm-why">Why we're asking: {{ item.friendly_reason }}.</p>
+        {% endif %}
+      {% else %}
+        <div class="confirm-pass-compare-wrap">
+          <table class="confirm-pass-compare">
+            <caption class="sr-only">Pass A and Pass B readings for this row</caption>
+            <thead>
+              <tr><th scope="col"></th><th scope="col">Pass A</th><th scope="col">Pass B</th></tr>
+            </thead>
+            <tbody>
+              {% for c in item.compare_rows %}
+                <tr class="{{ 'diff-field' if c.diff else '' }}">
+                  <th scope="row">{{ c.label }}</th>
+                  <td>{{ c.a }}</td>
+                  <td>{{ c.b }}</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+        {% if item.single_pass %}
+          <p class="muted">Only one pass could read this row — the other pass found nothing here.</p>
+        {% endif %}
+      {% endif %}
+
+      {% if item.agreed %}
+        <div class="button-row">
+          <form hx-post="/confirm/{{ item.row.id }}/confirm" hx-target="#confirm-queue" hx-swap="outerHTML">
+            <button type="submit" class="button-primary">Confirm</button>
+          </form>
+          <form hx-post="/confirm/{{ item.row.id }}/reject" hx-target="#confirm-queue" hx-swap="outerHTML">
+            <button type="submit" class="button-danger">Reject</button>
+          </form>
+        </div>
+      {% else %}
+        <div class="button-row">
+          {% if item.has_pass_a %}
+            <form hx-post="/confirm/{{ item.row.id }}/resolve-pass/a" hx-target="#confirm-queue" hx-swap="outerHTML">
+              <button type="submit" class="button-primary">Use reading A</button>
+            </form>
+          {% endif %}
+          {% if item.has_pass_b %}
+            <form hx-post="/confirm/{{ item.row.id }}/resolve-pass/b" hx-target="#confirm-queue" hx-swap="outerHTML">
+              <button type="submit" class="button-primary">Use reading B</button>
+            </form>
+          {% endif %}
+          <form hx-post="/confirm/{{ item.row.id }}/reject" hx-target="#confirm-queue" hx-swap="outerHTML">
+            <button type="submit" class="button-danger">Reject</button>
+          </form>
+        </div>
+      {% endif %}
+
+      <details class="correct-details">
+        {% if item.agreed %}
+          <summary>Something's wrong — let me fix it</summary>
+        {% else %}
+          <summary>Edit manually</summary>
+        {% endif %}
+        <form hx-post="/confirm/{{ item.row.id }}/correct" hx-target="#confirm-queue" hx-swap="outerHTML"
+              class="correct-form">
+          <label>
+            Date
+            <input type="date" name="date" value="{{ item.row.date.isoformat() }}">
+          </label>
+          <label>
+            Name
+            <input type="text" name="name" value="{{ item.row.name }}">
+          </label>
+          <label>
+            Value
+            <input type="text" name="value" value="{{ item.row.value if item.row.value is not none else '' }}">
+          </label>
+          <label>
+            Value (text)
+            <input type="text" name="value_text" value="{{ item.row.value_text or '' }}">
+          </label>
+          <label>
+            Unit
+            <input type="text" name="ucum_unit" value="{{ item.row.ucum_unit or '' }}">
+          </label>
+          <label>
+            Reference low
+            <input type="text" name="ref_low" value="{{ item.row.ref_low if item.row.ref_low is not none else '' }}">
+          </label>
+          <label>
+            Reference high
+            <input type="text" name="ref_high" value="{{ item.row.ref_high if item.row.ref_high is not none else '' }}">
+          </label>
+          <label>
+            Flag
+            <input type="text" name="flag" value="{{ item.row.flag.value if item.row.flag else '' }}">
+          </label>
+          <label>
+            Specimen
+            <select name="specimen">
+              <option value="" selected>(no change — currently {{ item.row.specimen }})</option>
+              {% for s in ["serum", "plasma", "whole_blood", "urine", "stool", "csf", "saliva", "other", "unknown"] %}
+                <option value="{{ s }}">{{ s }}</option>
+              {% endfor %}
+            </select>
+          </label>
+          <button type="submit">Save correction</button>
+        </form>
+      </details>
+    </div>
+  </div>
+</article>

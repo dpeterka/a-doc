@@ -22,6 +22,7 @@ from adoc.casefile.ledger import load_ledger
 from adoc.casefile.repo import LEDGER_RELPATH, DataRepo
 from adoc.casefile.schema import Ledger
 from adoc.labs.db import LabsDb
+from adoc.labs.models import LabResult
 from adoc.labs.queries import abnormal_summary
 
 CASE_SUMMARY_RELPATH = "case/case-summary.md"
@@ -33,6 +34,7 @@ DEFAULT_RECENT_ENCOUNTERS = 5
 
 LEDGER_SECTION_KEY = "ledger"
 PATIENT_THEORIES_SECTION_KEY = "patient_theories"
+GENOMICS_INVENTORY_RELPATH = "case/genomics-inventory.md"
 
 
 class ContextSection(BaseModel):
@@ -102,6 +104,17 @@ def _recent_encounters_section(repo: DataRepo, limit: int) -> ContextSection:
     )
 
 
+def _labs_label(row: LabResult) -> str:
+    """`row.name`, suffixed with its specimen when that's not `"unknown"`
+    (e.g. "Glucose (urine)") - the same canonical name can legitimately
+    carry two different specimens (a urinalysis GLUCOSE reading and a
+    serum glucose reading), and the context pack must not present them as
+    if they were one result."""
+    if row.specimen == "unknown":
+        return row.name
+    return f"{row.name} ({row.specimen})"
+
+
 def _labs_section(db: LabsDb) -> ContextSection:
     abnormal = abnormal_summary(db)
     latest = db.latest_panel()
@@ -112,7 +125,7 @@ def _labs_section(db: LabsDb) -> ContextSection:
             value = row.value_text if row.value is None else str(row.value)
             unit = f" {row.ucum_unit}" if row.ucum_unit else ""
             flag = f" [{row.flag}]" if row.flag else ""
-            lines.append(f"- {row.name}: {value}{unit}{flag} — {row.date.isoformat()}")
+            lines.append(f"- {_labs_label(row)}: {value}{unit}{flag} — {row.date.isoformat()}")
     else:
         lines.append("- _None currently flagged._")
 
@@ -122,7 +135,7 @@ def _labs_section(db: LabsDb) -> ContextSection:
         for row in latest:
             value = row.value_text if row.value is None else str(row.value)
             unit = f" {row.ucum_unit}" if row.ucum_unit else ""
-            lines.append(f"- {row.name}: {value}{unit} — {row.date.isoformat()}")
+            lines.append(f"- {_labs_label(row)}: {value}{unit} — {row.date.isoformat()}")
     else:
         lines.append("- _No labs recorded yet._")
 
@@ -159,8 +172,9 @@ def build_context(
       2. patient theories (`case/patient-theories.md`), only if that file exists
       3. recent encounters (last `recent_encounters_limit`)
       4. abnormal labs summary + latest panel
-      5. open questions (`case/questions-open.md`)
-      6. differential-ledger.yaml, ONLY when `include_ledger=True`
+      5. genomics inventory (`case/genomics-inventory.md`), only if present
+      6. open questions (`case/questions-open.md`)
+      7. differential-ledger.yaml, ONLY when `include_ledger=True`
 
     A blind-review caller passes `include_ledger=False`, which both omits
     the ledger section from `.render()`'s text and keeps `"ledger"` out of
@@ -184,6 +198,15 @@ def build_context(
 
     sections.append(_recent_encounters_section(repo, recent_encounters_limit))
     sections.append(_labs_section(db))
+
+    if (repo.root / GENOMICS_INVENTORY_RELPATH).exists():
+        sections.append(
+            ContextSection(
+                key="genomics_inventory",
+                title="Genomic Data On File",
+                content=repo.read(GENOMICS_INVENTORY_RELPATH),
+            )
+        )
 
     open_questions = _read_or_placeholder(repo, OPEN_QUESTIONS_RELPATH, "_None yet._")
     sections.append(

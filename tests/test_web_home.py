@@ -100,6 +100,39 @@ def test_pending_confirmation_banner_shows_the_count(tmp_path: Path) -> None:
     assert "review queue" in response.text.lower() or "confirm" in response.text.lower()
 
 
+def test_failed_documents_banner_shows_the_count(tmp_path: Path) -> None:
+    app, repo, _db, _calls = build_app(tmp_path)
+    _seed_ledger(repo, {"cm-01": "cant-miss"})
+    failed_dir = repo.root / "work" / "failed"
+    failed_dir.mkdir(parents=True, exist_ok=True)
+    (failed_dir / "junk.pdf").write_bytes(b"junk")
+    record = {
+        "filename": "junk.pdf",
+        "failed_at": "2026-05-01T00:00:00+00:00",
+        "reason": "not a pdf",
+        "original_inbox_path": "junk.pdf",
+    }
+    (failed_dir / "failures.jsonl").write_text(json.dumps(record) + "\n", encoding="utf-8")
+    client = TestClient(app)
+    login(client)
+
+    response = client.get("/")
+
+    assert "couldn't be processed" in response.text
+    assert "/failed" in response.text
+
+
+def test_failed_documents_banner_is_hidden_when_there_are_no_failures(tmp_path: Path) -> None:
+    app, repo, _db, _calls = build_app(tmp_path)
+    _seed_ledger(repo, {"cm-01": "cant-miss"})
+    client = TestClient(app)
+    login(client)
+
+    response = client.get("/")
+
+    assert "couldn't be processed" not in response.text
+
+
 def test_whats_new_shows_ledger_history_since_last_visit(tmp_path: Path) -> None:
     app, repo, _db, _calls = build_app(tmp_path)
     _seed_ledger(repo, {"cm-01": "cant-miss"})

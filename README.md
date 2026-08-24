@@ -32,6 +32,28 @@ charts) is page CRUD, and only part of it is chat.
 See `PLAN.md` for the full research-backed rationale, phasing, and schemas,
 and `CLAUDE.md` for agent/contributor rules.
 
+## Supported input types
+
+The Dropbox inbox / manual upload accept two document kinds, detected by
+content (never by filename extension alone — see `ingest/filetypes.py`):
+
+- **PDF** (`%PDF-` magic): archived immutably, page images rendered via
+  `pdftoppm`, and read by the vision double-pass extractor (a PDF-native
+  pass + a rendered-page-image pass, cross-model).
+- **`.docx`** (a real OOXML zip package, `.docx` suffix): archived
+  immutably like a PDF but with **no page rendering** — a-doc reads it
+  directly as TEXT with `python-docx` (a pure-Python dependency; no
+  LibreOffice/PDF conversion step). A lab-classified `.docx` goes through
+  the same cross-model double-pass and reconcile/confirm-queue gates as a
+  PDF lab report (page numbers default to 1 — a `.docx` has no page
+  structure); a narrative `.docx` (clinical history, supplement plan)
+  becomes a full-text `patient-report`/`imaging` encounter carrying the
+  complete extracted text.
+
+Anything else is rejected with a clear error asking for a PDF or `.docx`.
+Because a `.docx` has no page image, its confirm-queue rows show a text
+fallback panel instead of a source-page image.
+
 ## Setup
 
 ```bash
@@ -199,12 +221,41 @@ each other or from the web task by any lock — this is an accepted gap
 (cadence and single-patient scale make a collision low-probability, not
 impossible), not a solved problem.
 
+### Seeding a deployment from local onboarding
+
+The approved onboarding flow is: run `adoc onboard` (and any initial
+`adoc backfill`/`adoc ingest`) **locally first**, curate the case file
+until it's in good shape, then hand it to the deployed remote — not the
+other way around. Concretely:
+
+1. Locally, with `ADOC_DATA_DIR` pointed at your curated data repo:
+   `ADOC_BACKUP_BUCKET=<backup-bucket> uv run adoc backup`. This is the
+   exact same `adoc backup` the nightly ECS scheduled task runs — it
+   git-bundles the full history + `labs-export.jsonl` + `sources/` to
+   `s3://<backup-bucket>/latest/`.
+2. On the remote side, nothing further is required: the next task to
+   start against an **empty EFS** filesystem (i.e. `<data_dir>` missing
+   or empty) runs `adoc bootstrap-data` (via `docker-entrypoint.sh`),
+   which sees `ADOC_BACKUP_BUCKET` set, finds the backup, and restores
+   it automatically — `git clone` of the bundle (full history, checked
+   out, remote stripped), `sources/`, `labs-export.jsonl`, and a rebuilt
+   `labs.sqlite`. No manual restore step for this path any more.
+3. Once seeded, ongoing Dropbox ingestion on the remote is safe to layer
+   on top: `sources/` documents are sha256-addressed and `labs` rows are
+   deduped on `(date, name, source_doc)` (see `labs/db.py`), so
+   re-ingesting anything already present in the restored history is a
+   no-op rather than a duplicate.
+
 ### Restore-from-backup drill (release gate)
 
 PLAN.md's Phase-1 acceptance criteria and `CLAUDE.md`/ADR 0004 call a
 tested restore a release gate — do this before considering a deploy
-"done," not just once at setup. Unlike the EC2 design, EFS is not
-destroyed by a routine task/service replacement, so this drill now
+"done," not just once at setup. Restore is now one command,
+`adoc restore` (`src/adoc/backup.py`'s `restore_from_bucket`, the tested
+inverse of `run_backup` — see `tests/test_backup.py`), which refuses to
+run over an already-initialized data repo (no `--force` is offered) and
+fails clearly if the bucket has no backup. Unlike the EC2 design, EFS is
+not destroyed by a routine task/service replacement, so this drill
 specifically exercises restoring onto a **freshly created** filesystem
 (e.g. after deleting and redeploying the `ecs` stack, or standing up a new
 environment):
@@ -212,24 +263,21 @@ environment):
 1. Confirm a real backup exists: `aws s3 ls
    s3://<backup-bucket>/latest/a-doc-data.bundle` (bucket name is the
    `BucketName` output of the `a-doc-backup` stack).
-2. Get a shell on a running task via ECS Exec (see "User provisioning")
-   and, from it, restore manually:
-   ```bash
-   aws s3 cp s3://<backup-bucket>/latest/a-doc-data.bundle /tmp/a-doc-data.bundle
-   git clone /tmp/a-doc-data.bundle /data/a-doc-data.restored
-   aws s3 sync s3://<backup-bucket>/latest/sources/ /data/a-doc-data.restored/sources/
-   aws s3 cp s3://<backup-bucket>/latest/labs-export.jsonl \
-     /data/a-doc-data.restored/labs-export.jsonl
-   ```
-3. Verify the restored repo: `git -C /data/a-doc-data.restored log
-   --oneline -5` shows real history, not an empty init commit; `adoc init`
-   (with `ADOC_DATA_DIR` pointed at the restored path) reports "already
-   initialized" rather than creating a new empty case file.
-4. Once satisfied, swap it into place (`mv /data/a-doc-data
-   /data/a-doc-data.bak && mv /data/a-doc-data.restored /data/a-doc-data`)
-   and force a new deployment of the web service so it picks up the
-   restored data.
-5. Confirm `https://adoc.petabloc.io/healthz` returns `ok` and the ALB
+2. Clear EFS and let the task re-seed itself automatically: stop the
+   running web task (or scale the ECS service to 0 and back to 1) after
+   emptying `<data_dir>` on EFS — the next task to start runs
+   `adoc bootstrap-data`, which restores from the bucket since it's set
+   and has a backup. This is the manual re-seed procedure: **stop task /
+   scale 0→1 after clearing EFS**, nothing more.
+   - To restore by hand instead (e.g. to inspect the result before
+     swapping it in), get a shell via ECS Exec (see "User provisioning")
+     and run `adoc restore --bucket <backup-bucket>` with `ADOC_DATA_DIR`
+     pointed at a fresh path, or invoke `restore_from_bucket` directly.
+3. Verify the restored repo: `git -C <data_dir> log --oneline -5` shows
+   real history, not just an empty init commit, and `adoc init` (pointed
+   at the same `ADOC_DATA_DIR`) reports "already initialized" rather than
+   creating a new empty case file.
+4. Confirm `https://adoc.petabloc.io/healthz` returns `ok` and the ALB
    target group shows the task healthy (below).
 
 ### How the patient reaches the UI

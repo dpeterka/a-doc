@@ -43,7 +43,12 @@ from typing import Any, Protocol, TypeVar
 
 from pydantic import BaseModel
 
-from adoc.reason.client import LlmClient, TransientTransportError
+from adoc.reason.client import (
+    LlmClient,
+    TransientTransportError,
+    _openai_strict_schema,
+    _unwrap_tool_input,
+)
 
 # --------------------------------------------------------------------------
 # Document/image content parts
@@ -103,6 +108,7 @@ class VisionTransportResponse:
     tool_input: dict[str, Any] | None
     input_tokens: int
     output_tokens: int
+    truncated: bool = False  # provider hit its output-token limit
 
 
 VisionTransportFn = Callable[[VisionTransportRequest], VisionTransportResponse]
@@ -240,6 +246,7 @@ class AnthropicVisionProvider:
             tool_input=tool_input,
             input_tokens=response.usage.input_tokens,
             output_tokens=response.usage.output_tokens,
+            truncated=response.stop_reason == "max_tokens",
         )
 
 
@@ -270,7 +277,10 @@ class OpenAIVisionProvider:
 
         kwargs: dict[str, Any] = {
             "model": request.model,
-            "max_tokens": request.max_tokens,
+            # gpt-5.x rejects 'max_tokens'; this pass-B provider is
+            # OpenAI-proper only (never Featherless), so use the new name
+            # unconditionally — parity with reason.client's OpenAIProvider.
+            "max_completion_tokens": request.max_tokens,
             "messages": [
                 {"role": "system", "content": request.system},
                 {"role": "user", "content": content},
@@ -279,7 +289,9 @@ class OpenAIVisionProvider:
                 "type": "json_schema",
                 "json_schema": {
                     "name": request.schema.__name__,
-                    "schema": request.schema.model_json_schema(),
+                    # Strict mode requires additionalProperties/required on
+                    # every object node — same adaptation as reason.client.
+                    "schema": _openai_strict_schema(request.schema.model_json_schema()),
                     "strict": True,
                 },
             },
@@ -304,11 +316,13 @@ class OpenAIVisionProvider:
             raise VisionError(f"openai: response was not valid JSON: {exc}") from exc
 
         usage = response.usage
+        finish = response.choices[0].finish_reason if response.choices else None
         return VisionTransportResponse(
             text=text,
             tool_input=tool_input,
             input_tokens=usage.prompt_tokens if usage else 0,
             output_tokens=usage.completion_tokens if usage else 0,
+            truncated=finish == "length",
         )
 
 
@@ -357,6 +371,16 @@ class VisionClient:
                     transport=transports.get("openai"),
                 ),
             }
+
+    @property
+    def client(self) -> LlmClient:
+        """The wrapped `LlmClient` - reused by `ingest.pipeline`'s docx path,
+        which has no binary pages to send and calls `LlmClient.complete`
+        directly (classification + `extract.double_pass_extract_text`)
+        rather than this class's vision-specific `extract`. Exposed rather
+        than duplicated so both paths share one set of role bindings,
+        scrubber, audit log, and retry policy."""
+        return self._client
 
     def extract(
         self,
@@ -414,8 +438,21 @@ class VisionClient:
                 role, binding.provider, binding.model, response, duration, scrub_count, error=True
             )
             raise VisionError(f"role {role!r}: provider returned no structured output")
+        if response.truncated:
+            # A truncated extraction is silent data loss (a real LabCorp
+            # panel came back as one row) — fail hard so it lands in the
+            # ingest report instead of the labs table.
+            raise VisionError(
+                f"role {role!r}: output hit the token limit; extraction is "
+                "incomplete — raise max_tokens for this call"
+            )
         try:
-            parsed = schema.model_validate(response.tool_input)
+            try:
+                parsed = schema.model_validate(response.tool_input)
+            except Exception:
+                # Same Claude wrapper-key quirk handled in reason.client:
+                # flat-first, unwrap-on-failure.
+                parsed = schema.model_validate(_unwrap_tool_input(response.tool_input))
         except Exception as exc:
             self._audit(
                 role, binding.provider, binding.model, response, duration, scrub_count, error=True

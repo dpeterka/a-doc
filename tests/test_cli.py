@@ -12,19 +12,24 @@ docstring calls out) so no real provider/network call ever happens.
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
 from conftest import TINY_PDF_BYTES, fake_page_renderer
+from git import Repo as GitRepo
 
 import adoc.cli as cli
 from adoc.casefile.repo import DataRepo
 from adoc.cli import main
 from adoc.config import ModelBinding
 from adoc.ingest.schema import ClassifyResult, DocumentExtraction
+from adoc.labs.db import LabsDb
+from adoc.labs.models import DocumentStatus, ExtractionStatus, LabDocument, LabResult
 from adoc.reason.client import AnthropicProvider, LlmClient, TransportRequest, TransportResponse
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -285,6 +290,400 @@ def test_review_runs_end_to_end_with_a_fake_client(
     out = capsys.readouterr().out
     assert "ledger 0 -> 1" in out
     assert "tagged review-" in out
+
+
+def test_labs_infer_specimen_fails_without_data_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("ADOC_DATA_DIR", raising=False)
+
+    code = main(["labs-infer-specimen"])
+
+    assert code == 1
+    assert "configuration error" in capsys.readouterr().err
+
+
+def test_labs_infer_specimen_fails_if_data_repo_not_initialized(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("ADOC_DATA_DIR", str(tmp_path / "a-doc-data"))
+    monkeypatch.setenv("ADOC_MODELS_FILE", str(REPO_ROOT / "models.yaml"))
+
+    code = main(["labs-infer-specimen"])
+
+    assert code == 1
+    assert "run `adoc init` first" in capsys.readouterr().err
+
+
+def test_labs_infer_specimen_runs_end_to_end_and_commits(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    data_dir = tmp_path / "a-doc-data"
+    repo = DataRepo.init_at(data_dir)
+    monkeypatch.setenv("ADOC_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("ADOC_MODELS_FILE", str(REPO_ROOT / "models.yaml"))
+
+    sha_urine = "a" * 64
+    sha_other = "b" * 64
+    with LabsDb(data_dir / "labs.sqlite") as db:
+        db.upsert_document(
+            LabDocument(
+                sha256=sha_urine,
+                filename="urinalysis-2026-05-02.pdf",
+                doc_type="lab_report",
+                page_count=1,
+                ingested_at=datetime(2026, 5, 3, 12, 0, 0),
+                status=DocumentStatus.COMPLETE,
+            )
+        )
+        db.upsert_document(
+            LabDocument(
+                sha256=sha_other,
+                filename="labcorp-cmp-2026-05-02.pdf",
+                doc_type="lab_report",
+                page_count=1,
+                ingested_at=datetime(2026, 5, 3, 12, 0, 0),
+                status=DocumentStatus.COMPLETE,
+            )
+        )
+        db.insert_results(
+            [
+                LabResult(
+                    date=date(2026, 5, 2),
+                    name="glucose",
+                    name_raw="GLUCOSE",
+                    value=None,
+                    value_text="NEGATIVE",
+                    source_doc=sha_urine,
+                    raw_json=json.dumps({"name_raw": "GLUCOSE"}),
+                ),
+                LabResult(
+                    date=date(2026, 5, 2),
+                    name="sodium",
+                    name_raw="Sodium",
+                    value=140.0,
+                    ucum_unit="mmol/L",
+                    source_doc=sha_other,
+                    raw_json=json.dumps({"name_raw": "Sodium"}),
+                ),
+            ]
+        )
+        db.export_jsonl(data_dir / "labs-export.jsonl")
+    repo.commit("seed labs data", paths=["labs-export.jsonl"])
+
+    code = main(["labs-infer-specimen"])
+
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "updated 1 row(s)" in out
+    assert "urine: 1" in out
+    assert "1 row(s) remain unknown" in out
+
+    with LabsDb(data_dir / "labs.sqlite") as db:
+        rows = {row.name: row for row in db.series("glucose") + db.series("sodium")}
+        assert rows["glucose"].specimen == "urine"
+        assert rows["sodium"].specimen == "unknown"
+
+    export_text = (data_dir / "labs-export.jsonl").read_text(encoding="utf-8")
+    assert '"specimen": "urine"' in export_text
+
+    # idempotent: a second run finds nothing left to update
+    second_code = main(["labs-infer-specimen"])
+    assert second_code == 0
+    second_out = capsys.readouterr().out
+    assert "updated 0 row(s)" in second_out
+
+
+# --------------------------------------------------------------------------
+# labs-dedupe-twins (queue-ergonomics slice item 4)
+# --------------------------------------------------------------------------
+
+
+def _exploding_classifier_client() -> LlmClient:
+    """A fake `LlmClient` whose `classifier` transport explodes if ever
+    called - the rule-path twin case below must never reach the LLM."""
+
+    def _transport(request: TransportRequest) -> TransportResponse:
+        raise AssertionError("the classifier LLM must not be called for a rule-path twin")
+
+    bindings = {"classifier": [ModelBinding(provider="anthropic", model="fake-haiku")]}
+    providers = {"anthropic": AnthropicProvider(api_key=None, transport=_transport)}
+    return LlmClient(bindings, providers)
+
+
+def test_labs_dedupe_twins_fails_without_data_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("ADOC_DATA_DIR", raising=False)
+
+    code = main(["labs-dedupe-twins"])
+
+    assert code == 1
+    assert "configuration error" in capsys.readouterr().err
+
+
+def test_labs_dedupe_twins_fails_if_data_repo_not_initialized(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("ADOC_DATA_DIR", str(tmp_path / "a-doc-data"))
+    monkeypatch.setenv("ADOC_MODELS_FILE", str(REPO_ROOT / "models.yaml"))
+
+    code = main(["labs-dedupe-twins"])
+
+    assert code == 1
+    assert "run `adoc init` first" in capsys.readouterr().err
+
+
+def _seed_twin_pair(data_dir: Path) -> tuple[str, int]:
+    """One AUTO row and its rule-path twin PENDING single_pass row, same
+    document/page/value - returns `(sha256, pending_row_id)`."""
+    sha = "a" * 64
+    repo = DataRepo.init_at(data_dir)
+    with LabsDb(data_dir / "labs.sqlite") as db:
+        db.upsert_document(
+            LabDocument(
+                sha256=sha,
+                filename="dexa.pdf",
+                doc_type="lab_report",
+                page_count=6,
+                ingested_at=datetime(2026, 5, 3, 12, 0, 0),
+                status=DocumentStatus.COMPLETE,
+            )
+        )
+        db.insert_results(
+            [
+                LabResult(
+                    date=date(2026, 5, 2),
+                    name="t-score",
+                    name_raw="LEFT HIP femoral neck T-Score",
+                    value=-1.2,
+                    source_doc=sha,
+                    source_page=5,
+                    raw_json=json.dumps({"reasons": []}),
+                )
+            ]
+        )
+        (pending_id,) = db.insert_results(
+            [
+                LabResult(
+                    date=date(2026, 5, 2),
+                    name="t-score-2",
+                    name_raw="T-Score",
+                    value=-1.2,
+                    source_doc=sha,
+                    source_page=5,
+                    extraction_status=ExtractionStatus.PENDING,
+                    raw_json=json.dumps({"reasons": ["single_pass"]}),
+                )
+            ]
+        )
+        db.export_jsonl(data_dir / "labs-export.jsonl")
+    repo.commit("seed twin pair", paths=["labs-export.jsonl"])
+    assert pending_id is not None
+    return sha, pending_id
+
+
+def test_labs_dedupe_twins_dry_run_reports_and_mutates_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    data_dir = tmp_path / "a-doc-data"
+    monkeypatch.setenv("ADOC_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("ADOC_MODELS_FILE", str(REPO_ROOT / "models.yaml"))
+    monkeypatch.setattr(cli, "_build_llm_client", lambda settings: _exploding_classifier_client())
+    _sha, pending_id = _seed_twin_pair(data_dir)
+
+    code = main(["labs-dedupe-twins", "--dry-run"])
+
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "dry-run" in out
+    assert "would reject 1" in out
+    assert not (data_dir / "work" / "twin-sweep.json").exists()
+
+    with LabsDb(data_dir / "labs.sqlite") as db:
+        row = db.get_row(pending_id)
+        assert row is not None
+        assert row.extraction_status == ExtractionStatus.PENDING
+
+
+def test_labs_dedupe_twins_runs_end_to_end_and_commits(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    data_dir = tmp_path / "a-doc-data"
+    monkeypatch.setenv("ADOC_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("ADOC_MODELS_FILE", str(REPO_ROOT / "models.yaml"))
+    monkeypatch.setattr(cli, "_build_llm_client", lambda settings: _exploding_classifier_client())
+    _sha, pending_id = _seed_twin_pair(data_dir)
+    repo = DataRepo(data_dir)
+    git_repo = GitRepo(repo.root)
+    commits_before = len(list(git_repo.iter_commits()))
+
+    code = main(["labs-dedupe-twins"])
+
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "rejected 1" in out
+
+    with LabsDb(data_dir / "labs.sqlite") as db:
+        row = db.get_row(pending_id)
+        assert row is not None
+        assert row.extraction_status == ExtractionStatus.REJECTED
+        assert row.raw_payload()["method"] == "rule"
+
+    commits_after = len(list(git_repo.iter_commits()))
+    assert commits_after == commits_before + 1
+
+    summary_path = data_dir / "work" / "twin-sweep.json"
+    assert summary_path.exists()
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert summary["rejected"] == 1
+
+    # idempotent: a second run finds nothing left to reject
+    second_code = main(["labs-dedupe-twins"])
+    assert second_code == 0
+    second_out = capsys.readouterr().out
+    assert "rejected 0" in second_out
+
+
+# --------------------------------------------------------------------------
+# labs-reclassify (feature/semantic-compare)
+# --------------------------------------------------------------------------
+
+
+def test_labs_reclassify_fails_without_data_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("ADOC_DATA_DIR", raising=False)
+
+    code = main(["labs-reclassify"])
+
+    assert code == 1
+    assert "configuration error" in capsys.readouterr().err
+
+
+def test_labs_reclassify_fails_if_data_repo_not_initialized(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("ADOC_DATA_DIR", str(tmp_path / "a-doc-data"))
+    monkeypatch.setenv("ADOC_MODELS_FILE", str(REPO_ROOT / "models.yaml"))
+
+    code = main(["labs-reclassify"])
+
+    assert code == 1
+    assert "run `adoc init` first" in capsys.readouterr().err
+
+
+def _seed_false_ref_range_mismatch(data_dir: Path) -> tuple[DataRepo, int]:
+    """A PENDING row that queued under the old literal ref-range comparison
+    ("<20" vs "<20 Units") - a comparator false positive under the new
+    semantic comparators."""
+    sha = "a" * 64
+    repo = DataRepo.init_at(data_dir)
+    with LabsDb(data_dir / "labs.sqlite") as db:
+        db.upsert_document(
+            LabDocument(
+                sha256=sha,
+                filename="doc.pdf",
+                doc_type="lab_report",
+                page_count=1,
+                ingested_at=datetime(2026, 5, 3, 12, 0, 0),
+                status=DocumentStatus.COMPLETE,
+            )
+        )
+        pass_a = {
+            "name_raw": "Potassium",
+            "value": 4.1,
+            "value_text": None,
+            "unit_raw": "mmol/L",
+            "ref_range_raw": "<20",
+            "flag_raw": None,
+            "specimen": "unknown",
+            "page": 1,
+            "confidence": "high",
+        }
+        pass_b = {**pass_a, "ref_range_raw": "<20 Units"}
+        (pending_id,) = db.insert_results(
+            [
+                LabResult(
+                    date=date(2026, 5, 2),
+                    name="potassium",
+                    name_raw="Potassium",
+                    value=4.1,
+                    ucum_unit="mmol/L",
+                    source_doc=sha,
+                    extraction_status=ExtractionStatus.PENDING,
+                    raw_json=json.dumps(
+                        {
+                            "pass_a": pass_a,
+                            "pass_b": pass_b,
+                            "reasons": ["ref_range_mismatch: '<20' vs '<20 Units'"],
+                        }
+                    ),
+                )
+            ]
+        )
+        db.export_jsonl(data_dir / "labs-export.jsonl")
+    repo.commit("seed false ref-range mismatch", paths=["labs-export.jsonl"])
+    assert pending_id is not None
+    return repo, pending_id
+
+
+def test_labs_reclassify_dry_run_reports_and_mutates_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    data_dir = tmp_path / "a-doc-data"
+    monkeypatch.setenv("ADOC_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("ADOC_MODELS_FILE", str(REPO_ROOT / "models.yaml"))
+    _repo, pending_id = _seed_false_ref_range_mismatch(data_dir)
+
+    code = main(["labs-reclassify", "--dry-run"])
+
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "dry-run" in out
+    assert "would auto-flip 1" in out
+
+    with LabsDb(data_dir / "labs.sqlite") as db:
+        row = db.get_row(pending_id)
+        assert row is not None
+        assert row.extraction_status == ExtractionStatus.PENDING
+
+
+def test_labs_reclassify_runs_end_to_end_and_commits(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    data_dir = tmp_path / "a-doc-data"
+    monkeypatch.setenv("ADOC_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("ADOC_MODELS_FILE", str(REPO_ROOT / "models.yaml"))
+    repo, pending_id = _seed_false_ref_range_mismatch(data_dir)
+    git_repo = GitRepo(repo.root)
+    commits_before = len(list(git_repo.iter_commits()))
+
+    code = main(["labs-reclassify"])
+
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "auto-flipped 1" in out
+
+    with LabsDb(data_dir / "labs.sqlite") as db:
+        row = db.get_row(pending_id)
+        assert row is not None
+        assert row.extraction_status == ExtractionStatus.AUTO
+        payload = row.raw_payload()
+        assert payload["reasons"] == []
+        assert "reclassified_at" in payload
+
+    commits_after = len(list(git_repo.iter_commits()))
+    assert commits_after == commits_before + 1
+
+    # idempotent: a second run finds nothing left to flip
+    second_code = main(["labs-reclassify"])
+    assert second_code == 0
+    second_out = capsys.readouterr().out
+    assert "auto-flipped 0" in second_out
 
 
 def test_eval_runs_offline_with_out_dir(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -581,6 +980,206 @@ def test_backup_runs_end_to_end_with_a_fake_s3_client(
     out = capsys.readouterr().out
     assert "bundle uploaded to s3://a-doc-backup-bucket/latest/a-doc-data.bundle" in out
     assert any(key == "latest/a-doc-data.bundle" for _, _, key in fake_s3.uploads)
+
+
+def test_restore_fails_without_data_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("ADOC_DATA_DIR", raising=False)
+
+    code = main(["restore"])
+
+    assert code == 1
+    assert "configuration error" in capsys.readouterr().err
+
+
+def test_restore_fails_without_a_bucket_configured(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from test_backup import FakeS3Client
+
+    monkeypatch.setenv("ADOC_DATA_DIR", str(tmp_path / "a-doc-data"))
+    monkeypatch.delenv("ADOC_BACKUP_BUCKET", raising=False)
+    monkeypatch.setattr(cli, "_build_s3_client", lambda: FakeS3Client())
+
+    code = main(["restore"])
+
+    assert code == 1
+    assert "ADOC_BACKUP_BUCKET" in capsys.readouterr().err
+
+
+def test_restore_fails_if_data_dir_already_initialized(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from test_backup import FakeS3Client
+
+    data_dir = tmp_path / "a-doc-data"
+    DataRepo.init_at(data_dir)
+    monkeypatch.setenv("ADOC_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("ADOC_BACKUP_BUCKET", "a-doc-backup-bucket")
+    monkeypatch.setattr(cli, "_build_s3_client", lambda: FakeS3Client())
+
+    code = main(["restore"])
+
+    assert code == 1
+    assert "already contains an initialized data repo" in capsys.readouterr().err
+
+
+def test_restore_runs_end_to_end_with_a_fake_s3_client(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from test_backup import FakeS3Client, _seed_with_labs
+
+    from adoc.backup import run_backup
+
+    src = tmp_path / "src-data"
+    DataRepo.init_at(src)
+    _seed_with_labs(src)
+    fake_s3 = FakeS3Client()
+    run_backup(src, "a-doc-backup-bucket", fake_s3)
+
+    dst = tmp_path / "restored-data"
+    monkeypatch.setenv("ADOC_DATA_DIR", str(dst))
+    monkeypatch.setenv("ADOC_BACKUP_BUCKET", "a-doc-backup-bucket")
+    monkeypatch.setattr(cli, "_build_s3_client", lambda: fake_s3)
+
+    code = main(["restore"])
+
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "cloned bundle" in out
+    assert "sources/ - 3 restored" in out
+    assert "labs.sqlite rebuilt from labs-export.jsonl - 2 rows" in out
+    assert DataRepo(dst).is_initialized
+
+
+def test_restore_bucket_flag_overrides_settings(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from test_backup import FakeS3Client, _seed_with_labs
+
+    from adoc.backup import run_backup
+
+    src = tmp_path / "src-data"
+    DataRepo.init_at(src)
+    _seed_with_labs(src)
+    fake_s3 = FakeS3Client()
+    run_backup(src, "the-real-bucket", fake_s3)
+
+    dst = tmp_path / "restored-data"
+    monkeypatch.setenv("ADOC_DATA_DIR", str(dst))
+    monkeypatch.delenv("ADOC_BACKUP_BUCKET", raising=False)
+    monkeypatch.setattr(cli, "_build_s3_client", lambda: fake_s3)
+
+    code = main(["restore", "--bucket", "the-real-bucket"])
+
+    assert code == 0
+    assert DataRepo(dst).is_initialized
+
+
+def test_bootstrap_data_noop_when_data_dir_already_has_data(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    data_dir = tmp_path / "a-doc-data"
+    data_dir.mkdir()
+    (data_dir / "some-file").write_text("already here", encoding="utf-8")
+    monkeypatch.setenv("ADOC_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("ADOC_BACKUP_BUCKET", "a-doc-backup-bucket")
+
+    code = main(["bootstrap-data"])
+
+    assert code == 0
+    assert "already has data" in capsys.readouterr().out
+    assert not (data_dir / ".git").exists()
+
+
+def test_bootstrap_data_initializes_when_no_bucket_is_configured(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    data_dir = tmp_path / "a-doc-data"
+    monkeypatch.setenv("ADOC_DATA_DIR", str(data_dir))
+    monkeypatch.delenv("ADOC_BACKUP_BUCKET", raising=False)
+
+    code = main(["bootstrap-data"])
+
+    assert code == 0
+    assert "initialized data repo" in capsys.readouterr().out
+    assert DataRepo(data_dir).is_initialized
+
+
+def test_bootstrap_data_restores_when_the_bucket_has_a_backup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from test_backup import FakeS3Client, _seed_with_labs
+
+    from adoc.backup import run_backup
+
+    src = tmp_path / "src-data"
+    DataRepo.init_at(src)
+    _seed_with_labs(src)
+    fake_s3 = FakeS3Client()
+    run_backup(src, "a-doc-backup-bucket", fake_s3)
+
+    data_dir = tmp_path / "a-doc-data"
+    monkeypatch.setenv("ADOC_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("ADOC_BACKUP_BUCKET", "a-doc-backup-bucket")
+    monkeypatch.setattr(cli, "_build_s3_client", lambda: fake_s3)
+
+    code = main(["bootstrap-data"])
+
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "restored from s3://a-doc-backup-bucket/latest/" in out
+    assert DataRepo(data_dir).is_initialized
+
+
+def test_bootstrap_data_falls_back_to_init_when_the_bucket_has_no_backup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from test_backup import FakeS3Client
+
+    data_dir = tmp_path / "a-doc-data"
+    monkeypatch.setenv("ADOC_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("ADOC_BACKUP_BUCKET", "a-doc-backup-bucket")
+    monkeypatch.setattr(cli, "_build_s3_client", lambda: FakeS3Client())
+
+    code = main(["bootstrap-data"])
+
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "falling back to 'adoc init'" in out
+    assert "initialized data repo" in out
+    assert DataRepo(data_dir).is_initialized
+
+
+def test_bootstrap_data_fails_loudly_on_a_real_restore_error_instead_of_silently_initializing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    class _ExplodingS3Client:
+        def list_objects_v2(
+            self, Bucket: str, Prefix: str, ContinuationToken: str | None = None
+        ) -> dict[str, Any]:
+            raise RuntimeError("simulated AWS outage")
+
+        def download_file(self, Bucket: str, Key: str, Filename: str) -> None:
+            raise RuntimeError("simulated AWS outage")  # pragma: no cover - not reached
+
+        def upload_file(self, Filename: str, Bucket: str, Key: str) -> None:
+            raise RuntimeError("simulated AWS outage")  # pragma: no cover - not reached
+
+    data_dir = tmp_path / "a-doc-data"
+    monkeypatch.setenv("ADOC_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("ADOC_BACKUP_BUCKET", "a-doc-backup-bucket")
+    monkeypatch.setattr(cli, "_build_s3_client", lambda: _ExplodingS3Client())
+
+    code = main(["bootstrap-data"])
+
+    assert code == 1
+    err = capsys.readouterr().err
+    assert "restore failed" in err
+    # the outage must not be papered over by silently falling back to init
+    assert not DataRepo(data_dir).is_initialized
 
 
 def test_unknown_subcommand_exits_nonzero() -> None:

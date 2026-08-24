@@ -8,25 +8,67 @@ provider - no network in tests. A fake page renderer stands in for
 
 from __future__ import annotations
 
+import io
 import json
+import zipfile
 from collections.abc import Sequence
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
 from conftest import TINY_PDF_BYTES, fake_page_renderer
+from docx import Document
 from git import Repo
 from pydantic import BaseModel
 
 from adoc.casefile.encounters import read_encounter
 from adoc.casefile.repo import DataRepo
-from adoc.ingest.pipeline import ingest_file, ingest_inbox
+from adoc.config import ModelBinding
+from adoc.ingest.pipeline import MAX_ZIP_MEMBERS, ingest_directory, ingest_file, ingest_inbox
 from adoc.ingest.schema import ClassifyResult, DocumentExtraction
-from adoc.ingest.vision import Part
+from adoc.ingest.vision import Part, VisionClient
 from adoc.labs.db import LabsDb
 from adoc.labs.models import DocumentStatus
+from adoc.reason.client import (
+    AnthropicProvider,
+    LlmClient,
+    OpenAIProvider,
+    TransportRequest,
+    TransportResponse,
+)
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures" / "extractions"
+BGZF_MAGIC = bytes.fromhex("1f8b0804")
+
+
+def _make_zip(zip_path: Path, members: dict[str, bytes]) -> Path:
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        for name, data in members.items():
+            zf.writestr(name, data)
+    return zip_path
+
+
+def _exploding_transport(name: str) -> Any:
+    def _transport(request: TransportRequest) -> TransportResponse:
+        raise AssertionError(f"the {name} transport must not be called for a genomic file")
+
+    return _transport
+
+
+def _build_exploding_vision_client() -> VisionClient:
+    """A `VisionClient` whose every provider transport raises if ever
+    invoked - the "zero LLM calls" proof for genomic intake (genomics/
+    filetypes task item 2/6)."""
+    bindings: dict[str, list[ModelBinding]] = {
+        "classifier": [ModelBinding(provider="anthropic", model="fake-haiku")],
+        "extractor_pass_a": [ModelBinding(provider="anthropic", model="fake-sonnet")],
+        "extractor_pass_b": [ModelBinding(provider="openai", model="fake-gpt")],
+    }
+    providers = {
+        "anthropic": AnthropicProvider(api_key=None, transport=_exploding_transport("anthropic")),
+        "openai": OpenAIProvider(api_key=None, transport=_exploding_transport("openai")),
+    }
+    return VisionClient(LlmClient(bindings, providers))
 
 
 def _load_fixture(name: str) -> tuple[DocumentExtraction, DocumentExtraction]:
@@ -220,3 +262,677 @@ def test_ingest_inbox_scans_and_ingests_every_file(tmp_path: Path) -> None:
     assert all(f.outcome == "ingested" for f in report.files)
     assert report.total_auto == 4
     assert report.total_pending == 0
+
+
+def test_scan_files_is_recursive_and_skips_sync_artifacts(tmp_path: Path) -> None:
+    """Dropbox/rclone preserve subfolders in the inbox; nested files must be found."""
+    from adoc.ingest.pipeline import _scan_files
+
+    (tmp_path / "Labs" / "LabCorp").mkdir(parents=True)
+    (tmp_path / "Labs" / "LabCorp" / "b.pdf").write_bytes(b"x")
+    (tmp_path / "a.pdf").write_bytes(b"x")
+    (tmp_path / "desktop.ini").write_bytes(b"x")
+    (tmp_path / ".hidden").write_bytes(b"x")
+
+    names = [p.name for p in _scan_files(tmp_path)]
+
+    # Deterministic full-path order: "Labs/LabCorp/b.pdf" sorts before "a.pdf".
+    assert names == ["b.pdf", "a.pdf"]
+
+
+# --------------------------------------------------------------------------
+# Post-ingest inbox hygiene (pipeline module docstring): `ingest_inbox`
+# (and any `ingest_file` call that opts in via `inbox_root=`) deletes an
+# ingested/duplicate inbox file and moves an error'd one to `work/failed/`
+# with a `failures.jsonl` record. `ingest_directory` (the `adoc backfill
+# <external dir>` engine) never applies this - the invariant tests below
+# pin that a backfilled directory is never touched, success or failure.
+# --------------------------------------------------------------------------
+
+
+def test_ingest_inbox_deletes_the_file_once_ingested(tmp_path: Path) -> None:
+    repo = DataRepo.init_at(tmp_path / "data-repo")
+    db = LabsDb(tmp_path / "labs.sqlite")
+    inbox_file = repo.root / "inbox" / "quest.pdf"
+    inbox_file.write_bytes(TINY_PDF_BYTES)
+    vision = FakeVisionClient("clean_agreement.json")
+
+    report = ingest_inbox(
+        repo=repo, db=db, vision=vision, clock=_fixed_clock, renderer=fake_page_renderer(1)
+    )
+
+    assert report.files[0].outcome == "ingested"
+    assert not inbox_file.exists()
+    # The immutable archive copy is authoritative and untouched.
+    assert any((repo.root / "sources").glob(f"{report.files[0].sha256}__quest.pdf"))
+
+
+def test_ingest_inbox_deletes_the_file_once_duplicate(tmp_path: Path) -> None:
+    repo = DataRepo.init_at(tmp_path / "data-repo")
+    db = LabsDb(tmp_path / "labs.sqlite")
+    inbox_dir = repo.root / "inbox"
+    (inbox_dir / "first.pdf").write_bytes(TINY_PDF_BYTES)
+    vision = FakeVisionClient("clean_agreement.json")
+    ingest_inbox(
+        repo=repo, db=db, vision=vision, clock=_fixed_clock, renderer=fake_page_renderer(1)
+    )
+
+    # Identical bytes, dropped into the inbox again under a new name.
+    (inbox_dir / "second.pdf").write_bytes(TINY_PDF_BYTES)
+    report = ingest_inbox(
+        repo=repo, db=db, vision=vision, clock=_fixed_clock, renderer=fake_page_renderer(1)
+    )
+
+    assert report.files[0].outcome == "duplicate"
+    assert not (inbox_dir / "second.pdf").exists()
+
+
+def test_ingest_inbox_moves_a_failed_file_to_work_failed_with_a_record(tmp_path: Path) -> None:
+    repo = DataRepo.init_at(tmp_path / "data-repo")
+    db = LabsDb(tmp_path / "labs.sqlite")
+    inbox_dir = repo.root / "inbox"
+    bad = inbox_dir / "corrupt.pdf"
+    bad.write_bytes(b"not really a pdf")
+    vision = FakeVisionClient("clean_agreement.json")
+
+    report = ingest_inbox(
+        repo=repo, db=db, vision=vision, clock=_fixed_clock, renderer=fake_page_renderer(1)
+    )
+
+    assert report.files[0].outcome == "error"
+    assert not bad.exists()
+
+    failed_path = repo.root / "work" / "failed" / "corrupt.pdf"
+    assert failed_path.exists()
+    assert failed_path.read_bytes() == b"not really a pdf"
+
+    failures_log = repo.root / "work" / "failed" / "failures.jsonl"
+    lines = failures_log.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 1
+    record = json.loads(lines[0])
+    assert record["filename"] == "corrupt.pdf"
+    assert record["original_inbox_path"] == "corrupt.pdf"
+    assert record["reason"]
+    # Pydantic serializes a UTC datetime with a "Z" suffix rather than
+    # "+00:00" - compare the parsed values, not the raw strings.
+    assert datetime.fromisoformat(record["failed_at"]) == _fixed_clock()
+
+
+def test_ingest_inbox_flattens_nested_failed_paths(tmp_path: Path) -> None:
+    repo = DataRepo.init_at(tmp_path / "data-repo")
+    db = LabsDb(tmp_path / "labs.sqlite")
+    nested = repo.root / "inbox" / "Labs" / "LabCorp"
+    nested.mkdir(parents=True)
+    bad = nested / "b.pdf"
+    bad.write_bytes(b"still not a pdf")
+    vision = FakeVisionClient("clean_agreement.json")
+
+    ingest_inbox(
+        repo=repo, db=db, vision=vision, clock=_fixed_clock, renderer=fake_page_renderer(1)
+    )
+
+    flattened = repo.root / "work" / "failed" / "Labs__LabCorp__b.pdf"
+    assert flattened.exists()
+    record = json.loads(
+        (repo.root / "work" / "failed" / "failures.jsonl").read_text(encoding="utf-8").strip()
+    )
+    assert record["original_inbox_path"] == "Labs/LabCorp/b.pdf"
+
+
+def test_backfill_directory_never_deletes_or_moves_user_files_even_on_error(
+    tmp_path: Path,
+) -> None:
+    """`adoc backfill <external dir>` must never touch the patient's own
+    files - success or failure."""
+    repo = DataRepo.init_at(tmp_path / "data-repo")
+    db = LabsDb(tmp_path / "labs.sqlite")
+    external_dir = tmp_path / "external-photos"
+    external_dir.mkdir()
+    # A genuinely unsupported type (.txt is now a supported "text" intake
+    # kind - see the genomics/filetypes task item 1/3).
+    bad_file = external_dir / "photo.png"
+    original_bytes = b"\x89PNG\r\n\x1a\nnot really a png, not a real document"
+    bad_file.write_bytes(original_bytes)
+    vision = FakeVisionClient("clean_agreement.json")
+
+    report = ingest_directory(
+        external_dir,
+        repo=repo,
+        db=db,
+        vision=vision,
+        clock=_fixed_clock,
+        renderer=fake_page_renderer(1),
+    )
+
+    assert report.files[0].outcome == "error"
+    assert bad_file.exists()
+    assert bad_file.read_bytes() == original_bytes
+    assert not (repo.root / "work" / "failed").exists()
+
+
+def test_backfill_directory_never_deletes_a_successfully_ingested_file(tmp_path: Path) -> None:
+    """Same invariant, the success path: backfilling still never deletes
+    the original file (unlike `ingest_inbox`, which does)."""
+    repo = DataRepo.init_at(tmp_path / "data-repo")
+    db = LabsDb(tmp_path / "labs.sqlite")
+    external_dir = tmp_path / "external-photos"
+    external_dir.mkdir()
+    good_file = external_dir / "quest.pdf"
+    good_file.write_bytes(TINY_PDF_BYTES)
+    vision = FakeVisionClient("clean_agreement.json")
+
+    report = ingest_directory(
+        external_dir,
+        repo=repo,
+        db=db,
+        vision=vision,
+        clock=_fixed_clock,
+        renderer=fake_page_renderer(1),
+    )
+
+    assert report.files[0].outcome == "ingested"
+    assert good_file.exists()
+    assert good_file.read_bytes() == TINY_PDF_BYTES
+
+
+# --------------------------------------------------------------------------
+# docx routing (PLAN.md docx ingestion: docx = TEXT documents). These build
+# a real `.docx` with `python-docx` and a real `VisionClient` wrapping a
+# fake-transport `LlmClient` (mirroring `tests/test_stages.py`'s pattern) so
+# `_ingest_docx`'s actual seam - `vision.client` - is exercised for real,
+# never a duck-typed stand-in.
+# --------------------------------------------------------------------------
+
+
+def _make_narrative_docx(path: Path) -> None:
+    document = Document()
+    document.add_paragraph("Patient-authored clinical history.")
+    document.add_paragraph("Onset of joint pain in March 2026, worsening through the summer.")
+    document.save(str(path))
+
+
+def _make_lab_docx(path: Path) -> None:
+    document = Document()
+    document.add_paragraph("Home lab panel, ordered 2026-08-01.")
+    table = document.add_table(rows=2, cols=3)
+    table.cell(0, 0).text = "Test"
+    table.cell(0, 1).text = "Result"
+    table.cell(0, 2).text = "Range"
+    table.cell(1, 0).text = "Potassium"
+    table.cell(1, 1).text = "4.1"
+    table.cell(1, 2).text = "3.5-5.1"
+    document.save(str(path))
+
+
+def _build_docx_llm_client(
+    *,
+    classify_payload: dict[str, Any],
+    pass_a_payload: dict[str, Any] | None,
+    pass_b_payload: dict[str, Any] | None,
+    calls: list[str],
+) -> LlmClient:
+    """`classifier`/`extractor_pass_a` -> anthropic, `extractor_pass_b` ->
+    openai (mirrors `models.yaml`'s real bindings); the anthropic transport
+    dispatches on the requested schema since both roles share that
+    provider."""
+
+    def anthropic_transport(request: TransportRequest) -> TransportResponse:
+        assert request.schema is not None
+        name = request.schema.__name__
+        if name == "ClassifyResult":
+            calls.append("classifier")
+            tool_input = classify_payload
+        elif name == "DocumentExtraction":
+            calls.append("extractor_pass_a")
+            assert pass_a_payload is not None
+            tool_input = pass_a_payload
+        else:  # pragma: no cover - defensive
+            raise AssertionError(f"unexpected schema for anthropic transport: {name}")
+        return TransportResponse(text="", tool_input=tool_input, input_tokens=10, output_tokens=10)
+
+    def openai_transport(request: TransportRequest) -> TransportResponse:
+        assert request.schema is not None
+        calls.append("extractor_pass_b")
+        assert pass_b_payload is not None
+        return TransportResponse(
+            text="", tool_input=pass_b_payload, input_tokens=10, output_tokens=10
+        )
+
+    bindings: dict[str, list[ModelBinding]] = {
+        "classifier": [ModelBinding(provider="anthropic", model="fake-haiku")],
+        "extractor_pass_a": [ModelBinding(provider="anthropic", model="fake-sonnet")],
+        "extractor_pass_b": [ModelBinding(provider="openai", model="fake-gpt")],
+    }
+    providers = {
+        "anthropic": AnthropicProvider(api_key=None, transport=anthropic_transport),
+        "openai": OpenAIProvider(api_key=None, transport=openai_transport),
+    }
+    return LlmClient(bindings, providers)
+
+
+def test_docx_narrative_document_becomes_a_full_text_encounter(tmp_path: Path) -> None:
+    repo = DataRepo.init_at(tmp_path / "data-repo")
+    db = LabsDb(tmp_path / "labs.sqlite")
+    doc_path = tmp_path / "history.docx"
+    _make_narrative_docx(doc_path)
+
+    calls: list[str] = []
+    client = _build_docx_llm_client(
+        classify_payload={"doc_type": "clinical_note", "doc_date": "2026-08-01"},
+        pass_a_payload=None,
+        pass_b_payload=None,
+        calls=calls,
+    )
+    vision = VisionClient(client)
+
+    report = ingest_file(doc_path, repo=repo, db=db, vision=vision, clock=_fixed_clock)
+
+    outcome = report.files[0]
+    assert outcome.outcome == "ingested"
+    assert outcome.doc_type == "clinical_note"
+    assert outcome.rows_auto == 0
+    assert outcome.rows_pending == 0
+    assert outcome.commit_sha is not None
+    # extractor roles are never called for a non-lab docx
+    assert calls == ["classifier"]
+    assert db.pending() == []
+
+    documents = db.list_documents()
+    assert len(documents) == 1
+    assert documents[0].page_count == 1
+
+    encounters_dir = repo.root / "case" / "encounters"
+    encounter_files = list(encounters_dir.glob("2026-08-01--*.md"))
+    assert len(encounter_files) == 1
+    encounter = read_encounter(encounter_files[0])
+    assert encounter.frontmatter.type == "patient-report"
+    assert encounter.frontmatter.sources
+    assert "Patient-authored clinical history." in encounter.extracted_text
+    assert "Onset of joint pain in March 2026" in encounter.extracted_text
+
+    git_repo = Repo(repo.root)
+    assert git_repo.head.commit.hexsha == outcome.commit_sha
+
+
+def test_docx_lab_report_double_pass_text_reconciles_to_auto_row(tmp_path: Path) -> None:
+    repo = DataRepo.init_at(tmp_path / "data-repo")
+    db = LabsDb(tmp_path / "labs.sqlite")
+    doc_path = tmp_path / "home-lab.docx"
+    _make_lab_docx(doc_path)
+
+    result_row = {
+        "name_raw": "Potassium",
+        "value": 4.1,
+        "unit_raw": "mmol/L",
+        "ref_range_raw": "3.5-5.1",
+        "page": 1,
+        "confidence": "high",
+    }
+    extraction_payload = {
+        "doc_type": "lab_report",
+        "collection_date": "2026-08-01",
+        "results": [result_row],
+        "narrative_findings": [],
+        "illegible_regions": [],
+    }
+    calls: list[str] = []
+    client = _build_docx_llm_client(
+        classify_payload={"doc_type": "lab_report", "doc_date": "2026-08-01"},
+        pass_a_payload=extraction_payload,
+        pass_b_payload=extraction_payload,
+        calls=calls,
+    )
+    vision = VisionClient(client)
+
+    report = ingest_file(doc_path, repo=repo, db=db, vision=vision, clock=_fixed_clock)
+
+    outcome = report.files[0]
+    assert outcome.outcome == "ingested"
+    assert outcome.doc_type == "lab_report"
+    assert outcome.rows_auto == 1
+    assert outcome.rows_pending == 0
+    assert outcome.issues == []
+    assert calls == ["classifier", "extractor_pass_a", "extractor_pass_b"]
+
+    documents = db.list_documents()
+    assert len(documents) == 1
+    assert documents[0].page_count == 1
+
+    export_path = repo.root / "labs-export.jsonl"
+    assert export_path.exists()
+    lines = export_path.read_text(encoding="utf-8").strip().splitlines()
+    assert any(json.loads(line)["table"] == "lab" for line in lines)
+
+
+# --------------------------------------------------------------------------
+# plain .txt/.md text routing (genomics/filetypes task item 3): the SAME
+# shared TEXT flow docx uses (`_ingest_text_like`), just reached via
+# `path.read_text(errors="replace")` instead of `extract_docx_text`.
+# --------------------------------------------------------------------------
+
+
+def test_txt_narrative_document_becomes_a_full_text_encounter(tmp_path: Path) -> None:
+    repo = DataRepo.init_at(tmp_path / "data-repo")
+    db = LabsDb(tmp_path / "labs.sqlite")
+    doc_path = tmp_path / "history.txt"
+    doc_path.write_text(
+        "Patient-authored clinical history.\n"
+        "Onset of joint pain in March 2026, worsening through the summer.\n",
+        encoding="utf-8",
+    )
+
+    calls: list[str] = []
+    client = _build_docx_llm_client(
+        classify_payload={"doc_type": "clinical_note", "doc_date": "2026-08-01"},
+        pass_a_payload=None,
+        pass_b_payload=None,
+        calls=calls,
+    )
+    vision = VisionClient(client)
+
+    report = ingest_file(doc_path, repo=repo, db=db, vision=vision, clock=_fixed_clock)
+
+    outcome = report.files[0]
+    assert outcome.outcome == "ingested"
+    assert outcome.doc_type == "clinical_note"
+    assert outcome.commit_sha is not None
+    # extractor roles are never called for a non-lab text file
+    assert calls == ["classifier"]
+
+    documents = db.list_documents()
+    assert len(documents) == 1
+    assert documents[0].page_count == 1
+
+    encounters_dir = repo.root / "case" / "encounters"
+    encounter_files = list(encounters_dir.glob("2026-08-01--*.md"))
+    assert len(encounter_files) == 1
+    encounter = read_encounter(encounter_files[0])
+    assert encounter.frontmatter.type == "patient-report"
+    assert "Patient-authored clinical history." in encounter.extracted_text
+    assert "Onset of joint pain in March 2026" in encounter.extracted_text
+
+
+def test_ingest_inbox_moves_an_oversized_text_file_to_failed_with_a_clear_reason(
+    tmp_path: Path,
+) -> None:
+    repo = DataRepo.init_at(tmp_path / "data-repo")
+    db = LabsDb(tmp_path / "labs.sqlite")
+    inbox_dir = repo.root / "inbox"
+    inbox_dir.mkdir(parents=True, exist_ok=True)
+    big = inbox_dir / "huge.txt"
+    big.write_text("x" * (1024 * 1024 + 1), encoding="utf-8")
+    vision = FakeVisionClient("clean_agreement.json")
+
+    report = ingest_inbox(
+        repo=repo, db=db, vision=vision, clock=_fixed_clock, renderer=fake_page_renderer(1)
+    )
+
+    assert report.files[0].outcome == "error"
+    assert "larger than the" in report.files[0].issues[0]
+    assert not big.exists()
+    assert (repo.root / "work" / "failed" / "huge.txt").exists()
+
+
+# --------------------------------------------------------------------------
+# genomic intake (CRITICAL DESIGN RULE: never enters the LLM document
+# pipeline) - genomics/filetypes task items 2/6.
+# --------------------------------------------------------------------------
+
+
+def test_genomic_file_never_calls_the_llm_and_is_registered_in_the_inventory(
+    tmp_path: Path,
+) -> None:
+    repo = DataRepo.init_at(tmp_path / "data-repo")
+    db = LabsDb(tmp_path / "labs.sqlite")
+    doc_path = tmp_path / "chr1.imputed.bcf"
+    doc_path.write_bytes(BGZF_MAGIC + b"\x00" * 64)
+    vision = _build_exploding_vision_client()
+
+    report = ingest_file(doc_path, repo=repo, db=db, vision=vision, clock=_fixed_clock)
+
+    outcome = report.files[0]
+    assert outcome.outcome == "ingested"
+    assert outcome.doc_type == "genomic_data"
+    assert outcome.commit_sha is not None
+
+    documents = db.list_documents()
+    assert len(documents) == 1
+    assert documents[0].doc_type == "genomic_data"
+    assert documents[0].page_count == 1
+    assert documents[0].status == DocumentStatus.COMPLETE
+
+    inventory = (repo.root / "case" / "genomics-inventory.md").read_text(encoding="utf-8")
+    assert "chr1.imputed.bcf" in inventory
+
+    # No per-file encounter for a genomic file.
+    assert list((repo.root / "case" / "encounters").glob("*.md")) == []
+
+    git_repo = Repo(repo.root)
+    assert "chr1.imputed.bcf" not in git_repo.git.ls_files()
+
+
+def test_genomic_file_duplicate_still_gets_inbox_hygiene(tmp_path: Path) -> None:
+    repo = DataRepo.init_at(tmp_path / "data-repo")
+    db = LabsDb(tmp_path / "labs.sqlite")
+    inbox_dir = repo.root / "inbox"
+    inbox_dir.mkdir(parents=True, exist_ok=True)
+    (inbox_dir / "chr1.imputed.bcf").write_bytes(BGZF_MAGIC + b"\x00" * 64)
+    vision = _build_exploding_vision_client()
+    ingest_inbox(repo=repo, db=db, vision=vision, clock=_fixed_clock)
+
+    # Same bytes, different filename (must still end in ".bcf" to be
+    # detected as genomic at all) - same sha256, so the dedupe check must
+    # treat it as a duplicate regardless of filename.
+    (inbox_dir / "chr1.imputed.duplicate.bcf").write_bytes(BGZF_MAGIC + b"\x00" * 64)
+    report = ingest_inbox(repo=repo, db=db, vision=vision, clock=_fixed_clock)
+
+    assert report.files[0].outcome == "duplicate"
+    assert not (inbox_dir / "chr1.imputed.duplicate.bcf").exists()
+
+
+# --------------------------------------------------------------------------
+# zip expansion (genomics/filetypes task item 4): members are routed
+# through `detect_intake_kind` and ingested exactly like inbox files.
+# --------------------------------------------------------------------------
+
+
+def test_zip_expands_and_ingests_each_member_like_its_own_inbox_file(tmp_path: Path) -> None:
+    repo = DataRepo.init_at(tmp_path / "data-repo")
+    db = LabsDb(tmp_path / "labs.sqlite")
+    zip_path = _make_zip(
+        tmp_path / "bundle.zip",
+        {
+            "quest.pdf": TINY_PDF_BYTES,
+            "chr1.imputed.bcf": BGZF_MAGIC + b"\x00" * 64,
+        },
+    )
+    vision = FakeVisionClient("clean_agreement.json")
+
+    report = ingest_file(
+        zip_path,
+        repo=repo,
+        db=db,
+        vision=vision,
+        clock=_fixed_clock,
+        renderer=fake_page_renderer(1),
+    )
+
+    assert len(report.files) == 2
+    assert all(f.outcome == "ingested" for f in report.files)
+    assert len(db.list_documents()) == 2
+    doc_types = {d.doc_type for d in db.list_documents()}
+    assert doc_types == {"lab_report", "genomic_data"}
+
+
+def test_zip_itself_is_never_archived_only_its_members_are(tmp_path: Path) -> None:
+    repo = DataRepo.init_at(tmp_path / "data-repo")
+    db = LabsDb(tmp_path / "labs.sqlite")
+    zip_path = _make_zip(tmp_path / "bundle.zip", {"quest.pdf": TINY_PDF_BYTES})
+    vision = FakeVisionClient("clean_agreement.json")
+
+    ingest_file(
+        zip_path,
+        repo=repo,
+        db=db,
+        vision=vision,
+        clock=_fixed_clock,
+        renderer=fake_page_renderer(1),
+    )
+
+    assert not any((repo.root / "sources").glob("*__bundle.zip"))
+
+
+def test_zip_of_all_genomic_members_creates_no_encounters(tmp_path: Path) -> None:
+    repo = DataRepo.init_at(tmp_path / "data-repo")
+    db = LabsDb(tmp_path / "labs.sqlite")
+    zip_path = _make_zip(
+        tmp_path / "genomes.zip",
+        {
+            # Distinct content per member - identical bytes would share a
+            # sha256 and dedupe as the "same" genomic file.
+            "chr1.imputed.bcf": BGZF_MAGIC + b"chr1" + b"\x00" * 64,
+            "chr2.imputed.bcf": BGZF_MAGIC + b"chr2" + b"\x00" * 64,
+        },
+    )
+    vision = _build_exploding_vision_client()
+
+    report = ingest_file(zip_path, repo=repo, db=db, vision=vision, clock=_fixed_clock)
+
+    assert len(report.files) == 2
+    assert all(f.outcome == "ingested" for f in report.files)
+    assert len(db.list_documents()) == 2
+    assert list((repo.root / "case" / "encounters").glob("*.md")) == []
+
+
+def test_zip_member_with_path_traversal_is_skipped_but_others_still_ingest(
+    tmp_path: Path,
+) -> None:
+    repo = DataRepo.init_at(tmp_path / "data-repo")
+    db = LabsDb(tmp_path / "labs.sqlite")
+    zip_path = _make_zip(
+        tmp_path / "bundle.zip",
+        {
+            "../../etc/passwd": b"malicious content",
+            "quest.pdf": TINY_PDF_BYTES,
+        },
+    )
+    vision = FakeVisionClient("clean_agreement.json")
+
+    report = ingest_file(
+        zip_path,
+        repo=repo,
+        db=db,
+        vision=vision,
+        clock=_fixed_clock,
+        renderer=fake_page_renderer(1),
+    )
+
+    outcomes_by_result = {f.outcome for f in report.files}
+    assert outcomes_by_result == {"error", "ingested"}
+    bad = next(f for f in report.files if f.outcome == "error")
+    assert "unsafe member path" in bad.issues[0]
+    assert len(db.list_documents()) == 1
+    # the traversal target was never written anywhere real
+    assert not (tmp_path.parent.parent / "etc" / "passwd").exists()
+
+
+def test_zip_rejects_a_nested_zip_member_without_recursing(tmp_path: Path) -> None:
+    repo = DataRepo.init_at(tmp_path / "data-repo")
+    db = LabsDb(tmp_path / "labs.sqlite")
+
+    inner_buf = io.BytesIO()
+    with zipfile.ZipFile(inner_buf, "w") as inner_zf:
+        inner_zf.writestr("quest.pdf", TINY_PDF_BYTES)
+
+    zip_path = _make_zip(
+        tmp_path / "bundle.zip",
+        {
+            "nested.zip": inner_buf.getvalue(),
+            "quest.pdf": TINY_PDF_BYTES,
+        },
+    )
+    vision = FakeVisionClient("clean_agreement.json")
+
+    report = ingest_file(
+        zip_path,
+        repo=repo,
+        db=db,
+        vision=vision,
+        clock=_fixed_clock,
+        renderer=fake_page_renderer(1),
+    )
+
+    nested_outcome = next(f for f in report.files if "nested.zip" in f.path)
+    assert nested_outcome.outcome == "error"
+    assert "nested zip" in nested_outcome.issues[0]
+    # the top-level pdf member still ingests despite the rejected nested zip
+    assert any(f.outcome == "ingested" for f in report.files)
+    assert len(db.list_documents()) == 1
+
+
+def test_zip_rejects_the_whole_archive_over_the_member_cap(tmp_path: Path) -> None:
+    repo = DataRepo.init_at(tmp_path / "data-repo")
+    db = LabsDb(tmp_path / "labs.sqlite")
+    members = {f"f{i}.txt": b"x" for i in range(MAX_ZIP_MEMBERS + 1)}
+    zip_path = _make_zip(tmp_path / "bundle.zip", members)
+    vision = FakeVisionClient("clean_agreement.json")
+
+    report = ingest_file(zip_path, repo=repo, db=db, vision=vision, clock=_fixed_clock)
+
+    assert len(report.files) == 1
+    assert report.files[0].outcome == "error"
+    assert "member cap" in report.files[0].issues[0]
+    assert db.list_documents() == []
+
+
+def test_zip_rejects_the_whole_archive_over_the_uncompressed_size_cap(tmp_path: Path) -> None:
+    from adoc.ingest import pipeline as pipeline_module
+
+    repo = DataRepo.init_at(tmp_path / "data-repo")
+    db = LabsDb(tmp_path / "labs.sqlite")
+    zip_path = _make_zip(tmp_path / "bundle.zip", {"quest.pdf": TINY_PDF_BYTES})
+    vision = FakeVisionClient("clean_agreement.json")
+
+    original_cap = pipeline_module.MAX_ZIP_UNCOMPRESSED_BYTES
+    pipeline_module.MAX_ZIP_UNCOMPRESSED_BYTES = 1
+    try:
+        report = ingest_file(zip_path, repo=repo, db=db, vision=vision, clock=_fixed_clock)
+    finally:
+        pipeline_module.MAX_ZIP_UNCOMPRESSED_BYTES = original_cap
+
+    assert len(report.files) == 1
+    assert report.files[0].outcome == "error"
+    assert "exceeds the" in report.files[0].issues[0]
+    assert db.list_documents() == []
+
+
+def test_ingest_inbox_deletes_a_successfully_expanded_zip(tmp_path: Path) -> None:
+    repo = DataRepo.init_at(tmp_path / "data-repo")
+    db = LabsDb(tmp_path / "labs.sqlite")
+    inbox_dir = repo.root / "inbox"
+    inbox_dir.mkdir(parents=True, exist_ok=True)
+    zip_path = _make_zip(inbox_dir / "bundle.zip", {"quest.pdf": TINY_PDF_BYTES})
+    vision = FakeVisionClient("clean_agreement.json")
+
+    report = ingest_inbox(
+        repo=repo, db=db, vision=vision, clock=_fixed_clock, renderer=fake_page_renderer(1)
+    )
+
+    assert not zip_path.exists()
+    assert all(f.outcome == "ingested" for f in report.files)
+
+
+def test_ingest_inbox_moves_a_bad_zip_to_failed(tmp_path: Path) -> None:
+    repo = DataRepo.init_at(tmp_path / "data-repo")
+    db = LabsDb(tmp_path / "labs.sqlite")
+    inbox_dir = repo.root / "inbox"
+    inbox_dir.mkdir(parents=True, exist_ok=True)
+    bad_zip = inbox_dir / "corrupt.zip"
+    bad_zip.write_bytes(b"PK\x03\x04 not really a zip")
+    vision = FakeVisionClient("clean_agreement.json")
+
+    report = ingest_inbox(repo=repo, db=db, vision=vision, clock=_fixed_clock)
+
+    assert report.files[0].outcome == "error"
+    assert not bad_zip.exists()
+    assert (repo.root / "work" / "failed" / "corrupt.zip").exists()

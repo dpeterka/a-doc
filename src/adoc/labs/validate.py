@@ -27,12 +27,23 @@ from adoc.labs.models import LabFlag, LabResult
 if TYPE_CHECKING:
     from adoc.labs.db import LabsDb
 
-ValueKind = Literal["numeric", "titer", "qualitative"]
+ValueKind = Literal["numeric", "titer", "qualitative", "score"]
+"""`"score"` (queue-ergonomics slice item 2) is for analytes that are a
+computed score by their nature - a DEXA T-score/Z-score or a FRAX
+fracture-probability percentage - and so legitimately carry no unit (T/Z)
+or only "%" (FRAX) and no clinical reference range at all. `validate_row`
+treats it like `"numeric"` (bounds + flag checks) but never complains
+about a missing unit - see `AnalyteSpec.allowed_units`'s docstring below."""
 
 # Trend-outlier: relative deviation from the patient's own recent median that
 # triggers a flag (PLAN.md: "decimal-error detection", e.g. K 4.1 -> 41).
 TREND_OUTLIER_RATIO = 0.4
 TREND_OUTLIER_MIN_PRIORS = 3
+# A >=10x-class shift is the decimal-misread signature (4.1 -> 41). Below
+# this, a cross-pass-agreed value is treated as a real physiological spike
+# (this patient spikes frequently — confirmed against source PDFs) and the
+# outlier becomes an annotation, not an auto-accept blocker.
+DECIMAL_SIGNATURE_RATIO = 9.0
 
 
 class IssueCode(StrEnum):
@@ -56,6 +67,9 @@ class AnalyteSpec:
     canonical_name: str
     aliases: tuple[str, ...]
     kind: ValueKind
+    # For kind="score": the units a *printed* score is allowed to carry
+    # besides no unit at all (always fine for a score - see `validate_row`).
+    # T-score/Z-score: empty (unitless by nature). FRAX: `("%",)`.
     allowed_units: tuple[str, ...] = field(default_factory=tuple)
     bounds: tuple[float, float] | None = None  # hard physiologic plausibility bounds
 
@@ -66,6 +80,71 @@ def _normalize(text: str) -> str:
 
 
 _TITER_PATTERN = re.compile(r"^1\s*:\s*\d+$")
+
+# Unit spelling families (feature/semantic-compare): real-corpus reconcile
+# false-positives showed extraction passes printing the SAME unit in
+# different, equally-valid spellings (e.g. "Million/uL" vs "M/uL" vs
+# "x10^6/uL"). Each inner tuple is one family of interchangeable spellings,
+# pre-normalized (casefold, no internal whitespace - see `_normalize_unit_text`).
+# Deliberately does NOT merge families a clinician would NOT treat as
+# interchangeable even though they look similar: "IU/mL" and "U/mL" stay
+# separate (different assay standardization), and "units"/"U" (a bare,
+# unit-less flag on some printed ranges) stays its own family too.
+UNIT_SYNONYMS: tuple[tuple[str, ...], ...] = (
+    ("10*6/ul", "x10^6/ul", "m/ul", "million/ul", "x10e6/ul"),
+    ("10*3/ul", "x10^3/ul", "k/ul", "thousand/ul", "x10e3/ul"),
+    ("mg/dl",),
+    ("g/dl",),
+    ("mmol/l",),
+    ("mcg/dl", "ug/dl", "µg/dl"),
+    ("miu/l", "uiu/ml"),  # numerically equivalent for TSH reporting
+    ("ng/ml",),
+    ("pg/ml",),
+    ("%",),
+    ("mm/hr", "mm/h"),
+    ("iu/ml",),  # kept separate from U/mL - not assumed equal
+    ("u/ml",),
+    ("units", "u"),
+)
+
+
+def _normalize_unit_text(text: str) -> str:
+    """Case/whitespace-insensitive key for `UNIT_SYNONYMS`/`canonical_unit`
+    lookup. Internal whitespace is removed entirely (not just collapsed) -
+    unit spellings never carry semantically meaningful spaces."""
+    return re.sub(r"\s+", "", text.strip().casefold())
+
+
+_UNIT_SYNONYM_INDEX: dict[str, str] = {
+    _normalize_unit_text(member): family[0] for family in UNIT_SYNONYMS for member in family
+}
+
+
+def canonical_unit(raw: str | None) -> str | None:
+    """The canonical family token for `raw` (module docstring), or `None`
+    if `raw` doesn't match any known spelling family - never a guess."""
+    if raw is None:
+        return None
+    normalized = _normalize_unit_text(raw)
+    if not normalized:
+        return None
+    return _UNIT_SYNONYM_INDEX.get(normalized)
+
+
+def _unit_in_whitelist(unit: str | None, allowed: tuple[str, ...]) -> bool:
+    """`unit` matches one of `allowed`'s printed spellings, or shares its
+    `canonical_unit` family (feature/semantic-compare: `validate_row`'s
+    whitelist accepts any synonym of a whitelisted unit, not just the exact
+    spellings enumerated in `AnalyteSpec.allowed_units`)."""
+    if unit is None:
+        return False
+    unit_key = canonical_unit(unit) or _normalize_unit_text(unit)
+    for allowed_unit in allowed:
+        allowed_key = canonical_unit(allowed_unit) or _normalize_unit_text(allowed_unit)
+        if unit_key == allowed_key:
+            return True
+    return False
+
 
 # ~25 analytes common to autoimmune workups: CBC, CMP, inflammation, thyroid,
 # autoimmune serology, and iron/vitamin panels frequently ordered alongside
@@ -79,14 +158,14 @@ ANALYTE_SPECS: dict[str, AnalyteSpec] = {
             "WBC",
             ("wbc", "white blood cell count", "white blood cells", "leukocytes"),
             "numeric",
-            ("10*3/uL", "x10^3/uL", "K/uL"),
+            ("10*3/uL", "x10^3/uL", "K/uL", "Thousand/uL"),
             (0.1, 100.0),
         ),
         AnalyteSpec(
             "RBC",
             ("rbc", "red blood cell count", "red blood cells", "erythrocytes"),
             "numeric",
-            ("10*6/uL", "x10^6/uL", "M/uL"),
+            ("10*6/uL", "x10^6/uL", "M/uL", "Million/uL"),
             (0.5, 10.0),
         ),
         AnalyteSpec(
@@ -107,7 +186,7 @@ ANALYTE_SPECS: dict[str, AnalyteSpec] = {
             "platelets",
             ("platelets", "platelet count", "plt"),
             "numeric",
-            ("10*3/uL", "x10^3/uL", "K/uL"),
+            ("10*3/uL", "x10^3/uL", "K/uL", "Thousand/uL"),
             (1.0, 2000.0),
         ),
         # --- CMP ---
@@ -260,6 +339,42 @@ ANALYTE_SPECS: dict[str, AnalyteSpec] = {
             ("%",),
             (1.0, 100.0),
         ),
+        # --- Scores (queue-ergonomics slice item 2: FRAX/T-score/Z-score
+        # have no unit/reference range by nature - `kind="score"` skips
+        # `validate_row`'s unit-whitelist complaint when the printed unit
+        # is None (or "%" for FRAX), and no ref range is ever expected).
+        # `canonicalize`'s suffix-match rule (below) lets a site-prefixed
+        # DEXA row name like "LEFT HIP femoral neck T-Score" resolve to
+        # this spec even though the alias table itself only matches whole
+        # names.
+        AnalyteSpec(
+            "T-score",
+            ("t-score", "t score"),
+            "score",
+            (),
+            (-6.0, 6.0),
+        ),
+        AnalyteSpec(
+            "Z-score",
+            ("z-score", "z score"),
+            "score",
+            (),
+            (-6.0, 6.0),
+        ),
+        AnalyteSpec(
+            "FRAX 10-year probability of hip fracture",
+            (),
+            "score",
+            ("%",),
+            (0.0, 100.0),
+        ),
+        AnalyteSpec(
+            "FRAX 10-year probability of major osteoporotic fracture",
+            (),
+            "score",
+            ("%",),
+            (0.0, 100.0),
+        ),
     )
 }
 
@@ -269,15 +384,47 @@ for _spec in ANALYTE_SPECS.values():
     for _alias in _spec.aliases:
         _ALIAS_TO_CANONICAL[_normalize(_alias)] = _spec.canonical_name
 
+# Suffix-match table for `kind="score"` analytes ONLY (queue-ergonomics
+# slice item 2): a DEXA row is commonly printed with a site prefix the
+# exact-alias table above can't see through (e.g. "LEFT HIP femoral neck
+# T-Score", "L1-L4 Z-Score"). Sorted longest-normalized-alias-first so a
+# more specific suffix always wins a match before a shorter one gets the
+# chance. Deliberately scoped to score-kind aliases only - every other
+# analyte keeps exact-alias matching, unchanged, to avoid a same-suffix
+# false positive (e.g. nothing here is short/generic enough to
+# accidentally suffix-match an unrelated test name).
+_SCORE_SUFFIX_TO_CANONICAL: list[tuple[str, str]] = sorted(
+    (
+        (_normalize(_alias), _spec.canonical_name)
+        for _spec in ANALYTE_SPECS.values()
+        if _spec.kind == "score"
+        for _alias in (_spec.canonical_name, *_spec.aliases)
+    ),
+    key=lambda pair: len(pair[0]),
+    reverse=True,
+)
+
 
 def canonicalize(name_raw: str) -> str | None:
     """Map a raw analyte name to its canonical name, or `None` if unknown.
 
-    Lookup is case/punctuation-insensitive (`_normalize`). Unknown analytes
-    return `None` rather than raising — per PLAN.md, ingestion is never
-    blocked on coding an analyte we don't yet recognize.
+    Lookup is case/punctuation-insensitive (`_normalize`). An exact
+    whole-name alias match is tried first; if that fails, a `kind="score"`
+    suffix match is tried (module-level `_SCORE_SUFFIX_TO_CANONICAL` -
+    site-prefixed DEXA rows like "LEFT HIP femoral neck T-Score" resolve
+    to the "T-score" spec this way). Every non-score analyte is exact-
+    alias-only, unchanged. Unknown analytes return `None` rather than
+    raising — per PLAN.md, ingestion is never blocked on coding an
+    analyte we don't yet recognize.
     """
-    return _ALIAS_TO_CANONICAL.get(_normalize(name_raw))
+    normalized = _normalize(name_raw)
+    exact = _ALIAS_TO_CANONICAL.get(normalized)
+    if exact is not None:
+        return exact
+    for suffix, canonical in _SCORE_SUFFIX_TO_CANONICAL:
+        if normalized.endswith(suffix):
+            return canonical
+    return None
 
 
 def _flag_issue(row: LabResult) -> ValidationIssue | None:
@@ -315,7 +462,7 @@ def validate_row(row: LabResult) -> list[ValidationIssue]:
         return issues
 
     if spec.kind == "numeric":
-        if row.ucum_unit is None or row.ucum_unit not in spec.allowed_units:
+        if not _unit_in_whitelist(row.ucum_unit, spec.allowed_units):
             issues.append(
                 ValidationIssue(
                     IssueCode.UNKNOWN_UNIT,
@@ -347,22 +494,59 @@ def validate_row(row: LabResult) -> list[ValidationIssue]:
                 )
             )
 
+    elif spec.kind == "score":
+        # A score is unitless by nature (T-score/Z-score) or "%"-only
+        # (FRAX) - `row.ucum_unit is None` never complains (unlike
+        # "numeric", where a missing unit itself IS the complaint); only
+        # an actually-printed, non-whitelisted unit does. No reference
+        # range is ever expected for a score, so nothing here checks one.
+        if row.ucum_unit is not None and not _unit_in_whitelist(row.ucum_unit, spec.allowed_units):
+            issues.append(
+                ValidationIssue(
+                    IssueCode.UNKNOWN_UNIT,
+                    f"{spec.canonical_name}: unit {row.ucum_unit!r} not in "
+                    f"whitelist {spec.allowed_units}",
+                )
+            )
+        if row.value is not None and spec.bounds is not None:
+            low, high = spec.bounds
+            if not (low <= row.value <= high):
+                issues.append(
+                    ValidationIssue(
+                        IssueCode.OUT_OF_BOUNDS,
+                        f"{spec.canonical_name}: value {row.value} outside plausible "
+                        f"bounds [{low}, {high}] - likely extraction error",
+                    )
+                )
+        flag_issue = _flag_issue(row)
+        if flag_issue is not None:
+            issues.append(flag_issue)
+
     return issues
 
 
-def trend_outlier(db: LabsDb, row: LabResult) -> ValidationIssue | None:
-    """Flag a >40% jump vs. the patient's own recent median (>=3 priors).
+def trend_deviation(db: LabsDb, row: LabResult) -> float | None:
+    """Relative deviation of `row.value` from the median of all EARLIER
+    readings (by collection date) of the same canonical analyte AND THE
+    SAME SPECIMEN as `row`; None when fewer than TREND_OUTLIER_MIN_PRIORS
+    priors exist or the value is non-numeric.
 
-    Catches decimal-shift extraction errors (e.g. potassium 4.1 misread as
-    41) without any clinical knowledge — pure statistics on this patient's
-    own history for the same canonical analyte.
+    Scoping priors to `row.specimen` keeps a urinalysis GLUCOSE
+    "NEGATIVE" reading from ever being compared against a serum glucose
+    trend (or vice versa) even though both canonicalize to the same
+    `name` — see `labs/models.py`'s `Specimen` docstring. A row whose own
+    specimen is `"unknown"` (true of every row before this dimension
+    existed, and of any newly-extracted row whose report didn't state
+    one) compares against other `"unknown"`-specimen priors of the same
+    canonical name — i.e. exactly today's behavior, unchanged, since
+    pre-migration data is entirely `"unknown"`.
     """
     if row.value is None:
         return None
     canonical = canonicalize(row.name) or row.name
     priors = [
         r.value
-        for r in db.series(canonical)
+        for r in db.series(canonical, row.specimen)
         if r.value is not None and r.id != row.id and r.date < row.date
     ]
     if len(priors) < TREND_OUTLIER_MIN_PRIORS:
@@ -370,11 +554,22 @@ def trend_outlier(db: LabsDb, row: LabResult) -> ValidationIssue | None:
     median = statistics.median(priors)
     if median == 0:
         return None
-    ratio = abs(row.value - median) / abs(median)
-    if ratio > TREND_OUTLIER_RATIO:
+    return abs(row.value - median) / abs(median)
+
+
+def trend_outlier(db: LabsDb, row: LabResult) -> ValidationIssue | None:
+    """Flag a >40% jump vs. the median of the patient's earlier readings
+    (>=3 priors) OF THE SAME SPECIMEN. Catches decimal-shift extraction
+    errors (e.g. potassium 4.1 misread as 41) without any clinical
+    knowledge — pure statistics on this patient's own history for the same
+    canonical analyte and specimen (see `trend_deviation`'s docstring).
+    """
+    ratio = trend_deviation(db, row)
+    if ratio is not None and ratio > TREND_OUTLIER_RATIO:
+        canonical = canonicalize(row.name) or row.name
         return ValidationIssue(
             IssueCode.TREND_OUTLIER,
-            f"{canonical}: value {row.value} is {ratio:.0%} away from recent median "
-            f"{median} across {len(priors)} priors - possible decimal error",
+            f"{canonical}: value {row.value} is {ratio:.0%} away from the median of "
+            f"earlier readings - possible decimal error",
         )
     return None

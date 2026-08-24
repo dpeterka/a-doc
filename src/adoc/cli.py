@@ -15,7 +15,12 @@ intake wizard. `user add|list|remove` manages the web login credential
 store (`web.users`) — `add`'s password prompts go through `_getpass`, a
 seam tests override so a test run never blocks on stdin. `backup` runs
 `adoc.backup.run_backup` against a real S3 client (`_build_s3_client` is
-the seam tests override with a fake). No stubs remain.
+the seam tests override with a fake); `restore` runs its inverse,
+`adoc.backup.restore_from_bucket`, against the same seam. `bootstrap-data`
+is the decide-and-run command `docker-entrypoint.sh` delegates to at
+container start (restore if `ADOC_BACKUP_BUCKET` is set and a backup
+exists, `init` otherwise) — kept in Python rather than shell so the
+decision logic is unit-testable. No stubs remain.
 """
 
 from __future__ import annotations
@@ -23,11 +28,20 @@ from __future__ import annotations
 import argparse
 import sys
 from collections.abc import Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 
 from fastapi import FastAPI
 
-from adoc.backup import BackupError, S3Client, build_s3_client, run_backup
+from adoc.backup import (
+    BackupError,
+    NoBackupError,
+    RestoreError,
+    S3Client,
+    build_s3_client,
+    restore_from_bucket,
+    run_backup,
+)
 from adoc.casefile.repo import LEDGER_RELPATH, DataRepo
 from adoc.config import Settings, load_model_bindings
 from adoc.evals.report import write_comparison_report, write_report
@@ -38,6 +52,9 @@ from adoc.ingest.vision import VisionClient
 from adoc.intake.cli import run_onboarding_session
 from adoc.intake.wizard import IntakeWizard
 from adoc.labs.db import LabsDb
+from adoc.labs.reclassify import reclassify_pending
+from adoc.labs.specimen import infer_unknown_specimens
+from adoc.labs.twins import sweep_twins, write_sweep_summary
 from adoc.privacy import Scrubber
 from adoc.reason.client import LlmClient, LlmError
 from adoc.reason.review import run_weekly_review
@@ -219,6 +236,90 @@ def _cmd_backup(_args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_restore(args: argparse.Namespace) -> int:
+    try:
+        settings = Settings()
+    except Exception as exc:  # noqa: BLE001 - surface any config error to the user
+        print(f"restore: configuration error: {exc}", file=sys.stderr)
+        return 1
+
+    bucket = args.bucket or settings.backup_bucket or ""
+    try:
+        report = restore_from_bucket(
+            bucket,
+            settings.data_dir,
+            s3_client=_build_s3_client(),
+            sqlite_journal_mode=settings.sqlite_journal_mode,
+        )
+    except RestoreError as exc:
+        print(f"restore: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"restore: cloned bundle (commit {report.bundle_commit_sha[:12]}) into {report.data_dir}")
+    print(f"restore: sources/ - {report.sources_restored} restored")
+    print(f"restore: labs.sqlite rebuilt from labs-export.jsonl - {report.lab_rows_rebuilt} rows")
+    for warning in report.warnings:
+        print(f"restore: warning: {warning}")
+    return 0
+
+
+def _cmd_bootstrap_data(_args: argparse.Namespace) -> int:
+    """The decide-and-run logic `docker-entrypoint.sh` used to guess at in
+    shell: on a missing/empty data dir, restore from `ADOC_BACKUP_BUCKET`
+    if one is configured, falling back to `adoc init` only when the
+    bucket genuinely has no backup yet (`NoBackupError`) — any other
+    failure (bad credentials, a network hiccup, a real S3 error) must
+    fail loudly rather than silently initializing an empty case file over
+    what might just be a transient problem reaching a real backup. A data
+    dir that already has *something* in it is left untouched either way
+    (matches the entrypoint's prior `[ -z "$(ls -A ...)" ]` check).
+    """
+    try:
+        settings = Settings()
+    except Exception as exc:  # noqa: BLE001 - surface any config error to the user
+        print(f"bootstrap-data: configuration error: {exc}", file=sys.stderr)
+        return 1
+
+    data_dir = settings.data_dir
+    if data_dir.is_dir() and any(data_dir.iterdir()):
+        print(f"bootstrap-data: {data_dir} already has data; nothing to do")
+        return 0
+
+    if settings.backup_bucket:
+        try:
+            report = restore_from_bucket(
+                settings.backup_bucket,
+                data_dir,
+                s3_client=_build_s3_client(),
+                sqlite_journal_mode=settings.sqlite_journal_mode,
+            )
+        except NoBackupError as exc:
+            print(f"bootstrap-data: {exc}; falling back to 'adoc init'")
+        except Exception as exc:  # noqa: BLE001 - a real error must fail loudly, never silent-init
+            print(f"bootstrap-data: restore failed: {exc}", file=sys.stderr)
+            return 1
+        else:
+            print(
+                f"bootstrap-data: restored from s3://{report.bucket}/latest/ "
+                f"(commit {report.bundle_commit_sha[:12]}, {report.lab_rows_rebuilt} lab rows)"
+            )
+            for warning in report.warnings:
+                print(f"bootstrap-data: warning: {warning}")
+            return 0
+
+    try:
+        already_initialized = DataRepo(data_dir).is_initialized
+        DataRepo.init_at(data_dir)
+    except OSError as exc:
+        print(f"bootstrap-data: cannot create data dir: {exc}", file=sys.stderr)
+        return 1
+    if already_initialized:
+        print(f"bootstrap-data: data repo already initialized at {data_dir}")
+    else:
+        print(f"bootstrap-data: initialized data repo at {data_dir}")
+    return 0
+
+
 def _print_ingest_report(report: IngestReport) -> None:
     for outcome in report.files:
         print(
@@ -272,6 +373,158 @@ def _cmd_ingest(args: argparse.Namespace) -> int:
         print(f"ingest: configuration error: {exc}", file=sys.stderr)
         return 1
     return _run_ingest(settings, directory=None, reason=args.reason)
+
+
+def _cmd_labs_infer_specimen(_args: argparse.Namespace) -> int:
+    """Deterministic maintenance pass (`labs/specimen.py`; NO LLM calls):
+    back-fill `specimen` for existing rows still at the pre-migration
+    default `"unknown"`, from their source document's filename/doc_type
+    keywords only. Idempotent - a row it updates simply won't be
+    `"unknown"` on the next run.
+    """
+    try:
+        settings = Settings()
+    except Exception as exc:  # noqa: BLE001 - surface any config error to the user
+        print(f"labs-infer-specimen: configuration error: {exc}", file=sys.stderr)
+        return 1
+
+    repo = DataRepo(settings.data_dir)
+    if not repo.is_initialized:
+        print(
+            f"labs-infer-specimen: data repo not initialized at {settings.data_dir} "
+            "- run `adoc init` first",
+            file=sys.stderr,
+        )
+        return 1
+
+    db_path = settings.data_dir / "labs.sqlite"
+    with LabsDb(db_path, journal_mode=settings.sqlite_journal_mode) as db:
+        report = infer_unknown_specimens(db)
+        if report.updated:
+            db.export_jsonl(repo.root / "labs-export.jsonl")
+            breakdown = ", ".join(f"{k}={v}" for k, v in sorted(report.by_specimen.items()))
+            repo.commit(
+                f"labs: inferred specimen for {report.updated} row(s) ({breakdown})",
+                paths=["labs-export.jsonl"],
+            )
+
+    print(f"labs-infer-specimen: updated {report.updated} row(s)")
+    for specimen, count in sorted(report.by_specimen.items()):
+        print(f"  - {specimen}: {count}")
+    print(f"labs-infer-specimen: {report.remaining_unknown} row(s) remain unknown")
+    return 0
+
+
+def _cmd_labs_dedupe_twins(args: argparse.Namespace) -> int:
+    """Queue-ergonomics slice item 4: sweep legacy single-pass PENDING rows
+    for a duplicate ("twin") already-resolved row in the same document and
+    auto-reject the duplicate half (`labs/twins.py`'s `sweep_twins`).
+    `--dry-run` computes and reports the same thing without mutating
+    anything - no rejects, no export, no commit, no summary write.
+    """
+    try:
+        settings = Settings()
+    except Exception as exc:  # noqa: BLE001 - surface any config error to the user
+        print(f"labs-dedupe-twins: configuration error: {exc}", file=sys.stderr)
+        return 1
+
+    repo = DataRepo(settings.data_dir)
+    if not repo.is_initialized:
+        print(
+            f"labs-dedupe-twins: data repo not initialized at {settings.data_dir} "
+            "- run `adoc init` first",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        client = _build_llm_client(settings)
+    except Exception as exc:  # noqa: BLE001 - surface any config error to the user
+        print(f"labs-dedupe-twins: configuration error: {exc}", file=sys.stderr)
+        return 1
+
+    db_path = settings.data_dir / "labs.sqlite"
+    with LabsDb(db_path, journal_mode=settings.sqlite_journal_mode) as db:
+        report = sweep_twins(db, client, dry_run=args.dry_run)
+
+        if args.dry_run:
+            print(f"labs-dedupe-twins: dry-run - checked {report.checked} single_pass row(s)")
+            print(
+                f"labs-dedupe-twins: dry-run - would reject {report.rejected} "
+                f"({report.rejected_rule} rule, {report.rejected_llm} llm)"
+            )
+            return 0
+
+        if report.rejected:
+            db.export_jsonl(repo.root / "labs-export.jsonl")
+            repo.commit(
+                f"labs: auto-rejected {report.rejected} twin row(s) as duplicates "
+                f"({report.rejected_rule} rule, {report.rejected_llm} llm)",
+                paths=["labs-export.jsonl"],
+            )
+        write_sweep_summary(repo.root, report, at=datetime.now(UTC))
+
+    print(f"labs-dedupe-twins: checked {report.checked} single_pass row(s)")
+    print(
+        f"labs-dedupe-twins: rejected {report.rejected} "
+        f"({report.rejected_rule} rule, {report.rejected_llm} llm)"
+    )
+    return 0
+
+
+def _cmd_labs_reclassify(args: argparse.Namespace) -> int:
+    """Deterministic maintenance pass (`labs/reclassify.py`; NO LLM calls):
+    recompute every still-PENDING matched-pair row's reasons under the
+    current semantic comparators (`ingest.reconcile`'s
+    `ref_ranges_equivalent`/`units_equivalent`/`flags_equivalent`) and the
+    current `labs.sqlite`/`ANALYTE_SPECS` - flips a row whose reasons all
+    turn out to be comparator false positives to `auto`, and rewrites
+    still-PENDING rows' reason lists so confirm-queue bucketing reflects
+    the current comparators. Idempotent - see `reclassify_pending`'s
+    docstring.
+    """
+    try:
+        settings = Settings()
+    except Exception as exc:  # noqa: BLE001 - surface any config error to the user
+        print(f"labs-reclassify: configuration error: {exc}", file=sys.stderr)
+        return 1
+
+    repo = DataRepo(settings.data_dir)
+    if not repo.is_initialized:
+        print(
+            f"labs-reclassify: data repo not initialized at {settings.data_dir} "
+            "- run `adoc init` first",
+            file=sys.stderr,
+        )
+        return 1
+
+    db_path = settings.data_dir / "labs.sqlite"
+    with LabsDb(db_path, journal_mode=settings.sqlite_journal_mode) as db:
+        report = reclassify_pending(db, dry_run=args.dry_run)
+
+        if args.dry_run:
+            print(f"labs-reclassify: dry-run - checked {report.checked} row(s)")
+            print(
+                f"labs-reclassify: dry-run - would auto-flip {report.auto_flipped}, "
+                f"re-bucket {report.rebucketed_agreed} agreed, "
+                f"leave {report.still_disagreed} disagreed"
+            )
+            return 0
+
+        if report.rewritten:
+            db.export_jsonl(repo.root / "labs-export.jsonl")
+            repo.commit(
+                f"labs: reclassified {report.rewritten} pending row(s) under the current "
+                f"comparators (auto={report.auto_flipped}, agreed={report.rebucketed_agreed}, "
+                f"disagreed={report.still_disagreed})",
+                paths=["labs-export.jsonl"],
+            )
+
+    print(f"labs-reclassify: checked {report.checked} row(s)")
+    print(f"labs-reclassify: auto-flipped {report.auto_flipped}")
+    print(f"labs-reclassify: re-bucketed agreed {report.rebucketed_agreed}")
+    print(f"labs-reclassify: still disagreed {report.still_disagreed}")
+    return 0
 
 
 def _cmd_review(_args: argparse.Namespace) -> int:
@@ -417,9 +670,59 @@ def build_parser() -> argparse.ArgumentParser:
         func=_cmd_review
     )
     subparsers.add_parser(
+        "labs-infer-specimen",
+        help=(
+            "deterministically back-fill specimen for existing 'unknown' rows from their "
+            "source document's filename/doc_type keywords (no LLM calls)"
+        ),
+    ).set_defaults(func=_cmd_labs_infer_specimen)
+    labs_dedupe_twins_parser = subparsers.add_parser(
+        "labs-dedupe-twins",
+        help=(
+            "sweep legacy single-pass PENDING rows for a duplicate already-resolved row in "
+            "the same document and auto-reject the duplicate half"
+        ),
+    )
+    labs_dedupe_twins_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="report what the sweep would do without mutating anything",
+    )
+    labs_dedupe_twins_parser.set_defaults(func=_cmd_labs_dedupe_twins)
+    labs_reclassify_parser = subparsers.add_parser(
+        "labs-reclassify",
+        help=(
+            "recompute still-PENDING rows' reasons under the current semantic reconcile "
+            "comparators, flipping comparator false-positive mismatches to auto (no LLM calls)"
+        ),
+    )
+    labs_reclassify_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="report what the sweep would do without mutating anything",
+    )
+    labs_reclassify_parser.set_defaults(func=_cmd_labs_reclassify)
+    subparsers.add_parser(
         "backup",
         help="git-bundle the data repo and upload it (+ sources/, labs-export.jsonl) to S3",
     ).set_defaults(func=_cmd_backup)
+    restore_parser = subparsers.add_parser(
+        "restore",
+        help="seed an uninitialized data repo from an S3 backup (the inverse of `adoc backup`)",
+    )
+    restore_parser.add_argument(
+        "--bucket",
+        default=None,
+        help="backup bucket name (default: ADOC_BACKUP_BUCKET / Settings.backup_bucket)",
+    )
+    restore_parser.set_defaults(func=_cmd_restore)
+    subparsers.add_parser(
+        "bootstrap-data",
+        help=(
+            "restore from ADOC_BACKUP_BUCKET if set and a backup exists, else `adoc init` "
+            "(what docker-entrypoint.sh runs on container start)"
+        ),
+    ).set_defaults(func=_cmd_bootstrap_data)
     serve_parser = subparsers.add_parser("serve", help="run the web UI")
     serve_parser.add_argument("--host", default="127.0.0.1", help="bind host (default: 127.0.0.1)")
     serve_parser.add_argument("--port", type=int, default=8080, help="bind port (default: 8080)")

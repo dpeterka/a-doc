@@ -163,6 +163,44 @@ def test_labs_section_includes_abnormal_and_latest_panel(repo: DataRepo, db: Lab
     assert "4.1" in content
 
 
+def test_labs_section_labels_non_unknown_specimen(repo: DataRepo, db: LabsDb) -> None:
+    """A row whose specimen isn't `"unknown"` is labeled e.g. "Glucose
+    (urine)" - the same canonical name can carry a serum reading too, and
+    the context pack must not present them as if they were one result."""
+    db.insert_results(
+        [
+            LabResult(
+                date=date(2026, 5, 2),
+                name="glucose",
+                name_raw="GLUCOSE",
+                value=None,
+                value_text="NEGATIVE",
+                source_doc=SHA,
+                raw_json=json.dumps({"name_raw": "GLUCOSE"}),
+                specimen="urine",
+            ),
+            LabResult(
+                date=date(2026, 5, 2),
+                name="glucose",
+                name_raw="Glucose",
+                value=92.0,
+                ucum_unit="mg/dL",
+                source_doc=SHA,
+                raw_json=json.dumps({"name_raw": "Glucose"}),
+                specimen="serum",
+            ),
+        ]
+    )
+    pack = build_context(repo, db, include_ledger=False)
+    content = next(s.content for s in pack.sections if s.key == "labs")
+
+    assert "glucose (urine): NEGATIVE" in content
+    assert "glucose (serum): 92.0" in content
+    # unknown-specimen rows (e.g. "potassium" from the fixture) are never
+    # suffixed
+    assert "potassium (unknown)" not in content
+
+
 def test_render_produces_stable_markdown_headers(repo: DataRepo, db: LabsDb) -> None:
     pack = build_context(repo, db, include_ledger=True)
     text = pack.render()
@@ -189,3 +227,19 @@ def test_missing_case_files_fall_back_to_placeholders(tmp_path: Path, db: LabsDb
     open_questions = next(s.content for s in pack.sections if s.key == "open_questions")
     assert case_summary == "_Not yet populated._"
     assert open_questions == "_None yet._"
+
+
+def test_genomics_inventory_section_included_when_present(repo: DataRepo, db: LabsDb) -> None:
+    repo.write("case/genomics-inventory.md", "# Genomic data\n\n| file | kind |\n")
+
+    pack = build_context(repo, db, include_ledger=False)
+
+    assert "genomics_inventory" in pack.keys
+    assert "Genomic Data On File" in pack.render()
+
+
+def test_genomics_inventory_section_absent_when_missing(repo: DataRepo, db: LabsDb) -> None:
+
+    pack = build_context(repo, db, include_ledger=False)
+
+    assert "genomics_inventory" not in pack.keys

@@ -21,7 +21,16 @@ _COMMIT_ACTOR = Actor("adoc", "adoc@localhost")
 _CASE_SUBDIRS = ("encounters", "reviews")
 _TOP_LEVEL_DIRS = ("sources", "inbox", "work", "logs")
 
-_GITIGNORE = "labs.sqlite\ninbox/\nwork/\nlogs/\n"
+_GITIGNORE = (
+    "labs.sqlite\nlabs.sqlite-shm\nlabs.sqlite-wal\nlabs.sqlite-journal\n"
+    "inbox/\nwork/\nlogs/\nsources/genomics/\n"
+)
+"""`sources/genomics/` (real patient genotype files - up to ~400MB across a
+23andMe export plus imputed per-chromosome BCFs) must never enter the data
+repo's git history/bundle, unlike the rest of `sources/`, which IS tracked
+(immutable originals). `ingest.genomics.archive_genomic_file` also
+lazy-appends this line for a data repo initialized before this line
+existed - see that module's `_ensure_gitignore_excludes_genomics`."""
 
 _PLACEHOLDER_FILES = {
     "case/case-summary.md": "# Case Summary\n\n_Not yet populated._\n",

@@ -62,7 +62,7 @@ def db(tmp_path: Path) -> LabsDb:
 
 def test_schema_created_with_user_version(db: LabsDb) -> None:
     version = db._conn.execute("PRAGMA user_version").fetchone()[0]
-    assert version == 1
+    assert version == 2
     tables = {
         row[0]
         for row in db._conn.execute(
@@ -302,3 +302,366 @@ def test_rebuild_from_jsonl_is_idempotent_and_replaces_existing_content(
 
     assert {d.sha256 for d in other.list_documents()} == {SHA_A, SHA_B}
     assert len(other.series("potassium")) == 1
+
+
+# --------------------------------------------------------------------------
+# Specimen dimension: migration/schema, unique constraint, latest_panel,
+# series filtering, and old/new-format JSONL rebuild tolerance.
+# --------------------------------------------------------------------------
+
+
+def test_migration_adds_specimen_column_with_unknown_default(db: LabsDb) -> None:
+    version = db._conn.execute("PRAGMA user_version").fetchone()[0]
+    assert version == 2
+    columns = {row[1] for row in db._conn.execute("PRAGMA table_info(labs)").fetchall()}
+    assert "specimen" in columns
+
+    (row_id,) = db.insert_results([_lab()])
+    row = db.get_row(row_id)  # type: ignore[arg-type]
+    assert row is not None
+    assert row.specimen == "unknown"
+
+
+def test_unique_constraint_allows_same_analyte_different_specimen_same_doc(db: LabsDb) -> None:
+    """The real finding this whole slice is about: a urinalysis GLUCOSE
+    "NEGATIVE" reading and a serum glucose mg/dL reading, same document,
+    same date, same canonical name - now distinguished by specimen instead
+    of colliding on the UNIQUE(date, name, source_doc) constraint."""
+    ids = db.insert_results(
+        [
+            _lab(
+                name="glucose",
+                value=None,
+                value_text="NEGATIVE",
+                ucum_unit=None,
+                ref_low=None,
+                ref_high=None,
+                specimen="urine",
+            ),
+            _lab(name="glucose", value=92.0, ucum_unit="mg/dL", specimen="serum"),
+        ]
+    )
+    assert all(i is not None for i in ids)
+    assert len(db.series("glucose")) == 2
+    assert len(db.series("glucose", "urine")) == 1
+    assert len(db.series("glucose", "serum")) == 1
+
+
+def test_unique_constraint_still_dedupes_within_same_specimen(db: LabsDb) -> None:
+    first = _lab(specimen="urine")
+    duplicate = _lab(specimen="urine")  # identical (date, name, specimen, source_doc)
+
+    ids = db.insert_results([first, duplicate])
+    assert ids[0] is not None
+    assert ids[1] is None
+    assert len(db.series("potassium")) == 1
+
+
+def test_series_specimen_none_returns_all_specimens(db: LabsDb) -> None:
+    db.insert_results(
+        [
+            _lab(name="glucose", value=None, value_text="NEGATIVE", specimen="urine"),
+            _lab(name="glucose", value=92.0, ucum_unit="mg/dL", specimen="serum"),
+        ]
+    )
+    assert len(db.series("glucose")) == 2
+    assert len(db.series("glucose", None)) == 2
+
+
+def test_latest_panel_splits_by_specimen_not_just_name(db: LabsDb) -> None:
+    """Before this dimension existed, `latest_panel` grouped by `name`
+    alone, so a urine glucose reading and a serum glucose reading (same
+    canonical name) would collide - only the later-dated one would ever
+    surface. Grouping by (name, specimen) fixes that."""
+    db.insert_results(
+        [
+            _lab(
+                name="glucose",
+                value=None,
+                value_text="NEGATIVE",
+                ucum_unit=None,
+                ref_low=None,
+                ref_high=None,
+                lab_date=date(2026, 1, 1),
+                specimen="urine",
+            ),
+            _lab(
+                name="glucose",
+                value=92.0,
+                ucum_unit="mg/dL",
+                lab_date=date(2026, 6, 1),
+                specimen="serum",
+            ),
+        ]
+    )
+    panel = {(row.name, row.specimen): row for row in db.latest_panel()}
+    assert panel[("glucose", "urine")].value_text == "NEGATIVE"
+    assert panel[("glucose", "serum")].value == 92.0
+
+
+def test_update_specimen_does_not_change_extraction_status(db: LabsDb) -> None:
+    (row_id,) = db.insert_results([_lab(extraction_status=ExtractionStatus.AUTO)])
+    assert row_id is not None
+    db.update_specimen(row_id, "urine")
+    row = db.get_row(row_id)
+    assert row is not None
+    assert row.specimen == "urine"
+    assert row.extraction_status == ExtractionStatus.AUTO
+
+
+def test_rows_with_unknown_specimen_excludes_already_known(db: LabsDb) -> None:
+    ids = db.insert_results([_lab(specimen="urine"), _lab(name="sodium", value=140.0)])
+    assert all(i is not None for i in ids)
+    unknown = db.rows_with_unknown_specimen()
+    assert [r.name for r in unknown] == ["sodium"]
+
+
+def test_jsonl_rebuild_tolerates_old_format_lines_missing_specimen(
+    db: LabsDb, tmp_path: Path
+) -> None:
+    """A pre-migration export line has no `specimen` key at all in its `row`
+    payload - `rebuild_from_jsonl` must still load it, defaulting to
+    `"unknown"` (the pydantic model default), not raise."""
+    (row_id,) = db.insert_results([_lab()])
+    export_path = tmp_path / "export.jsonl"
+    db.export_jsonl(export_path)
+
+    lines = export_path.read_text(encoding="utf-8").splitlines()
+    old_format_lines = []
+    for line in lines:
+        payload = json.loads(line)
+        if payload["table"] == "lab":
+            payload["row"].pop("specimen", None)  # simulate a pre-migration export
+        old_format_lines.append(json.dumps(payload))
+    old_export = tmp_path / "old-export.jsonl"
+    old_export.write_text("\n".join(old_format_lines) + "\n", encoding="utf-8")
+
+    rebuilt = LabsDb(tmp_path / "rebuilt-old.sqlite")
+    rebuilt.rebuild_from_jsonl(old_export)
+
+    row = rebuilt.get_row(row_id)  # type: ignore[arg-type]
+    assert row is not None
+    assert row.specimen == "unknown"
+
+
+def test_jsonl_export_rebuild_round_trip_preserves_specimen(db: LabsDb, tmp_path: Path) -> None:
+    db.insert_results(
+        [
+            _lab(name="glucose", value=None, value_text="NEGATIVE", specimen="urine"),
+            _lab(name="glucose", value=92.0, ucum_unit="mg/dL", specimen="serum"),
+        ]
+    )
+    export_a = tmp_path / "export-a.jsonl"
+    db.export_jsonl(export_a)
+
+    rebuilt = LabsDb(tmp_path / "rebuilt-new.sqlite")
+    rebuilt.rebuild_from_jsonl(export_a)
+
+    export_b = tmp_path / "export-b.jsonl"
+    rebuilt.export_jsonl(export_b)
+    assert export_a.read_text(encoding="utf-8") == export_b.read_text(encoding="utf-8")
+
+    specimens = {row.specimen for row in rebuilt.series("glucose")}
+    assert specimens == {"urine", "serum"}
+
+
+# --------------------------------------------------------------------------
+# resolve_with_pass (queue-ergonomics slice item 1): the confirm queue's
+# "Use reading A"/"Use reading B" actions on a disagreement row.
+# --------------------------------------------------------------------------
+
+
+def _disagreement_row(db: LabsDb, *, pass_a: dict, pass_b: dict, **overrides: object) -> int:
+    raw_json = json.dumps({"pass_a": pass_a, "pass_b": pass_b, "reasons": ["value_mismatch"]})
+    fields: dict[str, object] = {
+        "date": date(2026, 5, 2),
+        "name": "ferritin",
+        "name_raw": "ferritin",
+        "value": pass_a["value"],
+        "ucum_unit": pass_a.get("unit_raw"),
+        "source_doc": SHA_A,
+        "extraction_status": ExtractionStatus.PENDING,
+        "raw_json": raw_json,
+    }
+    fields.update(overrides)
+    (row_id,) = db.insert_results([LabResult.model_validate(fields)])
+    assert row_id is not None
+    return row_id
+
+
+def test_resolve_with_pass_a_applies_pass_as_fields(db: LabsDb) -> None:
+    row_id = _disagreement_row(
+        db,
+        pass_a={
+            "name_raw": "ferritin",
+            "value": 8.0,
+            "unit_raw": "ng/mL",
+            "ref_range_raw": "10-200",
+            "flag_raw": "L",
+            "specimen": "serum",
+        },
+        pass_b={
+            "name_raw": "ferritin",
+            "value": 9.5,
+            "unit_raw": "ng/mL",
+            "ref_range_raw": "10-200",
+            "flag_raw": None,
+            "specimen": "serum",
+        },
+    )
+
+    db.resolve_with_pass(row_id, "a")
+
+    row = db.get_row(row_id)
+    assert row is not None
+    assert row.value == 8.0
+    assert row.ucum_unit == "ng/mL"
+    assert row.ref_low == 10.0
+    assert row.ref_high == 200.0
+    assert row.flag == LabFlag.LOW
+    assert row.specimen == "serum"
+    assert row.extraction_status == ExtractionStatus.CORRECTED
+    payload = row.raw_payload()
+    assert payload["resolved_with"] == "pass_a"
+    # the original extraction (both passes) is left intact for audit
+    assert payload["pass_a"]["value"] == 8.0
+    assert payload["pass_b"]["value"] == 9.5
+
+
+def test_resolve_with_pass_b_applies_pass_bs_fields(db: LabsDb) -> None:
+    row_id = _disagreement_row(
+        db,
+        pass_a={
+            "name_raw": "ferritin",
+            "value": 8.0,
+            "unit_raw": "ng/mL",
+            "ref_range_raw": "10-200",
+            "flag_raw": "L",
+            "specimen": "serum",
+        },
+        pass_b={
+            "name_raw": "ferritin",
+            "value": 9.5,
+            "unit_raw": "ng/mL",
+            "ref_range_raw": "10-200",
+            "flag_raw": None,
+            "specimen": "serum",
+        },
+    )
+
+    db.resolve_with_pass(row_id, "b")
+
+    row = db.get_row(row_id)
+    assert row is not None
+    assert row.value == 9.5
+    assert row.flag is None
+    assert row.extraction_status == ExtractionStatus.CORRECTED
+    payload = row.raw_payload()
+    assert payload["resolved_with"] == "pass_b"
+
+
+def test_resolve_with_pass_recanonicalizes_name(db: LabsDb) -> None:
+    """The chosen pass's OWN name is what recomputes the canonical `name`
+    - not whatever the row happened to carry before (a contrived case:
+    the two passes disagreeing on the name outright, to prove
+    recanonicalization actually runs per-pass rather than being carried
+    over from the row's prior state)."""
+    row_id = _disagreement_row(
+        db,
+        pass_a={"name_raw": "Sodium", "value": 140.0, "unit_raw": "mmol/L", "specimen": "serum"},
+        pass_b={"name_raw": "Potassium", "value": 4.1, "unit_raw": "mmol/L", "specimen": "serum"},
+        name="sodium",
+        name_raw="Sodium",
+    )
+
+    db.resolve_with_pass(row_id, "b")
+
+    row = db.get_row(row_id)
+    assert row is not None
+    assert row.name == "potassium"
+    assert row.name_raw == "Potassium"
+    assert row.value == 4.1
+
+
+def test_resolve_with_pass_rejects_bad_which(db: LabsDb) -> None:
+    row_id = _disagreement_row(
+        db,
+        pass_a={"name_raw": "ferritin", "value": 8.0},
+        pass_b={"name_raw": "ferritin", "value": 9.5},
+    )
+    with pytest.raises(ValueError):
+        db.resolve_with_pass(row_id, "c")  # type: ignore[arg-type]
+
+
+def test_resolve_with_pass_raises_when_that_pass_has_no_data(db: LabsDb) -> None:
+    raw_json = json.dumps(
+        {
+            "pass_a": {"name_raw": "ferritin", "value": 8.0},
+            "pass_b": None,
+            "reasons": ["single_pass"],
+        }
+    )
+    (row_id,) = db.insert_results(
+        [
+            LabResult(
+                date=date(2026, 5, 2),
+                name="ferritin",
+                name_raw="ferritin",
+                value=8.0,
+                source_doc=SHA_A,
+                extraction_status=ExtractionStatus.PENDING,
+                raw_json=raw_json,
+            )
+        ]
+    )
+    assert row_id is not None
+    with pytest.raises(ValueError):
+        db.resolve_with_pass(row_id, "b")
+
+
+# --------------------------------------------------------------------------
+# reject_row_as_twin / resolved_rows_for_document (queue-ergonomics slice
+# item 4: the labs-dedupe-twins sweep).
+# --------------------------------------------------------------------------
+
+
+def test_reject_row_as_twin_marks_rejected_with_audit_note(db: LabsDb) -> None:
+    (auto_id,) = db.insert_results([_lab(extraction_status=ExtractionStatus.AUTO)])
+    (pending_id,) = db.insert_results(
+        [_lab(name="sodium", value=140.0, extraction_status=ExtractionStatus.PENDING)]
+    )
+    assert auto_id is not None and pending_id is not None
+
+    db.reject_row_as_twin(pending_id, twin_of=auto_id, method="rule")
+
+    row = db.get_row(pending_id)
+    assert row is not None
+    assert row.extraction_status == ExtractionStatus.REJECTED
+    payload = row.raw_payload()
+    assert payload["auto_rejected_twin_of"] == auto_id
+    assert payload["method"] == "rule"
+
+
+def test_resolved_rows_for_document_excludes_pending_and_other_documents(db: LabsDb) -> None:
+    (auto_id,) = db.insert_results([_lab(extraction_status=ExtractionStatus.AUTO)])
+    (confirmed_id,) = db.insert_results(
+        [_lab(name="sodium", value=140.0, extraction_status=ExtractionStatus.CONFIRMED)]
+    )
+    (pending_id,) = db.insert_results(
+        [_lab(name="calcium", value=9.5, extraction_status=ExtractionStatus.PENDING)]
+    )
+    (other_doc_id,) = db.insert_results(
+        [
+            _lab(
+                name="glucose",
+                value=95.0,
+                source_doc=SHA_B,
+                extraction_status=ExtractionStatus.AUTO,
+            )
+        ]
+    )
+    assert all(i is not None for i in (auto_id, confirmed_id, pending_id, other_doc_id))
+
+    resolved = db.resolved_rows_for_document(SHA_A)
+    resolved_ids = {r.id for r in resolved}
+    assert resolved_ids == {auto_id, confirmed_id}
