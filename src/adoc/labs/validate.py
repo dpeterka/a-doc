@@ -84,14 +84,14 @@ ANALYTE_SPECS: dict[str, AnalyteSpec] = {
             "WBC",
             ("wbc", "white blood cell count", "white blood cells", "leukocytes"),
             "numeric",
-            ("10*3/uL", "x10^3/uL", "K/uL"),
+            ("10*3/uL", "x10^3/uL", "K/uL", "Thousand/uL"),
             (0.1, 100.0),
         ),
         AnalyteSpec(
             "RBC",
             ("rbc", "red blood cell count", "red blood cells", "erythrocytes"),
             "numeric",
-            ("10*6/uL", "x10^6/uL", "M/uL"),
+            ("10*6/uL", "x10^6/uL", "M/uL", "Million/uL"),
             (0.5, 10.0),
         ),
         AnalyteSpec(
@@ -112,7 +112,7 @@ ANALYTE_SPECS: dict[str, AnalyteSpec] = {
             "platelets",
             ("platelets", "platelet count", "plt"),
             "numeric",
-            ("10*3/uL", "x10^3/uL", "K/uL"),
+            ("10*3/uL", "x10^3/uL", "K/uL", "Thousand/uL"),
             (1.0, 2000.0),
         ),
         # --- CMP ---
@@ -320,7 +320,8 @@ def validate_row(row: LabResult) -> list[ValidationIssue]:
         return issues
 
     if spec.kind == "numeric":
-        if row.ucum_unit is None or row.ucum_unit not in spec.allowed_units:
+        allowed = {u.lower() for u in spec.allowed_units}
+        if row.ucum_unit is None or row.ucum_unit.lower() not in allowed:
             issues.append(
                 ValidationIssue(
                     IssueCode.UNKNOWN_UNIT,

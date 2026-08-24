@@ -220,3 +220,18 @@ def test_trend_outlier_no_value_returns_none(db: LabsDb) -> None:
         lab_date=date(2026, 6, 1),
     )
     assert trend_outlier(db, new_row) is None
+
+
+def test_labcorp_long_form_unit_spellings_are_accepted() -> None:
+    """LabCorp prints 'Million/uL'/'Thousand/uL' (real-corpus finding); these
+    are the same units as M/uL / K/uL and must not queue. Comparison is
+    case-insensitive."""
+    for name, unit, value in (
+        ("RBC", "Million/uL", 5.04),
+        ("RBC", "million/ul", 5.04),
+        ("WBC", "Thousand/uL", 6.2),
+        ("Platelets", "thousand/uL", 250.0),
+    ):
+        row = _lab(name=name, ucum_unit=unit, value=value)
+        issues = validate_row(row)
+        assert not any(i.code == IssueCode.UNKNOWN_UNIT for i in issues), (name, unit)
