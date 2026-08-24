@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -290,6 +292,96 @@ def test_from_settings_injects_fake_transports_so_no_sdk_client_is_built(
     result = client.complete("primary_reasoner", system="s", messages=[])
 
     assert result.text == "fake"
+
+
+def test_anthropic_default_transport_disables_sdk_retries_and_sets_a_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """M1: the SDK client must be constructed with `max_retries=0` and an
+    explicit timeout, so the app's own retry loop (`LlmClient._call_with_retry`)
+    is the only retry policy - no retries stacked under retries."""
+    captured: dict[str, object] = {}
+
+    class FakeMessages:
+        def create(self, **kwargs: object) -> types.SimpleNamespace:
+            return types.SimpleNamespace(
+                content=[], usage=types.SimpleNamespace(input_tokens=1, output_tokens=1)
+            )
+
+    class FakeAnthropicClient:
+        def __init__(self, **kwargs: object) -> None:
+            captured.update(kwargs)
+            self.messages = FakeMessages()
+
+    fake_module = types.SimpleNamespace(
+        Anthropic=FakeAnthropicClient,
+        RateLimitError=Exception,
+        APIConnectionError=Exception,
+        APIStatusError=Exception,
+    )
+    monkeypatch.setitem(sys.modules, "anthropic", fake_module)
+
+    provider = AnthropicProvider(api_key="test-key")
+    request = TransportRequest(
+        model="claude-opus-5", system="s", messages=[], schema=None, params={}, max_tokens=100
+    )
+
+    provider.complete(request)
+
+    assert captured["api_key"] == "test-key"
+    assert captured["max_retries"] == 0
+    assert captured["timeout"] == 300.0
+
+
+def test_openai_default_transport_disables_sdk_retries_and_sets_a_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same M1 fix, OpenAI-family provider (also covers the Featherless
+    OpenAI-compatible path, which shares `_default_transport`)."""
+    captured: dict[str, object] = {}
+
+    class FakeCompletions:
+        def create(self, **kwargs: object) -> types.SimpleNamespace:
+            message = types.SimpleNamespace(content="ok")
+            choice = types.SimpleNamespace(message=message, finish_reason="stop")
+            return types.SimpleNamespace(
+                choices=[choice],
+                usage=types.SimpleNamespace(prompt_tokens=1, completion_tokens=1),
+            )
+
+    class FakeChat:
+        def __init__(self) -> None:
+            self.completions = FakeCompletions()
+
+    class FakeOpenAIClient:
+        def __init__(self, **kwargs: object) -> None:
+            captured.update(kwargs)
+            self.chat = FakeChat()
+
+    fake_module = types.SimpleNamespace(
+        OpenAI=FakeOpenAIClient,
+        RateLimitError=Exception,
+        APIConnectionError=Exception,
+        APIStatusError=Exception,
+    )
+    monkeypatch.setitem(sys.modules, "openai", fake_module)
+
+    provider = OpenAIProvider(api_key="test-key", base_url=FEATHERLESS_BASE_URL)
+    request = TransportRequest(
+        model="deepseek-ai/DeepSeek-R1-0528",
+        system="s",
+        messages=[],
+        schema=None,
+        params={},
+        max_tokens=100,
+    )
+
+    provider.complete(request)
+
+    assert captured["api_key"] == "test-key"
+    assert captured["base_url"] == FEATHERLESS_BASE_URL
+    assert captured["max_retries"] == 0
+    assert captured["timeout"] == 300.0
 
 
 def test_structured_output_unwraps_single_key_nesting() -> None:

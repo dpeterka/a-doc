@@ -1,6 +1,6 @@
 # 0004. AWS infrastructure as CloudFormation, no console-created resources
 
-Status: Accepted (compute-target sections superseded by ADR 0006 — ECS Fargate + EFS replaced the EC2 node; access sections superseded by ADR 0007 — public ALB replaced Tailscale. The IaC principle itself stands.)
+Status: Accepted (compute-target sections superseded by ADR 0006 — ECS Fargate + EFS replaced the EC2 node; access sections superseded by ADR 0007 — public ALB replaced Tailscale. Networking also superseded in the same direction: `network.yaml`'s single public subnet became two AZ-spread public subnets, because ADR 0007's public ALB requires at least two subnets in different Availability Zones; this is a networking-layer consequence of that pivot, not an independent decision. The IaC principle itself stands.)
 
 ## Context
 

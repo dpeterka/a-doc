@@ -48,6 +48,11 @@ class Settings(BaseSettings):
     # EFS mount and WAL is unsafe on NFS-family filesystems.
     sqlite_journal_mode: str = "WAL"
 
+    # Upper bound on a single `/upload` file, in MB (see `web.routes.upload`):
+    # rejected before any pipeline call (ingest/vision), with a warm
+    # in-page message rather than an unbounded read into memory/disk.
+    max_upload_mb: int = 25
+
     # S3 bucket `adoc backup` uploads the git bundle + labs-export.jsonl +
     # sources/ to (see `adoc.backup`). Set by the ECS task definitions
     # (`deploy/cfn/ecs.yaml`) from the backup stack's bucket name; unset for

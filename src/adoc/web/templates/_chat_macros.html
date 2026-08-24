@@ -7,6 +7,8 @@
     <div class="chat-bubble chat-bubble-assistant chat-kind-{{ entry.kind }}">
       {% if entry.kind == "urgent" %}
         <p class="chat-urgent-label">Please seek care now</p>
+      {% elif entry.kind == "withheld" %}
+        <p class="chat-urgent-label">Reply withheld by a safety check</p>
       {% endif %}
       <p>{{ entry.text }}</p>
       {% if entry.tests_to_request %}
