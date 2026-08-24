@@ -19,14 +19,17 @@ a correction routed through `revise()`.
 
 `run_onboarding_session` remains exactly as-is (the `--legacy-wizard` CLI
 escape hatch, `adoc.cli._cmd_onboard`, still calls it directly against an
-`IntakeWizard`). `run_conversational_onboarding_session` below is the new
-default loop (docs/adr/0011-conversational-agentic-onboarding.md): each
-patient line is handed straight to `intake.agent.run_intake_turn`, which
-owns all persistence and section-completion logic itself, so this loop is
-just print/input plumbing — unlike the legacy loop, it never exits once
-every section is complete, since facts (and therefore the underlying case
-file) may be corrected or added to at any time, during or after onboarding
-(only EOF ends the session).
+`IntakeWizard`). `run_conversational_onboarding_session` below is the
+default loop (docs/adr/0012-initial-visit-conversation.md): it prints the
+deterministic opener (`intake.agent.INTAKE_OPENER_MESSAGE`) once, then
+hands every patient line straight to `intake.agent.run_intake_turn`, which
+owns all persistence and coverage/completion logic itself — this loop is
+just print/input plumbing. There is no section display and no stepping;
+the loop ends on real EOF (Ctrl-D, state already saved) or as soon as the
+turn just processed leaves the intake marked complete
+(`intake.agent.intake_is_complete`) — a fresh REPL run against an
+already-complete case file still accepts one more correction/addition
+before exiting, since facts stay correctable forever.
 """
 
 from __future__ import annotations
@@ -34,7 +37,7 @@ from __future__ import annotations
 from collections.abc import Callable
 
 from adoc.casefile.repo import DataRepo
-from adoc.intake.wizard import INTAKE_STATE_RELPATH, IntakeWizard, load_intake_state
+from adoc.intake.wizard import IntakeWizard
 from adoc.labs.db import LabsDb
 from adoc.reason.client import LlmClient, LlmError
 
@@ -131,29 +134,32 @@ def run_conversational_onboarding_session(
     input_fn: InputFn = input,
     print_fn: PrintFn = print,
 ) -> int:
-    """Run the conversational onboarding loop (docs/adr/0011) to EOF.
+    """Run the conversational initial-visit loop
+    (docs/adr/0012-initial-visit-conversation.md) to completion or EOF.
 
     Every patient line goes straight to `intake.agent.run_intake_turn`,
     which screens, reasons about, applies, and persists the turn on its
-    own; this function is just print/input plumbing around it. Hitting
-    EOF (queue exhausted in a test, or a real Ctrl-D) ends the session
-    cleanly and resumably, same as `run_onboarding_session`'s EOF handling
-    — but unlike that loop, this one never exits early just because every
-    section is complete, since facts stay correctable/addable forever.
+    own; this function is just print/input plumbing around it. There is no
+    section/topic display of any kind. Hitting EOF (queue exhausted in a
+    test, or a real Ctrl-D) ends the session cleanly and resumably; the
+    loop also ends, after printing that turn's reply, the moment
+    `intake.agent.intake_is_complete` turns true — matching the CLI spec's
+    "exits on intake_complete or Ctrl-D." A repo that is already complete
+    when the session starts still gets one more turn before the loop exits
+    (facts stay correctable/addable forever), just not an open-ended one.
     """
     # Imported here (not at module level) to avoid `intake.cli` importing
     # `intake.agent` (and everything it pulls in) for callers that only
     # ever use the legacy `run_onboarding_session` loop above.
-    from adoc.intake.agent import run_intake_turn
-    from adoc.intake.sections import SECTIONS
+    from adoc.intake.agent import INTAKE_OPENER_MESSAGE, intake_is_complete, run_intake_turn
 
-    state = load_intake_state(repo.root / INTAKE_STATE_RELPATH)
-    if state.cursor is not None:
-        spec = next(s for s in SECTIONS if s.key == state.cursor)
-        print_fn(f"Let's talk about {spec.title.lower()}.")
-        print_fn(spec.intro)
+    if intake_is_complete(repo):
+        print_fn(
+            "Your initial visit is already on file — anything you tell me here still "
+            "updates your case file."
+        )
     else:
-        print_fn("Onboarding is already complete — you can still correct or add anything here.")
+        print_fn(INTAKE_OPENER_MESSAGE)
 
     while True:
         try:
@@ -170,3 +176,6 @@ def run_conversational_onboarding_session(
         outcome = run_intake_turn(client, repo, db, text)
         print_fn("")
         print_fn(outcome.text)
+
+        if intake_is_complete(repo):
+            return 0

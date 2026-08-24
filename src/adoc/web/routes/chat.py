@@ -1,11 +1,27 @@
-"""Chat surface (PLAN.md "Session loops (b)"): the red-flag screen runs
+"""Chat surface (PLAN.md "Session loops (b)"; onboarding merged in per
+`docs/adr/0012-initial-visit-conversation.md`): the red-flag screen runs
 server-side, before any model call, for every turn — this module calls
 `safety.red_flag_screen` itself, first, rather than relying on it only
-happening inside `run_diagnostic_turn`/`run_informational_turn`, because
-`route_turn` (which decides which of those two to call) is itself a model
-call. On a flagged turn, `route_turn` and every runner are skipped
-entirely — zero client calls, matching the red-team contract in
-`tests/test_stages.py`.
+happening inside `run_diagnostic_turn`/`run_informational_turn`/
+`run_intake_turn`, because `route_turn` (which decides which diagnostic
+runner to call) is itself a model call. On a flagged turn, `route_turn` and
+every runner are skipped entirely — zero client calls, matching the
+red-team contract in `tests/test_stages.py`.
+
+**One chat surface.** While the initial-visit conversation is incomplete
+(`intake.agent.intake_is_complete` is false), every turn — including the
+very first — is routed through `intake.agent.run_intake_turn` instead of
+`route_turn`/the diagnostic pipeline; once the deterministic wrap-up gate
+accepts `intake_complete`, turns flow through the normal diagnostic/
+informational routing below, forever after. Both paths append into the
+SAME transcript (`web.casefile_helpers.append_chat_entry`/`read_recent_chat`)
+so the patient experiences one continuous conversation with no visible
+seam between "onboarding" and "chat." The deterministic first-visit opener
+(`intake.agent.INTAKE_OPENER_MESSAGE`, a constant — never an LLM call) is
+rendered into a fresh `GET /chat` when the transcript is empty and intake
+is incomplete, and is written into that transcript on the first patient
+turn so later renders (and the intake engine's own context) see coherent
+history.
 """
 
 from __future__ import annotations
@@ -20,6 +36,7 @@ from starlette.responses import HTMLResponse, Response
 
 from adoc.casefile.ledger import LedgerInvariantError
 from adoc.casefile.repo import LEDGER_RELPATH, DataRepo
+from adoc.intake.agent import INTAKE_OPENER_MESSAGE, intake_is_complete, run_intake_turn
 from adoc.labs.db import LabsDb
 from adoc.reason.client import LlmClient, LlmError, LlmResult
 from adoc.reason.dag import ContractViolation
@@ -63,6 +80,20 @@ _LEDGER_INVARIANT_MESSAGE = (
 def _wants_sse(request: Request) -> bool:
     accept = request.headers.get("accept", "")
     return "text/event-stream" in accept
+
+
+def _handle_intake_turn(
+    text: str, *, client: LlmClient, repo: DataRepo, db: LabsDb
+) -> dict[str, Any]:
+    """One turn of the initial-visit conversation, while intake is
+    incomplete. `run_intake_turn` owns its own red-flag screening,
+    fact-op application, and coverage/wrap-up gating; this just maps its
+    outcome onto the same `{kind, text, tests_to_request}` shape
+    `_handle_turn` returns, so the shared `_chat_turn.html` template and
+    transcript persistence need no branching on which path produced a
+    turn."""
+    outcome = run_intake_turn(client, repo, db, text)
+    return {"kind": outcome.kind, "text": outcome.text, "tests_to_request": []}
 
 
 def _handle_turn(text: str, *, client: LlmClient, repo: DataRepo, db: LabsDb) -> dict[str, Any]:
@@ -127,7 +158,17 @@ def _handle_turn(text: str, *, client: LlmClient, repo: DataRepo, db: LabsDb) ->
 @router.get("")
 def chat_page(request: Request, repo: DataRepo = Depends(get_repo)) -> Response:
     transcript = read_recent_chat(repo)
-    return templates.TemplateResponse(request, "chat.html", {"transcript": transcript})
+    intake_incomplete = not intake_is_complete(repo)
+    if not transcript and intake_incomplete:
+        # Deterministic opener, rendered but not yet persisted — it is
+        # written into the real transcript on the first patient turn (see
+        # chat_send) so later renders show coherent history.
+        transcript = [{"role": "assistant", "kind": "informational", "text": INTAKE_OPENER_MESSAGE}]
+    return templates.TemplateResponse(
+        request,
+        "chat.html",
+        {"transcript": transcript, "intake_incomplete": intake_incomplete},
+    )
 
 
 @router.post("/send")
@@ -148,8 +189,26 @@ def chat_send(
         )
         return HTMLResponse(html)
 
+    transcript_was_empty = not read_recent_chat(repo)
+    intake_incomplete = not intake_is_complete(repo)
+    if transcript_was_empty and intake_incomplete:
+        append_chat_entry(
+            repo,
+            {
+                "timestamp": now.isoformat(),
+                "role": "assistant",
+                "kind": "informational",
+                "text": INTAKE_OPENER_MESSAGE,
+                "tests_to_request": [],
+            },
+        )
+
     append_chat_entry(repo, {"timestamp": now.isoformat(), "role": "patient", "text": stripped})
-    turn = _handle_turn(stripped, client=client, repo=repo, db=db)
+    turn = (
+        _handle_intake_turn(stripped, client=client, repo=repo, db=db)
+        if intake_incomplete
+        else _handle_turn(stripped, client=client, repo=repo, db=db)
+    )
     append_chat_entry(
         repo,
         {

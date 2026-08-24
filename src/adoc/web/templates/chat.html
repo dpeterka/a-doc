@@ -3,10 +3,18 @@
 {% block title %}Chat — a-doc{% endblock %}
 {% block content %}
   <h1>Chat</h1>
-  <p class="muted">
-    Ask a question about your case file, or tell a-doc about something new — a symptom, a
-    result, anything. Every message is checked for emergency warning signs before anything else.
-  </p>
+
+  {% if intake_incomplete %}
+    <p class="banner">
+      Initial visit — I'll ask about your history as we talk. Share whatever feels most
+      important first.
+    </p>
+  {% else %}
+    <p class="muted">
+      Ask a question about your case file, or tell a-doc about something new — a symptom, a
+      result, anything. Every message is checked for emergency warning signs before anything else.
+    </p>
+  {% endif %}
 
   <div id="chat-transcript" class="chat-transcript">
     {% for entry in transcript %}
@@ -21,4 +29,18 @@
       <button type="submit">Send</button>
     </div>
   </form>
+
+  <script>
+    (function () {
+      var params = new URLSearchParams(window.location.search);
+      var prefill = params.get("prefill");
+      if (prefill) {
+        var textarea = document.getElementById("chat-text");
+        if (textarea) {
+          textarea.value = prefill;
+          textarea.focus();
+        }
+      }
+    })();
+  </script>
 {% endblock %}

@@ -1,16 +1,17 @@
 {% extends "base.html" %}
-{% block title %}Review — Onboarding — a-doc{% endblock %}
+{% block title %}Intake record — a-doc{% endblock %}
 {% block content %}
-  <h1>Everything recorded so far</h1>
+  <h1>Intake record</h1>
   <p class="muted">
-    Every fact captured during onboarding, grouped by section. Nothing here is ever silently
-    deleted — a correction is recorded as a revision, and removing something marks it retracted
-    rather than erasing it.
+    Every fact captured so far in your conversations, grouped here for review only — the
+    conversation itself never steps through these groups one at a time. Nothing here is ever
+    silently deleted — a correction is recorded as a revision, and removing something marks it
+    retracted rather than erasing it.
   </p>
-  <p><a href="/onboard">&larr; Back to onboarding chat</a></p>
+  <p><a href="/chat">&larr; Back to chat</a></p>
 
   {% if not baseline_incomplete %}
-    <p class="banner">Onboarding complete — you can still correct or add details here.</p>
+    <p class="banner">Initial visit complete — you can still correct or add details here.</p>
   {% endif %}
 
   {% for key, section in sections.items() %}
@@ -71,7 +72,7 @@
       button.addEventListener("click", function () {
         var statement = button.getAttribute("data-statement");
         var prefill = "About '" + statement + "': ";
-        window.location.href = "/onboard?prefill=" + encodeURIComponent(prefill);
+        window.location.href = "/chat?prefill=" + encodeURIComponent(prefill);
       });
     });
   </script>

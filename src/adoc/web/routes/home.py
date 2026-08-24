@@ -14,11 +14,10 @@ from adoc.casefile.ledger import load_ledger
 from adoc.casefile.repo import LEDGER_RELPATH, DataRepo
 from adoc.casefile.schema import Hypothesis, Ledger, Tier
 from adoc.ingest.failures import read_failures
-from adoc.intake.wizard import IntakeWizard
+from adoc.intake.agent import intake_is_complete
 from adoc.labs.db import LabsDb
-from adoc.reason.client import LlmClient
 from adoc.web.casefile_helpers import ledger_history_since, read_last_seen, write_last_seen
-from adoc.web.deps import get_client, get_db, get_repo
+from adoc.web.deps import get_db, get_repo
 from adoc.web.templating import templates
 
 router = APIRouter()
@@ -45,7 +44,6 @@ def home(
     request: Request,
     repo: DataRepo = Depends(get_repo),
     db: LabsDb = Depends(get_db),
-    client: LlmClient = Depends(get_client),
 ) -> Response:
     ledger = load_ledger(repo.root / LEDGER_RELPATH)
     tiers = _group_by_tier(ledger)
@@ -54,9 +52,7 @@ def home(
     whats_new = ledger_history_since(repo, last_seen)
     write_last_seen(repo, datetime.now(UTC))
 
-    wizard = IntakeWizard(repo, client)
-    baseline_incomplete = wizard.baseline_incomplete()
-    completed, total = wizard.progress()
+    baseline_incomplete = not intake_is_complete(repo)
 
     pending_count = len(db.pending())
     open_questions_html = _open_questions_text(repo)
@@ -72,7 +68,6 @@ def home(
             "pending_count": pending_count,
             "failed_count": failed_count,
             "baseline_incomplete": baseline_incomplete,
-            "intake_progress": (completed, total),
             "ledger_version": ledger.version,
         },
     )

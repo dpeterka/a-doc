@@ -12,8 +12,8 @@
     <a class="app-title" href="/">a-doc</a>
     <nav class="app-nav">
       <a href="/">Home</a>
-      <a href="/onboard">Onboarding</a>
       <a href="/chat">Chat</a>
+      {% if has_intake_facts(request) %}<a href="/onboard/review">Intake record</a>{% endif %}
       <details class="nav-dropdown">
         <summary>Documents</summary>
         <div class="nav-dropdown-menu">
