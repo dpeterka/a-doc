@@ -63,7 +63,7 @@ def test_init_succeeds_with_valid_env(
     assert code == 0
     out = capsys.readouterr().out
     assert "data_dir=" in out
-    assert "loaded 7 model role bindings" in out
+    assert "loaded 8 model role bindings" in out
 
 
 def test_init_creates_data_repo_and_is_idempotent(
@@ -190,7 +190,7 @@ def test_onboard_fails_if_data_repo_not_initialized(
     assert "run `adoc init` first" in err
 
 
-def test_onboard_runs_the_wizard_loop_against_an_initialized_repo(
+def test_onboard_legacy_wizard_flag_runs_the_wizard_loop_against_an_initialized_repo(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -210,11 +210,40 @@ def test_onboard_runs_the_wizard_loop_against_an_initialized_repo(
 
     # Immediate EOF: no LLM call is ever made, so no network / API key is
     # needed to exercise the wiring end-to-end.
-    code = main(["onboard"])
+    code = main(["onboard", "--legacy-wizard"])
 
     assert code == 0
     out = capsys.readouterr().out
     assert "[1/10] Basics" in out
+    assert "resume anytime with `adoc onboard`" in out
+
+
+def test_onboard_default_runs_the_conversational_engine_against_an_initialized_repo(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    data_dir = tmp_path / "a-doc-data"
+    monkeypatch.setenv("ADOC_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("ADOC_MODELS_FILE", str(REPO_ROOT / "models.yaml"))
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+    assert main(["init"]) == 0
+    capsys.readouterr()
+
+    def _eof_input(_prompt: str = "") -> str:
+        raise EOFError
+
+    monkeypatch.setattr("builtins.input", _eof_input)
+
+    # Immediate EOF: no LLM call is ever made either (the loop returns as
+    # soon as the first input_fn() call raises), so no network / API key
+    # is needed here either.
+    code = main(["onboard"])
+
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "Let's talk about basics." in out
     assert "resume anytime with `adoc onboard`" in out
 
 

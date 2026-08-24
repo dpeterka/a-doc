@@ -1,7 +1,9 @@
-"""Onboarding surface (PLAN.md "Onboarding & end-user experience"): a web
-wizard driven entirely by `intake.wizard.IntakeWizard` — this module never
-re-implements section logic, merge semantics, or persistence, only HTTP
-plumbing and rendering around the wizard's existing public API.
+"""Onboarding surface (`docs/adr/0011-conversational-agentic-onboarding.md`):
+a chat surface driven entirely by `intake.agent.run_intake_turn` — this
+module never re-implements fact extraction, completion-gating, or
+persistence, only HTTP plumbing and rendering around the engine's existing
+public API (mirroring `web.routes.chat`'s form-POST pattern; no SSE
+needed).
 """
 
 from __future__ import annotations
@@ -12,130 +14,95 @@ from fastapi import APIRouter, Depends, Form, Request
 from starlette.responses import Response
 
 from adoc.casefile.repo import DataRepo
-from adoc.config import Settings
+from adoc.intake.agent import read_intake_transcript, run_intake_turn
+from adoc.intake.facts import IntakeFactsStore, section_completion_blockers
 from adoc.intake.sections import SECTIONS
-from adoc.intake.wizard import (
-    INTAKE_STATE_RELPATH,
-    IntakeError,
-    IntakeWizard,
-    SectionState,
-    load_intake_state,
-)
-from adoc.reason.client import LlmClient, LlmError
-from adoc.web.deps import get_client, get_repo, get_settings
+from adoc.intake.wizard import INTAKE_STATE_RELPATH, SectionState, load_intake_state
+from adoc.labs.db import LabsDb
+from adoc.reason.client import LlmClient
+from adoc.web.deps import get_client, get_db, get_repo
 from adoc.web.templating import templates
 
 router = APIRouter(prefix="/onboard")
 
 
-def _build_wizard(repo: DataRepo, client: LlmClient, settings: Settings) -> IntakeWizard:
-    return IntakeWizard(repo, client, dropbox_folder=settings.dropbox_folder)
-
-
-def _section_rows(repo: DataRepo, current_key: str | None) -> list[dict[str, Any]]:
+def _section_rows(
+    repo: DataRepo, facts_store: IntakeFactsStore, current_key: str | None
+) -> list[dict[str, Any]]:
     state = load_intake_state(repo.root / INTAKE_STATE_RELPATH)
     rows: list[dict[str, Any]] = []
     for spec in SECTIONS:
         section_state = state.sections.get(spec.key, SectionState())
+        open_items = len(section_completion_blockers(facts_store.facts, spec.key))
         rows.append(
             {
                 "key": spec.key,
                 "title": spec.title,
                 "status": section_state.status,
                 "is_current": spec.key == current_key,
+                "open_items": open_items,
             }
         )
     return rows
 
 
-def _panel_context(wizard: IntakeWizard, repo: DataRepo, *, error: str | None = None) -> dict:
-    spec = wizard.current_section()
+def _panel_context(repo: DataRepo, *, error: str | None = None) -> dict[str, Any]:
+    state = load_intake_state(repo.root / INTAKE_STATE_RELPATH)
+    facts_store = IntakeFactsStore(repo.root)
+    completed = sum(
+        1 for section_state in state.sections.values() if section_state.status == "complete"
+    )
     return {
-        "prompt_text": wizard.prompt_for_current(),
-        "status": wizard.current_status(),
-        "section_key": spec.key if spec is not None else None,
-        "progress": wizard.progress(),
-        "sections": _section_rows(repo, spec.key if spec is not None else None),
+        "transcript": read_intake_transcript(repo),
+        "sections": _section_rows(repo, facts_store, state.cursor),
+        "current_key": state.cursor,
+        "progress": (completed, len(SECTIONS)),
+        "baseline_incomplete": state.cursor is not None,
         "error": error,
     }
 
 
 @router.get("")
-def onboard_page(
-    request: Request,
-    repo: DataRepo = Depends(get_repo),
-    client: LlmClient = Depends(get_client),
-    settings: Settings = Depends(get_settings),
-) -> Response:
-    wizard = _build_wizard(repo, client, settings)
-    return templates.TemplateResponse(request, "onboard.html", _panel_context(wizard, repo))
+def onboard_page(request: Request, repo: DataRepo = Depends(get_repo)) -> Response:
+    return templates.TemplateResponse(request, "onboard.html", _panel_context(repo))
 
 
-@router.post("/submit")
-def onboard_submit(
+@router.post("/send")
+def onboard_send(
     request: Request,
     text: str = Form(...),
     repo: DataRepo = Depends(get_repo),
+    db: LabsDb = Depends(get_db),
     client: LlmClient = Depends(get_client),
-    settings: Settings = Depends(get_settings),
 ) -> Response:
-    wizard = _build_wizard(repo, client, settings)
+    stripped = text.strip()
     error: str | None = None
-    if not text.strip():
-        error = "Please write something before submitting."
+    if not stripped:
+        error = "Please write something before sending."
     else:
-        try:
-            wizard.submit(text)
-        except (LlmError, IntakeError) as exc:
-            error = f"Sorry, I couldn't process that: {exc}"
+        run_intake_turn(client, repo, db, stripped)
 
     return templates.TemplateResponse(
-        request, "_onboard_panel.html", _panel_context(wizard, repo, error=error)
+        request, "_onboard_panel.html", _panel_context(repo, error=error)
     )
 
 
-@router.post("/confirm")
-def onboard_confirm(
-    request: Request,
-    repo: DataRepo = Depends(get_repo),
-    client: LlmClient = Depends(get_client),
-    settings: Settings = Depends(get_settings),
-) -> Response:
-    wizard = _build_wizard(repo, client, settings)
-    error: str | None = None
-    try:
-        wizard.confirm()
-    except (ValueError, KeyError) as exc:
-        # Defense in depth: a section writer choking on extracted data must
-        # never 500 the patient's onboarding (real crash: unparseable
-        # date_approx) - surface it as a revisable problem instead.
-        error = (
-            "Something in what was recorded couldn't be saved - please revise "
-            f"this section (detail: {exc})"
-        )
-    except IntakeError as exc:
-        error = str(exc)
+@router.get("/review")
+def onboard_review(request: Request, repo: DataRepo = Depends(get_repo)) -> Response:
+    facts_store = IntakeFactsStore(repo.root)
+    state = load_intake_state(repo.root / INTAKE_STATE_RELPATH)
+
+    sections: dict[str, dict[str, Any]] = {}
+    for spec in SECTIONS:
+        section_facts = [f for f in facts_store.facts if f.section == spec.key]
+        sections[spec.key] = {
+            "title": spec.title,
+            "active": [f for f in section_facts if f.status == "active"],
+            "retracted": [f for f in section_facts if f.status == "retracted"],
+        }
 
     return templates.TemplateResponse(
-        request, "_onboard_panel.html", _panel_context(wizard, repo, error=error)
-    )
-
-
-@router.get("/section/{key}")
-def onboard_reopen(
-    request: Request,
-    key: str,
-    repo: DataRepo = Depends(get_repo),
-    client: LlmClient = Depends(get_client),
-    settings: Settings = Depends(get_settings),
-) -> Response:
-    wizard = _build_wizard(repo, client, settings)
-    error: str | None = None
-    try:
-        wizard.reopen(key)
-    except KeyError:
-        error = f"No such section: {key!r}"
-
-    return templates.TemplateResponse(
-        request, "onboard.html", _panel_context(wizard, repo, error=error)
+        request,
+        "onboard_review.html",
+        {"sections": sections, "baseline_incomplete": state.cursor is not None},
     )

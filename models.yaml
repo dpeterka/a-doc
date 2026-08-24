@@ -56,3 +56,15 @@ roles:
     model: claude-opus-5
     params:
       effort: high
+
+  # Conversational onboarding (docs/adr/0011): probes vagueness, establishes
+  # timing, classifies doctor-diagnosed vs. patient-assumption attribution,
+  # and cross-references already-ingested documents — needs the same
+  # case-level judgment as the primary reasoner, so it is bound to the same
+  # model. A NEW role (not a change to an existing binding); see CLAUDE.md
+  # rule 4 if this is ever rebound independently of `primary_reasoner`.
+  intake_agent:
+    provider: anthropic
+    model: claude-opus-5
+    params:
+      effort: high

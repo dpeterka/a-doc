@@ -49,7 +49,7 @@ from adoc.evals.runner import known_suites, run_suite
 from adoc.ingest.archive import PageRenderer, pdftoppm_renderer
 from adoc.ingest.pipeline import IngestReport, ingest_directory, ingest_inbox
 from adoc.ingest.vision import VisionClient
-from adoc.intake.cli import run_onboarding_session
+from adoc.intake.cli import run_conversational_onboarding_session, run_onboarding_session
 from adoc.intake.wizard import IntakeWizard
 from adoc.labs.db import LabsDb
 from adoc.labs.recanonicalize import recanonicalize_rows
@@ -152,7 +152,12 @@ def _cmd_user_remove(args: argparse.Namespace) -> int:
     return 1
 
 
-def _cmd_onboard(_args: argparse.Namespace) -> int:
+def _cmd_onboard(args: argparse.Namespace) -> int:
+    """Default: the conversational onboarding engine (docs/adr/0011). Pass
+    `--legacy-wizard` to run the original state-machine wizard loop instead
+    (`IntakeWizard` + `run_onboarding_session` — unchanged, still the CLI's
+    escape hatch and still what `test_intake_wizard.py`/`test_intake_cli.py`
+    exercise directly)."""
     try:
         settings = Settings()
     except Exception as exc:  # noqa: BLE001 - surface any config error to the user
@@ -170,10 +175,17 @@ def _cmd_onboard(_args: argparse.Namespace) -> int:
         print(f"onboard: configuration error: {exc}", file=sys.stderr)
         return 1
 
-    wizard = IntakeWizard(repo, client, dropbox_folder=settings.dropbox_folder)
     # `input`/`print` are looked up here (not bound as a default parameter
     # value at import time) so tests can monkeypatch `builtins.input`.
-    return run_onboarding_session(wizard, input_fn=input, print_fn=print)
+    if args.legacy_wizard:
+        wizard = IntakeWizard(repo, client, dropbox_folder=settings.dropbox_folder)
+        return run_onboarding_session(wizard, input_fn=input, print_fn=print)
+
+    db_path = settings.data_dir / "labs.sqlite"
+    with LabsDb(db_path, journal_mode=settings.sqlite_journal_mode) as db:
+        return run_conversational_onboarding_session(
+            client, repo, db, input_fn=input, print_fn=print
+        )
 
 
 def _build_llm_client(settings: Settings) -> LlmClient:
@@ -721,9 +733,17 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("init", help="validate configuration and models.yaml").set_defaults(
         func=_cmd_init
     )
-    subparsers.add_parser("onboard", help="run the onboarding intake wizard").set_defaults(
-        func=_cmd_onboard
+    onboard_parser = subparsers.add_parser(
+        "onboard", help="run the conversational onboarding intake session"
     )
+    onboard_parser.add_argument(
+        "--legacy-wizard",
+        action="store_true",
+        default=False,
+        help="run the original form-style section-by-section wizard instead of the "
+        "conversational engine",
+    )
+    onboard_parser.set_defaults(func=_cmd_onboard)
     ingest_parser = subparsers.add_parser("ingest", help="run the document ingestion pipeline")
     ingest_parser.add_argument(
         "--reason",
