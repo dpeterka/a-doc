@@ -163,6 +163,29 @@ def test_labs_section_includes_abnormal_and_latest_panel(repo: DataRepo, db: Lab
     assert "4.1" in content
 
 
+def test_labs_section_groups_by_panel_in_deterministic_curated_order(
+    repo: DataRepo, db: LabsDb
+) -> None:
+    """`potassium` (Comprehensive Metabolic Panel) and `ana-titer`
+    (Autoimmune Serology, seeded by the `db` fixture) must render under
+    their curated panel headings, with CMP before Autoimmune Serology per
+    `labs.panels.PANEL_ORDER` - not incidental to insertion/db order."""
+    pack = build_context(repo, db, include_ledger=False)
+    content = next(s.content for s in pack.sections if s.key == "labs")
+    # Only `potassium` (CMP) and `ana-titer` (Autoimmune Serology) are
+    # non-abnormal/latest - scope the ordering check to the "Latest panel"
+    # subsection, since the "Abnormal" subsection above it only ever
+    # contains `ana-titer` (the only flagged row) and would otherwise make
+    # "Autoimmune Serology" appear to come first for an unrelated reason.
+    latest_panel_content = content[content.index("### Latest panel") :]
+
+    assert "**Comprehensive Metabolic Panel**" in latest_panel_content
+    assert "**Autoimmune Serology**" in latest_panel_content
+    assert latest_panel_content.index("**Comprehensive Metabolic Panel**") < (
+        latest_panel_content.index("**Autoimmune Serology**")
+    )
+
+
 def test_labs_section_labels_non_unknown_specimen(repo: DataRepo, db: LabsDb) -> None:
     """A row whose specimen isn't `"unknown"` is labeled e.g. "Glucose
     (urine)" - the same canonical name can carry a serum reading too, and

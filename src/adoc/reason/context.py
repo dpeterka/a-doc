@@ -23,6 +23,7 @@ from adoc.casefile.repo import LEDGER_RELPATH, DataRepo
 from adoc.casefile.schema import Ledger
 from adoc.labs.db import LabsDb
 from adoc.labs.models import LabResult
+from adoc.labs.panels import derived_from_note, panel_sort_key
 from adoc.labs.queries import abnormal_summary
 
 CASE_SUMMARY_RELPATH = "case/case-summary.md"
@@ -115,27 +116,57 @@ def _labs_label(row: LabResult) -> str:
     return f"{row.name} ({row.specimen})"
 
 
+def _group_rows_by_panel(rows: list[LabResult]) -> list[tuple[str, list[LabResult]]]:
+    """`rows` grouped by curated clinical panel (`labs.panels.panel_sort_key`),
+    in that helper's fixed, deterministic order - "Other" (no curated panel)
+    always last. Grouping labs by panel here (not just alphabetically by
+    name) keeps this section's output stable across builds - it depends
+    only on `ANALYTE_SPECS`'s curated panel assignment and each row's own
+    name/date, never on incidental dict/set ordering - which matters for
+    prompt caching (module docstring)."""
+    ordered = sorted(rows, key=lambda row: panel_sort_key(row.name))
+    groups: list[tuple[str, list[LabResult]]] = []
+    for row in ordered:
+        panel = panel_sort_key(row.name)[1]
+        if groups and groups[-1][0] == panel:
+            groups[-1][1].append(row)
+        else:
+            groups.append((panel, [row]))
+    return groups
+
+
 def _labs_section(db: LabsDb) -> ContextSection:
     abnormal = abnormal_summary(db)
     latest = db.latest_panel()
 
     lines: list[str] = ["### Abnormal (most recent per analyte)"]
     if abnormal:
-        for row in abnormal:
-            value = row.value_text if row.value is None else str(row.value)
-            unit = f" {row.ucum_unit}" if row.ucum_unit else ""
-            flag = f" [{row.flag}]" if row.flag else ""
-            lines.append(f"- {_labs_label(row)}: {value}{unit}{flag} — {row.date.isoformat()}")
+        for panel, panel_rows in _group_rows_by_panel(abnormal):
+            lines.append(f"**{panel}**")
+            for row in panel_rows:
+                value = row.value_text if row.value is None else str(row.value)
+                unit = f" {row.ucum_unit}" if row.ucum_unit else ""
+                flag = f" [{row.flag}]" if row.flag else ""
+                lines.append(f"- {_labs_label(row)}: {value}{unit}{flag} — {row.date.isoformat()}")
     else:
         lines.append("- _None currently flagged._")
 
     lines.append("")
     lines.append("### Latest panel (all analytes)")
     if latest:
-        for row in latest:
-            value = row.value_text if row.value is None else str(row.value)
-            unit = f" {row.ucum_unit}" if row.ucum_unit else ""
-            lines.append(f"- {_labs_label(row)}: {value}{unit} — {row.date.isoformat()}")
+        # Derived analytes (e.g. TSAT, A/G Ratio) get a short "(calculated
+        # from ...)" note so a reasoning stage never mistakes a computed
+        # value for an independently-measured one.
+        for panel, panel_rows in _group_rows_by_panel(latest):
+            lines.append(f"**{panel}**")
+            for row in panel_rows:
+                value = row.value_text if row.value is None else str(row.value)
+                unit = f" {row.ucum_unit}" if row.ucum_unit else ""
+                note = derived_from_note(row.name)
+                note_suffix = f" ({note})" if note else ""
+                lines.append(
+                    f"- {_labs_label(row)}: {value}{unit} — {row.date.isoformat()}{note_suffix}"
+                )
     else:
         lines.append("- _No labs recorded yet._")
 

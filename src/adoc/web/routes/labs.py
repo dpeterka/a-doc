@@ -23,6 +23,7 @@ from starlette.responses import JSONResponse, RedirectResponse, Response
 
 from adoc.labs.db import LabsDb
 from adoc.labs.models import LabDocument, LabResult, Specimen
+from adoc.labs.panels import OTHER_PANEL, derived_from_note, panel_for, panel_sort_key
 from adoc.labs.queries import trend_series
 from adoc.labs.validate import ANALYTE_SPECS, canonicalize
 from adoc.web.deps import get_db
@@ -150,9 +151,26 @@ def labs_index(request: Request, db: LabsDb = Depends(get_db)) -> Response:
                 "latest": latest,
                 "sparkline_svg": _sparkline_svg(values),
                 "url_name": encode_analyte_id(latest.name),
+                "panel": panel_for(latest.name),
             }
         )
-    return templates.TemplateResponse(request, "labs_index.html", {"analytes": analytes})
+    # Group by curated panel (lab-taxonomy layer, item 5): `panel_sort_key`
+    # fixes a stable, deterministic order - curated `PANEL_ORDER` first,
+    # "Other" always last - then alphabetical by analyte name within a
+    # panel. Grouping is done here (not in the template) so the template
+    # stays a dumb renderer of an already-ordered list of (panel, analytes)
+    # groups.
+    analytes.sort(key=lambda item: panel_sort_key(item["name"]))
+    groups: list[dict[str, Any]] = []
+    for item in analytes:
+        panel = item["panel"]
+        if groups and groups[-1]["panel"] == panel:
+            groups[-1]["analytes"].append(item)
+        else:
+            groups.append({"panel": panel, "analytes": [item]})
+    return templates.TemplateResponse(
+        request, "labs_index.html", {"groups": groups, "other_panel": OTHER_PANEL}
+    )
 
 
 def _reading_rows(
@@ -220,6 +238,9 @@ def labs_detail(request: Request, name_id: str, db: LabsDb = Depends(get_db)) ->
             "specimens": specimens,
             "sections": sections,
             "is_score": is_score,
+            "panel": panel_for(name),
+            "other_panel": OTHER_PANEL,
+            "derived_from_note": derived_from_note(name),
         },
     )
 
