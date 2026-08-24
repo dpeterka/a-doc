@@ -261,11 +261,26 @@ def require_prior_node(name: str) -> Contract:
 
 
 def forbid_context_key(key: str) -> Contract:
-    """Precondition: context key `key` must be absent — the blind-reviewer rule.
+    """Precondition: context key `key` must be absent from the RUN CONTEXT
+    (the `ctx` dict `run()` threads through every node — see `Ctx` above),
+    not from any particular node's own input payload.
 
-    Used as the Blind-Reviewer node's precondition that the differential
-    ledger is absent from its context pack, so it is forced to produce a
-    de novo differential (ADR 0002, PLAN.md "Anti-anchoring").
+    This is a check on the run's overall history: it catches a caller that
+    literally puts a `"ledger"` entry into `run()`'s `initial` dict (or
+    that a prior node produced one under that name). It does NOT inspect
+    the *content* of whatever payload a node actually receives — a node
+    whose own input payload happens to carry a ledger section under some
+    other structure (e.g. a `ContextPack` built with `include_ledger=True`
+    and passed under a different context key, such as
+    `"blind_context_pack"`) sails past this check untouched, because that
+    payload's ledger content was never a `ctx["ledger"]` entry in the first
+    place (this was a real gap found in `reason.review`'s blind-panel
+    wiring — see `edge_payload_lacks_section` below, which is the
+    content-aware check for that case).
+
+    Kept for this original, narrower purpose (and to avoid weakening its
+    existing tests): a defense-in-depth check that nothing ever smuggles a
+    `"ledger"` key into a blind node's run context directly.
     """
 
     def predicate(ctx: Ctx, _value: BaseModel | None) -> str | None:
@@ -274,3 +289,40 @@ def forbid_context_key(key: str) -> Contract:
         return None
 
     return Contract(name=f"forbid_context_key:{key}", predicate=predicate)
+
+
+def edge_payload_lacks_section(section_key: str) -> Contract:
+    """Precondition: the node's own VALIDATED INPUT payload must not expose
+    `section_key` among its `.keys` — a content-aware alternative to
+    `forbid_context_key` for nodes whose blindness must be verified against
+    what they were actually handed, not against the run-context dict.
+
+    Motivating bug (ADR 0002 amendment): the weekly review's blind-panel
+    nodes are wired with `depends_on="blind_context_pack"`, so their real
+    input is a `ContextPack`, never a `ctx["ledger"]` entry.
+    `forbid_context_key("ledger")` therefore had nothing to catch even in a
+    genuine regression where the pack itself was built with
+    `include_ledger=True` — the ledger section would be sitting right in
+    the pack the model reads, and the old contract would still pass. This
+    contract inspects the validated payload directly: for any `value`
+    exposing a `.keys` collection (e.g. `reason.context.ContextPack.keys`),
+    it fails when `section_key` is present in it. A payload with no `.keys`
+    attribute (most `Node` input models) is not this contract's concern and
+    always passes.
+    """
+
+    def predicate(_ctx: Ctx, value: BaseModel | None) -> str | None:
+        if value is None:
+            return None
+        keys = getattr(value, "keys", None)
+        if keys is None:
+            return None
+        try:
+            present = section_key in keys
+        except TypeError:
+            return None
+        if present:
+            return f"payload section {section_key!r} must be absent (blind-reviewer rule)"
+        return None
+
+    return Contract(name=f"edge_payload_lacks_section:{section_key}", predicate=predicate)

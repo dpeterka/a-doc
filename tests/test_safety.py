@@ -157,3 +157,52 @@ def test_treatment_gate_span_reasons_distinguish_dosage_from_imperative_verb() -
     assert result.passed is False
     reasons = {span.reason for span in result.spans}
     assert "dosage pattern" in reasons
+
+
+# --- S1 remediation: window-based imperative-verb detection ------------------------------
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Stop taking your prednisone.",
+        "Start taking hydroxychloroquine.",
+        "You should take two tablets of ibuprofen every morning.",
+        "Increase your dose of metformin.",
+    ],
+)
+def test_treatment_gate_blocks_verb_and_drug_separated_by_intervening_words(text: str) -> None:
+    """The old detector only matched a drug token IMMEDIATELY after the
+    imperative verb (past at most one determiner); these all slipped
+    through. The window-based scan must block every one."""
+    result = treatment_gate(text)
+    assert result.passed is False
+    assert result.spans
+
+
+def test_treatment_gate_allows_clause_that_defers_to_a_clinician_even_naming_a_drug() -> None:
+    """A clause anchored on ask/discuss/talk with your doctor/clinician/
+    specialist defers the actual decision, so it is allowed even though it
+    names a drug alongside a gating verb ("taper")."""
+    result = treatment_gate(
+        "It's worth discussing whether to taper prednisone with your rheumatologist."
+    )
+    assert result.passed is True
+    assert result.spans == []
+
+
+def test_treatment_gate_still_blocks_imperative_verb_outside_a_deferred_clause() -> None:
+    """The doctor-deferral carve-out is scoped to its own clause: a second,
+    unrelated clause in the same message must still be gated."""
+    result = treatment_gate(
+        "Ask your doctor about your levothyroxine dose. Stop taking your prednisone now."
+    )
+    assert result.passed is False
+    assert any("prednisone" in span.text.lower() for span in result.spans)
+
+
+def test_treatment_gate_imperative_window_does_not_reach_across_a_sentence_boundary() -> None:
+    """A drug name in the NEXT sentence must not link back to an imperative
+    verb in the prior one."""
+    result = treatment_gate("Stop worrying about your labs. Prednisone was mentioned once.")
+    assert result.passed is True

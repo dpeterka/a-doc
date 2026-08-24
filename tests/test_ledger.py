@@ -127,6 +127,26 @@ def test_hypothesis_id_must_be_a_slug() -> None:
         make_hypothesis(id="SLE 01")
 
 
+# --- S3 remediation: RecordChallenge.note must be substantive ---------------------------
+
+
+@pytest.mark.parametrize("note", ["", ".", "reviewed", "ok", "   ", "short note"])
+def test_record_challenge_note_below_min_length_is_rejected(note: str) -> None:
+    with pytest.raises(ValidationError):
+        RecordChallenge(id="sle-01", note=note)
+
+
+def test_record_challenge_note_at_min_length_after_strip_is_accepted() -> None:
+    # Exactly 20 characters after stripping surrounding whitespace.
+    note = "  " + "x" * 20 + "  "
+    challenge = RecordChallenge(id="sle-01", note=note)
+    assert challenge.note.strip() == "x" * 20
+
+
+def test_record_challenge_note_substantive_text_is_accepted() -> None:
+    RecordChallenge(id="sle-01", note="Anti-dsDNA still pending; no contradicting evidence yet.")
+
+
 # --- happy path -------------------------------------------------------------------------
 
 
@@ -349,6 +369,75 @@ def test_invariant_b_does_not_apply_to_model_origin_hypotheses() -> None:
     assert new_ledger.hypotheses[1].tier == "most-likely"
 
 
+def test_invariant_b_rejects_promotion_on_a_stale_pre_diff_challenge() -> None:
+    """S3 remediation: invariant (b) previously required only that
+    `last_challenged` be non-None (a challenge, EVER) before allowing a
+    patient-origin promotion. That let an ancient PRE-diff challenge marker
+    combine with a fresh same-diff RecordChallenge (which satisfies
+    invariant (c)'s staleness check on its own) to look "challenged enough"
+    for promotion. Invariant (b) must independently require that the
+    challenge backing the promotion was itself RECENT — i.e. dated from a
+    strictly earlier diff no more than STALENESS_HORIZON versions back —
+    not merely present at some point in the hypothesis's history.
+    """
+    patient_hyp = make_hypothesis(
+        id="lyme-01",
+        tier="expanded",
+        origin="patient",
+        status="patient-proposed",
+        last_challenged=date(2026, 1, 1),  # non-None, but ancient
+        last_challenged_version=0,
+    )
+    fresh_cant_miss = make_cant_miss()
+    fresh_cant_miss.last_challenged_version = 4
+    ledger = Ledger(
+        version=4,
+        updated=datetime(2026, 8, 3, tzinfo=UTC),
+        hypotheses=[fresh_cant_miss, patient_hyp],
+    )
+    # new_version = 5, threshold = 5 - STALENESS_HORIZON(2) = 3. This diff
+    # challenges lyme-01 again in the SAME diff as the promotion attempt —
+    # enough to satisfy invariant (c)'s staleness check on its own — but
+    # invariant (b) must still reject the promotion because the PRE-diff
+    # challenge marker (last_challenged_version=0) it would otherwise rely
+    # on is stale.
+    diff = diff_with(
+        [
+            RecordChallenge(id="lyme-01", note="Re-reviewed again; still active as of today."),
+            UpdateHypothesis(id="lyme-01", tier="most-likely"),
+        ]
+    )
+
+    with pytest.raises(LedgerInvariantError, match="stale"):
+        apply_diff(ledger, diff)
+
+
+def test_invariant_b_allows_promotion_on_a_recent_challenge_within_horizon() -> None:
+    """Companion to the staleness-rejection test above: a challenge that is
+    old but still within the staleness horizon must still allow promotion."""
+    patient_hyp = make_hypothesis(
+        id="lyme-01",
+        tier="expanded",
+        origin="patient",
+        status="patient-proposed",
+        last_challenged=date(2026, 8, 1),
+        last_challenged_version=3,
+    )
+    fresh_cant_miss = make_cant_miss()
+    fresh_cant_miss.last_challenged_version = 4
+    ledger = Ledger(
+        version=4,
+        updated=datetime(2026, 8, 3, tzinfo=UTC),
+        hypotheses=[fresh_cant_miss, patient_hyp],
+    )
+    # new_version = 5; threshold = 5 - 2 = 3; last_challenged_version (3) is
+    # not below the threshold, so this is still recent enough.
+    diff = diff_with([UpdateHypothesis(id="lyme-01", tier="most-likely")])
+
+    new_ledger = apply_diff(ledger, diff)
+    assert new_ledger.hypotheses[1].tier == "most-likely"
+
+
 # --- invariant (c): staleness -----------------------------------------------------------
 
 
@@ -499,7 +588,7 @@ def test_append_history_never_rewrites_prior_lines(tmp_path: Path) -> None:
     ledger1 = apply_diff(ledger, diff1)
     append_history(history_path, diff1, ledger1)
 
-    diff2 = diff_with([RecordChallenge(id="pe-01", note="still relevant")])
+    diff2 = diff_with([RecordChallenge(id="pe-01", note="Reviewed again: still relevant.")])
     ledger2 = apply_diff(ledger1, diff2)
     append_history(history_path, diff2, ledger2)
 

@@ -9,6 +9,9 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 from web_support import build_app, login, make_challenger_transport, make_primary_transport
 
+from adoc.casefile.ledger import load_ledger
+from adoc.casefile.repo import LEDGER_RELPATH
+
 _SLE_MOST_LIKELY_OP = {
     "op": "add_hypothesis",
     "hypothesis": {
@@ -104,6 +107,90 @@ def test_blank_message_shows_an_error_without_calling_the_llm(tmp_path: Path) ->
     assert response.status_code == 200
     assert "type a message" in response.text.lower()
     assert calls == []
+
+
+def test_dosing_laden_composer_output_is_withheld_but_ledger_is_still_updated(
+    tmp_path: Path,
+) -> None:
+    """S5 remediation: the Composer's output failing safety.treatment_gate
+    raises a ContractViolation AFTER the diagnostic DAG's `apply` node has
+    already committed the ledger diff (Ledger-Maintainer -> Challenger ->
+    apply -> Composer). That must render as a warm, 200-status withheld
+    message — never a bare 500/traceback — and the ledger update must
+    stand: the case file was genuinely updated even though the reply text
+    was blocked.
+    """
+    calls: list = []
+    bad_reply = {
+        "tiers_rendered": (
+            "Most Likely: a lupus-like presentation. You should take 20 mg prednisone daily."
+        ),
+        "tests_to_request": [],
+        "framing_ack": True,
+    }
+    primary = make_primary_transport([_PE_CANT_MISS_OP], bad_reply, calls)
+    challenger = make_challenger_transport(counter_arguments=[], additional_ops=[], calls=calls)
+    app, repo, _db, _calls = build_app(
+        tmp_path, primary_transport=primary, challenger_transport=challenger
+    )
+    client = TestClient(app)
+    login(client)
+
+    ledger_before = load_ledger(repo.root / LEDGER_RELPATH)
+
+    response = client.post(
+        "/chat/send",
+        data={"text": "My joints have been aching for weeks and I'm constantly exhausted."},
+    )
+
+    assert response.status_code == 200
+    assert "traceback" not in response.text.lower()
+    assert "internal server error" not in response.text.lower()
+    body_lower = response.text.lower()
+    assert "safety check" in body_lower or "withheld" in body_lower
+
+    ledger_after = load_ledger(repo.root / LEDGER_RELPATH)
+    assert ledger_after.version > ledger_before.version
+
+
+_ACTIVE_NO_CANT_MISS_OP = {
+    "op": "add_hypothesis",
+    "hypothesis": {
+        "id": "sle-01",
+        "name": "Systemic lupus erythematosus",
+        "tier": "expanded",
+        "probability": "moderate",
+        "status": "active",
+        "origin": "model",
+        "first_proposed": "2026-08-01",
+    },
+}
+
+
+def test_ledger_invariant_violation_is_withheld_not_a_bare_500(tmp_path: Path) -> None:
+    """S5 remediation: a LedgerInvariantError (here: the proposed diff would
+    leave the cant-miss tier empty while a hypothesis remains active) must
+    also render as a warm withheld message with a 200 status, never a bare
+    500/traceback."""
+    calls: list = []
+    primary = make_primary_transport([_ACTIVE_NO_CANT_MISS_OP], {}, calls)
+    challenger = make_challenger_transport(counter_arguments=[], additional_ops=[], calls=calls)
+    app, _repo, _db, _calls = build_app(
+        tmp_path, primary_transport=primary, challenger_transport=challenger
+    )
+    client = TestClient(app)
+    login(client)
+
+    response = client.post(
+        "/chat/send",
+        data={"text": "My joints have been aching for weeks."},
+    )
+
+    assert response.status_code == 200
+    assert "traceback" not in response.text.lower()
+    assert "internal server error" not in response.text.lower()
+    body_lower = response.text.lower()
+    assert "safety guard" in body_lower or "consistency check" in body_lower
 
 
 def test_chat_page_renders_without_error_when_transcript_is_empty(tmp_path: Path) -> None:

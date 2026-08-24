@@ -44,3 +44,20 @@ replayable and testable node-by-node in isolation.
   structurally impossible rather than merely discouraged.
 - Because contracts are just code with clear pre/postconditions, they are
   unit-testable independent of any live model call, using golden fixtures.
+
+## Amendment (2026-08-24): blind-reviewer precondition is content-aware
+
+The blind-reviewer rule above ("the differential ledger is absent from its
+context pack") was originally enforced only by `reason.dag.forbid_context_key`,
+which checks the DAG *run-context dict* for a `"ledger"` entry. In
+`reason.review`'s weekly-review DAG, the blind-panel nodes never receive
+their input via a `ctx["ledger"]` entry at all — they read a `ContextPack`
+passed under the `"blind_context_pack"` key — so `forbid_context_key` had
+nothing to catch even in a real regression where that pack was built with
+`include_ledger=True`. The blind-panel nodes' precondition now also
+includes `reason.dag.edge_payload_lacks_section("ledger")`, which inspects
+the node's own validated input payload (`ContextPack.keys`) directly, so a
+pack that actually carries the ledger section trips the contract regardless
+of what the run-context dict looks like. `forbid_context_key` is retained
+for its original, narrower purpose (guarding against a `"ledger"` key
+literally appearing in the run context) and is unchanged.

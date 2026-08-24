@@ -171,10 +171,30 @@ class AddEvidence(BaseModel):
     evidence: Evidence
 
 
+MIN_SUBSTANTIVE_NOTE_LENGTH = 20
+
+
 class RecordChallenge(BaseModel):
     op: Literal["record_challenge"] = "record_challenge"
     id: str
     note: str
+
+    @field_validator("note")
+    @classmethod
+    def _check_note_is_substantive(cls, value: str) -> str:
+        """S3 remediation: a challenge note must carry actual substance —
+        schema-level `min_length` alone can't express "after stripping
+        whitespace", so this validator does the strip-then-length check.
+        A model (or test double) stamping "." or "reviewed" across every
+        hypothesis is not a substantive challenge (see also
+        `reason.review`'s challenge-sweep/adjudication completeness
+        contracts, which enforce the same floor at the DAG layer)."""
+        if len(value.strip()) < MIN_SUBSTANTIVE_NOTE_LENGTH:
+            raise ValueError(
+                "RecordChallenge.note must be substantive: at least "
+                f"{MIN_SUBSTANTIVE_NOTE_LENGTH} characters after stripping whitespace"
+            )
+        return value
 
 
 LedgerOp = Annotated[
