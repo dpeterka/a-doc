@@ -302,6 +302,20 @@ def ingest_file(
     )
 
 
+def _scan_files(root: Path) -> list[Path]:
+    """All regular files under `root`, recursive, name-ordered.
+
+    Recursive because Dropbox uploads (and `rclone move`) preserve
+    subfolder structure inside the inbox. Hidden files and Windows
+    sync artifacts are skipped.
+    """
+    return sorted(
+        p
+        for p in root.rglob("*")
+        if p.is_file() and not p.name.startswith(".") and p.name.lower() != "desktop.ini"
+    )
+
+
 def ingest_inbox(
     *,
     repo: DataRepo,
@@ -314,7 +328,7 @@ def ingest_inbox(
     inbox = repo.root / "inbox"
     if not inbox.is_dir():
         return IngestReport(files=[])
-    files = sorted(p for p in inbox.iterdir() if p.is_file())
+    files = _scan_files(inbox)
     return IngestReport(
         files=[
             _ingest_one(p, repo=repo, db=db, vision=vision, clock=clock, renderer=renderer)
@@ -333,7 +347,7 @@ def ingest_directory(
     renderer: PageRenderer = pdftoppm_renderer,
 ) -> IngestReport:
     """Ingest every file directly under `directory`, in name order (`adoc backfill`)."""
-    files = sorted(p for p in directory.iterdir() if p.is_file())
+    files = _scan_files(directory)
     return IngestReport(
         files=[
             _ingest_one(p, repo=repo, db=db, vision=vision, clock=clock, renderer=renderer)

@@ -220,3 +220,19 @@ def test_ingest_inbox_scans_and_ingests_every_file(tmp_path: Path) -> None:
     assert all(f.outcome == "ingested" for f in report.files)
     assert report.total_auto == 4
     assert report.total_pending == 0
+
+
+def test_scan_files_is_recursive_and_skips_sync_artifacts(tmp_path: Path) -> None:
+    """Dropbox/rclone preserve subfolders in the inbox; nested files must be found."""
+    from adoc.ingest.pipeline import _scan_files
+
+    (tmp_path / "Labs" / "LabCorp").mkdir(parents=True)
+    (tmp_path / "Labs" / "LabCorp" / "b.pdf").write_bytes(b"x")
+    (tmp_path / "a.pdf").write_bytes(b"x")
+    (tmp_path / "desktop.ini").write_bytes(b"x")
+    (tmp_path / ".hidden").write_bytes(b"x")
+
+    names = [p.name for p in _scan_files(tmp_path)]
+
+    # Deterministic full-path order: "Labs/LabCorp/b.pdf" sorts before "a.pdf".
+    assert names == ["b.pdf", "a.pdf"]
