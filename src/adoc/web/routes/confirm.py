@@ -20,7 +20,7 @@ from starlette.responses import Response
 
 from adoc.casefile.repo import DataRepo
 from adoc.ingest.reconcile import row_is_agreed
-from adoc.labs.db import LabsDb, PendingRow
+from adoc.labs.db import LabsDb, PendingRow, ResolutionConvergedError
 from adoc.labs.models import LabFlag, LabResult
 from adoc.labs.twins import read_last_sweep_summary
 from adoc.labs.validate import ANALYTE_SPECS, canonicalize
@@ -344,9 +344,22 @@ def resolve_with_pass(
     (queue-ergonomics slice item 1): apply that pass's fields wholesale
     (`LabsDb.resolve_with_pass`) instead of silently keeping pass A's
     placeholder reading, as a bare Confirm used to."""
-    db.resolve_with_pass(row_id, which)
+    try:
+        db.resolve_with_pass(row_id, which)
+        message = None
+    except ResolutionConvergedError as exc:
+        # The chosen reading already exists as another row of this document
+        # (its unpaired twin) - the queue item was rejected as a duplicate.
+        message = (
+            "That reading already exists in this document's records - "
+            "this queue item was marked as its duplicate."
+        )
+        _ = exc
     _export_and_commit(repo, db, f"confirm: row {row_id} resolved with pass {which.upper()}")
-    return templates.TemplateResponse(request, "_confirm_queue.html", _pending_context(repo, db))
+    context = _pending_context(repo, db)
+    if message:
+        context["notice"] = message
+    return templates.TemplateResponse(request, "_confirm_queue.html", context)
 
 
 @router.post("/{row_id}/reject")

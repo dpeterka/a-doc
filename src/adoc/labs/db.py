@@ -280,6 +280,19 @@ def _parse_flag(flag_raw: str | None) -> LabFlag | None:
         return None
 
 
+class ResolutionConvergedError(Exception):
+    """`resolve_with_pass` found the chosen pass's reading already exists as
+    another row of the same document - the queue item was rejected as that
+    row's duplicate instead of being updated (see resolve_with_pass)."""
+
+    def __init__(self, *, row_id: int, existing_id: int) -> None:
+        self.row_id = row_id
+        self.existing_id = existing_id
+        super().__init__(
+            f"row {row_id} converged onto existing row {existing_id}; rejected as duplicate"
+        )
+
+
 class LabsDb:
     """Sqlite-backed store for the `documents`/`labs` tables (stdlib sqlite3)."""
 
@@ -553,6 +566,24 @@ class LabsDb:
         canonical = canonicalize(name_raw)
         ref_low, ref_high = _parse_ref_range(pass_data.get("ref_range_raw"))
         flag = _parse_flag(pass_data.get("flag_raw"))
+
+        # Applying this pass's name/specimen may converge onto a row that
+        # ALREADY exists for the same (date, name, specimen, source_doc) -
+        # the unpaired other-pass twin of this very reading. That is a
+        # resolution, not an error: reject this queue item as the twin's
+        # duplicate instead of violating the UNIQUE constraint.
+        new_name = canonical or name_raw
+        new_specimen = pass_data.get("specimen") or row.specimen
+        collision = self._conn.execute(
+            """
+            SELECT id FROM labs
+            WHERE date = ? AND name = ? AND specimen = ? AND source_doc = ? AND id != ?
+            """,
+            (row.date.isoformat(), new_name, new_specimen, row.source_doc, row_id),
+        ).fetchone()
+        if collision is not None:
+            self.reject_row_as_twin(row_id, twin_of=int(collision[0]), method="rule")
+            raise ResolutionConvergedError(row_id=row_id, existing_id=int(collision[0]))
 
         payload["resolved_with"] = f"pass_{which}"
         new_raw_json = json.dumps(payload)
