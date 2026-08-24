@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -24,6 +25,26 @@ from typing import Any, Literal
 
 from adoc.labs.models import ExtractionStatus, LabDocument, LabFlag, LabResult, Specimen
 from adoc.labs.validate import canonicalize
+
+
+@dataclass(frozen=True)
+class DocumentOverview:
+    """One ingested document alongside its lab-row status counts.
+
+    Returned by `LabsDb.documents_overview()` for the "Documents > Consumed"
+    page: `accepted_count` is every row past human/auto review (`auto`,
+    `confirmed`, `corrected` - the same trio `resolved_rows_for_document`
+    treats as "resolved"), `awaiting_review_count` is rows still `pending`.
+    A `rejected` row counts toward neither - it was a duplicate/mistake,
+    not a result the patient has or is waiting on. A genomic-data document
+    never has labs rows at all, so both counts are simply 0 for it - the
+    web route recognizes `doc_type == GENOMIC_DOC_TYPE` and shows its own
+    "stored for later genomic analysis" wording instead.
+    """
+
+    document: LabDocument
+    accepted_count: int
+    awaiting_review_count: int
 
 
 @dataclass(frozen=True)
@@ -404,6 +425,35 @@ class LabsDb:
     def list_documents(self) -> list[LabDocument]:
         rows = self._conn.execute("SELECT * FROM documents ORDER BY ingested_at DESC").fetchall()
         return [_row_to_document(row) for row in rows]
+
+    def documents_overview(self) -> list[DocumentOverview]:
+        """Every ingested document, newest first, alongside its
+        accepted/awaiting-review lab-row counts — the "Documents >
+        Consumed" page's per-document summary (see `DocumentOverview`)."""
+        rows = self._conn.execute(
+            "SELECT source_doc, extraction_status, COUNT(*) AS n FROM labs "
+            "GROUP BY source_doc, extraction_status"
+        ).fetchall()
+        counts_by_doc: dict[str, dict[str, int]] = defaultdict(dict)
+        for row in rows:
+            counts_by_doc[row["source_doc"]][row["extraction_status"]] = row["n"]
+
+        accepted_statuses = (
+            ExtractionStatus.AUTO.value,
+            ExtractionStatus.CONFIRMED.value,
+            ExtractionStatus.CORRECTED.value,
+        )
+        overviews: list[DocumentOverview] = []
+        for doc in self.list_documents():
+            by_status = counts_by_doc.get(doc.sha256, {})
+            accepted = sum(by_status.get(status, 0) for status in accepted_statuses)
+            awaiting = by_status.get(ExtractionStatus.PENDING.value, 0)
+            overviews.append(
+                DocumentOverview(
+                    document=doc, accepted_count=accepted, awaiting_review_count=awaiting
+                )
+            )
+        return overviews
 
     # ----------------------------------------------------------------
     # Labs: insert + confirm queue
