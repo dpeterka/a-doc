@@ -3,54 +3,99 @@
 {% block content %}
   <h1>{{ name }}</h1>
   <p class="muted"><a href="/labs">&larr; back to all labs</a></p>
+  {% if is_score %}
+    <p class="muted">Calculated score — no reference range applies.</p>
+  {% endif %}
 
   {% if has_data %}
     {#
       A canonical name can carry more than one specimen (e.g. a urinalysis
       GLUCOSE "NEGATIVE" reading and a serum glucose mg/dL reading both
-      canonicalize to "glucose") - one chart per specimen present, rather
-      than merging them into a single misleading series. When there's
-      only the one (usual) specimen, its container just has no suffix.
+      canonicalize to "glucose") - one chart (plus its own reading table)
+      per specimen present, rather than merging them into a single
+      misleading series. When there's only the one (usual) specimen, its
+      container just has no suffix.
     #}
-    {% for specimen in specimens %}
-      <h2 class="labs-chart-title">
-        {% if specimen != "unknown" %}{{ name }} ({{ specimen }}){% else %}{{ name }}{% endif %}
-      </h2>
-      <div id="labs-chart-{{ loop.index }}" class="labs-chart"></div>
+    {% for section in sections %}
+      <section class="labs-section">
+        <h2 class="labs-chart-title">
+          {% if section.specimen != "unknown" %}{{ name }} ({{ section.specimen }}){% else %}{{ name }}{% endif %}
+        </h2>
+
+        <div id="labs-chart-{{ loop.index }}" class="labs-chart"></div>
+
+        <div class="table-wrap">
+          <table class="labs-readings-table">
+            <thead>
+              <tr>
+                <th>Date</th>
+                <th>Value</th>
+                <th>Unit</th>
+                <th>Flag</th>
+                <th>Source</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for row in section.rows %}
+                <tr>
+                  <td>{{ row.date.strftime("%b %d, %Y") }}</td>
+                  <td>{{ row.value if row.value is not none else row.value_text }}</td>
+                  <td>{% if row.unit %}{{ row.unit }}{% elif is_score %}calculated score{% endif %}</td>
+                  <td>{% if row.flag %}<span class="chip chip-flag">{{ row.flag }}</span>{% endif %}</td>
+                  <td><a href="{{ row.source_url }}">{{ row.source_filename }}</a></td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </section>
     {% endfor %}
+
     <script src="/static/vendor/plotly-basic.min.js" defer></script>
     <script defer>
       (function () {
         var analyteName = {{ name | tojson }};
+        var nameId = {{ name_id | tojson }};
         var specimens = {{ specimens | tojson }};
         specimens.forEach(function (specimen, index) {
-          var url = "/labs/" + encodeURIComponent(analyteName) + "/data?specimen="
-            + encodeURIComponent(specimen);
+          var chartEl = document.getElementById("labs-chart-" + (index + 1));
+          if (!chartEl) { return; }
+          var url = "/labs/" + nameId + "/data?specimen=" + encodeURIComponent(specimen);
           fetch(url)
             .then(function (response) { return response.json(); })
             .then(function (data) {
               var seriesName = specimen === "unknown" ? analyteName : analyteName + " (" + specimen + ")";
+              // Qualitative (value_text-only) readings carry a `null`
+              // value - Plotly simply leaves a gap for them instead of
+              // plotting anything, so they only ever show up in the
+              // table above, never on the chart.
               var valueTrace = {
                 x: data.dates,
                 y: data.values,
+                customdata: data.units,
+                hovertemplate: "%{x}<br>%{y} %{customdata}<extra></extra>",
                 mode: "lines+markers",
                 name: seriesName,
-                marker: { color: "#2f6f5e" },
+                marker: { color: "#2f6f5e", size: 7 },
               };
               var traces = [valueTrace];
               if (data.ref_low.some(function (v) { return v !== null; })) {
                 traces.push({
                   x: data.dates, y: data.ref_low, mode: "lines", name: "reference low",
-                  line: { dash: "dot", color: "#9aa5ad" },
+                  line: { dash: "dot", color: "#9aa5ad" }, hoverinfo: "skip",
                 });
               }
               if (data.ref_high.some(function (v) { return v !== null; })) {
+                // Shades the band between the reference-low and
+                // reference-high traces pushed just above (Plotly's
+                // "tonexty" fills toward the immediately preceding trace).
                 traces.push({
-                  x: data.dates, y: data.ref_high, mode: "lines", name: "reference high",
-                  line: { dash: "dot", color: "#9aa5ad" },
+                  x: data.dates, y: data.ref_high, mode: "lines", name: "reference range",
+                  line: { dash: "dot", color: "#9aa5ad" }, hoverinfo: "skip",
+                  fill: "tonexty", fillcolor: "rgba(154, 165, 173, 0.18)",
                 });
               }
-              Plotly.newPlot("labs-chart-" + (index + 1), traces, {
+              Plotly.newPlot(chartEl, traces, {
                 margin: { t: 20, r: 20, b: 40, l: 50 },
                 showlegend: true,
               }, { responsive: true, displayModeBar: false });
