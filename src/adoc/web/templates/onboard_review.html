@@ -14,6 +14,19 @@
     <p class="banner">Initial visit complete — you can still correct or add details here.</p>
   {% endif %}
 
+  {% if recent_facts %}
+    <section class="review-section since-last-visit">
+      <h2>Since last visit</h2>
+      <p class="muted">Reported in the last {{ recent_window_days }} days.</p>
+      {% for fact in recent_facts %}
+        <div class="fact-card">
+          <p>{{ fact.statement }}</p>
+          <p class="muted">reported {{ fact.reported_on }}</p>
+        </div>
+      {% endfor %}
+    </section>
+  {% endif %}
+
   {% for key, section in sections.items() %}
     <section class="review-section">
       <h2>{{ section.title }}</h2>
@@ -49,6 +62,18 @@
             </span>
             {% if fact.clarification_status == "needs_probe" %}
               <span class="badge badge-needs-probe">needs follow-up</span>
+            {% endif %}
+            <span class="badge badge-corroboration-{{ fact.corroboration }}">
+              {%- if fact.corroboration == "corroborated" -%}
+                Corroborated &#10003;{% if fact.corroboration_source %} ({{ fact.corroboration_source }}){% endif %}
+              {%- elif fact.corroboration == "contradicted" -%}
+                Contradicted &#9888;{% if fact.corroboration_note %} — {{ fact.corroboration_note }}{% endif %}
+              {%- else -%}
+                Unverified
+              {%- endif -%}
+            </span>
+            {% if fact.reported_on %}
+              <span class="muted">reported {{ fact.reported_on }}</span>
             {% endif %}
           </p>
           <button type="button" class="link-button correct-this-fact"

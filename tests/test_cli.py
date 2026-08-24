@@ -731,6 +731,124 @@ def test_labs_reclassify_runs_end_to_end_and_commits(
     assert "auto-flipped 0" in second_out
 
 
+# --------------------------------------------------------------------------
+# intake-corroborate (docs/adr/0013-fact-corroboration.md)
+# --------------------------------------------------------------------------
+
+
+def test_intake_corroborate_fails_without_data_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("ADOC_DATA_DIR", raising=False)
+
+    code = main(["intake-corroborate"])
+
+    assert code == 1
+    assert "configuration error" in capsys.readouterr().err
+
+
+def test_intake_corroborate_fails_if_data_repo_not_initialized(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("ADOC_DATA_DIR", str(tmp_path / "a-doc-data"))
+    monkeypatch.setenv("ADOC_MODELS_FILE", str(REPO_ROOT / "models.yaml"))
+
+    code = main(["intake-corroborate"])
+
+    assert code == 1
+    assert "run `adoc init` first" in capsys.readouterr().err
+
+
+def _seed_future_year_diagnosis(data_dir: Path) -> DataRepo:
+    from adoc.casefile.schema import Provenance
+    from adoc.intake.facts import AddFact, IntakeFactsStore, NewFact
+
+    repo = DataRepo.init_at(data_dir)
+    store = IntakeFactsStore(repo.root)
+    store.apply_ops(
+        [
+            AddFact(
+                fact=NewFact(
+                    id="future-dx",
+                    section="prior_diagnoses",
+                    kind="diagnosis",
+                    statement="A doctor diagnosed lupus in 2099.",
+                    attribution="doctor_diagnosed",
+                    fields={"year": 2099, "by_whom": "Dr. Lee"},
+                )
+            )
+        ],
+        Provenance(
+            app_version="0.0.0-test",
+            prompt_template_version="1",
+            model_id="fake",
+            dag_node="intake-agent",
+            timestamp=datetime(2026, 1, 1),
+        ),
+    )
+    store.save()
+    repo.commit("seed a future-year diagnosis fact", paths=["case/intake-facts.yaml"])
+    return repo
+
+
+def test_intake_corroborate_dry_run_reports_and_mutates_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    data_dir = tmp_path / "a-doc-data"
+    monkeypatch.setenv("ADOC_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("ADOC_MODELS_FILE", str(REPO_ROOT / "models.yaml"))
+    _seed_future_year_diagnosis(data_dir)
+
+    code = main(["intake-corroborate", "--dry-run"])
+
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "dry-run" in out
+    assert "would update 1" in out
+
+    from adoc.intake.facts import IntakeFactsStore
+
+    store = IntakeFactsStore(data_dir)
+    fact = store.get("future-dx")
+    assert fact is not None
+    assert fact.corroboration == "unverified"  # untouched by --dry-run
+
+
+def test_intake_corroborate_runs_end_to_end_and_commits(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    data_dir = tmp_path / "a-doc-data"
+    monkeypatch.setenv("ADOC_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("ADOC_MODELS_FILE", str(REPO_ROOT / "models.yaml"))
+    repo = _seed_future_year_diagnosis(data_dir)
+    git_repo = GitRepo(repo.root)
+    commits_before = len(list(git_repo.iter_commits()))
+
+    code = main(["intake-corroborate"])
+
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "updated 1" in out
+    assert "contradicted: 1" in out
+
+    from adoc.intake.facts import IntakeFactsStore
+
+    store = IntakeFactsStore(data_dir)
+    fact = store.get("future-dx")
+    assert fact is not None
+    assert fact.corroboration == "contradicted"
+
+    commits_after = len(list(git_repo.iter_commits()))
+    assert commits_after == commits_before + 1
+
+    # idempotent: a second run finds nothing left to update
+    second_code = main(["intake-corroborate"])
+    assert second_code == 0
+    second_out = capsys.readouterr().out
+    assert "updated 0" in second_out
+
+
 def test_eval_runs_offline_with_out_dir(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     out_dir = tmp_path / "eval-out"
 

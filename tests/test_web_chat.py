@@ -16,6 +16,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 from web_support import (
     build_app,
+    exploding_transport,
     login,
     make_challenger_transport,
     make_primary_transport,
@@ -24,7 +25,7 @@ from web_support import (
 
 from adoc.casefile.ledger import load_ledger
 from adoc.casefile.repo import LEDGER_RELPATH
-from adoc.intake.agent import INTAKE_OPENER_MESSAGE, IntakeTurnResult
+from adoc.intake.agent import INTAKE_OPENER_MESSAGE, IntakeTurnResult, VisitCaptureResult
 from adoc.reason.client import TransportRequest, TransportResponse
 
 _SLE_MOST_LIKELY_OP = {
@@ -401,3 +402,134 @@ def test_onboard_send_post_redirects_to_chat(tmp_path: Path) -> None:
 
     assert response.status_code == 303
     assert response.headers["location"] == "/chat"
+
+
+# --- interval history: post-intake visit capture (docs/adr/0013) -----------------------
+
+
+def _visit_capture_transport(ops: list, calls: list):
+    def transport(request: TransportRequest) -> TransportResponse:
+        calls.append(request)
+        assert request.schema is VisitCaptureResult
+        return TransportResponse(text="", tool_input={"ops": ops}, input_tokens=5, output_tokens=5)
+
+    return transport
+
+
+def test_successful_diagnostic_turn_triggers_visit_capture(tmp_path: Path) -> None:
+    capture_calls: list = []
+    capture_transport = _visit_capture_transport(
+        [
+            {
+                "op": "add_fact",
+                "fact": {
+                    "id": "new-symptom",
+                    "section": "symptoms",
+                    "kind": "symptom",
+                    "statement": "New knee swelling mentioned in this visit.",
+                },
+            }
+        ],
+        capture_calls,
+    )
+    calls: list = []
+    primary = make_primary_transport([_PE_CANT_MISS_OP], _PATIENT_REPLY, calls)
+    challenger = make_challenger_transport(counter_arguments=[], additional_ops=[], calls=calls)
+    app, repo, _db, _calls = build_app(
+        tmp_path,
+        primary_transport=primary,
+        challenger_transport=challenger,
+        visit_capture_transport=capture_transport,
+    )
+    mark_intake_complete(repo)
+    client = TestClient(app)
+    login(client)
+
+    response = client.post(
+        "/chat/send",
+        data={"text": "My joints have been aching for weeks and I'm constantly exhausted."},
+    )
+
+    assert response.status_code == 200
+    assert len(capture_calls) == 1
+
+    from adoc.intake.facts import IntakeFactsStore
+
+    store = IntakeFactsStore(repo.root)
+    fact = store.get("new-symptom")
+    assert fact is not None
+    assert fact.provenance.dag_node == "visit-capture"
+
+
+def test_red_flag_turn_never_triggers_visit_capture(tmp_path: Path) -> None:
+    capture_calls: list = []
+    app, repo, _db, _calls = build_app(
+        tmp_path, visit_capture_transport=exploding_transport(capture_calls)
+    )
+    mark_intake_complete(repo)
+    client = TestClient(app)
+    login(client)
+
+    response = client.post(
+        "/chat/send", data={"text": "I have crushing chest pain radiating to my left arm"}
+    )
+
+    assert response.status_code == 200
+    assert capture_calls == []
+
+
+def test_withheld_turn_never_triggers_visit_capture(tmp_path: Path) -> None:
+    capture_calls: list = []
+    bad_reply = {
+        "tiers_rendered": (
+            "Most Likely: a lupus-like presentation. You should take 20 mg prednisone daily."
+        ),
+        "tests_to_request": [],
+        "framing_ack": True,
+    }
+    calls: list = []
+    primary = make_primary_transport([_PE_CANT_MISS_OP], bad_reply, calls)
+    challenger = make_challenger_transport(counter_arguments=[], additional_ops=[], calls=calls)
+    app, repo, _db, _calls = build_app(
+        tmp_path,
+        primary_transport=primary,
+        challenger_transport=challenger,
+        visit_capture_transport=exploding_transport(capture_calls),
+    )
+    mark_intake_complete(repo)
+    client = TestClient(app)
+    login(client)
+
+    response = client.post(
+        "/chat/send",
+        data={"text": "My joints have been aching for weeks and I'm constantly exhausted."},
+    )
+
+    assert response.status_code == 200
+    assert capture_calls == []
+
+
+def test_error_turn_never_triggers_visit_capture(tmp_path: Path) -> None:
+    capture_calls: list = []
+
+    def broken_route_transport(request: TransportRequest) -> TransportResponse:
+        assert request.schema is not None
+        if request.schema.__name__ == "TurnRoute":
+            return TransportResponse(
+                text="not structured", tool_input=None, input_tokens=1, output_tokens=1
+            )
+        raise AssertionError("must never reach past a failed route_turn call")
+
+    app, repo, _db, _calls = build_app(
+        tmp_path,
+        primary_transport=broken_route_transport,
+        visit_capture_transport=exploding_transport(capture_calls),
+    )
+    mark_intake_complete(repo)
+    client = TestClient(app)
+    login(client)
+
+    response = client.post("/chat/send", data={"text": "My joints have been aching for weeks."})
+
+    assert response.status_code == 200
+    assert capture_calls == []
