@@ -43,7 +43,7 @@ from typing import Any, Protocol, TypeVar
 
 from pydantic import BaseModel
 
-from adoc.reason.client import LlmClient, TransientTransportError
+from adoc.reason.client import LlmClient, TransientTransportError, _unwrap_tool_input
 
 # --------------------------------------------------------------------------
 # Document/image content parts
@@ -415,7 +415,12 @@ class VisionClient:
             )
             raise VisionError(f"role {role!r}: provider returned no structured output")
         try:
-            parsed = schema.model_validate(response.tool_input)
+            try:
+                parsed = schema.model_validate(response.tool_input)
+            except Exception:
+                # Same Claude wrapper-key quirk handled in reason.client:
+                # flat-first, unwrap-on-failure.
+                parsed = schema.model_validate(_unwrap_tool_input(response.tool_input))
         except Exception as exc:
             self._audit(
                 role, binding.provider, binding.model, response, duration, scrub_count, error=True
