@@ -388,3 +388,63 @@ def test_sweep_summary_round_trips(tmp_path: Path) -> None:
 
 def test_read_last_sweep_summary_returns_none_when_absent(tmp_path: Path) -> None:
     assert read_last_sweep_summary(tmp_path) is None
+
+
+def _single_pass_row(name_raw: str, *, value: float, side: str, page: int = 4) -> LabResult:
+    """A stranded one-sided row: raw_json carries only that pass's payload,
+    exactly as `reconcile` serializes unmatched leftovers."""
+    payload = {
+        "reasons": ["single_pass"],
+        "pass_a": {"name_raw": name_raw} if side == "a" else None,
+        "pass_b": {"name_raw": name_raw} if side == "b" else None,
+    }
+    row = _row(name_raw, value=value, page=page, status=ExtractionStatus.PENDING)
+    return row.model_copy(update={"raw_json": json.dumps(payload)})
+
+
+def test_pending_pending_twins_are_retro_paired(tmp_path: Path) -> None:
+    """Phase 2: both halves stranded PENDING (opposite passes, same value)
+    pair up - the longer name survives as an agreed name_variant row, the
+    other is rejected as its twin."""
+    db = LabsDb(tmp_path / "labs.sqlite")
+    db.upsert_document(_doc())
+    (long_id,) = db.insert_results(
+        [_single_pass_row("FRAX 10-year probability of hip fracture", value=1.2, side="a")]
+    )
+    (short_id,) = db.insert_results(
+        [_single_pass_row("10-year probability of hip fracture is", value=1.2, side="b")]
+    )
+
+    report = sweep_twins(db, _client(None))
+
+    assert report.paired == 1
+    assert long_id is not None and short_id is not None
+    surviving = db.get_row(long_id)
+    rejected = db.get_row(short_id)
+    assert rejected is not None and rejected.extraction_status is ExtractionStatus.REJECTED
+    assert surviving is not None and surviving.extraction_status is ExtractionStatus.PENDING
+    payload = surviving.raw_payload()
+    assert "name_variant" in payload["reasons"]
+    assert "single_pass" not in payload["reasons"]
+    assert payload["name_variant_of"] == "10-year probability of hip fracture is"
+
+
+def test_same_pass_same_value_rows_never_retro_pair(tmp_path: Path) -> None:
+    """Two same-value rows from the SAME pass are different measurements
+    (e.g. two 0.0 absolute counts) - never paired."""
+    db = LabsDb(tmp_path / "labs.sqlite")
+    db.upsert_document(_doc())
+    ids = db.insert_results(
+        [
+            _single_pass_row("Basophils Absolute", value=0.0, side="a"),
+            _single_pass_row("Eosinophils Absolute", value=0.0, side="a"),
+        ]
+    )
+
+    report = sweep_twins(db, _client(None))
+
+    assert report.paired == 0
+    for rid in ids:
+        assert rid is not None
+        row = db.get_row(rid)
+        assert row is not None and row.extraction_status is ExtractionStatus.PENDING

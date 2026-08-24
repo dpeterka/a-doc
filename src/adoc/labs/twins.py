@@ -92,6 +92,7 @@ class TwinSweepReport:
     rejected_rule: int = 0
     rejected_llm: int = 0
     rejected_ids: list[int] = field(default_factory=list)
+    paired: int = 0  # pending<->pending retro-pairs (survivor upgraded to name_variant)
 
 
 def _normalize_unit(unit: str | None) -> str | None:
@@ -233,7 +234,107 @@ def sweep_twins(db: LabsDb, client: LlmClient, *, dry_run: bool = False) -> Twin
         if not dry_run:
             db.reject_row_as_twin(row.id, twin_of=candidate.id, method=method)  # type: ignore[arg-type]
 
+    _retro_pair_pending_twins(db, client, report, dry_run=dry_run)
     return report
+
+
+def _pass_side(row: LabResult) -> str | None:
+    """Which extraction pass produced this single-pass row: "a", "b", or
+    None when it isn't a one-sided row at all."""
+    payload = row.raw_payload()
+    has_a = payload.get("pass_a") is not None
+    has_b = payload.get("pass_b") is not None
+    if has_a and not has_b:
+        return "a"
+    if has_b and not has_a:
+        return "b"
+    return None
+
+
+def _retro_pair_pending_twins(
+    db: LabsDb, client: LlmClient, report: TwinSweepReport, *, dry_run: bool
+) -> None:
+    """Phase 2: pending<->pending twins. Before reconcile's RESCUE pass
+    existed, BOTH halves of a differently-named pair could be stranded
+    PENDING - neither ever resolves, so phase 1's resolved-candidate gate
+    never fires. Pair them here: same document, page within tolerance,
+    identical value(-text), compatible unit, same specimen-or-unknown, and
+    - critically - originating from OPPOSITE passes (two same-value rows
+    from the SAME pass are genuinely different measurements, never paired).
+    The longer-named row survives (upgraded to the agreed `name_variant`
+    bucket, still awaiting one human OK); the other is rejected as its
+    twin."""
+    remaining = [
+        row
+        for row in db.pending()
+        if row.id not in set(report.rejected_ids)
+        and "single_pass" in row.raw_payload().get("reasons", [])
+    ]
+    by_doc: dict[str, list[LabResult]] = {}
+    for row in remaining:
+        by_doc.setdefault(row.source_doc, []).append(row)
+
+    used: set[int] = set()
+    for doc_rows in by_doc.values():
+        for i, row_a in enumerate(doc_rows):
+            if row_a.id in used:
+                continue
+            side_a = _pass_side(row_a)
+            if side_a is None:
+                continue
+            for row_b in doc_rows[i + 1 :]:
+                if row_b.id in used:
+                    continue
+                side_b = _pass_side(row_b)
+                if side_b is None or side_b == side_a:
+                    continue
+                if row_a.source_page is None or row_b.source_page is None:
+                    continue
+                if abs(row_a.source_page - row_b.source_page) > PAGE_TOLERANCE:
+                    continue
+                if not _values_match(row_a, row_b):
+                    continue
+                if not _units_compatible(row_a.ucum_unit, row_b.ucum_unit):
+                    continue
+                if not _specimen_compatible(row_a.specimen, row_b.specimen):
+                    continue
+
+                if names_equivalent_by_rule(row_a.name_raw, row_b.name_raw):
+                    method: str = "rule"
+                elif _names_equivalent_by_llm(
+                    client,
+                    row_a.name_raw,
+                    row_b.name_raw,
+                    value=str(row_a.value if row_a.value is not None else row_a.value_text),
+                    page=row_a.source_page,
+                ):
+                    method = "llm"
+                else:
+                    continue
+
+                longer, shorter = (
+                    (row_a, row_b)
+                    if len(clean_result_name(row_a.name_raw))
+                    >= len(clean_result_name(row_b.name_raw))
+                    else (row_b, row_a)
+                )
+                assert longer.id is not None and shorter.id is not None
+                report.checked += 1
+                report.paired += 1
+                report.rejected += 1
+                report.rejected_ids.append(shorter.id)
+                if method == "rule":
+                    report.rejected_rule += 1
+                else:
+                    report.rejected_llm += 1
+                if not dry_run:
+                    db.reject_row_as_twin(shorter.id, twin_of=longer.id, method=method)  # type: ignore[arg-type]
+                    db.mark_single_pass_as_name_variant(longer.id, other_name=shorter.name_raw)
+                used.add(shorter.id)
+                used.add(longer.id)
+                break
+
+    return
 
 
 def write_sweep_summary(repo_root: Path, report: TwinSweepReport, *, at: datetime) -> None:

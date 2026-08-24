@@ -590,6 +590,29 @@ class LabsDb:
         )
         self._conn.commit()
 
+    def mark_single_pass_as_name_variant(self, row_id: int, *, other_name: str) -> None:
+        """Upgrade a `single_pass` PENDING row that the twin sweep paired
+        with its opposite-pass twin: the `single_pass` reason becomes
+        `name_variant` (the agreed bucket) and the twin's differently-worded
+        name is recorded for audit. Status stays PENDING - a human still
+        OKs it, just via the bulk "models agreed" path instead of the
+        disagreement path.
+        """
+        row = self.get_row(row_id)
+        if row is None:
+            raise ValueError(f"mark_single_pass_as_name_variant: no such row {row_id}")
+        payload = row.raw_payload()
+        reasons = [r for r in payload.get("reasons", []) if r != "single_pass"]
+        if "name_variant" not in reasons:
+            reasons.insert(0, "name_variant")
+        payload["reasons"] = reasons
+        payload["name_variant_of"] = other_name
+        self._conn.execute(
+            "UPDATE labs SET raw_json = ? WHERE id = ?",
+            (json.dumps(payload), row_id),
+        )
+        self._conn.commit()
+
     def reject_row_as_twin(
         self, row_id: int, *, twin_of: int, method: Literal["rule", "llm"]
     ) -> None:
