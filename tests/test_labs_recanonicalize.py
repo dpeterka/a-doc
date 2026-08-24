@@ -422,3 +422,36 @@ def test_egfr_race_stratified_variants_never_collapse_onto_one_stored_name(db: L
     assert first is not None and second is not None
     assert first.name == "eGFR (African American)"
     assert second.name == "eGFR (Non-African American)"
+
+
+def test_rename_blocked_when_target_key_held_by_rejected_row(db: LabsDb) -> None:
+    """The table's UNIQUE(date, name, specimen, source_doc) spans REJECTED
+    rows too (found live: curation-rejected FRAX duplicates already held
+    the canonical-name key their kept siblings were being renamed to). A
+    planned rename onto a tombstone's key must simply not happen - stored
+    name kept, counted in `blocked_by_tombstone`, no IntegrityError."""
+    tombstone_id, live_id = db.insert_results(
+        [
+            _row(name="ACTH", name_raw="ACTH"),
+            _row(name="ACTH,PLASMA", name_raw="ACTH,PLASMA", value=2.0),
+        ]
+    )
+    assert tombstone_id is not None and live_id is not None
+    db.reject_row(tombstone_id)
+
+    dry = recanonicalize_rows(db, dry_run=True)
+    live = recanonicalize_rows(db, dry_run=False)
+
+    for report in (dry, live):
+        assert report.checked == 1
+        assert report.renamed == 0
+        assert report.blocked_by_tombstone == 1
+        assert report.untouched == 0
+    stored = db.get_row(live_id)
+    assert stored is not None
+    assert stored.name == "ACTH,PLASMA"
+    assert stored.extraction_status is not ExtractionStatus.REJECTED
+
+    # Idempotent: a second pass reports the same block, still no crash.
+    again = recanonicalize_rows(db, dry_run=False)
+    assert again.blocked_by_tombstone == 1

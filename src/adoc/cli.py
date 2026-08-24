@@ -568,7 +568,8 @@ def _cmd_labs_recanonicalize(args: argparse.Namespace) -> int:
                 f"labs-recanonicalize: dry-run - would rename {report.renamed}, "
                 f"merge {report.merged_duplicates} duplicate(s), "
                 f"queue {report.conflicts_queued} conflict(s), "
-                f"leave {report.untouched} untouched"
+                f"leave {report.untouched} untouched, "
+                f"block {report.blocked_by_tombstone} on rejected-row key(s)"
             )
             return 0
 
@@ -587,6 +588,11 @@ def _cmd_labs_recanonicalize(args: argparse.Namespace) -> int:
     print(f"labs-recanonicalize: merged {report.merged_duplicates} duplicate(s)")
     print(f"labs-recanonicalize: queued {report.conflicts_queued} conflict(s)")
     print(f"labs-recanonicalize: left {report.untouched} untouched")
+    if report.blocked_by_tombstone:
+        print(
+            f"labs-recanonicalize: {report.blocked_by_tombstone} rename(s) blocked - "
+            "target key held by a rejected row (stored name kept)"
+        )
     return 0
 
 

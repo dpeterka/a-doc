@@ -965,6 +965,18 @@ class LabsDb:
         ).fetchall()
         return [_row_to_lab(row) for row in rows]
 
+    def rejected_row_keys(self) -> set[tuple[str, str, str, str]]:
+        """The `(date, name, specimen, source_doc)` keys currently held by
+        REJECTED rows. The table's UNIQUE constraint spans rejected rows
+        too, so `adoc labs-recanonicalize`'s planner must treat these
+        tombstones as key-occupants: a rename targeting one of these keys
+        would raise IntegrityError even though no live row sits there."""
+        rows = self._conn.execute(
+            "SELECT date, name, specimen, source_doc FROM labs WHERE extraction_status = ?",
+            (ExtractionStatus.REJECTED.value,),
+        ).fetchall()
+        return {(r[0], r[1], r[2], r[3]) for r in rows}
+
     def rename_for_recanonicalization(self, row_id: int, new_name: str) -> None:
         """Set `row_id`'s `name` to `new_name` directly, without touching
         `extraction_status` (mirrors `update_specimen` - a deterministic
