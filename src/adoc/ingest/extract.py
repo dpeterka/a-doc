@@ -75,6 +75,13 @@ guessing a specific reading.
 """
 
 
+# Dense multi-page lab panels produce large JSON: the 4096-token default
+# silently truncated a real LabCorp panel to a single row. Sized for the
+# largest panels seen plus headroom; truncation is also detected hard in
+# vision.py via stop_reason.
+EXTRACTION_MAX_TOKENS = 16384
+
+
 def double_pass_extract(
     vision: VisionClient, archived: ArchivedDoc
 ) -> tuple[DocumentExtraction, DocumentExtraction]:
@@ -89,6 +96,7 @@ def double_pass_extract(
             )
         ],
         schema=DocumentExtraction,
+        max_tokens=EXTRACTION_MAX_TOKENS,
     )
 
     page_parts: list[TextPart | ImagePart] = []
@@ -102,6 +110,7 @@ def double_pass_extract(
         system=PROMPT_B,
         parts=page_parts,
         schema=DocumentExtraction,
+        max_tokens=EXTRACTION_MAX_TOKENS,
     )
 
     return pass_a, pass_b

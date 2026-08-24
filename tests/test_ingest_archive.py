@@ -88,3 +88,16 @@ def test_pdftoppm_renderer_raises_clear_error_when_binary_missing(
     db = LabsDb(tmp_path / "labs.sqlite")
     with pytest.raises(ArchiveError, match="pdftoppm"):
         archive_document(tmp_path / "data-repo", tiny_pdf_path, db=db)
+
+
+def test_archive_rejects_non_pdf_files(tmp_path: Path) -> None:
+    """Junk/docx must never reach the immutable sources/ store."""
+    import pytest
+
+    from adoc.ingest.archive import ArchiveError, archive_document
+
+    bogus = tmp_path / "notes.docx"
+    bogus.write_bytes(b"PK\x03\x04 not a pdf")
+
+    with pytest.raises(ArchiveError, match="not a PDF"):
+        archive_document(tmp_path, bogus, db=None, renderer=None)  # type: ignore[arg-type]
