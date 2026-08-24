@@ -212,11 +212,23 @@ _QUALITATIVE_RANGE_INDEX: dict[str, str] = {
 
 
 def _normalize_range_text(text: str) -> str:
-    """Unicode-dash-unify, collapse whitespace, casefold - the first
-    normalization pass `ref_ranges_equivalent` applies before trying to
-    strip a trailing unit token or parse the result's semantics."""
+    """Unicode-dash-unify, collapse whitespace, casefold, and strip a
+    leading "reference range:"/"ref range:"/"range:" label (real corpus:
+    '"Reference Range: NEGATIVE" vs "NEGATIVE"') - the first normalization
+    pass `ref_ranges_equivalent` applies before trying to strip a trailing
+    unit token or parse the result's semantics."""
     unified = text.translate(_DASH_TRANSLATION)
-    return re.sub(r"\s+", " ", unified.strip()).casefold()
+    collapsed = re.sub(r"\s+", " ", unified.strip()).casefold()
+    return re.sub(r"^(reference range|ref\.? range|range)\s*:\s*", "", collapsed)
+
+
+_SEE_NOTE_RE = re.compile(r"^see (note|comment)s?\b", re.IGNORECASE)
+
+
+def _is_range_pointer(text: str | None) -> bool:
+    """A "See Note 2"-style pointer carries no range semantics of its own -
+    treated as absent (the note's content lives in narrative_findings)."""
+    return text is not None and bool(_SEE_NOTE_RE.match(text.strip()))
 
 
 def _normalize_unit_token(text: str) -> str:
@@ -285,9 +297,12 @@ def ref_ranges_equivalent(
     corpus: 783 of 1159 queued rows), e.g. `"<20"` vs. `"<20 Units"`, or
     `"3.80-5.10"` vs. `"3.80 - 5.10 Million/uL"`.
 
-    Both None/empty -> equivalent (nothing printed by either pass). Exactly
-    one side empty -> NOT equivalent (a real omission difference - still
-    worth a human look, so it keeps queueing). Otherwise: normalize both
+    Both None/empty -> equivalent (nothing printed by either pass); a
+    "See Note N"-style pointer is treated as empty (no range semantics of
+    its own). Exactly one side empty -> NOT equivalent here, but the
+    caller downgrades that shape to the non-disagreement reason
+    `ref_range_single_source` when the provided side parses (a
+    completeness difference, not a conflict). Otherwise: normalize both
     (unicode dashes -> '-', collapse whitespace, casefold, strip a trailing
     unit token that matches either pass's own unit or a known synonym), then
     parse each side's semantics (numeric range / threshold / titer-threshold
@@ -296,8 +311,8 @@ def ref_ranges_equivalent(
     parse does this fall back to normalized-string equality; one side
     parsing and the other not is treated as a real difference.
     """
-    a_empty = a_raw is None or not a_raw.strip()
-    b_empty = b_raw is None or not b_raw.strip()
+    a_empty = a_raw is None or not a_raw.strip() or _is_range_pointer(a_raw)
+    b_empty = b_raw is None or not b_raw.strip() or _is_range_pointer(b_raw)
     if a_empty and b_empty:
         return True
     if a_empty != b_empty:
@@ -349,17 +364,45 @@ _FLAG_WORD_TO_CODE: dict[str, str] = {
 _UNFLAGGED_WORDS = frozenset({"n", "normal"})
 
 
+# Single letters LabCorp prints as performing-site/footnote markers, NOT
+# result flags (real corpus: 'B'/'C'/'D'/'F' vs None on 127 rows). 'A' is
+# deliberately NOT here: it is a legitimate Abnormal code, so an
+# 'A'-vs-absent pair stays a real, human-reviewable disagreement even
+# though some reports use 'A' as a footnote letter too - safety first.
+_FOOTNOTE_LETTERS = frozenset({"b", "c", "d", "e", "f", "g"})
+
+
 def _resolve_flag_token(raw: str | None) -> str:
     """`raw`'s canonical flag code, `""` for absent/unflagged, or the
     (casefolded) raw token itself if unrecognized - so two unrecognized-but-
     identical spellings still compare equal without silently treating them
-    as unflagged."""
+    as unflagged.
+
+    A comma/space-separated multi-token field is resolved token-wise
+    ('High, H' == 'High' == 'H'): recognized flag codes win; footnote
+    letters and bare digits carry no flag information and are dropped.
+    """
     if raw is None:
         return ""
     text = re.sub(r"\s+", " ", raw.strip()).casefold()
     if not text or text in _UNFLAGGED_WORDS:
         return ""
-    return _FLAG_WORD_TO_CODE.get(text, text)
+    if text in _FLAG_WORD_TO_CODE:
+        return _FLAG_WORD_TO_CODE[text]
+    codes: set[str] = set()
+    informative: list[str] = []
+    for token in re.split(r"[,;/ ]+", text):
+        if not token or token in _UNFLAGGED_WORDS:
+            continue
+        if token in _FLAG_WORD_TO_CODE:
+            codes.add(_FLAG_WORD_TO_CODE[token])
+        elif token in _FOOTNOTE_LETTERS or token.isdigit():
+            continue  # site/footnote marker - no flag information
+        else:
+            informative.append(token)
+    if codes:
+        return max(codes, key=len) if len(codes) > 1 else next(iter(codes))
+    return " ".join(informative)
 
 
 def flags_equivalent(a_raw: str | None, b_raw: str | None) -> bool:
@@ -748,7 +791,16 @@ def _evaluate_pair(
     if not unit_match:
         reasons.append(f"unit_mismatch: {a.unit_raw!r} vs {b.unit_raw!r}")
     if not ref_match:
-        reasons.append(f"ref_range_mismatch: {a.ref_range_raw!r} vs {b.ref_range_raw!r}")
+        a_ref_empty = not (a.ref_range_raw or "").strip() or _is_range_pointer(a.ref_range_raw)
+        b_ref_empty = not (b.ref_range_raw or "").strip() or _is_range_pointer(b.ref_range_raw)
+        if a_ref_empty != b_ref_empty:
+            # Exactly one pass transcribed a range while value/unit agreed:
+            # a completeness difference, not a conflict - lands in the
+            # agreed (bulk-OK) bucket rather than "needs your eyes".
+            provided = a.ref_range_raw if b_ref_empty else b.ref_range_raw
+            reasons.append(f"ref_range_single_source: {provided!r}")
+        else:
+            reasons.append(f"ref_range_mismatch: {a.ref_range_raw!r} vs {b.ref_range_raw!r}")
     if not flag_match:
         reasons.append(f"flag_mismatch: {a.flag_raw!r} vs {b.flag_raw!r}")
     if not specimen_match:

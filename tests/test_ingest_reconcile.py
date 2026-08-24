@@ -688,3 +688,60 @@ def test_rescue_accepts_residual_risk_when_units_are_compatible(tmp_path: Path) 
     assert len(rows) == 1
     assert rows[0].status == "pending"
     assert "name_variant" in rows[0].reasons
+
+
+@pytest.mark.parametrize(
+    ("flag_a", "flag_b", "equivalent"),
+    [
+        ("C", None, True),  # LabCorp performing-site footnote, not a flag
+        ("B", None, True),
+        ("D", None, True),
+        ("F", None, True),
+        ("High, H", "High", True),  # word+code duplication
+        ("Abnormal, C", "Abnormal", True),  # code + footnote
+        ("A, C", "A", True),
+        ("A", None, False),  # 'A' is a real Abnormal code - stays reviewable
+        ("H", None, False),  # real missed flag
+    ],
+)
+def test_flag_footnote_and_multitoken_equivalence(
+    flag_a: str | None, flag_b: str | None, equivalent: bool
+) -> None:
+    from adoc.ingest.reconcile import flags_equivalent
+
+    assert flags_equivalent(flag_a, flag_b) is equivalent
+
+
+@pytest.mark.parametrize(
+    ("ref_a", "ref_b", "equivalent"),
+    [
+        ("Reference Range: NEGATIVE", "NEGATIVE", True),
+        ("Reference Range: NOT DETECTED", "NOT DETECTED", True),
+        ("See Note 2", None, True),  # pointer carries no range semantics
+        (None, "See note 12", True),
+        ("<20", "<30", False),  # guard: real range conflict stays
+    ],
+)
+def test_ref_range_label_prefix_and_pointer_equivalence(
+    ref_a: str | None, ref_b: str | None, equivalent: bool
+) -> None:
+    from adoc.ingest.reconcile import ref_ranges_equivalent
+
+    assert ref_ranges_equivalent(ref_a, ref_b) is equivalent
+
+
+def test_single_source_ref_range_is_agreed_not_disagreement(tmp_path: Path) -> None:
+    """Exactly one pass transcribed the range (value/unit agree): queues in
+    the agreed bucket via ref_range_single_source, never 'needs eyes'."""
+    from adoc.ingest.reconcile import row_is_agreed
+
+    pass_a = _doc([_result(ref_range_raw="IgG <1:64")])
+    pass_b = _doc([_result(ref_range_raw=None)])
+
+    rows = reconcile(pass_a, pass_b, _empty_db(tmp_path))
+
+    assert len(rows) == 1
+    assert rows[0].status == "pending"
+    assert any(r.startswith("ref_range_single_source") for r in rows[0].reasons)
+    assert not any(r.startswith("ref_range_mismatch") for r in rows[0].reasons)
+    assert row_is_agreed(rows[0].reasons)
