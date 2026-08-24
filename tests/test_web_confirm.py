@@ -147,3 +147,49 @@ def test_correct_action_with_no_fields_shows_an_error(tmp_path: Path) -> None:
     row = db.get_row(row_id)
     assert row is not None
     assert row.extraction_status == ExtractionStatus.PENDING
+
+
+_DOCX_SHA = "e" * 64
+
+
+def _seed_pending_row_with_no_page_image(repo, db) -> int:
+    """A lab-classified docx's pending row: `documents` row present, but no
+    `sources/pages/<sha>/` directory at all - the docx path never renders
+    page images (PLAN.md docx ingestion: docx = TEXT documents)."""
+    db.upsert_document(
+        LabDocument(sha256=_DOCX_SHA, filename="home-lab.docx", doc_type="lab_report", page_count=1)
+    )
+    [row_id] = db.insert_results(
+        [
+            LabResult(
+                date=date(2026, 8, 1),
+                name="potassium",
+                name_raw="Potassium",
+                value=4.1,
+                ucum_unit="mmol/L",
+                source_doc=_DOCX_SHA,
+                source_page=1,
+                extraction_status=ExtractionStatus.PENDING,
+                raw_json=json.dumps({}),
+            )
+        ]
+    )
+    assert row_id is not None
+    return row_id
+
+
+def test_confirm_queue_shows_text_fallback_when_no_page_image_exists(tmp_path: Path) -> None:
+    app, repo, db, _calls = build_app(tmp_path)
+    row_id = _seed_pending_row_with_no_page_image(repo, db)
+    client = TestClient(app)
+    login(client)
+
+    response = client.get("/confirm")
+
+    assert response.status_code == 200
+    assert "Potassium" in response.text
+    assert f"/confirm/{row_id}/confirm" in response.text
+    # no broken <img> for a document with no rendered page image
+    assert "<img" not in response.text
+    assert "Text document" in response.text
+    assert "no page image" in response.text.lower()

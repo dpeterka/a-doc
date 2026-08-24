@@ -39,6 +39,13 @@ class Encounter(BaseModel):
     summary: str = ""
     new_findings: str = ""
     plan: str = ""
+    extracted_text: str = ""
+    """Full verbatim text of a source docx narrative document (PLAN.md docx
+    ingestion: "narrative docs become full-text encounters" - the context
+    pack needs the FULL extracted text, not a summary). Rendered as an
+    optional trailing `## Extracted text` section; empty for every
+    non-docx-sourced encounter, so existing encounter files round-trip
+    unchanged."""
 
 
 def slugify(text: str) -> str:
@@ -69,6 +76,8 @@ def render_encounter(encounter: Encounter) -> str:
         f"## New findings\n\n{encounter.new_findings.strip()}\n\n"
         f"## Plan / follow-ups\n\n{encounter.plan.strip()}\n"
     )
+    if encounter.extracted_text.strip():
+        body += f"\n## Extracted text\n\n{encounter.extracted_text.strip()}\n"
     return f"{_FRONTMATTER_DELIM}\n{buf.getvalue()}{_FRONTMATTER_DELIM}\n\n{body}"
 
 
@@ -91,6 +100,7 @@ def parse_encounter(text: str) -> Encounter:
         summary=sections.get("Summary", ""),
         new_findings=sections.get("New findings", ""),
         plan=sections.get("Plan / follow-ups", ""),
+        extracted_text=sections.get("Extracted text", ""),
     )
 
 

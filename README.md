@@ -32,6 +32,28 @@ charts) is page CRUD, and only part of it is chat.
 See `PLAN.md` for the full research-backed rationale, phasing, and schemas,
 and `CLAUDE.md` for agent/contributor rules.
 
+## Supported input types
+
+The Dropbox inbox / manual upload accept two document kinds, detected by
+content (never by filename extension alone — see `ingest/filetypes.py`):
+
+- **PDF** (`%PDF-` magic): archived immutably, page images rendered via
+  `pdftoppm`, and read by the vision double-pass extractor (a PDF-native
+  pass + a rendered-page-image pass, cross-model).
+- **`.docx`** (a real OOXML zip package, `.docx` suffix): archived
+  immutably like a PDF but with **no page rendering** — a-doc reads it
+  directly as TEXT with `python-docx` (a pure-Python dependency; no
+  LibreOffice/PDF conversion step). A lab-classified `.docx` goes through
+  the same cross-model double-pass and reconcile/confirm-queue gates as a
+  PDF lab report (page numbers default to 1 — a `.docx` has no page
+  structure); a narrative `.docx` (clinical history, supplement plan)
+  becomes a full-text `patient-report`/`imaging` encounter carrying the
+  complete extracted text.
+
+Anything else is rejected with a clear error asking for a PDF or `.docx`.
+Because a `.docx` has no page image, its confirm-queue rows show a text
+fallback panel instead of a source-page image.
+
 ## Setup
 
 ```bash

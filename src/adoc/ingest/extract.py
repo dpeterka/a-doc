@@ -19,6 +19,7 @@ from __future__ import annotations
 from adoc.ingest.archive import ArchivedDoc
 from adoc.ingest.schema import DocumentExtraction
 from adoc.ingest.vision import ImagePart, PdfPart, TextPart, VisionClient
+from adoc.reason.client import LlmClient, Message
 
 PROMPT_A_VERSION = "extractor-pass-a-v1"
 PROMPT_A = f"""[{PROMPT_A_VERSION}]
@@ -113,4 +114,98 @@ def double_pass_extract(
         max_tokens=EXTRACTION_MAX_TOKENS,
     )
 
+    return pass_a, pass_b
+
+
+# --------------------------------------------------------------------------
+# docx text double-pass (PLAN.md docx ingestion design decision: docx = TEXT
+# documents; no vision needed - `extractor_pass_a`/`extractor_pass_b`'s
+# bound models, claude-sonnet-5 and gpt-5.2, both handle plain text
+# natively, so this goes through `LlmClient.complete` rather than
+# `VisionClient.extract`).
+# --------------------------------------------------------------------------
+
+DOCX_PROMPT_A_VERSION = "docx-extractor-pass-a-v1"
+DOCX_PROMPT_A = f"""[{DOCX_PROMPT_A_VERSION}]
+You are extracting structured data from ONE .docx document, provided below
+as its full plain text (paragraphs in reading order; any tables rendered
+as pipe-delimited rows). This document has no page images - it was
+authored directly as text (a narrative document or a lab report exported
+to Word), not scanned.
+
+Return a single DocumentExtraction:
+- doc_type: your best classification (lab_report / clinical_note /
+  imaging_report / other).
+- facility, collection_date, report_date: from the text, if mentioned (use
+  ISO dates; omit a field if it is absent).
+- results: EVERY discrete lab analyte/result row you can find in the text
+  or in a rendered table, each with the exact name as written (name_raw),
+  its numeric value (value) or textual value such as a titer or
+  "positive"/"negative" (value_text), the unit as written (unit_raw), the
+  reference range as written (ref_range_raw), any H/L/HH/LL/A flag as
+  written (flag_raw), `page` set to 1 for every row (this document has no
+  page structure to report), and your confidence (high/medium/low) in this
+  specific row.
+- narrative_findings: free-text clinical observations or serology comments
+  that are not discrete result rows (these matter for autoimmune workups -
+  do not skip them).
+- illegible_regions: leave empty unless the text itself is garbled or
+  truncated - there is no scan quality to assess in a text document.
+
+Transcribe exactly what is written. Do not infer, normalize, or guess a
+value that is not in the text - never fabricate a result that is not
+present in the document.
+"""
+
+DOCX_PROMPT_B_VERSION = "docx-extractor-pass-b-v1"
+DOCX_PROMPT_B = f"""[{DOCX_PROMPT_B_VERSION}]
+You are independently re-reading the SAME .docx document's extracted text
+a SECOND, INDEPENDENT time. This is used to cross-check a separate model's
+reading of the same text - do not assume any other reading is correct;
+read the text fresh, from scratch, as if this were the first time you had
+seen it.
+
+Work through the text top to bottom. For every result row, table entry, or
+discrete lab value you find, emit one entry in `results` with: the label
+exactly as written (name_raw), the numeric (value) or textual (value_text)
+reading, the unit as written (unit_raw), the reference interval as written
+(ref_range_raw), any abnormal flag as written (flag_raw), `page` set to 1
+for every row (this document has no page structure to report), and a
+high/medium/low confidence for that specific reading based on how
+unambiguous the text is.
+
+Also set doc_type, facility, collection_date, and report_date from
+wherever the text states them; collect any narrative or serology
+commentary in narrative_findings; leave illegible_regions empty unless the
+text itself is genuinely garbled or truncated. If a value is ambiguous,
+prefer confidence=low over guessing a specific reading.
+"""
+
+
+def double_pass_extract_text(
+    client: LlmClient, text: str
+) -> tuple[DocumentExtraction, DocumentExtraction]:
+    """Cross-model double-pass extraction over a `.docx` document's plain
+    text (see `ingest.docx.extract_docx_text`). Both passes go through
+    `LlmClient.complete` - a docx has no binary pages to send, and the
+    `extractor_pass_a`/`extractor_pass_b` roles' bound models handle plain
+    text natively. `results[].page` always resolves to 1 (see the prompts
+    above) - a docx has no page structure to report.
+    """
+    pass_a = client.complete(
+        "extractor_pass_a",
+        system=DOCX_PROMPT_A,
+        messages=[Message(role="user", content=text)],
+        schema=DocumentExtraction,
+        max_tokens=EXTRACTION_MAX_TOKENS,
+    ).parsed
+    pass_b = client.complete(
+        "extractor_pass_b",
+        system=DOCX_PROMPT_B,
+        messages=[Message(role="user", content=text)],
+        schema=DocumentExtraction,
+        max_tokens=EXTRACTION_MAX_TOKENS,
+    ).parsed
+    assert isinstance(pass_a, DocumentExtraction)  # schema= guarantees this
+    assert isinstance(pass_b, DocumentExtraction)
     return pass_a, pass_b
