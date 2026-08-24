@@ -239,6 +239,11 @@ def report_ledger_hypotheses(repo: DataRepo) -> list[Hypothesis]:
 def test_blind_panel_precondition_fires_if_ledger_sneaks_into_context(
     repo: DataRepo, db: LabsDb
 ) -> None:
+    """`forbid_context_key("ledger")`'s original, narrower purpose: a
+    `"ledger"` key smuggled directly into the run context (as opposed to a
+    context pack that itself carries a ledger section — see the
+    content-aware `edge_payload_lacks_section` regression test below) must
+    still trip it."""
     _seed_ledger(repo)
 
     def _explode(request: TransportRequest) -> TransportResponse:
@@ -268,6 +273,43 @@ def test_blind_context_pack_never_includes_the_ledger(repo: DataRepo, db: LabsDb
     pack = build_context(repo, db, include_ledger=False)
     assert "ledger" not in pack.keys
     assert "Systemic lupus erythematosus" not in pack.render()
+
+
+def test_blind_panel_content_aware_precondition_fires_when_the_pack_itself_leaks_the_ledger(
+    repo: DataRepo, db: LabsDb
+) -> None:
+    """S2 regression: `forbid_context_key("ledger")` only ever inspected the
+    run-context DICT's keys, never the blind-panel node's actual input
+    payload — the panel's `ContextPack` lives under the `blind_context_pack`
+    run-context key, so a real regression where that pack was built with
+    `include_ledger=True` would sail past `forbid_context_key` untouched
+    (the run context never gets a `"ledger"` entry in this DAG at all).
+    `edge_payload_lacks_section("ledger")` inspects the payload's own
+    `.keys` directly and must catch this."""
+    _seed_ledger(repo)
+
+    def _explode(request: TransportRequest) -> TransportResponse:
+        raise AssertionError("transport must never be called once the precondition fails")
+
+    client = _build_client(_explode)
+    dag = build_review_dag(client, repo, db, repo.root / LEDGER_RELPATH, clock=_fixed_clock)
+    # The actual regression this guards against: build_context is called
+    # with include_ledger=True for what should have been the BLIND panel's
+    # pack, and handed to run() under the correct "blind_context_pack" key
+    # (no "ledger" key is smuggled into the run context at all).
+    leaky_context_pack = build_context(repo, db, include_ledger=True)
+
+    with pytest.raises(ContractViolation) as excinfo:
+        dag_run(
+            dag,
+            {
+                "initial": Marker(),
+                "blind_context_pack": leaky_context_pack,
+            },
+        )
+
+    assert excinfo.value.contract_name == "edge_payload_lacks_section:ledger"
+    assert excinfo.value.node == "blind_panel_0"
 
 
 # --- negative tests: completeness postconditions ------------------------------------------------
@@ -320,6 +362,129 @@ def test_challenge_sweep_completeness_contract_fires_on_missing_note(
         run_weekly_review(repo, db, client, clock=_fixed_clock)
 
     assert excinfo.value.contract_name == "challenge_sweep_covers_every_active_hypothesis"
+
+
+# --- S4 remediation: completeness postconditions require SUBSTANCE, not just non-empty --------
+
+
+def test_adjudication_completeness_contract_fires_on_a_too_short_rationale(
+    repo: DataRepo, db: LabsDb
+) -> None:
+    """A decision covering every divergence used to be enough, even if the
+    rationale was a placeholder like "."; the contract must now require at
+    least `MIN_SUBSTANTIVE_LENGTH` characters after stripping."""
+    _seed_ledger(repo)
+    calls: list[TransportRequest] = []
+    base_transport = _happy_path_transport(calls)
+
+    def transport(request: TransportRequest) -> TransportResponse:
+        response = base_transport(request)
+        assert request.schema is not None
+        if request.schema.__name__ == "AdjudicationPayload":
+            decisions = json.loads(json.dumps(response.tool_input["decisions"]))  # type: ignore[index]
+            decisions[0]["rationale"] = "."
+            return TransportResponse(
+                text="", tool_input={"decisions": decisions}, input_tokens=1, output_tokens=1
+            )
+        return response
+
+    client = _build_client(transport)
+
+    with pytest.raises(ContractViolation) as excinfo:
+        run_weekly_review(repo, db, client, clock=_fixed_clock)
+
+    assert excinfo.value.contract_name == "adjudication_covers_every_divergence"
+    assert "too short" in excinfo.value.message
+
+
+def test_adjudication_completeness_contract_fires_on_identical_rationale_everywhere(
+    repo: DataRepo, db: LabsDb
+) -> None:
+    """A model stamping the same sentence across every divergence is not a
+    substantive, per-divergence adjudication, even if that sentence is long
+    enough on its own."""
+    _seed_ledger(repo)
+    calls: list[TransportRequest] = []
+    base_transport = _happy_path_transport(calls)
+    stamped = "Reviewed and no change is warranted at this time."
+
+    def transport(request: TransportRequest) -> TransportResponse:
+        response = base_transport(request)
+        assert request.schema is not None
+        if request.schema.__name__ == "AdjudicationPayload":
+            decisions = json.loads(json.dumps(response.tool_input["decisions"]))  # type: ignore[index]
+            for decision in decisions:
+                decision["rationale"] = stamped
+            return TransportResponse(
+                text="", tool_input={"decisions": decisions}, input_tokens=1, output_tokens=1
+            )
+        return response
+
+    client = _build_client(transport)
+
+    with pytest.raises(ContractViolation) as excinfo:
+        run_weekly_review(repo, db, client, clock=_fixed_clock)
+
+    assert excinfo.value.contract_name == "adjudication_covers_every_divergence"
+    assert "identical" in excinfo.value.message
+
+
+def test_challenge_sweep_completeness_contract_fires_on_a_too_short_note(
+    repo: DataRepo, db: LabsDb
+) -> None:
+    _seed_ledger(repo)
+    calls: list[TransportRequest] = []
+    base_transport = _happy_path_transport(calls)
+
+    def transport(request: TransportRequest) -> TransportResponse:
+        response = base_transport(request)
+        assert request.schema is not None
+        if request.schema.__name__ == "ChallengeSweepPayload":
+            notes = json.loads(json.dumps(response.tool_input["notes"]))  # type: ignore[index]
+            notes[0]["note"] = "reviewed"
+            return TransportResponse(
+                text="", tool_input={"notes": notes}, input_tokens=1, output_tokens=1
+            )
+        return response
+
+    client = _build_client(transport)
+
+    with pytest.raises(ContractViolation) as excinfo:
+        run_weekly_review(repo, db, client, clock=_fixed_clock)
+
+    assert excinfo.value.contract_name == "challenge_sweep_covers_every_active_hypothesis"
+    assert "too short" in excinfo.value.message
+
+
+def test_challenge_sweep_completeness_contract_fires_on_identical_notes_everywhere(
+    repo: DataRepo, db: LabsDb
+) -> None:
+    """A model stamping the same note across every active hypothesis is not
+    a substantive, per-hypothesis challenge sweep."""
+    _seed_ledger(repo)
+    calls: list[TransportRequest] = []
+    base_transport = _happy_path_transport(calls)
+    stamped = "Reviewed again this week; nothing has changed."
+
+    def transport(request: TransportRequest) -> TransportResponse:
+        response = base_transport(request)
+        assert request.schema is not None
+        if request.schema.__name__ == "ChallengeSweepPayload":
+            notes = json.loads(json.dumps(response.tool_input["notes"]))  # type: ignore[index]
+            for note in notes:
+                note["note"] = stamped
+            return TransportResponse(
+                text="", tool_input={"notes": notes}, input_tokens=1, output_tokens=1
+            )
+        return response
+
+    client = _build_client(transport)
+
+    with pytest.raises(ContractViolation) as excinfo:
+        run_weekly_review(repo, db, client, clock=_fixed_clock)
+
+    assert excinfo.value.contract_name == "challenge_sweep_covers_every_active_hypothesis"
+    assert "identical" in excinfo.value.message
 
 
 # --- deterministic metrics, from synthetic fixtures (no DAG, no client) ------------------------

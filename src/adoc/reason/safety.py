@@ -310,11 +310,55 @@ _DOSAGE_RE = re.compile(
     re.IGNORECASE,
 )
 
-_IMPERATIVE_VERB_RE = re.compile(
-    r"\b(take|start|stop|increase|decrease|taper)\b\s+"
-    r"(?:your\s+|the\s+|a\s+|an\s+|his\s+|her\s+|my\s+)?"
-    r"([A-Za-z][A-Za-z0-9\-]{2,})",
-    re.IGNORECASE,
+# Imperative/hortative treatment-construction verbs (base + inflected forms,
+# including the gerund — "stop TAKING your prednisone", "I recommend
+# TAPERING") that anchor an instruction to start/stop/change a medication.
+# Deliberately word-level, not phrase-level: "you should take", "I recommend
+# tapering", "consider taking" are all caught by the bare verb form itself
+# ("take"/"tapering"/"taking") without needing to special-case the hortative
+# prefix — the prefix never changes whether the sentence is an instruction.
+_IMPERATIVE_VERB_FORMS: dict[str, str] = {
+    form: base
+    for base, forms in {
+        "take": ("take", "takes", "taking", "took"),
+        "start": ("start", "starts", "starting", "started"),
+        "stop": ("stop", "stops", "stopping", "stopped"),
+        "increase": ("increase", "increases", "increasing", "increased"),
+        "decrease": ("decrease", "decreases", "decreasing", "decreased"),
+        "taper": ("taper", "tapers", "tapering", "tapered"),
+        "switch": ("switch", "switches", "switching", "switched"),
+        "resume": ("resume", "resumes", "resuming", "resumed"),
+        "discontinue": ("discontinue", "discontinues", "discontinuing", "discontinued"),
+        "add": ("add", "adds", "adding", "added"),
+    }.items()
+    for form in forms
+}
+
+# How far past the anchor verb (in word tokens, within the same clause) a
+# drug-like token or dosing pattern still counts as governed by that verb —
+# "increase YOUR DOSE OF metformin" is 4 tokens; "take two tablets of
+# ibuprofen" is 4 tokens. ~8 tokens per the treatment_gate spec, generous on
+# purpose (a false positive here costs a little friction; a missed dosing
+# instruction does not get a second chance).
+_IMPERATIVE_WINDOW_TOKENS = 8
+
+_WORD_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9']*")
+
+# Clause boundaries for the imperative-verb window scan: a drug name several
+# sentences away from an unrelated "stop"/"start" must never link up with it.
+_CLAUSE_BOUNDARY_RE = re.compile(r"[.!?;\n]+")
+
+# The documented allowlist carve-out: a clause that defers the actual
+# decision to a clinician ("ask your doctor about tapering prednisone",
+# "worth discussing whether to taper prednisone with your rheumatologist")
+# describes a conversation to have, not an instruction to follow, so it is
+# allowed to name a drug alongside an otherwise-gating verb.
+_DEFER_TO_CLINICIAN_VERB_RE = re.compile(
+    r"\b(?:ask(?:ing|ed)?|discuss(?:ing|ed)?|talk(?:ing|ed)?)\b"
+)
+_CLINICIAN_REFERENT_RE = re.compile(
+    r"\b(?:doctor|doctors|physician|physicians|clinician|clinicians|specialist|specialists|"
+    r"provider|providers|\w*ologist|\w*ologists|\w*iatrist|\w*iatrists)\b"
 )
 
 # Curated drug/supplement vocabulary + suffix shapes, so an imperative verb
@@ -339,6 +383,7 @@ _DRUG_KEYWORDS = frozenset(
         "hydroxychloroquine",
         "plaquenil",
         "methotrexate",
+        "levothyroxine",
         "biotin",
         "vitamin",
         "iron",
@@ -362,6 +407,8 @@ _DRUG_SUFFIXES = (
     "pril",
     "olol",
     "azole",
+    "prazole",
+    "sartan",
     "cillin",
     "statin",
     "done",
@@ -374,19 +421,78 @@ _DRUG_SUFFIXES = (
 
 
 def _is_drug_like(token: str) -> bool:
-    lowered = token.lower().strip(".,;:")
+    lowered = token.lower().strip(".,;:'\"")
     if lowered in _DRUG_KEYWORDS:
         return True
     return any(lowered.endswith(suffix) for suffix in _DRUG_SUFFIXES)
+
+
+def _is_deferred_to_clinician(clause: str) -> bool:
+    """True when `clause` defers the actual decision to a clinician — see
+    `_DEFER_TO_CLINICIAN_VERB_RE`'s docstring-comment above."""
+    return bool(
+        _DEFER_TO_CLINICIAN_VERB_RE.search(clause) and _CLINICIAN_REFERENT_RE.search(clause)
+    )
+
+
+def _split_clauses(text: str) -> list[tuple[int, str]]:
+    """Split `text` into `(start_offset, clause_text)` pieces on sentence/
+    clause boundaries, so the imperative-verb window scan (and the
+    defer-to-clinician allowlist check) never reaches across an unrelated
+    clause."""
+    clauses: list[tuple[int, str]] = []
+    start = 0
+    for match in _CLAUSE_BOUNDARY_RE.finditer(text):
+        clauses.append((start, text[start : match.start()]))
+        start = match.end()
+    clauses.append((start, text[start:]))
+    return clauses
+
+
+def _imperative_treatment_spans(text: str) -> list[GateSpan]:
+    """Scan each clause of `text` for an imperative/hortative treatment
+    construction (start/stop/take/increase/decrease/taper/switch/resume/
+    discontinue/add — including "you should take", "I recommend tapering",
+    "consider taking") followed, within `_IMPERATIVE_WINDOW_TOKENS` word
+    tokens and the SAME clause, by a drug-like token. The window tolerates
+    anything in between (determiners, pronouns, quantities, "dose of",
+    "tablets of", ...) rather than requiring an exact shape, since a real
+    sentence reorders and pads this construction in many ways and a false
+    positive here is cheap. A clause that defers the decision to a
+    clinician is exempted (see `_is_deferred_to_clinician`).
+    """
+    spans: list[GateSpan] = []
+    for clause_start, clause_text in _split_clauses(text):
+        if _is_deferred_to_clinician(clause_text):
+            continue
+        tokens = list(_WORD_TOKEN_RE.finditer(clause_text))
+        for i, token in enumerate(tokens):
+            if token.group(0).lower() not in _IMPERATIVE_VERB_FORMS:
+                continue
+            window = tokens[i + 1 : i + 1 + _IMPERATIVE_WINDOW_TOKENS]
+            drug_token = next((t for t in window if _is_drug_like(t.group(0))), None)
+            if drug_token is None:
+                continue
+            span_start = clause_start + token.start()
+            span_end = clause_start + drug_token.end()
+            spans.append(
+                GateSpan(
+                    start=span_start,
+                    end=span_end,
+                    text=text[span_start:span_end],
+                    reason="imperative/hortative treatment instruction",
+                )
+            )
+    return spans
 
 
 def treatment_gate(text: str) -> GateResult:
     """Deterministic scan blocking dosing/prescriptive treatment instructions.
 
     Allowed (deliberately not flagged): naming a test to request, naming a
-    specialist type, or describing what doctors typically consider — none of
-    those trip either detector below, so no explicit allowlist regex is
-    needed beyond the detectors themselves being narrow.
+    specialist type, describing what doctors typically consider, or a
+    clause that defers the actual decision to a clinician ("ask your doctor
+    about tapering prednisone") — none of those trip either detector below.
     """
     spans: list[GateSpan] = []
 
@@ -400,17 +506,7 @@ def treatment_gate(text: str) -> GateResult:
             )
         )
 
-    for match in _IMPERATIVE_VERB_RE.finditer(text):
-        drug_token = match.group(2)
-        if _is_drug_like(drug_token):
-            spans.append(
-                GateSpan(
-                    start=match.start(),
-                    end=match.end(),
-                    text=match.group(0),
-                    reason="imperative medication instruction",
-                )
-            )
+    spans.extend(_imperative_treatment_spans(text))
 
     if not spans:
         return GateResult(passed=True)
