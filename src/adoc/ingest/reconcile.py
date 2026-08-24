@@ -154,9 +154,26 @@ def _pair_rows(
     return pairs
 
 
+# Collection dates outside this window are extraction misreads (a real
+# document seen here carried year 0906) — treated as missing so the row
+# queues and a human supplies the true date from the page image.
+_EARLIEST_PLAUSIBLE_DATE = date(1900, 1, 1)
+
+
+def _plausible(d: date | None) -> date | None:
+    if d is None:
+        return None
+    if d < _EARLIEST_PLAUSIBLE_DATE or d.year > date.today().year + 1:
+        return None
+    return d
+
+
 def _doc_date(pass_a: DocumentExtraction, pass_b: DocumentExtraction) -> date | None:
     return (
-        pass_a.collection_date or pass_a.report_date or pass_b.collection_date or pass_b.report_date
+        _plausible(pass_a.collection_date)
+        or _plausible(pass_a.report_date)
+        or _plausible(pass_b.collection_date)
+        or _plausible(pass_b.report_date)
     )
 
 
