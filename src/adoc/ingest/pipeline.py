@@ -1,15 +1,23 @@
 """Document ingestion pipeline (PLAN.md "Ingestion", session loop (a)).
 
-`ingest_file`/`ingest_inbox` wire together: dedupe -> archive -> classify
-(`classifier` role, first page) -> lab_report: double-pass extract ->
-reconcile -> `LabsDb.insert_results` + `labs-export.jsonl` export;
-non-lab document: an encounter stub (no LLM summary in this slice - a
-later slice wires the incremental reasoning pass) -> exactly one
-`DataRepo.commit` per document.
+`ingest_file`/`ingest_inbox` wire together: dedupe -> archive -> route on
+`ArchivedDoc.kind`.
 
-This module deliberately does NOT touch `casefile.ledger` or `reason.dag`:
-per the task scope, incremental reasoning over newly-ingested rows is a
-later slice.
+**PDF** (unchanged): classify (`classifier` role, first page image) ->
+lab_report: vision double-pass extract -> reconcile -> `LabsDb.insert_results`
++ `labs-export.jsonl` export; non-lab document: an encounter stub.
+
+**docx** (PLAN.md docx ingestion design decision: docx = TEXT documents):
+`ingest.docx.extract_docx_text` -> classify over the text (`classifier`
+role, `LlmClient.complete`, no vision) -> lab_report: TEXT double-pass
+(`extract.double_pass_extract_text`) -> the SAME reconcile/insert/export
+path as a PDF lab report; else (narrative/other/imaging): an encounter
+whose body carries the FULL extracted text under a `## Extracted text`
+section - PLAN.md's context pack needs the full narrative, not a summary.
+
+Either way, exactly one `DataRepo.commit` per document. This module
+deliberately does NOT touch `casefile.ledger` or `reason.dag`: per the task
+scope, incremental reasoning over newly-ingested rows is a later slice.
 """
 
 from __future__ import annotations
@@ -28,13 +36,21 @@ from adoc.casefile.encounters import (
     write_encounter,
 )
 from adoc.casefile.repo import DataRepo
-from adoc.ingest.archive import ArchiveError, PageRenderer, archive_document, pdftoppm_renderer
-from adoc.ingest.extract import double_pass_extract
+from adoc.ingest.archive import (
+    ArchivedDoc,
+    ArchiveError,
+    PageRenderer,
+    archive_document,
+    pdftoppm_renderer,
+)
+from adoc.ingest.docx import DocxExtractionError, extract_docx_text
+from adoc.ingest.extract import double_pass_extract, double_pass_extract_text
 from adoc.ingest.reconcile import ReconciledRow, parse_flag, parse_ref_range, reconcile
 from adoc.ingest.schema import ClassifyResult, DocType, DocumentExtraction
 from adoc.ingest.vision import ImagePart, VisionClient, VisionError
 from adoc.labs.db import LabsDb
 from adoc.labs.models import DocumentStatus, ExtractionStatus, LabDocument, LabResult
+from adoc.reason.client import LlmClient, LlmError, Message
 
 CLASSIFY_PROMPT_VERSION = "classifier-v1"
 CLASSIFY_PROMPT = f"""[{CLASSIFY_PROMPT_VERSION}]
@@ -46,10 +62,33 @@ guess at the document's date (the report date or visit date shown on the
 page) as doc_date, or omit it if no date is visible on this page.
 """
 
+DOCX_CLASSIFY_PROMPT_VERSION = "classifier-docx-v1"
+DOCX_CLASSIFY_PROMPT = f"""[{DOCX_CLASSIFY_PROMPT_VERSION}]
+Read this document's full extracted text (paragraphs in reading order,
+with any tables rendered as pipe-delimited rows) and classify the document
+as one of: lab_report (a lab/blood-work results report), clinical_note (a
+doctor/specialist visit note, or a narrative clinical history the patient
+wrote themselves), imaging_report (a radiology/imaging report), or other
+(e.g. a supplement plan or other narrative document). Also give your best
+guess at the document's date (a report date or visit date mentioned in the
+text) as doc_date, or omit it if no date is mentioned.
+"""
+
 _ENCOUNTER_TYPE_BY_DOC_TYPE: dict[str, EncounterType] = {
     "clinical_note": "specialist-visit",
     "imaging_report": "imaging",
     "other": "specialist-visit",
+}
+
+# docx narrative documents have no clinician letterhead/scan behind them -
+# they are text the patient wrote or assembled themselves (clinical
+# history, supplement plans), so PLAN.md's "same door as doctor notes,
+# labeled" `patient-report` type fits better than `specialist-visit` for
+# anything that isn't clearly imaging.
+_DOCX_ENCOUNTER_TYPE_BY_DOC_TYPE: dict[str, EncounterType] = {
+    "imaging_report": "imaging",
+    "clinical_note": "patient-report",
+    "other": "patient-report",
 }
 
 FileOutcomeKind = Literal["ingested", "duplicate", "error"]
@@ -183,14 +222,18 @@ def _ingest_non_lab(
     sha256: str,
     archived_name: str,
     page_count: int,
+    encounter_type_map: dict[str, EncounterType],
+    default_encounter_type: EncounterType,
+    extracted_text: str = "",
 ) -> FileOutcome:
     encounter = Encounter(
         frontmatter=EncounterFrontmatter(
             date=doc_date,
-            type=_ENCOUNTER_TYPE_BY_DOC_TYPE.get(doc_type, "specialist-visit"),
+            type=encounter_type_map.get(doc_type, default_encounter_type),
             sources=[archived_name],
         ),
         summary="(pending review)",
+        extracted_text=extracted_text,
     )
     write_encounter(repo.root / "case" / "encounters", encounter, slug=path.stem)
 
@@ -218,23 +261,15 @@ def _ingest_non_lab(
     )
 
 
-def _ingest_one(
+def _ingest_pdf(
     path: Path,
     *,
     repo: DataRepo,
     db: LabsDb,
     vision: VisionClient,
     clock: Callable[[], datetime],
-    renderer: PageRenderer,
+    archived: ArchivedDoc,
 ) -> FileOutcome:
-    try:
-        archived = archive_document(repo.root, path, db=db, renderer=renderer)
-    except ArchiveError as exc:
-        return FileOutcome(path=str(path), outcome="error", issues=[str(exc)])
-
-    if archived.already_ingested:
-        return FileOutcome(path=str(path), sha256=archived.sha256, outcome="duplicate")
-
     try:
         classify = vision.extract(
             "classifier",
@@ -279,7 +314,108 @@ def _ingest_one(
         sha256=archived.sha256,
         archived_name=archived.original_path.name,
         page_count=page_count,
+        encounter_type_map=_ENCOUNTER_TYPE_BY_DOC_TYPE,
+        default_encounter_type="specialist-visit",
     )
+
+
+def _ingest_docx(
+    path: Path,
+    *,
+    repo: DataRepo,
+    db: LabsDb,
+    client: LlmClient,
+    clock: Callable[[], datetime],
+    archived: ArchivedDoc,
+) -> FileOutcome:
+    """docx flow (PLAN.md docx ingestion): TEXT extraction -> text-based
+    classify -> lab_report: TEXT double-pass into the same reconcile/
+    insert/export gates a PDF lab report uses; else: a full-text encounter.
+    """
+    try:
+        text = extract_docx_text(archived.original_path)
+    except DocxExtractionError as exc:
+        return FileOutcome(
+            path=str(path), sha256=archived.sha256, outcome="error", issues=[str(exc)]
+        )
+
+    try:
+        classify_result = client.complete(
+            "classifier",
+            system=DOCX_CLASSIFY_PROMPT,
+            messages=[Message(role="user", content=text)],
+            schema=ClassifyResult,
+        )
+    except LlmError as exc:
+        return FileOutcome(
+            path=str(path), sha256=archived.sha256, outcome="error", issues=[str(exc)]
+        )
+    classify = classify_result.parsed
+    assert isinstance(classify, ClassifyResult)  # schema= guarantees this
+
+    doc_date = classify.doc_date or clock().date()
+    # A docx has no page structure - `LabDocument.page_count` still
+    # requires >=1, so it's recorded as one logical unit.
+    page_count = 1
+
+    if classify.doc_type == "lab_report":
+        try:
+            pass_a, pass_b = double_pass_extract_text(client, text)
+        except LlmError as exc:
+            return FileOutcome(
+                path=str(path), sha256=archived.sha256, outcome="error", issues=[str(exc)]
+            )
+        return _ingest_lab_report(
+            path,
+            repo=repo,
+            db=db,
+            clock=clock,
+            doc_date=doc_date,
+            pass_a=pass_a,
+            pass_b=pass_b,
+            sha256=archived.sha256,
+            page_count=page_count,
+        )
+
+    return _ingest_non_lab(
+        path,
+        repo=repo,
+        db=db,
+        clock=clock,
+        doc_date=doc_date,
+        doc_type=classify.doc_type,
+        sha256=archived.sha256,
+        archived_name=archived.original_path.name,
+        page_count=page_count,
+        encounter_type_map=_DOCX_ENCOUNTER_TYPE_BY_DOC_TYPE,
+        default_encounter_type="patient-report",
+        extracted_text=text,
+    )
+
+
+def _ingest_one(
+    path: Path,
+    *,
+    repo: DataRepo,
+    db: LabsDb,
+    vision: VisionClient,
+    clock: Callable[[], datetime],
+    renderer: PageRenderer,
+) -> FileOutcome:
+    try:
+        archived = archive_document(repo.root, path, db=db, renderer=renderer)
+    except ArchiveError as exc:
+        return FileOutcome(path=str(path), outcome="error", issues=[str(exc)])
+
+    if archived.already_ingested:
+        return FileOutcome(path=str(path), sha256=archived.sha256, outcome="duplicate")
+
+    if archived.kind == "docx":
+        return _ingest_docx(
+            path, repo=repo, db=db, client=vision.client, clock=clock, archived=archived
+        )
+
+    return _ingest_pdf(path, repo=repo, db=db, vision=vision, clock=clock, archived=archived)
 
 
 def ingest_file(

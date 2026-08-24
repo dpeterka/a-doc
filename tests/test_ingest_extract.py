@@ -1,13 +1,30 @@
-"""Tests for adoc.ingest.extract.double_pass_extract: role/prompt wiring."""
+"""Tests for adoc.ingest.extract: role/prompt wiring for both the vision
+double-pass (`double_pass_extract`) and the docx text double-pass
+(`double_pass_extract_text`)."""
 
 from __future__ import annotations
 
 from pathlib import Path
 
+from adoc.config import ModelBinding
 from adoc.ingest.archive import ArchivedDoc
-from adoc.ingest.extract import PROMPT_A_VERSION, PROMPT_B_VERSION, double_pass_extract
+from adoc.ingest.extract import (
+    DOCX_PROMPT_A_VERSION,
+    DOCX_PROMPT_B_VERSION,
+    PROMPT_A_VERSION,
+    PROMPT_B_VERSION,
+    double_pass_extract,
+    double_pass_extract_text,
+)
 from adoc.ingest.schema import DocumentExtraction, ExtractedResult
 from adoc.ingest.vision import ImagePart, PdfPart, TextPart, VisionClient
+from adoc.reason.client import (
+    AnthropicProvider,
+    LlmClient,
+    OpenAIProvider,
+    TransportRequest,
+    TransportResponse,
+)
 
 
 class _FakeVisionClient:
@@ -78,3 +95,73 @@ def test_vision_client_is_the_declared_type() -> None:
     # documents that double_pass_extract's real signature is VisionClient,
     # even though the test above exercises it with a structurally-typed fake.
     assert VisionClient.extract.__name__ == "extract"
+
+
+def test_double_pass_extract_text_sends_plain_text_to_both_roles(tmp_path: Path) -> None:
+    """`double_pass_extract_text` goes through `LlmClient.complete`, not
+    `VisionClient` - no binary parts, no page images, just the docx's
+    extracted text as one user message per pass."""
+    calls: list[TransportRequest] = []
+
+    def anthropic_transport(request: TransportRequest) -> TransportResponse:
+        calls.append(request)
+        return TransportResponse(
+            text="",
+            tool_input={
+                "doc_type": "lab_report",
+                "results": [
+                    {
+                        "name_raw": "Potassium",
+                        "value": 4.1,
+                        "page": 1,
+                        "confidence": "high",
+                    }
+                ],
+                "narrative_findings": [],
+                "illegible_regions": [],
+            },
+            input_tokens=10,
+            output_tokens=10,
+        )
+
+    def openai_transport(request: TransportRequest) -> TransportResponse:
+        calls.append(request)
+        return TransportResponse(
+            text="",
+            tool_input={
+                "doc_type": "lab_report",
+                "results": [
+                    {
+                        "name_raw": "Potassium",
+                        "value": 4.1,
+                        "page": 1,
+                        "confidence": "high",
+                    }
+                ],
+                "narrative_findings": [],
+                "illegible_regions": [],
+            },
+            input_tokens=10,
+            output_tokens=10,
+        )
+
+    bindings: dict[str, list[ModelBinding]] = {
+        "extractor_pass_a": [ModelBinding(provider="anthropic", model="fake-sonnet")],
+        "extractor_pass_b": [ModelBinding(provider="openai", model="fake-gpt")],
+    }
+    providers = {
+        "anthropic": AnthropicProvider(api_key=None, transport=anthropic_transport),
+        "openai": OpenAIProvider(api_key=None, transport=openai_transport),
+    }
+    client = LlmClient(bindings, providers)
+
+    pass_a, pass_b = double_pass_extract_text(client, "Home lab panel:\n\nPotassium 4.1")
+
+    assert isinstance(pass_a, DocumentExtraction)
+    assert isinstance(pass_b, DocumentExtraction)
+    assert len(calls) == 2
+    assert calls[0].messages[0].content == "Home lab panel:\n\nPotassium 4.1"
+    assert calls[1].messages[0].content == "Home lab panel:\n\nPotassium 4.1"
+    assert DOCX_PROMPT_A_VERSION in calls[0].system
+    assert DOCX_PROMPT_B_VERSION in calls[1].system
+    assert calls[0].system != calls[1].system

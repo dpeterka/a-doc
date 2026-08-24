@@ -13,7 +13,12 @@
             {% if item.image_url %}
               <img src="{{ item.image_url }}" alt="Source document page for {{ row.name }}" loading="lazy">
             {% else %}
-              <p class="muted">No source page image available.</p>
+              <div class="confirm-no-image" role="note">
+                <p class="muted">
+                  Text document — no page image; showing extracted text context instead. Review
+                  the values below against the source text.
+                </p>
+              </div>
             {% endif %}
           </div>
 

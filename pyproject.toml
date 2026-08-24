@@ -23,6 +23,7 @@ dependencies = [
   "python-multipart",
   "sse-starlette",
   "boto3",
+  "python-docx",
 ]
 
 [project.scripts]

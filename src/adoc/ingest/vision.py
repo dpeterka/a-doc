@@ -372,6 +372,16 @@ class VisionClient:
                 ),
             }
 
+    @property
+    def client(self) -> LlmClient:
+        """The wrapped `LlmClient` - reused by `ingest.pipeline`'s docx path,
+        which has no binary pages to send and calls `LlmClient.complete`
+        directly (classification + `extract.double_pass_extract_text`)
+        rather than this class's vision-specific `extract`. Exposed rather
+        than duplicated so both paths share one set of role bindings,
+        scrubber, audit log, and retry policy."""
+        return self._client
+
     def extract(
         self,
         role: str,

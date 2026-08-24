@@ -15,16 +15,25 @@ from pathlib import Path
 from typing import Any
 
 from conftest import TINY_PDF_BYTES, fake_page_renderer
+from docx import Document
 from git import Repo
 from pydantic import BaseModel
 
 from adoc.casefile.encounters import read_encounter
 from adoc.casefile.repo import DataRepo
+from adoc.config import ModelBinding
 from adoc.ingest.pipeline import ingest_file, ingest_inbox
 from adoc.ingest.schema import ClassifyResult, DocumentExtraction
-from adoc.ingest.vision import Part
+from adoc.ingest.vision import Part, VisionClient
 from adoc.labs.db import LabsDb
 from adoc.labs.models import DocumentStatus
+from adoc.reason.client import (
+    AnthropicProvider,
+    LlmClient,
+    OpenAIProvider,
+    TransportRequest,
+    TransportResponse,
+)
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures" / "extractions"
 
@@ -236,3 +245,172 @@ def test_scan_files_is_recursive_and_skips_sync_artifacts(tmp_path: Path) -> Non
 
     # Deterministic full-path order: "Labs/LabCorp/b.pdf" sorts before "a.pdf".
     assert names == ["b.pdf", "a.pdf"]
+
+
+# --------------------------------------------------------------------------
+# docx routing (PLAN.md docx ingestion: docx = TEXT documents). These build
+# a real `.docx` with `python-docx` and a real `VisionClient` wrapping a
+# fake-transport `LlmClient` (mirroring `tests/test_stages.py`'s pattern) so
+# `_ingest_docx`'s actual seam - `vision.client` - is exercised for real,
+# never a duck-typed stand-in.
+# --------------------------------------------------------------------------
+
+
+def _make_narrative_docx(path: Path) -> None:
+    document = Document()
+    document.add_paragraph("Patient-authored clinical history.")
+    document.add_paragraph("Onset of joint pain in March 2026, worsening through the summer.")
+    document.save(str(path))
+
+
+def _make_lab_docx(path: Path) -> None:
+    document = Document()
+    document.add_paragraph("Home lab panel, ordered 2026-08-01.")
+    table = document.add_table(rows=2, cols=3)
+    table.cell(0, 0).text = "Test"
+    table.cell(0, 1).text = "Result"
+    table.cell(0, 2).text = "Range"
+    table.cell(1, 0).text = "Potassium"
+    table.cell(1, 1).text = "4.1"
+    table.cell(1, 2).text = "3.5-5.1"
+    document.save(str(path))
+
+
+def _build_docx_llm_client(
+    *,
+    classify_payload: dict[str, Any],
+    pass_a_payload: dict[str, Any] | None,
+    pass_b_payload: dict[str, Any] | None,
+    calls: list[str],
+) -> LlmClient:
+    """`classifier`/`extractor_pass_a` -> anthropic, `extractor_pass_b` ->
+    openai (mirrors `models.yaml`'s real bindings); the anthropic transport
+    dispatches on the requested schema since both roles share that
+    provider."""
+
+    def anthropic_transport(request: TransportRequest) -> TransportResponse:
+        assert request.schema is not None
+        name = request.schema.__name__
+        if name == "ClassifyResult":
+            calls.append("classifier")
+            tool_input = classify_payload
+        elif name == "DocumentExtraction":
+            calls.append("extractor_pass_a")
+            assert pass_a_payload is not None
+            tool_input = pass_a_payload
+        else:  # pragma: no cover - defensive
+            raise AssertionError(f"unexpected schema for anthropic transport: {name}")
+        return TransportResponse(text="", tool_input=tool_input, input_tokens=10, output_tokens=10)
+
+    def openai_transport(request: TransportRequest) -> TransportResponse:
+        assert request.schema is not None
+        calls.append("extractor_pass_b")
+        assert pass_b_payload is not None
+        return TransportResponse(
+            text="", tool_input=pass_b_payload, input_tokens=10, output_tokens=10
+        )
+
+    bindings: dict[str, list[ModelBinding]] = {
+        "classifier": [ModelBinding(provider="anthropic", model="fake-haiku")],
+        "extractor_pass_a": [ModelBinding(provider="anthropic", model="fake-sonnet")],
+        "extractor_pass_b": [ModelBinding(provider="openai", model="fake-gpt")],
+    }
+    providers = {
+        "anthropic": AnthropicProvider(api_key=None, transport=anthropic_transport),
+        "openai": OpenAIProvider(api_key=None, transport=openai_transport),
+    }
+    return LlmClient(bindings, providers)
+
+
+def test_docx_narrative_document_becomes_a_full_text_encounter(tmp_path: Path) -> None:
+    repo = DataRepo.init_at(tmp_path / "data-repo")
+    db = LabsDb(tmp_path / "labs.sqlite")
+    doc_path = tmp_path / "history.docx"
+    _make_narrative_docx(doc_path)
+
+    calls: list[str] = []
+    client = _build_docx_llm_client(
+        classify_payload={"doc_type": "clinical_note", "doc_date": "2026-08-01"},
+        pass_a_payload=None,
+        pass_b_payload=None,
+        calls=calls,
+    )
+    vision = VisionClient(client)
+
+    report = ingest_file(doc_path, repo=repo, db=db, vision=vision, clock=_fixed_clock)
+
+    outcome = report.files[0]
+    assert outcome.outcome == "ingested"
+    assert outcome.doc_type == "clinical_note"
+    assert outcome.rows_auto == 0
+    assert outcome.rows_pending == 0
+    assert outcome.commit_sha is not None
+    # extractor roles are never called for a non-lab docx
+    assert calls == ["classifier"]
+    assert db.pending() == []
+
+    documents = db.list_documents()
+    assert len(documents) == 1
+    assert documents[0].page_count == 1
+
+    encounters_dir = repo.root / "case" / "encounters"
+    encounter_files = list(encounters_dir.glob("2026-08-01--*.md"))
+    assert len(encounter_files) == 1
+    encounter = read_encounter(encounter_files[0])
+    assert encounter.frontmatter.type == "patient-report"
+    assert encounter.frontmatter.sources
+    assert "Patient-authored clinical history." in encounter.extracted_text
+    assert "Onset of joint pain in March 2026" in encounter.extracted_text
+
+    git_repo = Repo(repo.root)
+    assert git_repo.head.commit.hexsha == outcome.commit_sha
+
+
+def test_docx_lab_report_double_pass_text_reconciles_to_auto_row(tmp_path: Path) -> None:
+    repo = DataRepo.init_at(tmp_path / "data-repo")
+    db = LabsDb(tmp_path / "labs.sqlite")
+    doc_path = tmp_path / "home-lab.docx"
+    _make_lab_docx(doc_path)
+
+    result_row = {
+        "name_raw": "Potassium",
+        "value": 4.1,
+        "unit_raw": "mmol/L",
+        "ref_range_raw": "3.5-5.1",
+        "page": 1,
+        "confidence": "high",
+    }
+    extraction_payload = {
+        "doc_type": "lab_report",
+        "collection_date": "2026-08-01",
+        "results": [result_row],
+        "narrative_findings": [],
+        "illegible_regions": [],
+    }
+    calls: list[str] = []
+    client = _build_docx_llm_client(
+        classify_payload={"doc_type": "lab_report", "doc_date": "2026-08-01"},
+        pass_a_payload=extraction_payload,
+        pass_b_payload=extraction_payload,
+        calls=calls,
+    )
+    vision = VisionClient(client)
+
+    report = ingest_file(doc_path, repo=repo, db=db, vision=vision, clock=_fixed_clock)
+
+    outcome = report.files[0]
+    assert outcome.outcome == "ingested"
+    assert outcome.doc_type == "lab_report"
+    assert outcome.rows_auto == 1
+    assert outcome.rows_pending == 0
+    assert outcome.issues == []
+    assert calls == ["classifier", "extractor_pass_a", "extractor_pass_b"]
+
+    documents = db.list_documents()
+    assert len(documents) == 1
+    assert documents[0].page_count == 1
+
+    export_path = repo.root / "labs-export.jsonl"
+    assert export_path.exists()
+    lines = export_path.read_text(encoding="utf-8").strip().splitlines()
+    assert any(json.loads(line)["table"] == "lab" for line in lines)

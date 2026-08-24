@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 from conftest import TINY_PDF_BYTES, fake_page_renderer
+from docx import Document
 
 from adoc.ingest.archive import ArchiveError, archive_document, sha256_file
 from adoc.labs.db import LabsDb
@@ -91,7 +92,7 @@ def test_pdftoppm_renderer_raises_clear_error_when_binary_missing(
 
 
 def test_archive_rejects_non_pdf_files(tmp_path: Path) -> None:
-    """Junk/docx must never reach the immutable sources/ store."""
+    """Junk/fake-docx must never reach the immutable sources/ store."""
     import pytest
 
     from adoc.ingest.archive import ArchiveError, archive_document
@@ -101,3 +102,52 @@ def test_archive_rejects_non_pdf_files(tmp_path: Path) -> None:
 
     with pytest.raises(ArchiveError, match="not a PDF"):
         archive_document(tmp_path, bogus, db=None, renderer=None)  # type: ignore[arg-type]
+
+
+def _make_docx(path: Path, text: str = "hello") -> None:
+    document = Document()
+    document.add_paragraph(text)
+    document.save(str(path))
+
+
+def test_archive_document_archives_a_real_docx_with_no_page_rendering(tmp_path: Path) -> None:
+    repo_root = tmp_path / "data-repo"
+    db = LabsDb(tmp_path / "labs.sqlite")
+    docx_path = tmp_path / "history.docx"
+    _make_docx(docx_path, "Patient-authored clinical history.")
+
+    def exploding_renderer(pdf_path: Path, out_dir: Path) -> list[Path]:  # pragma: no cover
+        raise AssertionError("a docx must never be rendered to page images")
+
+    archived = archive_document(repo_root, docx_path, db=db, renderer=exploding_renderer)
+
+    assert archived.kind == "docx"
+    assert archived.page_paths == []
+    assert archived.original_path.exists()
+    assert archived.original_path.read_bytes() == docx_path.read_bytes()
+    assert archived.original_path.name == f"{archived.sha256}__history.docx"
+    assert archived.already_ingested is False
+
+
+def test_archive_document_dedupes_docx_like_pdf(tmp_path: Path) -> None:
+    repo_root = tmp_path / "data-repo"
+    db = LabsDb(tmp_path / "labs.sqlite")
+    docx_path = tmp_path / "history.docx"
+    _make_docx(docx_path)
+
+    first = archive_document(repo_root, docx_path, db=db, renderer=fake_page_renderer(0))
+    db.upsert_document(
+        LabDocument(
+            sha256=first.sha256,
+            filename="history.docx",
+            doc_type="clinical_note",
+            page_count=1,
+            status=DocumentStatus.NEEDS_REVIEW,
+        )
+    )
+    second = archive_document(repo_root, docx_path, db=db, renderer=fake_page_renderer(0))
+
+    assert first.sha256 == second.sha256
+    assert second.already_ingested is True
+    assert second.kind == "docx"
+    assert second.page_paths == []
