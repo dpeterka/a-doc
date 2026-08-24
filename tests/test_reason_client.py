@@ -407,3 +407,12 @@ def test_openai_strict_schema_rejects_no_oneof_or_discriminator() -> None:
     assert '"oneOf"' not in adapted
     assert '"discriminator"' not in adapted
     assert '"anyOf"' in adapted
+
+
+def test_openai_empty_structured_content_raises_clear_error() -> None:
+    """Live failure: gpt-5.2's reasoning consumed the whole completion
+    budget, returning empty content with the schema unfulfilled — must be a
+    clear error, not 'not valid JSON'."""
+    from adoc.reason.client import REASONING_MAX_TOKENS
+
+    assert REASONING_MAX_TOKENS >= 32768
