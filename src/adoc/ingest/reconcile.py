@@ -103,6 +103,7 @@ from adoc.labs.models import LabFlag, LabResult, Specimen
 from adoc.labs.validate import (
     DECIMAL_SIGNATURE_RATIO,
     UNIT_SYNONYMS,
+    canonical_rename_target,
     canonical_unit,
     canonicalize,
     trend_deviation,
@@ -490,6 +491,28 @@ def _clean_results(results: Sequence[ExtractedResult]) -> list[ExtractedResult]:
     return cleaned
 
 
+def _stored_name(*name_raws: str) -> str | None:
+    """The canonical name a row may be PERSISTED under, or `None` to store
+    the raw name verbatim.
+
+    `ReconciledRow.canonical_name` used to take `canonicalize(...)`'s
+    permissive result (suffix-strip retry, score-suffix rule) - the same
+    over-merge `labs.validate`'s "Matching vs. renaming" docstring
+    describes for `adoc labs-recanonicalize`: a site-prefixed DEXA score
+    ("LEFT HIP Total Z-Score") was stored as bare "Z-score" AT INGESTION,
+    silently discarding the site. Only an EXACT alias match
+    (`canonical_rename_target`) may name a persisted row; permissive
+    `canonicalize` remains correct for everything read-time in this module
+    (grouping/pairing via `_match_key`, spec lookup for
+    `validate_row`/`trend_outlier` candidates).
+    """
+    for raw in name_raws:
+        target = canonical_rename_target(raw, raw)
+        if target is not None:
+            return target
+    return None
+
+
 def _match_key(name_raw: str) -> str:
     canonical = canonicalize(name_raw)
     if canonical:
@@ -729,7 +752,7 @@ def _reconcile_rescued_pair(
     )
     return ReconciledRow(
         name_raw=chosen_name,
-        canonical_name=canonical,
+        canonical_name=_stored_name(chosen_name, a.name_raw, b.name_raw),
         date=doc_date,
         value=representative.value,
         value_text=representative.value_text,
@@ -823,7 +846,7 @@ def _reconcile_single_pass(
     )
     return ReconciledRow(
         name_raw=present.name_raw,
-        canonical_name=canonical,
+        canonical_name=_stored_name(present.name_raw),
         date=doc_date,
         value=present.value,
         value_text=present.value_text,
@@ -963,7 +986,6 @@ def _reconcile_matched_pair(
     a: ExtractedResult, b: ExtractedResult, *, doc_date: date, missing_date: bool, db: LabsDb
 ) -> ReconciledRow:
     evaluation = _evaluate_pair(a, b, doc_date=doc_date, missing_date=missing_date, db=db)
-    canonical = canonicalize(a.name_raw) or canonicalize(b.name_raw)
 
     raw_json = json.dumps(
         {
@@ -979,7 +1001,7 @@ def _reconcile_matched_pair(
     # never presented as "the" agreed specimen.
     return ReconciledRow(
         name_raw=a.name_raw,
-        canonical_name=canonical,
+        canonical_name=_stored_name(a.name_raw, b.name_raw),
         date=doc_date,
         value=a.value,
         value_text=a.value_text,

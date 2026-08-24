@@ -101,7 +101,7 @@ from dataclasses import dataclass, field
 
 from adoc.labs.db import LabsDb, _readings_identical
 from adoc.labs.models import LabResult
-from adoc.labs.validate import canonical_rename_target
+from adoc.labs.validate import canonical_rename_target, canonicalize
 
 
 @dataclass
@@ -126,10 +126,30 @@ def _new_name_for(row: LabResult) -> str:
     """The name `row` would be renamed to under the CURRENT spec table's
     EXACT aliases only (`validate.canonical_rename_target`) - `name_raw`
     tried first (least-processed, most likely to match an alias
-    verbatim), then the currently-stored `name`, falling back to `row.name`
-    itself when neither is an exact alias of any spec (module docstring:
-    a suffix/score-assisted match is deliberately NOT a rename target)."""
-    return canonical_rename_target(row.name_raw, row.name) or row.name
+    verbatim), then the currently-stored `name` (module docstring: a
+    suffix/score-assisted match is deliberately NOT a rename target).
+
+    When NO exact alias vouches for the row, one legacy repair applies
+    before falling back to the stored name: `ingest.reconcile` used to
+    persist permissive `canonicalize(...)` results as stored names, so a
+    site-prefixed DEXA score ("LEFT HIP Total Z-Score") could be sitting
+    under bare "Z-score" - the exact info-discarding rename the exact-
+    alias policy now forbids. If the stored name differs from `name_raw`
+    and equals precisely what permissive `canonicalize(name_raw)` yields,
+    the stored name is that legacy artifact and is RESTORED to `name_raw`
+    (the row still gets full read-time `canonicalize` benefits under its
+    raw name). A stored name that differs from the permissive result was
+    set some other way (e.g. a human correction) and is left alone."""
+    target = canonical_rename_target(row.name_raw, row.name_raw)
+    if target is not None:
+        return target
+    # The legacy check must run BEFORE consulting the stored name for an
+    # exact alias: the artifact's stored name is typically a spec's own
+    # canonical name ("Z-score"), which IS an exact alias of itself and
+    # would otherwise re-legitimize the very rename being repaired.
+    if row.name != row.name_raw and canonicalize(row.name_raw) == row.name:
+        return row.name_raw
+    return canonical_rename_target(row.name, row.name) or row.name
 
 
 _GroupKey = tuple[str, str, str, str]  # (date, planned-name, specimen, source_doc)
