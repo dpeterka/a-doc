@@ -12,17 +12,19 @@ from __future__ import annotations
 from datetime import date
 
 from adoc.labs.db import LabsDb
-from adoc.labs.models import LabDocument, LabResult
+from adoc.labs.models import LabDocument, LabResult, Specimen
 
 
-def trend_series(db: LabsDb, name: str) -> list[LabResult]:
+def trend_series(db: LabsDb, name: str, specimen: Specimen | None = None) -> list[LabResult]:
     """Time-ordered results for one canonical analyte, ref ranges included.
 
     Each `LabResult` already carries `ref_low`/`ref_high`/`ref_text`, so the
     trend chart / composer can render the reference band alongside values
-    without a second query.
+    without a second query. `specimen=None` (default) returns every
+    specimen's readings for `name`; pass a specimen to scope the series to
+    just that one (see `LabsDb.series`).
     """
-    return db.series(name)
+    return db.series(name, specimen)
 
 
 def abnormal_summary(db: LabsDb, since: date | None = None) -> list[LabResult]:

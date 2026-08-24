@@ -19,7 +19,11 @@
     </div>
 
     <div class="confirm-fields">
-      <h3>{{ item.row.name }} <span class="muted">({{ item.row.date.isoformat() }})</span></h3>
+      <h3>
+        {{ item.row.name }}
+        {% if item.row.specimen != "unknown" %}<span class="chip chip-specimen">{{ item.row.specimen }}</span>{% endif %}
+        <span class="muted">({{ item.row.date.isoformat() }})</span>
+      </h3>
       <p class="muted">As read from the document: {{ item.row.name_raw }}</p>
 
       {% if item.agreed %}
@@ -100,6 +104,15 @@
           <label>
             Flag
             <input type="text" name="flag" value="{{ item.row.flag.value if item.row.flag else '' }}">
+          </label>
+          <label>
+            Specimen
+            <select name="specimen">
+              <option value="" selected>(no change — currently {{ item.row.specimen }})</option>
+              {% for s in ["serum", "plasma", "whole_blood", "urine", "stool", "csf", "saliva", "other", "unknown"] %}
+                <option value="{{ s }}">{{ s }}</option>
+              {% endfor %}
+            </select>
           </label>
           <button type="submit">Save correction</button>
         </form>

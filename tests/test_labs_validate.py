@@ -222,6 +222,88 @@ def test_trend_outlier_no_value_returns_none(db: LabsDb) -> None:
     assert trend_outlier(db, new_row) is None
 
 
+def test_trend_outlier_is_scoped_to_the_rows_own_specimen(db: LabsDb) -> None:
+    """The real finding: a urinalysis GLUCOSE reading and a serum glucose
+    reading canonicalize to the same `name`. A wildly different-looking
+    urine reading must never be compared against (or trigger a trend
+    outlier against) the serum series, and vice versa."""
+    serum_rows = [
+        _lab(
+            name="glucose",
+            value=v,
+            ucum_unit="mg/dL",
+            ref_low=70.0,
+            ref_high=100.0,
+            lab_date=date(2026, 1, i + 1),
+            specimen="serum",
+            extraction_status=ExtractionStatus.CONFIRMED,
+        )
+        for i, v in enumerate([90.0, 92.0, 88.0])
+    ]
+    db.insert_results(serum_rows)
+
+    # Only 1 prior urine reading exists (below TREND_OUTLIER_MIN_PRIORS),
+    # so even a wildly different-looking urine value must not trigger -
+    # if it were (wrongly) compared against the serum priors instead, it
+    # would trigger.
+    db.insert_results(
+        [
+            _lab(
+                name="glucose",
+                value=500.0,
+                ucum_unit="mg/dL",
+                lab_date=date(2026, 2, 1),
+                specimen="urine",
+                extraction_status=ExtractionStatus.CONFIRMED,
+            )
+        ]
+    )
+    urine_row = _lab(
+        name="glucose",
+        value=520.0,
+        ucum_unit="mg/dL",
+        lab_date=date(2026, 6, 1),
+        specimen="urine",
+    )
+    assert trend_outlier(db, urine_row) is None
+
+    # A genuine decimal-shift error WITHIN the serum series still triggers.
+    serum_outlier = _lab(
+        name="glucose",
+        value=900.0,
+        ucum_unit="mg/dL",
+        lab_date=date(2026, 6, 1),
+        specimen="serum",
+    )
+    issue = trend_outlier(db, serum_outlier)
+    assert issue is not None
+    assert issue.code is IssueCode.TREND_OUTLIER
+
+
+def test_trend_outlier_unknown_specimen_row_compares_against_unknown_priors_only(
+    db: LabsDb,
+) -> None:
+    """A row whose own specimen is `"unknown"` (true of all pre-migration
+    data) compares only against other `"unknown"`-specimen priors of the
+    same canonical name - i.e. exactly today's behavior, since
+    pre-migration data is entirely `"unknown"`."""
+    _seed_priors(db, [4.0, 4.1, 4.2])  # specimen defaults to "unknown"
+    db.insert_results(
+        [
+            _lab(
+                value=4.05,
+                lab_date=date(2026, 3, 1),
+                specimen="serum",
+                extraction_status=ExtractionStatus.CONFIRMED,
+            )
+        ]
+    )
+    new_row = _lab(value=41.0, lab_date=date(2026, 6, 1))  # specimen "unknown"
+    issue = trend_outlier(db, new_row)
+    assert issue is not None
+    assert issue.code is IssueCode.TREND_OUTLIER
+
+
 def test_labcorp_long_form_unit_spellings_are_accepted() -> None:
     """LabCorp prints 'Million/uL'/'Thousand/uL' (real-corpus finding); these
     are the same units as M/uL / K/uL and must not queue. Comparison is

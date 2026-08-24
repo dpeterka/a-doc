@@ -6,12 +6,18 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from adoc.config import ModelBinding
 from adoc.ingest.archive import ArchivedDoc
 from adoc.ingest.extract import (
+    DOCX_PROMPT_A,
     DOCX_PROMPT_A_VERSION,
+    DOCX_PROMPT_B,
     DOCX_PROMPT_B_VERSION,
+    PROMPT_A,
     PROMPT_A_VERSION,
+    PROMPT_B,
     PROMPT_B_VERSION,
     double_pass_extract,
     double_pass_extract_text,
@@ -165,3 +171,37 @@ def test_double_pass_extract_text_sends_plain_text_to_both_roles(tmp_path: Path)
     assert DOCX_PROMPT_A_VERSION in calls[0].system
     assert DOCX_PROMPT_B_VERSION in calls[1].system
     assert calls[0].system != calls[1].system
+
+
+# --------------------------------------------------------------------------
+# Specimen instruction + version bump (added alongside the `specimen`
+# dimension on `ExtractedResult`) - every extractor prompt must tell the
+# model to record a specimen per result from the report's own section
+# headers/labels, defaulting to "unknown" rather than guessing, and each
+# prompt's version constant must have moved past its pre-specimen value.
+# --------------------------------------------------------------------------
+
+
+def test_pdf_prompt_versions_are_bumped_past_v1() -> None:
+    assert PROMPT_A_VERSION == "extractor-pass-a-v2"
+    assert PROMPT_B_VERSION == "extractor-pass-b-v2"
+    assert PROMPT_A_VERSION != "extractor-pass-a-v1"
+    assert PROMPT_B_VERSION != "extractor-pass-b-v1"
+
+
+def test_docx_prompt_versions_are_bumped_past_v1() -> None:
+    assert DOCX_PROMPT_A_VERSION == "docx-extractor-pass-a-v2"
+    assert DOCX_PROMPT_B_VERSION == "docx-extractor-pass-b-v2"
+    assert DOCX_PROMPT_A_VERSION != "docx-extractor-pass-a-v1"
+    assert DOCX_PROMPT_B_VERSION != "docx-extractor-pass-b-v1"
+
+
+@pytest.mark.parametrize("prompt", [PROMPT_A, PROMPT_B, DOCX_PROMPT_A, DOCX_PROMPT_B])
+def test_every_extractor_prompt_instructs_recording_specimen_per_result(prompt: str) -> None:
+    lowered = prompt.lower()
+    assert "specimen" in lowered
+    # section-header/label examples the model should key off of
+    assert "urinalysis" in lowered
+    assert "stool" in lowered
+    # the "don't guess, default unknown" instruction
+    assert "unknown" in lowered

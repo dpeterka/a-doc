@@ -18,16 +18,22 @@ A row is **AUTO** only if ALL of the following gates pass (otherwise it is
   4. ref      - `ref_range_raw` is equal after case/whitespace
      normalization.
   5. flag     - `flag_raw` is equal after case/whitespace normalization.
-  6. confidence - both passes report `confidence == "high"`.
-  7. validate - `labs.validate.validate_row` on EITHER pass's reading
+  6. specimen - both passes agree on `specimen` (otherwise reason
+     `specimen_mismatch`) - this is what keeps a urinalysis GLUCOSE
+     "NEGATIVE" reading from ever being silently merged with a serum
+     glucose reading just because one pass misread which section a row
+     belonged to.
+  7. confidence - both passes report `confidence == "high"`.
+  8. validate - `labs.validate.validate_row` on EITHER pass's reading
      yields zero `ValidationIssue`s (unit whitelist, physiologic bounds,
      flag/value consistency, titer format) - checking both, not just one
      pass, catches an implausible misread even when the other pass got it
      right.
-  8. trend    - `labs.validate.trend_outlier` returns `None` for EITHER
-     pass's reading (no >40% jump vs. this patient's own recent median -
-     catches decimal-shift errors like potassium 4.1 misread as 41).
-  9. dated    - the document's date (collection_date, falling back to
+  9. trend    - `labs.validate.trend_outlier` returns `None` for EITHER
+     pass's reading (no >40% jump vs. this patient's own recent median,
+     scoped to that reading's own specimen - catches decimal-shift errors
+     like potassium 4.1 misread as 41).
+  10. dated   - the document's date (collection_date, falling back to
      report_date, from either pass) resolved to a real date.
 
 Both passes' raw extracted rows plus the computed reasons are serialized
@@ -47,7 +53,7 @@ from typing import TYPE_CHECKING, Literal
 from pydantic import BaseModel, Field
 
 from adoc.ingest.schema import DocumentExtraction, ExtractedResult
-from adoc.labs.models import LabFlag, LabResult
+from adoc.labs.models import LabFlag, LabResult, Specimen
 from adoc.labs.validate import (
     DECIMAL_SIGNATURE_RATIO,
     canonicalize,
@@ -79,6 +85,7 @@ class ReconciledRow(BaseModel):
     unit_raw: str | None
     ref_range_raw: str | None
     flag_raw: str | None
+    specimen: Specimen
     source_page: int | None
     status: ReconcileStatus
     reasons: list[str] = Field(default_factory=list)
@@ -136,15 +143,38 @@ def _group_by_key(results: Sequence[ExtractedResult]) -> dict[str, list[Extracte
 def _pair_rows(
     a_rows: list[ExtractedResult], b_rows: list[ExtractedResult]
 ) -> list[tuple[ExtractedResult | None, ExtractedResult | None]]:
-    """Greedy page-tolerant pairing within one analyte-name group."""
+    """Greedy page-tolerant pairing within one analyte-name group.
+
+    Page distance is still the primary criterion (unchanged), but the
+    specimen now breaks ties: when two `b` candidates are equally close in
+    page to `a`, the one reporting the SAME specimen as `a` wins. This
+    matters for a document that legitimately prints the same analyte name
+    under two different specimens close together (e.g. a combined
+    urinalysis + serum panel) — it keeps a same-specimen pass-A/pass-B pair
+    from being split apart by an equidistant, different-specimen row. A
+    genuine specimen disagreement between the two passes' readings of what
+    IS otherwise the same result is still paired (so it can be flagged
+    `specimen_mismatch` in `_reconcile_matched_pair`) — this only re-orders
+    which candidate wins a page-distance tie, it never refuses to pair.
+    """
     pairs: list[tuple[ExtractedResult | None, ExtractedResult | None]] = []
     remaining_b = list(b_rows)
     for a in a_rows:
         best_idx: int | None = None
         for idx, b in enumerate(remaining_b):
-            if abs(b.page - a.page) > PAGE_TOLERANCE:
+            distance = abs(b.page - a.page)
+            if distance > PAGE_TOLERANCE:
                 continue
-            if best_idx is None or abs(remaining_b[best_idx].page - a.page) > abs(b.page - a.page):
+            if best_idx is None:
+                best_idx = idx
+                continue
+            current = remaining_b[best_idx]
+            current_distance = abs(current.page - a.page)
+            if distance < current_distance or (
+                distance == current_distance
+                and b.specimen == a.specimen
+                and current.specimen != a.specimen
+            ):
                 best_idx = idx
         if best_idx is not None:
             pairs.append((a, remaining_b.pop(best_idx)))
@@ -196,6 +226,7 @@ def _candidate_lab_result(
         ref_high=ref_high,
         ref_text=row.ref_range_raw,
         flag=parse_flag(row.flag_raw),
+        specimen=row.specimen,
         source_doc=_PLACEHOLDER_SHA,
         source_page=row.page,
         raw_json="{}",
@@ -239,6 +270,7 @@ def _reconcile_single_pass(
         unit_raw=present.unit_raw,
         ref_range_raw=present.ref_range_raw,
         flag_raw=present.flag_raw,
+        specimen=present.specimen,
         source_page=present.page,
         status="pending",
         reasons=reasons,
@@ -256,6 +288,7 @@ def _reconcile_matched_pair(
     unit_match = _normalize_str(a.unit_raw) == _normalize_str(b.unit_raw)
     ref_match = _normalize_str(a.ref_range_raw) == _normalize_str(b.ref_range_raw)
     flag_match = _normalize_str(a.flag_raw) == _normalize_str(b.flag_raw)
+    specimen_match = a.specimen == b.specimen
     confidence_ok = a.confidence == "high" and b.confidence == "high"
 
     if not value_match:
@@ -268,6 +301,8 @@ def _reconcile_matched_pair(
         reasons.append(f"ref_range_mismatch: {a.ref_range_raw!r} vs {b.ref_range_raw!r}")
     if not flag_match:
         reasons.append(f"flag_mismatch: {a.flag_raw!r} vs {b.flag_raw!r}")
+    if not specimen_match:
+        reasons.append(f"specimen_mismatch: {a.specimen!r} vs {b.specimen!r}")
     if a.confidence != "high":
         reasons.append(f"pass_a_confidence:{a.confidence}")
     if b.confidence != "high":
@@ -307,6 +342,7 @@ def _reconcile_matched_pair(
         and unit_match
         and ref_match
         and flag_match
+        and specimen_match
         and confidence_ok
         and not issues
         and not decimal_signature
@@ -319,6 +355,11 @@ def _reconcile_matched_pair(
             "reasons": reasons,
         }
     )
+    # Both passes agreeing on specimen is the common case, and that agreed
+    # value is what carries into the persisted LabResult. When they
+    # disagree the row is PENDING regardless (`specimen_mismatch` above) —
+    # pass A's reading is kept as a placeholder pending human correction,
+    # never presented as "the" agreed specimen.
     return ReconciledRow(
         name_raw=a.name_raw,
         canonical_name=canonical,
@@ -328,6 +369,7 @@ def _reconcile_matched_pair(
         unit_raw=a.unit_raw,
         ref_range_raw=a.ref_range_raw,
         flag_raw=a.flag_raw,
+        specimen=a.specimen,
         source_page=a.page,
         status="auto" if gates_pass else "pending",
         reasons=reasons,
@@ -341,6 +383,7 @@ DISAGREEMENT_REASON_PREFIXES: tuple[str, ...] = (
     "unit_mismatch",
     "ref_range_mismatch",
     "flag_mismatch",
+    "specimen_mismatch",
     "single_pass",
     "pass_a_confidence:",
     "pass_b_confidence:",

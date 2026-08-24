@@ -21,7 +21,7 @@ from adoc.ingest.schema import DocumentExtraction
 from adoc.ingest.vision import ImagePart, PdfPart, TextPart, VisionClient
 from adoc.reason.client import LlmClient, Message
 
-PROMPT_A_VERSION = "extractor-pass-a-v1"
+PROMPT_A_VERSION = "extractor-pass-a-v2"
 PROMPT_A = f"""[{PROMPT_A_VERSION}]
 You are extracting structured data from ONE scanned/printed medical
 document (a lab report, clinical note, imaging report, or other document),
@@ -37,8 +37,19 @@ Return a single DocumentExtraction:
   textual value such as a titer or "positive"/"negative" (value_text), the
   unit as printed (unit_raw), the reference range as printed
   (ref_range_raw), any H/L/HH/LL/A flag as printed (flag_raw), the
-  1-indexed page it appears on, and your confidence (high/medium/low) in
-  this specific row.
+  specimen it was drawn from (specimen), the 1-indexed page it appears on,
+  and your confidence (high/medium/low) in this specific row.
+- specimen: record this PER RESULT ROW, from the report's own section
+  header or label immediately governing that row (e.g. a "URINALYSIS"
+  section -> urine; a "Stool"/"Stool Culture" section -> stool; a serum
+  chemistry panel such as a CMP/BMP, or any panel with no specimen stated
+  otherwise -> serum; CBC panels are typically whole_blood; a CSF/spinal
+  fluid analysis -> csf; a saliva panel -> saliva. Use one of: serum,
+  plasma, whole_blood, urine, stool, csf, saliva, other. If the document
+  does not state or clearly imply a specimen for a row, use "unknown" -
+  never guess. This matters: a document with BOTH a urinalysis and a
+  serum panel can print the SAME analyte name (e.g. "GLUCOSE") under each
+  section, and these are two different results that must not be conflated.
 - narrative_findings: free-text clinical observations or serology comments
   that are not discrete result rows (these matter for autoimmune workups -
   do not skip them).
@@ -50,7 +61,7 @@ value you cannot read - mark it illegible instead. Never fabricate a
 result that is not present in the document.
 """
 
-PROMPT_B_VERSION = "extractor-pass-b-v1"
+PROMPT_B_VERSION = "extractor-pass-b-v2"
 PROMPT_B = f"""[{PROMPT_B_VERSION}]
 You are independently re-transcribing ONE medical document from a sequence
 of page images (one image per page, in the order given). This is a SECOND,
@@ -63,9 +74,19 @@ discrete lab value visible on any page, emit one entry in `results` with:
 the label exactly as printed (name_raw), the numeric (value) or textual
 (value_text) reading, the printed unit (unit_raw), the printed reference
 interval (ref_range_raw), any abnormal flag as printed (flag_raw), the
-page number matching that image's position in the sequence (1-indexed),
-and a high/medium/low confidence for that specific reading based on how
-legible the image is.
+specimen it was drawn from (specimen), the page number matching that
+image's position in the sequence (1-indexed), and a high/medium/low
+confidence for that specific reading based on how legible the image is.
+
+For specimen, use the section header or label on the page that governs
+that row (e.g. "URINALYSIS" -> urine; "Stool"/"Stool Culture" -> stool; a
+serum chemistry panel, or an unlabeled panel -> serum; a CBC panel ->
+whole_blood; a CSF/spinal fluid analysis -> csf; a saliva panel -> saliva;
+anything else clearly stated -> other). Use "unknown" if the image gives
+you no basis to tell - never guess. The same analyte name can legitimately
+appear twice in one document under different specimens (e.g. "GLUCOSE" in
+both a urinalysis section and a serum panel) - record each occurrence's
+own specimen rather than assuming they are the same result.
 
 Also set doc_type, facility, collection_date, and report_date from
 whichever page(s) show them; collect any narrative or serology commentary
@@ -131,7 +152,7 @@ def double_pass_extract(
 # specific in the wording, so no rename was needed.
 # --------------------------------------------------------------------------
 
-DOCX_PROMPT_A_VERSION = "docx-extractor-pass-a-v1"
+DOCX_PROMPT_A_VERSION = "docx-extractor-pass-a-v2"
 DOCX_PROMPT_A = f"""[{DOCX_PROMPT_A_VERSION}]
 You are extracting structured data from ONE .docx document, provided below
 as its full plain text (paragraphs in reading order; any tables rendered
@@ -149,9 +170,21 @@ Return a single DocumentExtraction:
   its numeric value (value) or textual value such as a titer or
   "positive"/"negative" (value_text), the unit as written (unit_raw), the
   reference range as written (ref_range_raw), any H/L/HH/LL/A flag as
-  written (flag_raw), `page` set to 1 for every row (this document has no
-  page structure to report), and your confidence (high/medium/low) in this
-  specific row.
+  written (flag_raw), the specimen it was drawn from (specimen), `page`
+  set to 1 for every row (this document has no page structure to report),
+  and your confidence (high/medium/low) in this specific row.
+- specimen: record this PER RESULT ROW, from whichever section heading or
+  label in the text governs that row (e.g. an "Urinalysis" heading ->
+  urine; a "Stool"/"Stool Culture" heading -> stool; a serum chemistry
+  panel, or a panel with no specimen stated -> serum; a CBC panel ->
+  whole_blood; a CSF/spinal fluid analysis -> csf; a saliva panel ->
+  saliva). Use one of: serum, plasma, whole_blood, urine, stool, csf,
+  saliva, other. If the text does not state or clearly imply a specimen
+  for a row, use "unknown" - never guess. The same analyte name can
+  legitimately appear twice in one document under different specimens
+  (e.g. "GLUCOSE" under both a urinalysis section and a serum panel) -
+  record each occurrence's own specimen rather than assuming they are the
+  same result.
 - narrative_findings: free-text clinical observations or serology comments
   that are not discrete result rows (these matter for autoimmune workups -
   do not skip them).
@@ -163,7 +196,7 @@ value that is not in the text - never fabricate a result that is not
 present in the document.
 """
 
-DOCX_PROMPT_B_VERSION = "docx-extractor-pass-b-v1"
+DOCX_PROMPT_B_VERSION = "docx-extractor-pass-b-v2"
 DOCX_PROMPT_B = f"""[{DOCX_PROMPT_B_VERSION}]
 You are independently re-reading the SAME .docx document's extracted text
 a SECOND, INDEPENDENT time. This is used to cross-check a separate model's
@@ -175,10 +208,20 @@ Work through the text top to bottom. For every result row, table entry, or
 discrete lab value you find, emit one entry in `results` with: the label
 exactly as written (name_raw), the numeric (value) or textual (value_text)
 reading, the unit as written (unit_raw), the reference interval as written
-(ref_range_raw), any abnormal flag as written (flag_raw), `page` set to 1
-for every row (this document has no page structure to report), and a
-high/medium/low confidence for that specific reading based on how
-unambiguous the text is.
+(ref_range_raw), any abnormal flag as written (flag_raw), the specimen it
+was drawn from (specimen), `page` set to 1 for every row (this document
+has no page structure to report), and a high/medium/low confidence for
+that specific reading based on how unambiguous the text is.
+
+For specimen, use whichever section heading or label in the text governs
+that row (e.g. "Urinalysis" -> urine; "Stool"/"Stool Culture" -> stool; a
+serum chemistry panel, or an unlabeled panel -> serum; a CBC panel ->
+whole_blood; a CSF/spinal fluid analysis -> csf; a saliva panel -> saliva;
+anything else clearly stated -> other). Use "unknown" if the text gives
+you no basis to tell - never guess. The same analyte name can legitimately
+appear twice in one document under different specimens (e.g. "GLUCOSE"
+under both a urinalysis section and a serum panel) - record each
+occurrence's own specimen rather than assuming they are the same result.
 
 Also set doc_type, facility, collection_date, and report_date from
 wherever the text states them; collect any narrative or serology
