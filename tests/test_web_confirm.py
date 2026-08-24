@@ -14,7 +14,7 @@ from git import Repo
 from web_support import build_app, login
 
 from adoc.ingest.reconcile import row_is_agreed
-from adoc.labs.models import ExtractionStatus, LabDocument, LabResult
+from adoc.labs.models import DocumentStatus, ExtractionStatus, LabDocument, LabResult
 
 SHA = "d" * 64
 SHA2 = "f" * 64
@@ -537,3 +537,47 @@ def test_original_document_404s_for_an_unknown_sha(tmp_path: Path) -> None:
     response = client.get(f"/files/original/{SHA}")
 
     assert response.status_code == 404
+
+
+_DOCX_SHA = "e" * 64
+
+
+def test_confirm_queue_shows_text_fallback_when_no_page_image_exists(tmp_path: Path) -> None:
+    """A docx-sourced pending row has no rendered pages; the row must show
+    the text-document fallback instead of a broken <img> (ported onto the
+    redesigned grouped-queue markup)."""
+    app, repo, db, _calls = build_app(tmp_path)
+    db.upsert_document(
+        LabDocument(
+            sha256=_DOCX_SHA,
+            filename="home-lab.docx",
+            doc_type="lab_report",
+            doc_date=date(2026, 8, 1),
+            page_count=1,
+            status=DocumentStatus.COMPLETE,
+        )
+    )
+    row_id = db.insert_results(
+        [
+            LabResult(
+                date=date(2026, 8, 1),
+                name="potassium",
+                name_raw="Potassium",
+                value=4.1,
+                ucum_unit="mmol/L",
+                source_doc=_DOCX_SHA,
+                source_page=1,
+                extraction_status=ExtractionStatus.PENDING,
+                raw_json='{"reasons": ["missing_date"]}',
+            )
+        ]
+    )[0]
+    assert row_id is not None
+
+    client = TestClient(app)
+    login(client)
+    response = client.get("/confirm")
+
+    assert response.status_code == 200
+    assert "Text document" in response.text
+    assert "no page image" in response.text

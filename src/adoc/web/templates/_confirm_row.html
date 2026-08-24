@@ -9,7 +9,12 @@
         <img src="{{ item.image_url }}" alt="Source document page for {{ item.row.name }}"
              class="confirm-page-image" loading="lazy">
       {% else %}
-        <p class="muted">No source page image available.</p>
+        <div class="confirm-no-image" role="note">
+          <p class="muted">
+            Text document — no page image; review the values against the
+            extracted text in the original document.
+          </p>
+        </div>
       {% endif %}
     </div>
 

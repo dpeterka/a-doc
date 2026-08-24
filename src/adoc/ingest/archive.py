@@ -1,10 +1,14 @@
 """Immutable source-document archival (PLAN.md session loop (a)).
 
-`archive_document` computes a sha256, copies the original byte-for-byte
-into `sources/<sha>__<origname>` (never mutated afterwards - PLAN.md
-"State": "immutable `sources/`"), renders one PNG per page into
-`sources/pages/<sha>/`, and checks `LabsDb.documents` so the pipeline can
-skip re-extraction of a document it has already ingested.
+`archive_document` detects the document's kind by content
+(`ingest.filetypes.detect_doc_kind`), computes a sha256, and copies the
+original byte-for-byte into `sources/<sha>__<origname>` (never mutated
+afterwards - PLAN.md "State": "immutable `sources/`"). For a PDF it also
+renders one PNG per page into `sources/pages/<sha>/`; a `.docx` has no page
+images (`ArchivedDoc.page_paths == []` - see the module docstring of
+`ingest.docx` for why: it is ingested as TEXT, not converted to PDF/images).
+Either way, `LabsDb.documents` is checked so the pipeline can skip
+re-extraction of a document it has already ingested.
 
 Page rendering defaults to shelling out to `pdftoppm` (poppler-utils) - an
 *optional system binary*, never a new Python runtime dependency
@@ -21,6 +25,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+from adoc.ingest.filetypes import DocKind, detect_doc_kind
 from adoc.labs.db import LabsDb
 
 PageRenderer = Callable[[Path, Path], list[Path]]
@@ -37,9 +42,12 @@ class ArchivedDoc:
     original_path: Path
     """The archived immutable copy: `sources/<sha>__<origname>`."""
     page_paths: list[Path]
-    """Sorted page PNG paths: `sources/pages/<sha>/p-*.png`."""
+    """Sorted page PNG paths: `sources/pages/<sha>/p-*.png`. Always `[]` for
+    a `.docx` document - it is never rendered to images (TEXT ingestion)."""
     already_ingested: bool
     """True if `sha256` already had a `documents` row before this call."""
+    kind: DocKind = "pdf"
+    """`"pdf"` or `"docx"` - see `ingest.filetypes.detect_doc_kind`."""
 
 
 def sha256_file(path: Path) -> str:
@@ -92,8 +100,8 @@ def archive_document(
     already had a row for this sha *before* this call - the pipeline uses
     it to skip re-classification/re-extraction of a duplicate document.
     """
-    header = path.open("rb").read(5)
-    if header != b"%PDF-":
+    kind = detect_doc_kind(path)
+    if kind is None:
         raise ArchiveError(
             f"{path.name}: not a PDF (unsupported type); convert to PDF and re-upload"
         )
@@ -106,15 +114,21 @@ def archive_document(
     if not archived_path.exists():
         shutil.copy2(path, archived_path)
 
-    pages_dir = repo_root / "sources" / "pages" / sha
-    if pages_dir.is_dir() and any(pages_dir.iterdir()):
-        page_paths = sorted(pages_dir.iterdir())
+    if kind == "docx":
+        # No page rendering for docx - it is ingested as TEXT (see the
+        # module docstring); `page_paths` stays empty by design.
+        page_paths: list[Path] = []
     else:
-        page_paths = renderer(archived_path, pages_dir)
+        pages_dir = repo_root / "sources" / "pages" / sha
+        if pages_dir.is_dir() and any(pages_dir.iterdir()):
+            page_paths = sorted(pages_dir.iterdir())
+        else:
+            page_paths = renderer(archived_path, pages_dir)
 
     return ArchivedDoc(
         sha256=sha,
         original_path=archived_path,
         page_paths=page_paths,
         already_ingested=already_ingested,
+        kind=kind,
     )
