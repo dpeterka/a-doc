@@ -290,3 +290,13 @@ def test_from_settings_injects_fake_transports_so_no_sdk_client_is_built(
     result = client.complete("primary_reasoner", system="s", messages=[])
 
     assert result.text == "fake"
+
+
+def test_structured_output_unwraps_single_key_nesting() -> None:
+    """Claude occasionally nests tool input under a wrapper key; the client
+    validates flat-first and unwraps only when flat validation fails."""
+    from adoc.reason.client import _unwrap_tool_input
+
+    assert _unwrap_tool_input({"parameters": {"a": 1}}) == {"a": 1}
+    assert _unwrap_tool_input({"a": 1, "b": 2}) == {"a": 1, "b": 2}
+    assert _unwrap_tool_input({"a": 1}) == {"a": 1}
