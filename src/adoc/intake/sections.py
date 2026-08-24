@@ -49,7 +49,7 @@ class SymptomsSection(BaseModel):
 
 
 class MedicalEvent(BaseModel):
-    date_approx: str
+    date_approx: str | None = None
     title: str
     description: str = ""
 
@@ -223,7 +223,11 @@ SECTIONS: list[SectionSpec] = [
             "Extract the patient's major medical events into a list, each with "
             "an approximate date (`date_approx`, any granularity the patient "
             "gave — a year, a year-month, or a full date), a short title, and a "
-            "description. Only include events the patient actually described."
+            "description. When the patient gives NO timing for an event, set "
+            "`date_approx` to null — NEVER write placeholder strings like "
+            "'<UNKNOWN>' or 'unknown'. Keep vague-but-real timing words like "
+            "'recently' verbatim. Only include events the patient actually "
+            "described."
         ),
     ),
     SectionSpec(
