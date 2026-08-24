@@ -15,7 +15,12 @@ intake wizard. `user add|list|remove` manages the web login credential
 store (`web.users`) — `add`'s password prompts go through `_getpass`, a
 seam tests override so a test run never blocks on stdin. `backup` runs
 `adoc.backup.run_backup` against a real S3 client (`_build_s3_client` is
-the seam tests override with a fake). No stubs remain.
+the seam tests override with a fake); `restore` runs its inverse,
+`adoc.backup.restore_from_bucket`, against the same seam. `bootstrap-data`
+is the decide-and-run command `docker-entrypoint.sh` delegates to at
+container start (restore if `ADOC_BACKUP_BUCKET` is set and a backup
+exists, `init` otherwise) — kept in Python rather than shell so the
+decision logic is unit-testable. No stubs remain.
 """
 
 from __future__ import annotations
@@ -27,7 +32,15 @@ from pathlib import Path
 
 from fastapi import FastAPI
 
-from adoc.backup import BackupError, S3Client, build_s3_client, run_backup
+from adoc.backup import (
+    BackupError,
+    NoBackupError,
+    RestoreError,
+    S3Client,
+    build_s3_client,
+    restore_from_bucket,
+    run_backup,
+)
 from adoc.casefile.repo import LEDGER_RELPATH, DataRepo
 from adoc.config import Settings, load_model_bindings
 from adoc.evals.report import write_comparison_report, write_report
@@ -216,6 +229,90 @@ def _cmd_backup(_args: argparse.Namespace) -> int:
         f"backup: sources/ - {report.sources_uploaded} uploaded, {report.sources_skipped} unchanged"
     )
     print(f"backup: labs-export.jsonl uploaded: {report.jsonl_uploaded}")
+    return 0
+
+
+def _cmd_restore(args: argparse.Namespace) -> int:
+    try:
+        settings = Settings()
+    except Exception as exc:  # noqa: BLE001 - surface any config error to the user
+        print(f"restore: configuration error: {exc}", file=sys.stderr)
+        return 1
+
+    bucket = args.bucket or settings.backup_bucket or ""
+    try:
+        report = restore_from_bucket(
+            bucket,
+            settings.data_dir,
+            s3_client=_build_s3_client(),
+            sqlite_journal_mode=settings.sqlite_journal_mode,
+        )
+    except RestoreError as exc:
+        print(f"restore: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"restore: cloned bundle (commit {report.bundle_commit_sha[:12]}) into {report.data_dir}")
+    print(f"restore: sources/ - {report.sources_restored} restored")
+    print(f"restore: labs.sqlite rebuilt from labs-export.jsonl - {report.lab_rows_rebuilt} rows")
+    for warning in report.warnings:
+        print(f"restore: warning: {warning}")
+    return 0
+
+
+def _cmd_bootstrap_data(_args: argparse.Namespace) -> int:
+    """The decide-and-run logic `docker-entrypoint.sh` used to guess at in
+    shell: on a missing/empty data dir, restore from `ADOC_BACKUP_BUCKET`
+    if one is configured, falling back to `adoc init` only when the
+    bucket genuinely has no backup yet (`NoBackupError`) — any other
+    failure (bad credentials, a network hiccup, a real S3 error) must
+    fail loudly rather than silently initializing an empty case file over
+    what might just be a transient problem reaching a real backup. A data
+    dir that already has *something* in it is left untouched either way
+    (matches the entrypoint's prior `[ -z "$(ls -A ...)" ]` check).
+    """
+    try:
+        settings = Settings()
+    except Exception as exc:  # noqa: BLE001 - surface any config error to the user
+        print(f"bootstrap-data: configuration error: {exc}", file=sys.stderr)
+        return 1
+
+    data_dir = settings.data_dir
+    if data_dir.is_dir() and any(data_dir.iterdir()):
+        print(f"bootstrap-data: {data_dir} already has data; nothing to do")
+        return 0
+
+    if settings.backup_bucket:
+        try:
+            report = restore_from_bucket(
+                settings.backup_bucket,
+                data_dir,
+                s3_client=_build_s3_client(),
+                sqlite_journal_mode=settings.sqlite_journal_mode,
+            )
+        except NoBackupError as exc:
+            print(f"bootstrap-data: {exc}; falling back to 'adoc init'")
+        except Exception as exc:  # noqa: BLE001 - a real error must fail loudly, never silent-init
+            print(f"bootstrap-data: restore failed: {exc}", file=sys.stderr)
+            return 1
+        else:
+            print(
+                f"bootstrap-data: restored from s3://{report.bucket}/latest/ "
+                f"(commit {report.bundle_commit_sha[:12]}, {report.lab_rows_rebuilt} lab rows)"
+            )
+            for warning in report.warnings:
+                print(f"bootstrap-data: warning: {warning}")
+            return 0
+
+    try:
+        already_initialized = DataRepo(data_dir).is_initialized
+        DataRepo.init_at(data_dir)
+    except OSError as exc:
+        print(f"bootstrap-data: cannot create data dir: {exc}", file=sys.stderr)
+        return 1
+    if already_initialized:
+        print(f"bootstrap-data: data repo already initialized at {data_dir}")
+    else:
+        print(f"bootstrap-data: initialized data repo at {data_dir}")
     return 0
 
 
@@ -420,6 +517,23 @@ def build_parser() -> argparse.ArgumentParser:
         "backup",
         help="git-bundle the data repo and upload it (+ sources/, labs-export.jsonl) to S3",
     ).set_defaults(func=_cmd_backup)
+    restore_parser = subparsers.add_parser(
+        "restore",
+        help="seed an uninitialized data repo from an S3 backup (the inverse of `adoc backup`)",
+    )
+    restore_parser.add_argument(
+        "--bucket",
+        default=None,
+        help="backup bucket name (default: ADOC_BACKUP_BUCKET / Settings.backup_bucket)",
+    )
+    restore_parser.set_defaults(func=_cmd_restore)
+    subparsers.add_parser(
+        "bootstrap-data",
+        help=(
+            "restore from ADOC_BACKUP_BUCKET if set and a backup exists, else `adoc init` "
+            "(what docker-entrypoint.sh runs on container start)"
+        ),
+    ).set_defaults(func=_cmd_bootstrap_data)
     serve_parser = subparsers.add_parser("serve", help="run the web UI")
     serve_parser.add_argument("--host", default="127.0.0.1", help="bind host (default: 127.0.0.1)")
     serve_parser.add_argument("--port", type=int, default=8080, help="bind port (default: 8080)")

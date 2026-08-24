@@ -135,7 +135,7 @@ def test_each_gate_individually_forces_pending(
     )
 
 
-def test_trend_outlier_alone_forces_pending(tmp_path: Path) -> None:
+def test_agreed_trend_spike_autos_with_annotation(tmp_path: Path) -> None:
     db = _empty_db(tmp_path)
     db.upsert_document(
         LabDocument(
@@ -164,17 +164,60 @@ def test_trend_outlier_alone_forces_pending(tmp_path: Path) -> None:
             ]
         )
 
-    # 6.0 is a >40% jump vs the ~4.0 recent median, but still within the
-    # (1.0, 10.0) physiologic bounds - isolates the trend gate from the
-    # validate_row bounds gate.
+    # 6.0 is a >40% jump vs the ~4.0 median of earlier readings, but both
+    # passes AGREE — treated as real physiology (this patient spikes
+    # frequently): AUTO, with the spike kept as an annotation in reasons.
     pass_a = _doc([_result(value=6.0)])
     pass_b = _doc([_result(value=6.0)])
 
     rows = reconcile(pass_a, pass_b, db)
 
     assert len(rows) == 1
+    assert rows[0].status == "auto"
+    assert any("away from the median" in reason for reason in rows[0].reasons)
+
+
+def test_decimal_signature_shift_still_queues_even_on_agreement(tmp_path: Path) -> None:
+    """A >=10x-class shift is the decimal-misread signature (4.1 -> 41):
+    it must queue even when both passes agree on the misread value."""
+    db = _empty_db(tmp_path)
+    db.upsert_document(
+        LabDocument(
+            sha256=SHA,
+            filename="priors.pdf",
+            doc_type="lab_report",
+            page_count=1,
+            status=DocumentStatus.COMPLETE,
+        )
+    )
+    for day, value in ((1, 3.9), (8, 4.0), (15, 4.1)):
+        db.insert_results(
+            [
+                LabResult(
+                    date=date(2026, 4, day),
+                    name="potassium",
+                    name_raw="Potassium",
+                    value=value,
+                    ucum_unit="mmol/L",
+                    ref_low=3.5,
+                    ref_high=5.1,
+                    source_doc=SHA,
+                    extraction_status=ExtractionStatus.AUTO,
+                    raw_json="{}",
+                )
+            ]
+        )
+    # 41 vs ~4.0 median: bounds gate also fires, but the decimal-signature
+    # trend gate must hold independently even for an in-bounds 10x analyte,
+    # so assert the pending status plus the trend reason's presence.
+    pass_a = _doc([_result(value=41.0)])
+    pass_b = _doc([_result(value=41.0)])
+
+    rows = reconcile(pass_a, pass_b, db)
+
+    assert len(rows) == 1
     assert rows[0].status == "pending"
-    assert any("recent median" in reason for reason in rows[0].reasons)
+    assert any("away from the median" in reason for reason in rows[0].reasons)
 
 
 def test_missing_date_alone_forces_pending(tmp_path: Path) -> None:

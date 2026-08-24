@@ -43,7 +43,10 @@ _FRIENDLY_REASON_SUBSTRINGS: tuple[tuple[str, str], ...] = (
     ("not in whitelist", "the unit isn't one we recognize yet for this test"),
     ("outside plausible bounds", "the value is outside what's typical for this test"),
     ("does not match titer format", "the titer wasn't written in the usual format"),
-    ("away from recent median", "this value jumped a lot compared to your recent readings"),
+    (
+        "away from the median",
+        "this value is far outside the pattern of your earlier readings",
+    ),
     ("but value", "the H/L flag doesn't quite match the value"),
 )
 

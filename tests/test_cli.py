@@ -583,6 +583,206 @@ def test_backup_runs_end_to_end_with_a_fake_s3_client(
     assert any(key == "latest/a-doc-data.bundle" for _, _, key in fake_s3.uploads)
 
 
+def test_restore_fails_without_data_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("ADOC_DATA_DIR", raising=False)
+
+    code = main(["restore"])
+
+    assert code == 1
+    assert "configuration error" in capsys.readouterr().err
+
+
+def test_restore_fails_without_a_bucket_configured(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from test_backup import FakeS3Client
+
+    monkeypatch.setenv("ADOC_DATA_DIR", str(tmp_path / "a-doc-data"))
+    monkeypatch.delenv("ADOC_BACKUP_BUCKET", raising=False)
+    monkeypatch.setattr(cli, "_build_s3_client", lambda: FakeS3Client())
+
+    code = main(["restore"])
+
+    assert code == 1
+    assert "ADOC_BACKUP_BUCKET" in capsys.readouterr().err
+
+
+def test_restore_fails_if_data_dir_already_initialized(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from test_backup import FakeS3Client
+
+    data_dir = tmp_path / "a-doc-data"
+    DataRepo.init_at(data_dir)
+    monkeypatch.setenv("ADOC_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("ADOC_BACKUP_BUCKET", "a-doc-backup-bucket")
+    monkeypatch.setattr(cli, "_build_s3_client", lambda: FakeS3Client())
+
+    code = main(["restore"])
+
+    assert code == 1
+    assert "already contains an initialized data repo" in capsys.readouterr().err
+
+
+def test_restore_runs_end_to_end_with_a_fake_s3_client(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from test_backup import FakeS3Client, _seed_with_labs
+
+    from adoc.backup import run_backup
+
+    src = tmp_path / "src-data"
+    DataRepo.init_at(src)
+    _seed_with_labs(src)
+    fake_s3 = FakeS3Client()
+    run_backup(src, "a-doc-backup-bucket", fake_s3)
+
+    dst = tmp_path / "restored-data"
+    monkeypatch.setenv("ADOC_DATA_DIR", str(dst))
+    monkeypatch.setenv("ADOC_BACKUP_BUCKET", "a-doc-backup-bucket")
+    monkeypatch.setattr(cli, "_build_s3_client", lambda: fake_s3)
+
+    code = main(["restore"])
+
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "cloned bundle" in out
+    assert "sources/ - 3 restored" in out
+    assert "labs.sqlite rebuilt from labs-export.jsonl - 2 rows" in out
+    assert DataRepo(dst).is_initialized
+
+
+def test_restore_bucket_flag_overrides_settings(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from test_backup import FakeS3Client, _seed_with_labs
+
+    from adoc.backup import run_backup
+
+    src = tmp_path / "src-data"
+    DataRepo.init_at(src)
+    _seed_with_labs(src)
+    fake_s3 = FakeS3Client()
+    run_backup(src, "the-real-bucket", fake_s3)
+
+    dst = tmp_path / "restored-data"
+    monkeypatch.setenv("ADOC_DATA_DIR", str(dst))
+    monkeypatch.delenv("ADOC_BACKUP_BUCKET", raising=False)
+    monkeypatch.setattr(cli, "_build_s3_client", lambda: fake_s3)
+
+    code = main(["restore", "--bucket", "the-real-bucket"])
+
+    assert code == 0
+    assert DataRepo(dst).is_initialized
+
+
+def test_bootstrap_data_noop_when_data_dir_already_has_data(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    data_dir = tmp_path / "a-doc-data"
+    data_dir.mkdir()
+    (data_dir / "some-file").write_text("already here", encoding="utf-8")
+    monkeypatch.setenv("ADOC_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("ADOC_BACKUP_BUCKET", "a-doc-backup-bucket")
+
+    code = main(["bootstrap-data"])
+
+    assert code == 0
+    assert "already has data" in capsys.readouterr().out
+    assert not (data_dir / ".git").exists()
+
+
+def test_bootstrap_data_initializes_when_no_bucket_is_configured(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    data_dir = tmp_path / "a-doc-data"
+    monkeypatch.setenv("ADOC_DATA_DIR", str(data_dir))
+    monkeypatch.delenv("ADOC_BACKUP_BUCKET", raising=False)
+
+    code = main(["bootstrap-data"])
+
+    assert code == 0
+    assert "initialized data repo" in capsys.readouterr().out
+    assert DataRepo(data_dir).is_initialized
+
+
+def test_bootstrap_data_restores_when_the_bucket_has_a_backup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from test_backup import FakeS3Client, _seed_with_labs
+
+    from adoc.backup import run_backup
+
+    src = tmp_path / "src-data"
+    DataRepo.init_at(src)
+    _seed_with_labs(src)
+    fake_s3 = FakeS3Client()
+    run_backup(src, "a-doc-backup-bucket", fake_s3)
+
+    data_dir = tmp_path / "a-doc-data"
+    monkeypatch.setenv("ADOC_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("ADOC_BACKUP_BUCKET", "a-doc-backup-bucket")
+    monkeypatch.setattr(cli, "_build_s3_client", lambda: fake_s3)
+
+    code = main(["bootstrap-data"])
+
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "restored from s3://a-doc-backup-bucket/latest/" in out
+    assert DataRepo(data_dir).is_initialized
+
+
+def test_bootstrap_data_falls_back_to_init_when_the_bucket_has_no_backup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from test_backup import FakeS3Client
+
+    data_dir = tmp_path / "a-doc-data"
+    monkeypatch.setenv("ADOC_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("ADOC_BACKUP_BUCKET", "a-doc-backup-bucket")
+    monkeypatch.setattr(cli, "_build_s3_client", lambda: FakeS3Client())
+
+    code = main(["bootstrap-data"])
+
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "falling back to 'adoc init'" in out
+    assert "initialized data repo" in out
+    assert DataRepo(data_dir).is_initialized
+
+
+def test_bootstrap_data_fails_loudly_on_a_real_restore_error_instead_of_silently_initializing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    class _ExplodingS3Client:
+        def list_objects_v2(
+            self, Bucket: str, Prefix: str, ContinuationToken: str | None = None
+        ) -> dict[str, Any]:
+            raise RuntimeError("simulated AWS outage")
+
+        def download_file(self, Bucket: str, Key: str, Filename: str) -> None:
+            raise RuntimeError("simulated AWS outage")  # pragma: no cover - not reached
+
+        def upload_file(self, Filename: str, Bucket: str, Key: str) -> None:
+            raise RuntimeError("simulated AWS outage")  # pragma: no cover - not reached
+
+    data_dir = tmp_path / "a-doc-data"
+    monkeypatch.setenv("ADOC_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("ADOC_BACKUP_BUCKET", "a-doc-backup-bucket")
+    monkeypatch.setattr(cli, "_build_s3_client", lambda: _ExplodingS3Client())
+
+    code = main(["bootstrap-data"])
+
+    assert code == 1
+    err = capsys.readouterr().err
+    assert "restore failed" in err
+    # the outage must not be papered over by silently falling back to init
+    assert not DataRepo(data_dir).is_initialized
+
+
 def test_unknown_subcommand_exits_nonzero() -> None:
     with pytest.raises(SystemExit) as excinfo:
         main(["not-a-real-command"])
