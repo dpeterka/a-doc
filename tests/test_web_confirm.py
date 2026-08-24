@@ -182,10 +182,17 @@ def test_correct_action_with_no_fields_shows_an_error(tmp_path: Path) -> None:
             True,
         ),
         (["missing_date", "CRP: unit 'mg/dL' not in whitelist ('mg/L',)"], True),
+        # RESCUE-paired name variant with at least one shared meaningful
+        # token (D5) -> agreed, same as any other single-source annotation.
+        (["name_variant"], True),
         # Cross-pass disagreements, a row only one pass could read, or low
         # confidence on either pass -> disagreed, regardless of what else
         # is in the list.
         (["single_pass"], False),
+        # RESCUE-paired name variant with ZERO shared meaningful token (D5:
+        # the accepted residual risk of two different analytes coincidentally
+        # sharing a value/page) -> disagreed, needs a real look.
+        (["name_variant_unverified"], False),
         (["single_pass", "missing_date"], False),
         (["value_mismatch: 8.0 vs 9.0"], False),
         (["value_text_mismatch: 'positive' vs 'negative'"], False),
@@ -657,6 +664,58 @@ def test_specimen_mismatch_pending_row_lands_in_disagreement_bucket(tmp_path: Pa
     assert "Models disagreed" in response.text
     assert "serum" in response.text
     assert "urine" in response.text
+
+
+def test_name_variant_unverified_row_lands_in_disagreement_bucket(tmp_path: Path) -> None:
+    """D5: a RESCUE-paired row with zero shared meaningful token between
+    the two names (`name_variant_unverified`) needs a real look, not the
+    bulk-OK "models agreed" bucket."""
+    app, repo, db, _calls = build_app(tmp_path)
+    _seed_document(repo, db, sha=SHA, filename="doc.pdf")
+    _seed_pending_with_raw(
+        db,
+        sha=SHA,
+        name="Vitamin B12",
+        reasons=["name_variant_unverified"],
+        pass_a={
+            "name_raw": "Vitamin B12",
+            "value": 8.0,
+            "unit_raw": None,
+            "ref_range_raw": None,
+            "flag_raw": None,
+            "page": 1,
+            "confidence": "high",
+        },
+        pass_b={
+            "name_raw": "Ketones, Urine",
+            "value": 8.0,
+            "unit_raw": None,
+            "ref_range_raw": None,
+            "flag_raw": None,
+            "page": 1,
+            "confidence": "high",
+        },
+    )
+    client = TestClient(app)
+    login(client)
+
+    response = client.get("/confirm")
+
+    assert response.status_code == 200
+    assert "Models disagreed" in response.text
+    assert "Vitamin B12" in response.text
+
+
+def test_name_variant_unverified_has_a_plain_language_gloss() -> None:
+    """D5: the `_friendly_reason` mapping (`web.routes.confirm`) has a
+    dedicated plain-language line for `name_variant_unverified`, not the
+    generic "a routine check flagged this" fallback."""
+    from adoc.web.routes.confirm import _friendly_reason
+
+    gloss = _friendly_reason("name_variant_unverified")
+    assert gloss == (
+        "two readings matched by value but their names differ a lot - check they are the same test"
+    )
 
 
 def test_specimen_mismatch_is_classified_as_a_disagreement() -> None:

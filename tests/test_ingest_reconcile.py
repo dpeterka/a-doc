@@ -679,7 +679,11 @@ def test_rescue_accepts_residual_risk_when_units_are_compatible(tmp_path: Path) 
     """The flip side of the test above: when units ARE compatible (both
     unstated), two different-analyte same-value-on-the-same-page rows DO
     get rescued together - an accepted residual risk per the module
-    docstring."""
+    docstring. D5: since these two names share NO meaningful token ("Test"
+    is a generic filler word, not a real overlap), the pair is still
+    rescued (never left stranded as twin single_pass rows) but flagged
+    `name_variant_unverified` - a disagreement-bucketed reason, not the
+    silent bulk-OK `name_variant` - so a human actually looks."""
     pass_a = _doc([_result(name_raw="Foo Test", value=0.0, unit_raw=None, page=1)])
     pass_b = _doc([_result(name_raw="Bar Test", value=0.0, unit_raw=None, page=1)])
 
@@ -687,7 +691,47 @@ def test_rescue_accepts_residual_risk_when_units_are_compatible(tmp_path: Path) 
 
     assert len(rows) == 1
     assert rows[0].status == "pending"
-    assert "name_variant" in rows[0].reasons
+    assert "name_variant_unverified" in rows[0].reasons
+    assert "name_variant" not in rows[0].reasons
+    assert row_is_agreed(rows[0].reasons) is False
+
+
+def test_rescue_pair_with_shared_meaningful_token_is_name_variant_and_agreed(
+    tmp_path: Path,
+) -> None:
+    """D5: a rescued pair whose (cleaned) names share at least one
+    meaningful token (len > 2, not a stopword) is the common "same result,
+    worded differently" case - `name_variant`, still in the agreed
+    bucket."""
+    pass_a = _doc([_result(name_raw="Serum Iron Studies", value=45.0, unit_raw="ug/dL", page=2)])
+    pass_b = _doc([_result(name_raw="Iron, Total", value=45.0, unit_raw="ug/dL", page=2)])
+
+    rows = reconcile(pass_a, pass_b, _empty_db(tmp_path))
+
+    assert len(rows) == 1
+    assert rows[0].status == "pending"
+    assert rows[0].reasons[0] == "name_variant"
+    assert row_is_agreed(rows[0].reasons) is True
+
+
+def test_rescue_pair_with_no_shared_token_is_name_variant_unverified_and_disagreement(
+    tmp_path: Path,
+) -> None:
+    """D5: the flip side - zero meaningful token overlap between the two
+    (cleaned) names is the accepted residual risk (module docstring: two
+    genuinely different analytes coincidentally sharing a value/page).
+    Rescue still pairs them (never stranded as twin single_pass rows), but
+    the reason routes to the disagreement bucket instead of being bulk-OK'd
+    alongside genuine name variants."""
+    pass_a = _doc([_result(name_raw="Vitamin B12", value=0.0, unit_raw=None, page=1)])
+    pass_b = _doc([_result(name_raw="Ketones, Urine", value=0.0, unit_raw=None, page=1)])
+
+    rows = reconcile(pass_a, pass_b, _empty_db(tmp_path))
+
+    assert len(rows) == 1
+    assert rows[0].status == "pending"
+    assert rows[0].reasons[0] == "name_variant_unverified"
+    assert row_is_agreed(rows[0].reasons) is False
 
 
 @pytest.mark.parametrize(

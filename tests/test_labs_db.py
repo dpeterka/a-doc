@@ -665,3 +665,96 @@ def test_resolved_rows_for_document_excludes_pending_and_other_documents(db: Lab
     resolved = db.resolved_rows_for_document(SHA_A)
     resolved_ids = {r.id for r in resolved}
     assert resolved_ids == {auto_id, confirmed_id}
+
+
+# --------------------------------------------------------------------------
+# insert_results re-extraction handling (D1): a row colliding with one
+# already occupying its (date, name, specimen, source_doc) UNIQUE key must
+# never be a silent no-op against a row a human already resolved one way or
+# another - see `LabsDb.insert_results`'s docstring for the four cases.
+# --------------------------------------------------------------------------
+
+
+def test_insert_results_case_a_no_existing_row_inserts_normally(db: LabsDb) -> None:
+    (row_id,) = db.insert_results([_lab(value=4.1)])
+    assert row_id is not None
+    row = db.get_row(row_id)
+    assert row is not None
+    assert row.value == 4.1
+    assert row.extraction_status == ExtractionStatus.AUTO
+
+
+def test_insert_results_case_b_revives_a_rejected_row_with_corrected_reading(db: LabsDb) -> None:
+    """A rejected row occupies the UNIQUE key; a later re-extraction of the
+    same document with a corrected reading must revive it (overwrite its
+    fields, requeue PENDING), never silently drop the correction."""
+    (row_id,) = db.insert_results([_lab(value=8.0)])
+    assert row_id is not None
+    db.reject_row(row_id)
+
+    (result_id,) = db.insert_results([_lab(value=9.5)])
+
+    assert result_id == row_id  # revived in place, not a new row
+    row = db.get_row(row_id)
+    assert row is not None
+    assert row.value == 9.5
+    assert row.extraction_status == ExtractionStatus.PENDING
+    payload = row.raw_payload()
+    assert "re_extraction_after_rejection" in payload["reasons"]
+    assert payload["superseded_rejection"]["value"] == 8.0
+    assert len(db.series("potassium")) == 1
+
+
+def test_insert_results_case_c_dedupes_identical_reading_over_confirmed_row(db: LabsDb) -> None:
+    (row_id,) = db.insert_results([_lab(value=4.1)])
+    assert row_id is not None
+    db.confirm_row(row_id)
+
+    result = db.insert_results([_lab(value=4.1)])  # identical value/unit
+
+    assert result == [None]
+    row = db.get_row(row_id)
+    assert row is not None
+    assert row.extraction_status == ExtractionStatus.CONFIRMED  # untouched
+    assert len(db.series("potassium")) == 1
+
+
+def test_insert_results_case_d_differing_reextraction_flips_confirmed_row_to_pending(
+    db: LabsDb,
+) -> None:
+    """A confirmed row's key gets a re-extraction with a DIFFERENT value -
+    never silently dropped: the existing (human-confirmed) reading is left
+    untouched, but the row flips back to PENDING with the new reading
+    merged in for a human to resolve."""
+    (row_id,) = db.insert_results([_lab(value=4.1)])
+    assert row_id is not None
+    db.confirm_row(row_id)
+
+    (result_id,) = db.insert_results([_lab(value=4.4)])
+
+    assert result_id == row_id  # never silently dropped
+    row = db.get_row(row_id)
+    assert row is not None
+    assert row.value == 4.1  # the confirmed reading is untouched
+    assert row.extraction_status == ExtractionStatus.PENDING
+    payload = row.raw_payload()
+    assert payload["re_extraction_conflict"]["value"] == 4.4
+    assert any(r.startswith("re_extraction_conflict") for r in payload["reasons"])
+    assert len(db.series("potassium")) == 1  # still one row, not duplicated
+
+
+def test_insert_results_case_d_differing_reextraction_flips_pending_row_too(db: LabsDb) -> None:
+    """Case (d) applies to a still-PENDING existing row too, not just a
+    resolved one."""
+    (row_id,) = db.insert_results([_lab(value=4.1, extraction_status=ExtractionStatus.PENDING)])
+    assert row_id is not None
+
+    (result_id,) = db.insert_results([_lab(value=41.0)])
+
+    assert result_id == row_id
+    row = db.get_row(row_id)
+    assert row is not None
+    assert row.value == 4.1
+    assert row.extraction_status == ExtractionStatus.PENDING
+    payload = row.raw_payload()
+    assert payload["re_extraction_conflict"]["value"] == 41.0

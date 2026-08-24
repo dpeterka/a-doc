@@ -54,6 +54,10 @@ _FRIENDLY_REASON_SUBSTRINGS: tuple[tuple[str, str], ...] = (
         "this value is far outside the pattern of your earlier readings",
     ),
     ("but value", "the H/L flag doesn't quite match the value"),
+    (
+        "name_variant_unverified",
+        "two readings matched by value but their names differ a lot - check they are the same test",
+    ),
 )
 
 # Reason prefixes (see `ingest.reconcile`) that name which field of a

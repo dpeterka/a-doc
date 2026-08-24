@@ -8,6 +8,8 @@ import json
 from datetime import UTC, date, datetime
 from pathlib import Path
 
+import pytest
+
 from adoc.config import ModelBinding
 from adoc.labs.db import LabsDb
 from adoc.labs.models import DocumentStatus, ExtractionStatus, LabDocument, LabResult
@@ -95,8 +97,29 @@ def _client(same_measurement: bool | None) -> LlmClient:
 # --------------------------------------------------------------------------
 
 
-def test_names_equivalent_by_rule_matches_on_token_subset() -> None:
-    assert names_equivalent_by_rule("T-Score", "LEFT HIP femoral neck T-Score") is True
+def test_names_equivalent_by_rule_no_longer_matches_on_token_subset() -> None:
+    """D3: rule-path equivalence is exact-match (after clean+casefold) ONLY
+    now - a genuine suffix/subset variant like this one used to auto-decide
+    here, but now falls through to the LLM path instead (see
+    test_sweep_rejects_a_genuine_suffix_variant_via_llm below)."""
+    assert names_equivalent_by_rule("T-Score", "LEFT HIP femoral neck T-Score") is False
+
+
+@pytest.mark.parametrize(
+    "name_a,name_b",
+    [
+        ("Iron", "Iron Binding Capacity"),
+        ("T4", "Free T4"),
+        ("Calcium", "Ionized Calcium"),
+    ],
+)
+def test_names_equivalent_by_rule_rejects_clinically_distinct_paired_tests(
+    name_a: str, name_b: str
+) -> None:
+    """D3 regression: these are clinically DISTINCT paired tests (one name
+    happens to be a token subset of the other), never the same measurement
+    transcribed two ways - the rule path must not auto-decide them."""
+    assert names_equivalent_by_rule(name_a, name_b) is False
 
 
 def test_names_equivalent_by_rule_matches_after_casefold_and_cleaning() -> None:
@@ -132,12 +155,15 @@ def test_find_candidate_returns_none_when_value_differs(tmp_path: Path) -> None:
 
 
 def test_sweep_rejects_a_rule_path_twin(tmp_path: Path) -> None:
+    """D3: the rule path only decides an EXACT match (after
+    `clean_result_name` + casefold) - this pair (a trailing-fragment
+    variant of the same name) still qualifies; LLM must never be called."""
     db = LabsDb(tmp_path / "labs.sqlite")
     db.upsert_document(_doc())
     db.insert_results(
         [
             _row(
-                "LEFT HIP femoral neck T-Score",
+                "FRAX 10-year probability of hip fracture",
                 value=-1.2,
                 page=5,
                 status=ExtractionStatus.AUTO,
@@ -147,7 +173,7 @@ def test_sweep_rejects_a_rule_path_twin(tmp_path: Path) -> None:
     (pending_id,) = db.insert_results(
         [
             _row(
-                "T-Score",
+                "frax 10-year probability of hip fracture is",
                 value=-1.2,
                 page=5,
                 status=ExtractionStatus.PENDING,
@@ -170,6 +196,78 @@ def test_sweep_rejects_a_rule_path_twin(tmp_path: Path) -> None:
     payload = row.raw_payload()
     assert payload["method"] == "rule"
     assert "auto_rejected_twin_of" in payload
+
+
+def test_sweep_rejects_a_genuine_suffix_variant_via_llm(tmp_path: Path) -> None:
+    """D3: a genuine suffix/subset variant ("T-Score" vs a site-prefixed
+    DEXA row name) is no longer decided by the rule path - it now falls
+    through to the LLM path, which still judges it correctly as a twin."""
+    db = LabsDb(tmp_path / "labs.sqlite")
+    db.upsert_document(_doc())
+    db.insert_results(
+        [_row("LEFT HIP femoral neck T-Score", value=-1.2, page=5, status=ExtractionStatus.AUTO)]
+    )
+    (pending_id,) = db.insert_results(
+        [
+            _row(
+                "T-Score",
+                value=-1.2,
+                page=5,
+                status=ExtractionStatus.PENDING,
+                reasons=["single_pass"],
+            )
+        ]
+    )
+    assert pending_id is not None
+
+    report = sweep_twins(db, _client(True))
+
+    assert report.rejected == 1
+    assert report.rejected_rule == 0
+    assert report.rejected_llm == 1
+    row = db.get_row(pending_id)
+    assert row is not None
+    assert row.extraction_status == ExtractionStatus.REJECTED
+    assert row.raw_payload()["method"] == "llm"
+
+
+@pytest.mark.parametrize(
+    "existing_name,pending_name",
+    [
+        ("Iron Binding Capacity", "Iron"),
+        ("Free T4", "T4"),
+        ("Ionized Calcium", "Calcium"),
+    ],
+)
+def test_sweep_leaves_clinically_distinct_pairs_unrejected(
+    tmp_path: Path, existing_name: str, pending_name: str
+) -> None:
+    """D3 regression: with a fake LLM correctly answering
+    same_measurement=false, these three clinically-distinct pairs must
+    survive the sweep unrejected - the rule path no longer short-circuits
+    to an incorrect same-measurement decision on a token subset."""
+    db = LabsDb(tmp_path / "labs.sqlite")
+    db.upsert_document(_doc())
+    db.insert_results([_row(existing_name, value=1.0, page=3, status=ExtractionStatus.AUTO)])
+    (pending_id,) = db.insert_results(
+        [
+            _row(
+                pending_name,
+                value=1.0,
+                page=3,
+                status=ExtractionStatus.PENDING,
+                reasons=["single_pass"],
+            )
+        ]
+    )
+    assert pending_id is not None
+
+    report = sweep_twins(db, _client(False))
+
+    assert report.rejected == 0
+    row = db.get_row(pending_id)
+    assert row is not None
+    assert row.extraction_status == ExtractionStatus.PENDING
 
 
 def test_sweep_rejects_an_llm_path_twin(tmp_path: Path) -> None:
@@ -305,12 +403,19 @@ def test_sweep_dry_run_mutates_nothing(tmp_path: Path) -> None:
     db = LabsDb(tmp_path / "labs.sqlite")
     db.upsert_document(_doc())
     db.insert_results(
-        [_row("LEFT HIP femoral neck T-Score", value=-1.2, page=5, status=ExtractionStatus.AUTO)]
+        [
+            _row(
+                "FRAX 10-year probability of hip fracture",
+                value=-1.2,
+                page=5,
+                status=ExtractionStatus.AUTO,
+            )
+        ]
     )
     (pending_id,) = db.insert_results(
         [
             _row(
-                "T-Score",
+                "frax 10-year probability of hip fracture is",
                 value=-1.2,
                 page=5,
                 status=ExtractionStatus.PENDING,
@@ -332,12 +437,19 @@ def test_sweep_is_idempotent(tmp_path: Path) -> None:
     db = LabsDb(tmp_path / "labs.sqlite")
     db.upsert_document(_doc())
     db.insert_results(
-        [_row("LEFT HIP femoral neck T-Score", value=-1.2, page=5, status=ExtractionStatus.AUTO)]
+        [
+            _row(
+                "FRAX 10-year probability of hip fracture",
+                value=-1.2,
+                page=5,
+                status=ExtractionStatus.AUTO,
+            )
+        ]
     )
     db.insert_results(
         [
             _row(
-                "T-Score",
+                "frax 10-year probability of hip fracture is",
                 value=-1.2,
                 page=5,
                 status=ExtractionStatus.PENDING,
@@ -363,12 +475,19 @@ def test_sweep_summary_round_trips(tmp_path: Path) -> None:
     db = LabsDb(tmp_path / "labs.sqlite")
     db.upsert_document(_doc())
     db.insert_results(
-        [_row("LEFT HIP femoral neck T-Score", value=-1.2, page=5, status=ExtractionStatus.AUTO)]
+        [
+            _row(
+                "FRAX 10-year probability of hip fracture",
+                value=-1.2,
+                page=5,
+                status=ExtractionStatus.AUTO,
+            )
+        ]
     )
     db.insert_results(
         [
             _row(
-                "T-Score",
+                "frax 10-year probability of hip fracture is",
                 value=-1.2,
                 page=5,
                 status=ExtractionStatus.PENDING,
@@ -405,7 +524,12 @@ def _single_pass_row(name_raw: str, *, value: float, side: str, page: int = 4) -
 def test_pending_pending_twins_are_retro_paired(tmp_path: Path) -> None:
     """Phase 2: both halves stranded PENDING (opposite passes, same value)
     pair up - the longer name survives as an agreed name_variant row, the
-    other is rejected as its twin."""
+    other is rejected as its twin.
+
+    D3: after `clean_result_name`, "10-year probability of hip fracture is"
+    -> "10-year probability of hip fracture", a token SUBSET of (not exactly
+    equal to) "FRAX 10-year probability of hip fracture" - so this pairing
+    is decided by the LLM path now, not the rule path."""
     db = LabsDb(tmp_path / "labs.sqlite")
     db.upsert_document(_doc())
     (long_id,) = db.insert_results(
@@ -415,7 +539,7 @@ def test_pending_pending_twins_are_retro_paired(tmp_path: Path) -> None:
         [_single_pass_row("10-year probability of hip fracture is", value=1.2, side="b")]
     )
 
-    report = sweep_twins(db, _client(None))
+    report = sweep_twins(db, _client(True))
 
     assert report.paired == 1
     assert long_id is not None and short_id is not None
