@@ -606,3 +606,24 @@ def test_save_and_load_intake_state_round_trip(tmp_path: Path) -> None:
     assert loaded.sections["basics"].status == "complete"
     assert loaded.sections["basics"].draft == {"age": 41}
     assert loaded.cursor == "symptoms"
+
+
+def test_document_drop_auto_completes_when_sources_exist(tmp_path: Path) -> None:
+    """A seeded deployment (documents already ingested into sources/) must
+    not ask the patient to upload files they already provided."""
+    repo = DataRepo.init_at(tmp_path / "data")
+    (repo.root / "sources" / "abc__report.pdf").write_bytes(b"%PDF-fake")
+
+    client, _transport = _make_client({})
+    wizard = IntakeWizard(repo, client)
+
+    assert wizard._state.sections["document_drop"].status == "complete"
+
+
+def test_document_drop_still_asked_on_a_fresh_repo(tmp_path: Path) -> None:
+    repo = DataRepo.init_at(tmp_path / "data")
+
+    client, _transport = _make_client({})
+    wizard = IntakeWizard(repo, client)
+
+    assert wizard._state.sections["document_drop"].status == "pending"

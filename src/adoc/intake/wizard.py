@@ -508,9 +508,27 @@ class IntakeWizard:
         state = load_intake_state(self._state_path())
         for spec in SECTIONS:
             state.sections.setdefault(spec.key, SectionState())
+        self._auto_complete_document_drop(state)
         if state.cursor is not None and state.cursor not in {spec.key for spec in SECTIONS}:
             state.cursor = self._first_incomplete_key(state)
         return state
+
+    def _auto_complete_document_drop(self, state: IntakeState) -> None:
+        """When documents are already on file (a seeded/curated deployment:
+        `sources/` is non-empty), the document-drop section has nothing to
+        ask — mark it complete automatically instead of prompting the
+        patient to upload what is already there. A fresh, empty data repo
+        still gets the prompt."""
+        section = state.sections.get("document_drop")
+        if section is None or section.status == "complete":
+            return
+        sources = self._repo.root / "sources"
+        has_documents = sources.is_dir() and any(
+            entry.name != ".gitkeep" for entry in sources.iterdir()
+        )
+        if has_documents:
+            section.status = "complete"
+            section.completed_at = datetime.now(UTC)
 
     def _save_state(self) -> None:
         save_intake_state(self._state_path(), self._state)
