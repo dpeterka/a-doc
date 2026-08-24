@@ -51,6 +51,33 @@ def test_settings_optional_keys_default_none(
     assert settings.session_passphrase is None
 
 
+def test_settings_deploy_only_fields_default(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)  # hermetic: a developer .env must not leak into Settings
+    monkeypatch.setenv("ADOC_DATA_DIR", str(tmp_path))
+    monkeypatch.delenv("ADOC_SQLITE_JOURNAL_MODE", raising=False)
+    monkeypatch.delenv("ADOC_BACKUP_BUCKET", raising=False)
+
+    settings = Settings()
+
+    assert settings.sqlite_journal_mode == "WAL"
+    assert settings.backup_bucket is None
+
+
+def test_settings_deploy_only_fields_from_env(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("ADOC_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("ADOC_SQLITE_JOURNAL_MODE", "TRUNCATE")
+    monkeypatch.setenv("ADOC_BACKUP_BUCKET", "a-doc-backup-bucket")
+
+    settings = Settings()
+
+    assert settings.sqlite_journal_mode == "TRUNCATE"
+    assert settings.backup_bucket == "a-doc-backup-bucket"
+
+
 def test_load_model_bindings_has_all_roles() -> None:
     bindings = load_model_bindings(MODELS_FILE)
 

@@ -1,10 +1,10 @@
 # 0005. Cross-family model bindings for Challenger and blind panel
 
-Status: Accepted
+Status: Accepted (amended 2026-08-23: `gpt-5.2-thinking` does not exist as a model id — thinking depth is the `reasoning_effort` request parameter on `gpt-5.2`; the Featherless panelist is `deepseek-ai/DeepSeek-R1-0528`. All bindings live-verified returning parsed structured output.)
 
 ## Context
 
-Anchoring is the #1 predicted failure mode for this patient (PLAN.md
+Anchoring is the #1 predicted failure mode for this use case (PLAN.md
 "Research conclusions" #3): LLMs measurably anchor on and are sycophantic
 toward a user-presented theory. A Challenger stage implemented with the
 *same* model family as the Ledger-Maintainer risks sharing that model
@@ -21,7 +21,7 @@ model families:
 
 - `primary_reasoner` (Ledger-Maintainer, Composer, chat): Anthropic
   (`claude-opus-5`).
-- `challenger`: OpenAI (`gpt-5.2-thinking`) — a different family from the
+- `challenger`: OpenAI (`gpt-5.2`) — a different family from the
   primary reasoner, by design, so it can attack the primary's reasoning
   without inheriting its blind spots.
 - `blind_panel` (weekly review): three families — Anthropic, OpenAI, and a

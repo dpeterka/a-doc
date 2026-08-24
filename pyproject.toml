@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "adoc"
-version = "0.2.0"
+version = "0.3.0"
 description = "a-doc — personal longitudinal medical diagnostic assistant"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -22,6 +22,7 @@ dependencies = [
   "httpx",
   "python-multipart",
   "sse-starlette",
+  "boto3",
 ]
 
 [project.scripts]
@@ -60,6 +61,13 @@ disallow_untyped_defs = true
 warn_unused_ignores = true
 warn_return_any = true
 check_untyped_defs = true
+
+[[tool.mypy.overrides]]
+# boto3 ships no inline types and this project deliberately does not add
+# boto3-stubs/types-boto3 as a dev dependency (adoc.backup.S3Client is a
+# narrow Protocol seam instead — see that module's docstring).
+module = "boto3.*"
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

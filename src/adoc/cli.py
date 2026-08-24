@@ -13,7 +13,9 @@ and runs it under uvicorn (`_run_uvicorn` is the seam tests override so a
 test run never actually binds a socket). `onboard` is wired to the real
 intake wizard. `user add|list|remove` manages the web login credential
 store (`web.users`) — `add`'s password prompts go through `_getpass`, a
-seam tests override so a test run never blocks on stdin. No stubs remain.
+seam tests override so a test run never blocks on stdin. `backup` runs
+`adoc.backup.run_backup` against a real S3 client (`_build_s3_client` is
+the seam tests override with a fake). No stubs remain.
 """
 
 from __future__ import annotations
@@ -25,6 +27,7 @@ from pathlib import Path
 
 from fastapi import FastAPI
 
+from adoc.backup import BackupError, S3Client, build_s3_client, run_backup
 from adoc.casefile.repo import LEDGER_RELPATH, DataRepo
 from adoc.config import Settings, load_model_bindings
 from adoc.evals.report import write_comparison_report, write_report
@@ -181,6 +184,41 @@ def _build_renderer() -> PageRenderer:
     return pdftoppm_renderer
 
 
+def _build_s3_client() -> S3Client:
+    """Real wiring for `adoc backup`. Overridden by tests to inject a fake
+    S3 client so a test run never talks to AWS."""
+    return build_s3_client()
+
+
+def _cmd_backup(_args: argparse.Namespace) -> int:
+    try:
+        settings = Settings()
+    except Exception as exc:  # noqa: BLE001 - surface any config error to the user
+        print(f"backup: configuration error: {exc}", file=sys.stderr)
+        return 1
+
+    repo = DataRepo(settings.data_dir)
+    if not repo.is_initialized:
+        print(
+            f"backup: data repo not initialized at {settings.data_dir} - run `adoc init` first",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        report = run_backup(settings.data_dir, settings.backup_bucket or "", _build_s3_client())
+    except BackupError as exc:
+        print(f"backup: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"backup: bundle uploaded to s3://{report.bucket}/latest/a-doc-data.bundle")
+    print(
+        f"backup: sources/ - {report.sources_uploaded} uploaded, {report.sources_skipped} unchanged"
+    )
+    print(f"backup: labs-export.jsonl uploaded: {report.jsonl_uploaded}")
+    return 0
+
+
 def _print_ingest_report(report: IngestReport) -> None:
     for outcome in report.files:
         print(
@@ -208,7 +246,7 @@ def _run_ingest(settings: Settings, directory: Path | None, *, reason: bool = Fa
     vision = _build_vision_client(llm_client)
     renderer = _build_renderer()
     db_path = settings.data_dir / "labs.sqlite"
-    with LabsDb(db_path) as db:
+    with LabsDb(db_path, journal_mode=settings.sqlite_journal_mode) as db:
         if directory is not None:
             report = ingest_directory(directory, repo=repo, db=db, vision=vision, renderer=renderer)
         else:
@@ -258,7 +296,7 @@ def _cmd_review(_args: argparse.Namespace) -> int:
         return 1
 
     db_path = settings.data_dir / "labs.sqlite"
-    with LabsDb(db_path) as db:
+    with LabsDb(db_path, journal_mode=settings.sqlite_journal_mode) as db:
         report = run_weekly_review(repo, db, client)
 
     print(
@@ -378,6 +416,10 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("review", help="run the weekly deep review").set_defaults(
         func=_cmd_review
     )
+    subparsers.add_parser(
+        "backup",
+        help="git-bundle the data repo and upload it (+ sources/, labs-export.jsonl) to S3",
+    ).set_defaults(func=_cmd_backup)
     serve_parser = subparsers.add_parser("serve", help="run the web UI")
     serve_parser.add_argument("--host", default="127.0.0.1", help="bind host (default: 127.0.0.1)")
     serve_parser.add_argument("--port", type=int, default=8080, help="bind port (default: 8080)")

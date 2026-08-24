@@ -1,6 +1,6 @@
 # 0004. AWS infrastructure as CloudFormation, no console-created resources
 
-Status: Accepted
+Status: Accepted (compute-target sections superseded by ADR 0006 — ECS Fargate + EFS replaced the EC2 node; access sections superseded by ADR 0007 — public ALB replaced Tailscale. The IaC principle itself stands.)
 
 ## Context
 

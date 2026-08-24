@@ -3,21 +3,22 @@ Description: >
   a-doc ALB stack: public-facing Application Load Balancer, ACM certificate,
   and the Route53 alias record for the patient-facing domain. This is the
   public entry point that replaced Tailscale (explicit user decision) — the
-  instance itself is still not directly reachable from the internet (see
-  network.yaml's InstanceSecurityGroup, which only admits the ALB's
-  security group on port 8080). Authentication is now an in-app
+  app itself is still not directly reachable from the internet (see
+  deploy/cfn/ecs.yaml's ServiceSecurityGroup, which only admits the ALB's
+  security group on port 8080). Authentication is an in-app
   username/password gate with in-app rate limiting (src/adoc/web); this
   stack adds no WAF and no additional network-level auth by design.
+
+  The target group is TargetType "ip" (Fargate/awsvpc, registered/
+  deregistered dynamically by the ECS service in deploy/cfn/ecs.yaml) —
+  there is no static Targets list and no InstanceStackName import any more
+  (see ADR 0006: EC2+install.sh -> ECS Fargate + EFS).
 
 Parameters:
   NetworkStackName:
     Type: String
     Default: a-doc-network
     Description: Name of the deployed network stack (for cross-stack imports).
-  InstanceStackName:
-    Type: String
-    Default: a-doc-instance
-    Description: Name of the deployed instance stack (for cross-stack imports).
   DomainName:
     Type: String
     Default: adoc.petabloc.io
@@ -63,17 +64,16 @@ Resources:
         Fn::ImportValue: !Sub "${NetworkStackName}-VpcId"
       Port: 8080
       Protocol: HTTP
-      TargetType: instance
+      # Fargate awsvpc tasks are registered/deregistered by the ECS service
+      # itself (deploy/cfn/ecs.yaml's WebService), not declared statically
+      # here - no Targets property, no InstanceStackName import.
+      TargetType: ip
       HealthCheckEnabled: true
       HealthCheckProtocol: HTTP
       HealthCheckPath: /healthz
       HealthCheckIntervalSeconds: 30
       HealthyThresholdCount: 2
       UnhealthyThresholdCount: 3
-      Targets:
-        - Id:
-            Fn::ImportValue: !Sub "${InstanceStackName}-InstanceId"
-          Port: 8080
       Tags:
         - Key: Name
           Value: a-doc-tg
@@ -119,5 +119,9 @@ Outputs:
     Value: !GetAtt Alb.DNSName
     Export:
       Name: !Sub "${AWS::StackName}-AlbDnsName"
+  TargetGroupArn:
+    Value: !Ref TargetGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-TargetGroupArn"
   Url:
     Value: !Sub "https://${DomainName}/"

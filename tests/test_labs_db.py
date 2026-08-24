@@ -77,6 +77,20 @@ def test_foreign_keys_and_wal_enabled(db: LabsDb) -> None:
     assert db._conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
 
 
+def test_journal_mode_defaults_to_wal(tmp_path: Path) -> None:
+    """Local/dev/test default: WAL is fast on a normal local filesystem."""
+    store = LabsDb(tmp_path / "labs.sqlite")
+    assert store._conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+
+
+def test_journal_mode_truncate_for_nfs_efs(tmp_path: Path) -> None:
+    """Deployed (ECS/EFS) mode: TRUNCATE avoids WAL's shared-memory index
+    file, which is unsafe over NFS/EFS (see LabsDb.__init__'s docstring and
+    ADR 0006)."""
+    store = LabsDb(tmp_path / "labs.sqlite", journal_mode="TRUNCATE")
+    assert store._conn.execute("PRAGMA journal_mode").fetchone()[0] == "truncate"
+
+
 def test_insert_results_returns_ids(db: LabsDb) -> None:
     ids = db.insert_results([_lab(), _lab(name="sodium", value=140.0, ucum_unit="mmol/L")])
     assert all(isinstance(i, int) for i in ids)

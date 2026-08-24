@@ -140,7 +140,7 @@ def client_ip(request: Request, *, trust_forwarded_for: bool) -> str:
 
     `trust_forwarded_for` must only be true when every request that can
     reach this process has passed through the ALB — true in the deployed
-    app (`deploy/cfn/network.yaml`'s InstanceSecurityGroup admits inbound
+    app (`deploy/cfn/ecs.yaml`'s ServiceSecurityGroup admits inbound
     8080 from the ALB security group only, so nothing else can set this
     header), false by default (`Settings.trust_forwarded_for`) so a local
     `adoc serve` or a test run never trusts a client-supplied header.
