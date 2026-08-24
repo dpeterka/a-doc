@@ -92,6 +92,11 @@ def archive_document(
     already had a row for this sha *before* this call - the pipeline uses
     it to skip re-classification/re-extraction of a duplicate document.
     """
+    header = path.open("rb").read(5)
+    if header != b"%PDF-":
+        raise ArchiveError(
+            f"{path.name}: not a PDF (unsupported type); convert to PDF and re-upload"
+        )
     sha = sha256_file(path)
     already_ingested = db.get_document(sha) is not None
 
