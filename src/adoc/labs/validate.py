@@ -33,6 +33,11 @@ ValueKind = Literal["numeric", "titer", "qualitative"]
 # triggers a flag (PLAN.md: "decimal-error detection", e.g. K 4.1 -> 41).
 TREND_OUTLIER_RATIO = 0.4
 TREND_OUTLIER_MIN_PRIORS = 3
+# A >=10x-class shift is the decimal-misread signature (4.1 -> 41). Below
+# this, a cross-pass-agreed value is treated as a real physiological spike
+# (this patient spikes frequently — confirmed against source PDFs) and the
+# outlier becomes an annotation, not an auto-accept blocker.
+DECIMAL_SIGNATURE_RATIO = 9.0
 
 
 class IssueCode(StrEnum):
@@ -350,12 +355,11 @@ def validate_row(row: LabResult) -> list[ValidationIssue]:
     return issues
 
 
-def trend_outlier(db: LabsDb, row: LabResult) -> ValidationIssue | None:
-    """Flag a >40% jump vs. the patient's own recent median (>=3 priors).
-
-    Catches decimal-shift extraction errors (e.g. potassium 4.1 misread as
-    41) without any clinical knowledge — pure statistics on this patient's
-    own history for the same canonical analyte.
+def trend_deviation(db: LabsDb, row: LabResult) -> float | None:
+    """Relative deviation of `row.value` from the median of all EARLIER
+    readings (by collection date) of the same canonical analyte; None when
+    fewer than TREND_OUTLIER_MIN_PRIORS priors exist or the value is
+    non-numeric.
     """
     if row.value is None:
         return None
@@ -370,11 +374,21 @@ def trend_outlier(db: LabsDb, row: LabResult) -> ValidationIssue | None:
     median = statistics.median(priors)
     if median == 0:
         return None
-    ratio = abs(row.value - median) / abs(median)
-    if ratio > TREND_OUTLIER_RATIO:
+    return abs(row.value - median) / abs(median)
+
+
+def trend_outlier(db: LabsDb, row: LabResult) -> ValidationIssue | None:
+    """Flag a >40% jump vs. the median of the patient's earlier readings
+    (>=3 priors). Catches decimal-shift extraction errors (e.g. potassium
+    4.1 misread as 41) without any clinical knowledge — pure statistics on
+    this patient's own history for the same canonical analyte.
+    """
+    ratio = trend_deviation(db, row)
+    if ratio is not None and ratio > TREND_OUTLIER_RATIO:
+        canonical = canonicalize(row.name) or row.name
         return ValidationIssue(
             IssueCode.TREND_OUTLIER,
-            f"{canonical}: value {row.value} is {ratio:.0%} away from recent median "
-            f"{median} across {len(priors)} priors - possible decimal error",
+            f"{canonical}: value {row.value} is {ratio:.0%} away from the median of "
+            f"earlier readings - possible decimal error",
         )
     return None
