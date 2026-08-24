@@ -759,3 +759,34 @@ def test_trailing_see_note_suffix_is_stripped(ref_a: str, ref_b: str, equivalent
     from adoc.ingest.reconcile import ref_ranges_equivalent
 
     assert ref_ranges_equivalent(ref_a, ref_b) is equivalent
+
+
+@pytest.mark.parametrize(
+    ("ref_a", "ref_b", "equivalent"),
+    [
+        (  # real corpus: progesterone phase tiers, label prose differs
+            "Follicular <1.0; Luteal 2.6-21.5; Postmenopausal <0.5; "
+            "Pregnancy 1st 4.1-34.0, 2nd 24.0-76.0, 3rd 52.0-302.0",
+            "Female: Follicular Phase <1.0; Luteal Phase 2.6-21.5; "
+            "Post menopausal <0.5; Pregnancy 1st Trimester 4.1-34.0, "
+            "2nd Trimester 24.0-76.0, 3rd Trimester 52.0-302.0",
+            True,
+        ),
+        (  # one tier's number differs -> genuine mismatch stays
+            "Follicular <1.0; Luteal 2.6-21.5",
+            "Follicular <1.0; Luteal 2.6-22.5",
+            False,
+        ),
+        (  # different tier counts -> mismatch
+            "Follicular <1.0; Luteal 2.6-21.5",
+            "Follicular <1.0",
+            False,
+        ),
+    ],
+)
+def test_multi_tier_conditional_ranges_compare_numerically(
+    ref_a: str, ref_b: str, equivalent: bool
+) -> None:
+    from adoc.ingest.reconcile import ref_ranges_equivalent
+
+    assert ref_ranges_equivalent(ref_a, ref_b) is equivalent
