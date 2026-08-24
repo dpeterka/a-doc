@@ -46,6 +46,10 @@ _FRIENDLY_REASON_SUBSTRINGS: tuple[tuple[str, str], ...] = (
     ("outside plausible bounds", "the value is outside what's typical for this test"),
     ("does not match titer format", "the titer wasn't written in the usual format"),
     (
+        "ref_range_single_source",
+        "only one reading captured the reference range - we kept the one provided",
+    ),
+    (
         "away from the median",
         "this value is far outside the pattern of your earlier readings",
     ),
