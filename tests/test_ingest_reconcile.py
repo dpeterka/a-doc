@@ -239,3 +239,17 @@ def test_doc_date_prefers_collection_date_over_report_date(tmp_path: Path) -> No
     rows = reconcile(pass_a, pass_b, _empty_db(tmp_path))
 
     assert rows[0].date == date(2026, 5, 1)
+
+
+def test_implausible_extracted_date_is_treated_as_missing(tmp_path: Path) -> None:
+    """A shared misread like year 0906 must queue as missing_date, never
+    auto-accept under a bogus collection date (real-corpus finding)."""
+    pass_a = _doc([_result()], collection_date=date(906, 6, 6), report_date=None)
+    pass_b = _doc([_result()], collection_date=date(906, 6, 6), report_date=None)
+
+    rows = reconcile(pass_a, pass_b, _empty_db(tmp_path))
+
+    assert len(rows) == 1
+    assert rows[0].status == "pending"
+    assert "missing_date" in rows[0].reasons
+    assert rows[0].date == date.today()
