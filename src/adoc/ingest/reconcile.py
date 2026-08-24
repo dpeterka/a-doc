@@ -288,6 +288,22 @@ def _parse_ref_semantics(normalized_text: str) -> tuple[object, ...] | None:
     return None
 
 
+_RANGE_TOKEN_RE = re.compile(
+    r"(?:<=|>=|<|>)\s*\d+(?:\.\d+)?(?::\d+)?"  # thresholds, incl. titer thresholds
+    r"|\d+(?:\.\d+)?\s*-\s*\d+(?:\.\d+)?"  # low-high pairs
+)
+
+
+def _multi_tier_range_tokens(normalized_text: str) -> list[str]:
+    """The ordered numeric range tokens inside a multi-tier conditional
+    reference set (real corpus: progesterone's phase-dependent tiers -
+    "Follicular <1.0; Luteal 2.6-21.5; ... 3rd 52.0-302.0"). Tier LABELS are
+    prose the two extractors word differently ("Postmenopausal" vs
+    "Post menopausal"); the numeric sequence is the semantics.
+    """
+    return [re.sub(r"\s+", "", tok) for tok in _RANGE_TOKEN_RE.findall(normalized_text)]
+
+
 def ref_ranges_equivalent(
     a_raw: str | None,
     b_raw: str | None,
@@ -330,7 +346,14 @@ def ref_ranges_equivalent(
     if a_parsed is not None and b_parsed is not None:
         return a_parsed == b_parsed
     if a_parsed is None and b_parsed is None:
-        return a_norm == b_norm
+        if a_norm == b_norm:
+            return True
+        # Multi-tier conditional sets: compare the ordered numeric range
+        # sequence; two+ identical ranges in identical order is equivalence
+        # regardless of how the tier labels are worded.
+        a_tokens = _multi_tier_range_tokens(a_norm)
+        b_tokens = _multi_tier_range_tokens(b_norm)
+        return len(a_tokens) >= 2 and a_tokens == b_tokens
     return False
 
 
