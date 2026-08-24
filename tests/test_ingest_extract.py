@@ -183,15 +183,16 @@ def test_double_pass_extract_text_sends_plain_text_to_both_roles(tmp_path: Path)
 
 
 def test_pdf_prompt_versions_are_bumped_past_v1() -> None:
-    assert PROMPT_A_VERSION == "extractor-pass-a-v3"
-    assert PROMPT_B_VERSION == "extractor-pass-b-v3"
+    # assert shape + minimum, not an exact pin - prompt edits bump these
+    assert int(PROMPT_A_VERSION.rsplit("-v", 1)[1]) >= 3
+    assert int(PROMPT_B_VERSION.rsplit("-v", 1)[1]) >= 3
     assert PROMPT_A_VERSION != "extractor-pass-a-v1"
     assert PROMPT_B_VERSION != "extractor-pass-b-v1"
 
 
 def test_docx_prompt_versions_are_bumped_past_v1() -> None:
-    assert DOCX_PROMPT_A_VERSION == "docx-extractor-pass-a-v3"
-    assert DOCX_PROMPT_B_VERSION == "docx-extractor-pass-b-v3"
+    assert int(DOCX_PROMPT_A_VERSION.rsplit("-v", 1)[1]) >= 3
+    assert int(DOCX_PROMPT_B_VERSION.rsplit("-v", 1)[1]) >= 3
     assert DOCX_PROMPT_A_VERSION != "docx-extractor-pass-a-v1"
     assert DOCX_PROMPT_B_VERSION != "docx-extractor-pass-b-v1"
 
@@ -205,3 +206,12 @@ def test_every_extractor_prompt_instructs_recording_specimen_per_result(prompt: 
     assert "stool" in lowered
     # the "don't guess, default unknown" instruction
     assert "unknown" in lowered
+
+
+def test_prompts_forbid_derived_interpretation_columns() -> None:
+    """Allergen-panel 'Class' bands (real corpus: CLASS (BEEF F27) = 0/I)
+    must not become their own result rows."""
+    from adoc.ingest.extract import DOCX_PROMPT_A, DOCX_PROMPT_B, PROMPT_A, PROMPT_B
+
+    for prompt in (PROMPT_A, PROMPT_B, DOCX_PROMPT_A, DOCX_PROMPT_B):
+        assert "derivable from the value" in prompt
