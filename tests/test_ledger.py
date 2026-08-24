@@ -104,7 +104,7 @@ def test_source_ref_grammar_accepts_valid_refs(ref: str) -> None:
 @pytest.mark.parametrize(
     "ref",
     [
-        "labs:ana ana:2026-05-02",  # whitespace in slug still invalid  # uppercase not allowed in slug
+        "labs:ana ana:2026-05-02",  # whitespace in slug still invalid
         "labs:ana:05-02-2026",  # wrong date format
         "labs:ana",  # missing date
         "doc:smith-report.pdf",  # missing #p<int>
