@@ -294,7 +294,7 @@ Resources:
             - SourceVolume: data
               ContainerPath: /data
               ReadOnly: false
-          Environment: &app-environment
+          Environment:
             - Name: ADOC_DATA_DIR
               Value: /data/a-doc-data
             - Name: ADOC_SQLITE_JOURNAL_MODE
@@ -304,7 +304,7 @@ Resources:
                 Fn::ImportValue: !Sub "${BackupStackName}-BucketName"
             - Name: ADOC_TRUST_FORWARDED_FOR
               Value: "true"
-          Secrets: &app-secrets
+          Secrets:
             - Name: ANTHROPIC_API_KEY
               ValueFrom: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/a-doc/anthropic-api-key"
             - Name: OPENAI_API_KEY
@@ -352,8 +352,25 @@ Resources:
             - SourceVolume: data
               ContainerPath: /data
               ReadOnly: false
-          Environment: *app-environment
-          Secrets: *app-secrets
+          Environment:
+            - Name: ADOC_DATA_DIR
+              Value: /data/a-doc-data
+            - Name: ADOC_SQLITE_JOURNAL_MODE
+              Value: TRUNCATE
+            - Name: ADOC_BACKUP_BUCKET
+              Value:
+                Fn::ImportValue: !Sub "${BackupStackName}-BucketName"
+            - Name: ADOC_TRUST_FORWARDED_FOR
+              Value: "true"
+          Secrets:
+            - Name: ANTHROPIC_API_KEY
+              ValueFrom: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/a-doc/anthropic-api-key"
+            - Name: OPENAI_API_KEY
+              ValueFrom: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/a-doc/openai-api-key"
+            - Name: FEATHERLESS_API_KEY
+              ValueFrom: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/a-doc/featherless-api-key"
+            - Name: RCLONE_CONF
+              ValueFrom: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/a-doc/rclone-conf"
           LogConfiguration:
             LogDriver: awslogs
             Options:
