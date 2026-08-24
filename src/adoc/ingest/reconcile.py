@@ -219,7 +219,10 @@ def _normalize_range_text(text: str) -> str:
     unit token or parse the result's semantics."""
     unified = text.translate(_DASH_TRANSLATION)
     collapsed = re.sub(r"\s+", " ", unified.strip()).casefold()
-    return re.sub(r"^(reference range|ref\.? range|range)\s*:\s*", "", collapsed)
+    unlabeled = re.sub(r"^(reference range|ref\.? range|range)\s*:\s*", "", collapsed)
+    # A trailing "see note N"/"see comments" pointer adds no range semantics
+    # (real corpus: "Not Detected" vs "Not Detected See Note 1").
+    return re.sub(r"[\s,;.]*see (note|comment)s?( \d+)?\.?$", "", unlabeled).strip()
 
 
 _SEE_NOTE_RE = re.compile(r"^see (note|comment)s?\b", re.IGNORECASE)

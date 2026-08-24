@@ -745,3 +745,17 @@ def test_single_source_ref_range_is_agreed_not_disagreement(tmp_path: Path) -> N
     assert any(r.startswith("ref_range_single_source") for r in rows[0].reasons)
     assert not any(r.startswith("ref_range_mismatch") for r in rows[0].reasons)
     assert row_is_agreed(rows[0].reasons)
+
+
+@pytest.mark.parametrize(
+    ("ref_a", "ref_b", "equivalent"),
+    [
+        ("Not Detected", "Not Detected See Note 1", True),
+        ("<1.00 Index", "<1.00 Index. See Note 12", True),
+        ("Negative", "Positive See Note 1", False),  # guard: real difference stays
+    ],
+)
+def test_trailing_see_note_suffix_is_stripped(ref_a: str, ref_b: str, equivalent: bool) -> None:
+    from adoc.ingest.reconcile import ref_ranges_equivalent
+
+    assert ref_ranges_equivalent(ref_a, ref_b) is equivalent
