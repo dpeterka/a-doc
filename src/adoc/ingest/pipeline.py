@@ -18,10 +18,31 @@ section - PLAN.md's context pack needs the full narrative, not a summary.
 Either way, exactly one `DataRepo.commit` per document. This module
 deliberately does NOT touch `casefile.ledger` or `reason.dag`: per the task
 scope, incremental reasoning over newly-ingested rows is a later slice.
+
+**Post-ingest inbox hygiene** applies ONLY to files a caller identifies as
+owned by the data repo's `inbox/`, via `inbox_root=` (see `_ingest_one`):
+once a file's `FileOutcome` is known, an `ingested`/`duplicate` outcome
+deletes the inbox copy (the immutable `sources/` archive - or, for a
+duplicate, the archive from the *first* ingest - is authoritative; nothing
+is lost), and an `error` outcome moves the file to `work/failed/` and
+records it in `work/failed/failures.jsonl` (see `ingest.failures`) so the
+web `/failed` page can surface it. `ingest_inbox` passes its own `inbox/`
+as `inbox_root`; `ingest_file` and `ingest_directory` default to
+`inbox_root=None` (no hygiene) unless a caller opts in.
+
+**Invariant**: `ingest_directory` (the engine behind `adoc backfill
+<external dir>`) never passes `inbox_root` and so NEVER deletes or moves a
+file a caller passed it, error or not - backfilling a patient's own photo
+library or Dropbox export must never touch their files. Only
+`ingest_inbox`, and any `ingest_file` caller that explicitly opts in (the
+web upload route, ingesting a file it just wrote into `inbox/`), get
+hygiene. See `test_ingest_pipeline.py`'s
+`test_backfill_directory_never_deletes_or_moves_user_files_even_on_error`.
 """
 
 from __future__ import annotations
 
+import shutil
 from collections.abc import Callable
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -45,6 +66,7 @@ from adoc.ingest.archive import (
 )
 from adoc.ingest.docx import DocxExtractionError, extract_docx_text
 from adoc.ingest.extract import double_pass_extract, double_pass_extract_text
+from adoc.ingest.failures import FAILED_DIR_RELPATH, FailureRecord, append_failure, flatten_relpath
 from adoc.ingest.reconcile import ReconciledRow, parse_flag, parse_ref_range, reconcile
 from adoc.ingest.schema import ClassifyResult, DocType, DocumentExtraction
 from adoc.ingest.vision import ImagePart, VisionClient, VisionError
@@ -393,6 +415,48 @@ def _ingest_docx(
     )
 
 
+def _apply_inbox_hygiene(
+    path: Path,
+    outcome: FileOutcome,
+    *,
+    repo: DataRepo,
+    inbox_root: Path | None,
+    clock: Callable[[], datetime],
+) -> None:
+    """Post-ingest inbox hygiene (module docstring): only fires when
+    `inbox_root` is given AND `path` actually falls under it - `ingest_file`
+    and `ingest_directory` default `inbox_root=None`, so nothing happens
+    for them unless a caller opts in, and `ingest_directory` never opts in
+    (the `adoc backfill <external dir>` invariant)."""
+    if inbox_root is None:
+        return
+    try:
+        rel = path.relative_to(inbox_root)
+    except ValueError:
+        # Defensive: `path` wasn't actually under `inbox_root` - never
+        # guess at hygiene for a file we can't place relative to it.
+        return
+
+    if outcome.outcome in ("ingested", "duplicate"):
+        path.unlink(missing_ok=True)
+        return
+
+    # outcome.outcome == "error"
+    failed_dir = repo.root / FAILED_DIR_RELPATH
+    failed_dir.mkdir(parents=True, exist_ok=True)
+    dest = failed_dir / flatten_relpath(rel)
+    shutil.move(str(path), str(dest))
+    append_failure(
+        repo,
+        FailureRecord(
+            filename=path.name,
+            failed_at=clock(),
+            reason=outcome.issues[0] if outcome.issues else "unknown error",
+            original_inbox_path=str(rel),
+        ),
+    )
+
+
 def _ingest_one(
     path: Path,
     *,
@@ -401,21 +465,29 @@ def _ingest_one(
     vision: VisionClient,
     clock: Callable[[], datetime],
     renderer: PageRenderer,
+    inbox_root: Path | None = None,
 ) -> FileOutcome:
     try:
         archived = archive_document(repo.root, path, db=db, renderer=renderer)
     except ArchiveError as exc:
-        return FileOutcome(path=str(path), outcome="error", issues=[str(exc)])
+        outcome = FileOutcome(path=str(path), outcome="error", issues=[str(exc)])
+        _apply_inbox_hygiene(path, outcome, repo=repo, inbox_root=inbox_root, clock=clock)
+        return outcome
 
     if archived.already_ingested:
-        return FileOutcome(path=str(path), sha256=archived.sha256, outcome="duplicate")
+        outcome = FileOutcome(path=str(path), sha256=archived.sha256, outcome="duplicate")
+        _apply_inbox_hygiene(path, outcome, repo=repo, inbox_root=inbox_root, clock=clock)
+        return outcome
 
     if archived.kind == "docx":
-        return _ingest_docx(
+        outcome = _ingest_docx(
             path, repo=repo, db=db, client=vision.client, clock=clock, archived=archived
         )
+    else:
+        outcome = _ingest_pdf(path, repo=repo, db=db, vision=vision, clock=clock, archived=archived)
 
-    return _ingest_pdf(path, repo=repo, db=db, vision=vision, clock=clock, archived=archived)
+    _apply_inbox_hygiene(path, outcome, repo=repo, inbox_root=inbox_root, clock=clock)
+    return outcome
 
 
 def ingest_file(
@@ -426,15 +498,34 @@ def ingest_file(
     vision: VisionClient,
     clock: Callable[[], datetime] = _utcnow,
     renderer: PageRenderer = pdftoppm_renderer,
+    inbox_root: Path | None = None,
 ) -> IngestReport:
     """Ingest a single document. Always one `DataRepo.commit` unless the
     document is a duplicate (nothing changed) or archival/extraction failed.
 
     `renderer` is forwarded to `archive.archive_document` - tests inject a
     fake `PageRenderer` so this never depends on `pdftoppm` being installed.
+
+    `inbox_root`, if given, opts `path` into post-ingest inbox hygiene (see
+    the module docstring) - the web upload route passes the `inbox/` dir it
+    just wrote `path` into; callers ingesting a file that isn't the
+    patient's own inbox copy (e.g. a test fixture, or a retry that already
+    moved the file back into `inbox/` itself) pass it deliberately, and
+    every other caller leaves it `None` so nothing is ever deleted or moved
+    by surprise.
     """
     return IngestReport(
-        files=[_ingest_one(path, repo=repo, db=db, vision=vision, clock=clock, renderer=renderer)]
+        files=[
+            _ingest_one(
+                path,
+                repo=repo,
+                db=db,
+                vision=vision,
+                clock=clock,
+                renderer=renderer,
+                inbox_root=inbox_root,
+            )
+        ]
     )
 
 
@@ -460,14 +551,20 @@ def ingest_inbox(
     clock: Callable[[], datetime] = _utcnow,
     renderer: PageRenderer = pdftoppm_renderer,
 ) -> IngestReport:
-    """Scan `repo.root/inbox/` and ingest every file found there, in name order."""
+    """Scan `repo.root/inbox/` and ingest every file found there, in name
+    order. Every file scanned here IS the patient's own inbox copy, so each
+    one is opted into post-ingest inbox hygiene (module docstring):
+    ingested/duplicate deletes it, error moves it to `work/failed/`.
+    """
     inbox = repo.root / "inbox"
     if not inbox.is_dir():
         return IngestReport(files=[])
     files = _scan_files(inbox)
     return IngestReport(
         files=[
-            _ingest_one(p, repo=repo, db=db, vision=vision, clock=clock, renderer=renderer)
+            _ingest_one(
+                p, repo=repo, db=db, vision=vision, clock=clock, renderer=renderer, inbox_root=inbox
+            )
             for p in files
         ]
     )
@@ -482,7 +579,12 @@ def ingest_directory(
     clock: Callable[[], datetime] = _utcnow,
     renderer: PageRenderer = pdftoppm_renderer,
 ) -> IngestReport:
-    """Ingest every file directly under `directory`, in name order (`adoc backfill`)."""
+    """Ingest every file directly under `directory`, in name order (`adoc
+    backfill <directory>`). Deliberately never passes `inbox_root` to
+    `_ingest_one` - see the module docstring's invariant: a backfilled
+    directory is the patient's own external file store, and this must
+    never delete or move a file in it, whatever the outcome.
+    """
     files = _scan_files(directory)
     return IngestReport(
         files=[
