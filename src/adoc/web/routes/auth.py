@@ -9,9 +9,14 @@ from starlette.responses import PlainTextResponse, RedirectResponse, Response
 
 from adoc.config import Settings
 from adoc.web.deps import get_settings
-from adoc.web.security import clear_session_cookie, client_ip, set_session_cookie
+from adoc.web.security import (
+    clear_session_cookie,
+    client_ip,
+    resolve_secure_cookie_flag,
+    set_session_cookie,
+)
 from adoc.web.templating import templates
-from adoc.web.users import USERS_RELPATH, verify_user
+from adoc.web.users import USERS_RELPATH, get_fingerprint, verify_user
 
 router = APIRouter()
 
@@ -61,10 +66,17 @@ def login_submit(
 
     limiter.clear(username=username, ip=ip)
     response = RedirectResponse(url="/", status_code=303)
-    # uvicorn only ever sees plain HTTP behind the ALB; X-Forwarded-Proto is
-    # the ALB's signal that the original client connection was HTTPS.
-    secure = request.headers.get("x-forwarded-proto") == "https"
-    set_session_cookie(response, request.app.state.session_secret, secure=secure)
+    secure = resolve_secure_cookie_flag(request, trust_forwarded_for=settings.trust_forwarded_for)
+    fingerprint = get_fingerprint(users_path, username)
+    if fingerprint is None:  # pragma: no cover - verify_user just confirmed this record exists
+        raise RuntimeError(f"user store has no record for {username!r} immediately after login")
+    set_session_cookie(
+        response,
+        request.app.state.session_secret,
+        username=username,
+        fingerprint=fingerprint,
+        secure=secure,
+    )
     return response
 
 

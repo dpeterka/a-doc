@@ -23,12 +23,13 @@ from fastapi import APIRouter, Depends, File, Request, UploadFile
 from starlette.responses import Response
 
 from adoc.casefile.repo import DataRepo
+from adoc.config import Settings
 from adoc.ingest.archive import PageRenderer
 from adoc.ingest.filetypes import detect_intake_kind
 from adoc.ingest.pipeline import ingest_file
 from adoc.ingest.vision import VisionClient, VisionError
 from adoc.labs.db import LabsDb
-from adoc.web.deps import get_db, get_renderer, get_repo, get_vision
+from adoc.web.deps import get_db, get_renderer, get_repo, get_settings, get_vision
 from adoc.web.templating import templates
 
 router = APIRouter(prefix="/upload")
@@ -39,6 +40,41 @@ GENOMICS_NOTE = (
     "Genetic data files (23andMe exports, VCF/BCF) are stored for later "
     "genomic analysis, not read as documents."
 )
+
+# Read/write in chunks rather than `await file.read()`-ing the whole upload
+# into memory up front, so an oversized upload is caught (and its partial
+# inbox copy removed) as soon as it crosses `Settings.max_upload_mb`,
+# without ever fully buffering it.
+_UPLOAD_CHUNK_BYTES = 1024 * 1024  # 1 MiB
+
+
+def _oversized_file_message(filename: str, max_upload_mb: int) -> str:
+    """A warm, plain-language rejection - never a stack trace - naming the
+    file and the actual configured limit (`Settings.max_upload_mb`)."""
+    return (
+        f"{filename} is larger than the {max_upload_mb} MB a-doc currently accepts per upload. "
+        "Please split it into smaller files, or compress it, and try again."
+    )
+
+
+async def _save_upload_within_limit(file: UploadFile, dest: Path, *, max_bytes: int) -> bool:
+    """Stream `file`'s contents to `dest` in bounded chunks, aborting (and
+    removing the partial file) as soon as the running total exceeds
+    `max_bytes`. Returns True on success, False if the upload was too
+    large - in which case `dest` no longer exists and no more of the
+    upload is read."""
+    total = 0
+    with dest.open("wb") as fh:
+        while True:
+            chunk = await file.read(_UPLOAD_CHUNK_BYTES)
+            if not chunk:
+                return True
+            total += len(chunk)
+            if total > max_bytes:
+                fh.close()
+                dest.unlink(missing_ok=True)
+                return False
+            fh.write(chunk)
 
 
 def _unsupported_file_message(filename: str) -> str:
@@ -70,13 +106,24 @@ async def upload_submit(
     db: LabsDb = Depends(get_db),
     vision: VisionClient = Depends(get_vision),
     renderer: PageRenderer = Depends(get_renderer),
+    settings: Settings = Depends(get_settings),
 ) -> Response:
     filename = Path(file.filename or "upload").name
     inbox_dir = repo.root / "inbox"
     inbox_dir.mkdir(parents=True, exist_ok=True)
     dest = inbox_dir / filename
-    contents = await file.read()
-    dest.write_bytes(contents)
+
+    max_bytes = settings.max_upload_mb * 1024 * 1024
+    if not await _save_upload_within_limit(file, dest, max_bytes=max_bytes):
+        return templates.TemplateResponse(
+            request,
+            "upload.html",
+            {
+                "report": None,
+                "error": _oversized_file_message(filename, settings.max_upload_mb),
+                "genomics_note": GENOMICS_NOTE,
+            },
+        )
 
     if detect_intake_kind(dest) is None:
         dest.unlink(missing_ok=True)

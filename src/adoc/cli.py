@@ -87,11 +87,6 @@ def _cmd_init(_args: argparse.Namespace) -> int:
     return 0
 
 
-def _stub(name: str) -> int:
-    print(f"{name}: not implemented (phase 1)")
-    return 0
-
-
 def _getpass(prompt: str) -> str:  # pragma: no cover - exercises the real terminal
     """Real wiring for `adoc user add`'s password prompts. Overridden by
     tests (`monkeypatch.setattr(cli, "_getpass", ...)`) so a test run never

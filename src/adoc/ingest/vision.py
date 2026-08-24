@@ -46,6 +46,7 @@ from pydantic import BaseModel
 from adoc.reason.client import (
     LlmClient,
     TransientTransportError,
+    _estimate_cost,
     _openai_strict_schema,
     _unwrap_tool_input,
 )
@@ -53,6 +54,15 @@ from adoc.reason.client import (
 # --------------------------------------------------------------------------
 # Document/image content parts
 # --------------------------------------------------------------------------
+
+# Same rationale as `reason.client`'s identical constants: the app owns the
+# only retry policy (`VisionClient._call_with_retry`), so the SDK client's
+# own retries must be disabled and given an explicit finite timeout instead
+# of stacking retries-on-retries under the app-level loop.
+_ANTHROPIC_MAX_RETRIES = 0
+_ANTHROPIC_TIMEOUT_SECONDS = 300.0
+_OPENAI_MAX_RETRIES = 0
+_OPENAI_TIMEOUT_SECONDS = 300.0
 
 
 @dataclass(frozen=True)
@@ -200,7 +210,11 @@ class AnthropicVisionProvider:
         except ImportError as exc:  # pragma: no cover - dependency is pinned
             raise VisionError("the 'anthropic' package is not installed") from exc
 
-        client = anthropic.Anthropic(api_key=self._api_key)
+        client = anthropic.Anthropic(
+            api_key=self._api_key,
+            max_retries=_ANTHROPIC_MAX_RETRIES,
+            timeout=_ANTHROPIC_TIMEOUT_SECONDS,
+        )
         content = _anthropic_content_blocks(request.parts)
 
         kwargs: dict[str, Any] = {
@@ -272,7 +286,11 @@ class OpenAIVisionProvider:
         except ImportError as exc:  # pragma: no cover - dependency is pinned
             raise VisionError("the 'openai' package is not installed") from exc
 
-        client = openai.OpenAI(api_key=self._api_key)
+        client = openai.OpenAI(
+            api_key=self._api_key,
+            max_retries=_OPENAI_MAX_RETRIES,
+            timeout=_OPENAI_TIMEOUT_SECONDS,
+        )
         content = _openai_content_parts(request.parts)
 
         kwargs: dict[str, Any] = {
@@ -496,6 +514,11 @@ class VisionClient:
         if path is None:
             return
         path.parent.mkdir(parents=True, exist_ok=True)
+        cost_estimate = (
+            _estimate_cost(model, response.input_tokens, response.output_tokens)
+            if response is not None
+            else None
+        )
         record = {
             "timestamp": datetime.now(UTC).isoformat(),
             "role": role,
@@ -503,7 +526,7 @@ class VisionClient:
             "model": model,
             "input_tokens": response.input_tokens if response else None,
             "output_tokens": response.output_tokens if response else None,
-            "cost_estimate": None,
+            "cost_estimate": cost_estimate,
             "duration_s": round(duration, 4),
             "scrub_count": scrub_count,
             "error": error,

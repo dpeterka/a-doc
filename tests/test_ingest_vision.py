@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -180,3 +182,127 @@ def test_audit_log_records_vision_calls(tmp_path: Path) -> None:
 def test_anthropic_vision_provider_is_used_by_default_when_no_transport_injected() -> None:
     provider = AnthropicVisionProvider(api_key=None)
     assert provider._transport == provider._default_transport
+
+
+def test_anthropic_vision_default_transport_disables_sdk_retries_and_sets_a_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """M1: same fix as `reason.client.AnthropicProvider` - the vision SDK
+    client must also be built with `max_retries=0` and an explicit
+    timeout, so `VisionClient._call_with_retry` is the only retry policy."""
+    captured: dict[str, object] = {}
+
+    class FakeMessages:
+        def create(self, **kwargs: object) -> types.SimpleNamespace:
+            tool_use = types.SimpleNamespace(
+                type="tool_use", name="emit_result", input={"doc_type": "x"}
+            )
+            return types.SimpleNamespace(
+                content=[tool_use],
+                usage=types.SimpleNamespace(input_tokens=1, output_tokens=1),
+                stop_reason="end_turn",
+            )
+
+    class FakeAnthropicClient:
+        def __init__(self, **kwargs: object) -> None:
+            captured.update(kwargs)
+            self.messages = FakeMessages()
+
+    fake_module = types.SimpleNamespace(
+        Anthropic=FakeAnthropicClient,
+        RateLimitError=Exception,
+        APIConnectionError=Exception,
+        APIStatusError=Exception,
+    )
+    monkeypatch.setitem(sys.modules, "anthropic", fake_module)
+
+    provider = AnthropicVisionProvider(api_key="test-key")
+    request = VisionTransportRequest(
+        model="claude-sonnet-5",
+        system="s",
+        parts=[TextPart(text="hi")],
+        schema=Extraction,
+        params={},
+        max_tokens=100,
+    )
+
+    provider.extract(request)
+
+    assert captured["api_key"] == "test-key"
+    assert captured["max_retries"] == 0
+    assert captured["timeout"] == 300.0
+
+
+def test_openai_vision_default_transport_disables_sdk_retries_and_sets_a_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeCompletions:
+        def create(self, **kwargs: object) -> types.SimpleNamespace:
+            message = types.SimpleNamespace(content='{"doc_type": "x"}')
+            choice = types.SimpleNamespace(message=message, finish_reason="stop")
+            return types.SimpleNamespace(
+                choices=[choice],
+                usage=types.SimpleNamespace(prompt_tokens=1, completion_tokens=1),
+            )
+
+    class FakeChat:
+        def __init__(self) -> None:
+            self.completions = FakeCompletions()
+
+    class FakeOpenAIClient:
+        def __init__(self, **kwargs: object) -> None:
+            captured.update(kwargs)
+            self.chat = FakeChat()
+
+    fake_module = types.SimpleNamespace(
+        OpenAI=FakeOpenAIClient,
+        RateLimitError=Exception,
+        APIConnectionError=Exception,
+        APIStatusError=Exception,
+    )
+    monkeypatch.setitem(sys.modules, "openai", fake_module)
+
+    provider = OpenAIVisionProvider(api_key="test-key")
+    request = VisionTransportRequest(
+        model="gpt-5.2",
+        system="s",
+        parts=[ImagePart(data=b"\x89PNG", page=1)],
+        schema=Extraction,
+        params={},
+        max_tokens=100,
+    )
+
+    provider.extract(request)
+
+    assert captured["api_key"] == "test-key"
+    assert captured["max_retries"] == 0
+    assert captured["timeout"] == 300.0
+
+
+def test_audit_log_carries_a_non_null_cost_estimate_for_a_priced_model(tmp_path: Path) -> None:
+    """M3: `VisionClient._audit` must reuse `reason.client._estimate_cost`
+    instead of hardcoding `cost_estimate=None`."""
+
+    def fake_transport(request: VisionTransportRequest) -> VisionTransportResponse:
+        return VisionTransportResponse(
+            text="", tool_input={"doc_type": "lab_report"}, input_tokens=1_000, output_tokens=500
+        )
+
+    audit_path = tmp_path / "audit.jsonl"
+    client = LlmClient(
+        {"extractor_pass_a": [_binding("anthropic", "claude-sonnet-5")]},
+        {"anthropic": AnthropicProvider(api_key=None, transport=lambda r: _unused(r))},
+        audit_log_path=audit_path,
+    )
+    vision = VisionClient(client, transports={"anthropic": fake_transport})
+
+    vision.extract("extractor_pass_a", system="s", parts=[TextPart(text="t")], schema=Extraction)
+
+    import json
+
+    line = audit_path.read_text(encoding="utf-8").strip()
+    record = json.loads(line)
+    assert record["cost_estimate"] is not None
+    assert record["cost_estimate"] > 0
