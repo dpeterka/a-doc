@@ -13,6 +13,7 @@ from adoc.labs.models import DocumentStatus, ExtractionStatus, LabDocument, LabF
 from adoc.labs.validate import (
     ANALYTE_SPECS,
     IssueCode,
+    canonical_rename_target,
     canonicalize,
     trend_outlier,
     validate_row,
@@ -513,7 +514,7 @@ def test_hs_crp_is_not_merged_into_crp() -> None:
     [
         ("Chloride, Serum", "Chloride"),
         ("Alkaline Phosphatase, S", "Alkaline Phosphatase"),
-        ("Copper, Serum or Plasma", "Copper"),
+        ("Globulin, Serum", "Globulin"),
         ("17-OH-PROGESTERONE,LCMSMS", "17-Hydroxyprogesterone"),
     ],
 )
@@ -563,3 +564,103 @@ def test_labcorp_long_form_unit_spellings_are_accepted() -> None:
         row = _lab(name=name, ucum_unit=unit, value=value)
         issues = validate_row(row)
         assert not any(i.code == IssueCode.UNKNOWN_UNIT for i in issues), (name, unit)
+
+
+# ----------------------------------------------------------------
+# lab-taxonomy layer: specimen-distinct analytes must never share a
+# canonical (feature/taxonomy-distinctions spec-table sweep - same shape
+# as "Magnesium, RBC" above, found for Copper/Selenium/urine creatinine).
+# ----------------------------------------------------------------
+
+
+def test_copper_blood_and_serum_plasma_are_distinct_canonicals() -> None:
+    assert canonicalize("Copper, Blood") == "Copper, Blood"
+    assert canonicalize("Copper, Serum or Plasma") == "Copper, Serum or Plasma"
+    assert canonicalize("Copper, Blood") != canonicalize("Copper, Serum or Plasma")
+
+
+def test_selenium_blood_and_serum_plasma_are_distinct_canonicals() -> None:
+    assert canonicalize("Selenium, Blood") == "Selenium, Blood"
+    assert canonicalize("Selenium, Serum/Plasma") == "Selenium, Serum/Plasma"
+    assert canonicalize("Selenium, Blood") != canonicalize("Selenium, Serum/Plasma")
+
+
+def test_urine_creatinine_is_distinct_from_serum_creatinine() -> None:
+    assert canonicalize("Creatinine, Random Urine") == "Creatinine, Urine"
+    assert canonicalize("creatinine") == "creatinine"
+    assert canonicalize("Creatinine, Random Urine") != canonicalize("creatinine")
+
+
+# ----------------------------------------------------------------
+# canonical_rename_target (feature/taxonomy-distinctions): the strict,
+# exact-alias-only counterpart to `canonicalize` that
+# `labs.recanonicalize` uses to decide whether a stored row's `name` may
+# be physically overwritten. See `validate`'s module docstring ("Matching
+# vs. renaming").
+# ----------------------------------------------------------------
+
+
+@pytest.mark.parametrize("raw", ["ACTH,PLASMA", "ACTH, Plasma", "ACTH"])
+def test_canonical_rename_target_still_merges_exact_aliases(raw: str) -> None:
+    assert canonical_rename_target(raw, raw) == "ACTH"
+
+
+def test_canonical_rename_target_ignores_the_generic_suffix_strip_rule() -> None:
+    """ "Alkaline Phosphatase, S" only resolves via the suffix-strip retry
+    (`canonicalize` still merges it) - `canonical_rename_target` must
+    never rename it, since that retry is a heuristic resemblance, not a
+    human-reviewed exact alias."""
+    raw = "Alkaline Phosphatase, S"
+    assert canonicalize(raw) == "Alkaline Phosphatase"
+    assert canonical_rename_target(raw, raw) is None
+
+
+def test_canonical_rename_target_ignores_the_score_suffix_rule() -> None:
+    """A site-prefixed DEXA score name only resolves via the score-suffix
+    rule (`canonicalize` still merges it for panel/read purposes) -
+    `canonical_rename_target` must never rename it."""
+    raw = "LEFT HIP femoral neck T-Score"
+    assert canonicalize(raw) == "T-score"
+    assert canonical_rename_target(raw, raw) is None
+
+
+@pytest.mark.parametrize(
+    "raw",
+    ["LEFT HIP femoral neck Z-Score", "LEFT HIP Total Z-Score"],
+)
+def test_canonical_rename_target_preserves_site_prefixed_z_scores(raw: str) -> None:
+    """Real collision family: both site-prefixed Z-scores used to rename
+    onto one shared "Z-score" canonical via the score-suffix rule - stored
+    names must now be preserved (no rename target at all)."""
+    assert canonical_rename_target(raw, raw) is None
+
+
+def test_canonical_rename_target_gives_left_and_right_hip_bmd_distinct_targets() -> None:
+    """Real collision family: both sides used to rename onto one shared
+    "Total Hip BMD" canonical via a shared alias list - each side now has
+    its own spec and its own distinct rename target."""
+    left = canonical_rename_target("LEFT HIP Total BMD", "LEFT HIP Total BMD")
+    right = canonical_rename_target("RIGHT HIP Total BMD", "RIGHT HIP Total BMD")
+    assert left == "Left Hip Total BMD"
+    assert right == "Right Hip Total BMD"
+    assert left != right
+
+
+def test_canonical_rename_target_gives_manganese_specimens_distinct_targets() -> None:
+    """Real collision family: plasma/RBC manganese used to rename onto one
+    shared "Manganese" canonical via a shared alias list."""
+    plasma = canonical_rename_target("Manganese, Plasma", "Manganese, Plasma")
+    rbc = canonical_rename_target("Manganese, RBC", "Manganese, RBC")
+    assert plasma == "Manganese, Plasma"
+    assert rbc == "Manganese, RBC"
+    assert plasma != rbc
+
+
+def test_canonical_rename_target_gives_egfr_stratifications_distinct_targets() -> None:
+    """Real collision family: the two race-stratified eGFR variants used to
+    rename onto one shared "eGFR" canonical via a shared alias list."""
+    black = canonical_rename_target("eGFR If Africn Am", "eGFR If Africn Am")
+    non_black = canonical_rename_target("eGFR If NonAfricn Am", "eGFR If NonAfricn Am")
+    assert black == "eGFR (African American)"
+    assert non_black == "eGFR (Non-African American)"
+    assert black != non_black

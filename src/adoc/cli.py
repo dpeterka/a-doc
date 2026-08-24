@@ -768,8 +768,9 @@ def build_parser() -> argparse.ArgumentParser:
     labs_recanonicalize_parser = subparsers.add_parser(
         "labs-recanonicalize",
         help=(
-            "re-run canonicalize() against every non-rejected row's current spec table, "
-            "renaming/merging/queuing rows whose canonical name has changed (no LLM calls)"
+            "re-run canonical_rename_target() against every non-rejected row's current spec "
+            "table, renaming/merging/queuing rows whose EXACT-alias canonical name has "
+            "changed (no LLM calls)"
         ),
     )
     labs_recanonicalize_parser.add_argument(

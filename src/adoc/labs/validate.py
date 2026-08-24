@@ -12,6 +12,32 @@ per-analyte unit whitelist, physiologic bounds, trend-outlier check"):
 3. `trend_outlier` — flags a >40% jump vs. the patient's own recent median
    once >=3 priors exist (catches decimal-shift extraction errors, e.g. a
    potassium of 4.1 misread as 41).
+
+## Matching vs. renaming (feature/taxonomy-distinctions)
+
+A real-data sweep found `canonicalize`'s permissive suffix-strip and
+score-suffix rules had been used to *rename* stored rows, silently
+discarding a site/side ("LEFT HIP" vs "RIGHT HIP" hip BMD), specimen
+("Manganese, Plasma" vs "..., RBC"), or stratification ("eGFR If Africn
+Am" vs "...NonAfricn Am") those rules were never meant to erase - two
+CLINICALLY DISTINCT measurements ended up sharing one trend series. The
+fix splits "how do I group/validate/trend-scope this row" from "may I
+overwrite this row's stored name" into two functions:
+
+- `canonicalize(name) -> spec-or-None` stays fully permissive (exact
+  alias; the generic suffix-strip retry; the score-suffix rule) - it
+  drives read-time panel grouping (`labs.panels`), `validate_row`'s spec
+  lookup, and `trend_deviation`'s prior-series lookup. Widening what
+  reads as "the same family" here is safe: it never touches a stored row.
+- `canonical_rename_target(name_raw, name) -> str-or-None` is used ONLY
+  to decide whether `adoc labs-recanonicalize` (`labs.recanonicalize`) may
+  physically overwrite a row's stored `name`. It considers an EXACT alias
+  match only (no suffix-strip retry, no score-suffix rule) - a human
+  explicitly reviewed and listed that alias as denoting the identical
+  measurement (e.g. "ACTH,PLASMA" / "ACTH, Plasma"). Every other match
+  returns `None`, meaning "leave the stored name exactly as it is" - the
+  row still gets full `canonicalize` benefits (panel, validation, trend
+  scoping) at read time, just under its own distinct stored name.
 """
 
 from __future__ import annotations
@@ -336,11 +362,26 @@ _HAND_CURATED_SPECS: tuple[AnalyteSpec, ...] = (
     ),
     AnalyteSpec(
         "creatinine",
-        ("creatinine", "creat", "creatinine, random urine"),
+        ("creatinine", "creat"),
         "numeric",
         ("mg/dL",),
         (0.1, 20.0),
         panel="Comprehensive Metabolic Panel",
+    ),
+    # Random urine creatinine (used to normalize a spot urine protein/
+    # albumin ratio) is a different specimen, on a wildly different
+    # numeric scale, from serum creatinine above - a real collision-
+    # family finding (feature/taxonomy-distinctions) showed both merging
+    # onto one bare "creatinine" canonical via a shared alias list, which
+    # would have applied serum creatinine's plausibility bounds to urine
+    # values and silently combined two different trend series.
+    AnalyteSpec(
+        "Creatinine, Urine",
+        ("creatinine, random urine",),
+        "numeric",
+        (),
+        None,
+        panel="Urinalysis",
     ),
     AnalyteSpec(
         "ALT",
@@ -488,7 +529,31 @@ _HAND_CURATED_SPECS: tuple[AnalyteSpec, ...] = (
     ),
     AnalyteSpec(
         "eGFR",
-        ("egfr", "egfr if africn am", "egfr if nonafricn am"),
+        ("egfr",),
+        "numeric",
+        (),
+        None,
+        panel="Comprehensive Metabolic Panel",
+    ),
+    # Race-stratified eGFR variants report DIFFERENT computed values from
+    # the same creatinine/demographic inputs (different equation
+    # coefficients) - a real collision-family finding (feature/taxonomy-
+    # distinctions) showed both LabCorp abbreviated spellings merging onto
+    # plain "eGFR" via one shared alias list, silently overwriting one
+    # stratified value's trend series with the other's. Each
+    # stratification gets its own canonical and its own exact alias for
+    # the LabCorp abbreviated spelling.
+    AnalyteSpec(
+        "eGFR (African American)",
+        ("egfr if africn am",),
+        "numeric",
+        (),
+        None,
+        panel="Comprehensive Metabolic Panel",
+    ),
+    AnalyteSpec(
+        "eGFR (Non-African American)",
+        ("egfr if nonafricn am",),
         "numeric",
         (),
         None,
@@ -972,17 +1037,38 @@ _HAND_CURATED_SPECS: tuple[AnalyteSpec, ...] = (
         None,
         panel="Vitamins & Nutrition",
     ),
+    # Blood and serum/plasma copper are distinct specimen types with
+    # different reference ranges (same shape as "Manganese, Plasma"/",
+    # RBC" below) - a real-collision-shaped bug: merging them onto one
+    # bare "Copper" canonical (via one shared alias list) would silently
+    # combine two different trend series.
     AnalyteSpec(
-        "Copper",
-        ("copper, blood", "copper, serum or plasma"),
+        "Copper, Blood",
+        ("copper, blood",),
         "numeric",
         (),
         None,
         panel="Vitamins & Nutrition",
     ),
     AnalyteSpec(
-        "Selenium",
-        ("selenium, blood", "selenium, serum/plasma"),
+        "Copper, Serum or Plasma",
+        ("copper, serum or plasma",),
+        "numeric",
+        (),
+        None,
+        panel="Vitamins & Nutrition",
+    ),
+    AnalyteSpec(
+        "Selenium, Blood",
+        ("selenium, blood",),
+        "numeric",
+        (),
+        None,
+        panel="Vitamins & Nutrition",
+    ),
+    AnalyteSpec(
+        "Selenium, Serum/Plasma",
+        ("selenium, serum/plasma",),
         "numeric",
         (),
         None,
@@ -996,9 +1082,22 @@ _HAND_CURATED_SPECS: tuple[AnalyteSpec, ...] = (
         None,
         panel="Vitamins & Nutrition",
     ),
+    # Plasma and RBC (intracellular) manganese are distinct assays with
+    # different reference ranges (same shape as "Magnesium, RBC" above) -
+    # a real collision-family finding (feature/taxonomy-distinctions)
+    # showed both merging onto one bare "Manganese" canonical via a
+    # shared alias list, silently combining two different trend series.
     AnalyteSpec(
-        "Manganese",
-        ("manganese, plasma", "manganese, rbc"),
+        "Manganese, Plasma",
+        ("manganese, plasma",),
+        "numeric",
+        (),
+        None,
+        panel="Vitamins & Nutrition",
+    ),
+    AnalyteSpec(
+        "Manganese, RBC",
+        ("manganese, rbc",),
         "numeric",
         (),
         None,
@@ -1759,17 +1858,43 @@ _HAND_CURATED_SPECS: tuple[AnalyteSpec, ...] = (
         (0.0, 100.0),
         panel="Bone Density",
     ),
+    # Left/right hip BMD are different anatomic measurements with their
+    # own independent trend series - a real collision-family finding
+    # (feature/taxonomy-distinctions) showed both sides merging onto one
+    # bare "Total Hip BMD"/"Femoral Neck BMD" canonical via a shared alias
+    # list, silently overwriting one hip's series with the other's. Note
+    # score-kind DEXA rows ("... T-Score"/"... Z-Score") are unaffected by
+    # this split - those resolve via `_SCORE_SUFFIX_TO_CANONICAL` (below),
+    # a `canonicalize`-only (read-time) rule that `canonical_rename_target`
+    # never uses, so a site-prefixed score row's STORED name is already
+    # preserved distinct without needing its own per-side spec.
     AnalyteSpec(
-        "Total Hip BMD",
-        ("left hip total bmd", "right hip total bmd"),
+        "Left Hip Total BMD",
+        ("left hip total bmd",),
         "numeric",
         (),
         None,
         panel="Bone Density",
     ),
     AnalyteSpec(
-        "Femoral Neck BMD",
-        ("left hip femoral neck bmd", "right hip femoral neck bmd"),
+        "Right Hip Total BMD",
+        ("right hip total bmd",),
+        "numeric",
+        (),
+        None,
+        panel="Bone Density",
+    ),
+    AnalyteSpec(
+        "Left Hip Femoral Neck BMD",
+        ("left hip femoral neck bmd",),
+        "numeric",
+        (),
+        None,
+        panel="Bone Density",
+    ),
+    AnalyteSpec(
+        "Right Hip Femoral Neck BMD",
+        ("right hip femoral neck bmd",),
         "numeric",
         (),
         None,
@@ -2187,6 +2312,35 @@ def canonicalize(name_raw: str) -> str | None:
         stripped_exact = _ALIAS_TO_CANONICAL.get(_normalize(stripped))
         if stripped_exact is not None:
             return stripped_exact
+    return None
+
+
+def canonical_rename_target(name_raw: str, name: str) -> str | None:
+    """The name `adoc labs-recanonicalize` (`labs.recanonicalize`) may
+    overwrite a row's stored `name` with, or `None` to mean "leave the
+    stored name exactly as it is" (module docstring, "Matching vs.
+    renaming").
+
+    Unlike `canonicalize`, this considers ONLY an EXACT alias match (the
+    same case/punctuation normalization `canonicalize` uses) - never the
+    generic suffix-strip retry, never the score-suffix rule. Those two
+    rules are safe to use for read-time matching (`canonicalize`) but NOT
+    for physically renaming a stored row: they can each discard a
+    site/side, specimen, or stratification distinction an exact alias
+    entry never would, because an exact alias is a human-reviewed
+    statement that two spellings denote the IDENTICAL measurement (e.g.
+    "ACTH,PLASMA" / "ACTH, Plasma" - both merge, still, via this
+    function), where a suffix-strip/score-suffix match is only a
+    heuristic resemblance.
+
+    Tried against `name_raw` first (the least-processed form, most likely
+    to match an alias verbatim), then `name` - mirrors `canonicalize`'s
+    own resolution order for the exact-alias step.
+    """
+    for candidate in (name_raw, name):
+        exact = _ALIAS_TO_CANONICAL.get(_normalize(candidate))
+        if exact is not None:
+            return exact
     return None
 
 
