@@ -455,3 +455,33 @@ def test_rename_blocked_when_target_key_held_by_rejected_row(db: LabsDb) -> None
     # Idempotent: a second pass reports the same block, still no crash.
     again = recanonicalize_rows(db, dry_run=False)
     assert again.blocked_by_tombstone == 1
+
+
+def test_legacy_permissive_stored_name_is_restored_to_raw(db: LabsDb) -> None:
+    """Before feature/taxonomy-distinctions, `ingest.reconcile` persisted
+    permissive `canonicalize(...)` results as stored names - a site-
+    prefixed DEXA score could sit under bare "Z-score" (real rows found
+    locally). With no exact alias vouching for it, the sweep restores the
+    stored name to `name_raw`; a stored name that is NOT the permissive
+    artifact (e.g. a human correction) is left alone."""
+    legacy_id, corrected_id = db.insert_results(
+        [
+            _row(name="Z-score", name_raw="LEFT HIP Total Z-Score", value=-1.2),
+            _row(name="My Custom Label", name_raw="LEFT HIP femoral neck Z-Score", value=-0.5),
+        ]
+    )
+    assert legacy_id is not None and corrected_id is not None
+
+    report = recanonicalize_rows(db, dry_run=False)
+
+    assert report.renamed == 1
+    assert report.renamed_ids == [legacy_id]
+    restored = db.get_row(legacy_id)
+    assert restored is not None
+    assert restored.name == "LEFT HIP Total Z-Score"
+    untouched = db.get_row(corrected_id)
+    assert untouched is not None
+    assert untouched.name == "My Custom Label"
+
+    again = recanonicalize_rows(db, dry_run=True)
+    assert again.renamed == 0

@@ -24,7 +24,7 @@ from types import TracebackType
 from typing import Any, Literal
 
 from adoc.labs.models import ExtractionStatus, LabDocument, LabFlag, LabResult, Specimen
-from adoc.labs.validate import canonicalize
+from adoc.labs.validate import canonical_rename_target
 
 
 @dataclass(frozen=True)
@@ -736,7 +736,10 @@ class LabsDb:
             raise ValueError(f"resolve_with_pass: row {row_id} has no {pass_key!r} data to apply")
 
         name_raw = pass_data.get("name_raw") or row.name_raw
-        canonical = canonicalize(name_raw)
+        # Exact alias only - `resolve_with_pass` WRITES a stored name, so
+        # the permissive `canonicalize` (suffix-strip/score-suffix rules)
+        # must not name the row (labs.validate, "Matching vs. renaming").
+        canonical = canonical_rename_target(name_raw, name_raw)
         ref_low, ref_high = _parse_ref_range(pass_data.get("ref_range_raw"))
         flag = _parse_flag(pass_data.get("flag_raw"))
 
