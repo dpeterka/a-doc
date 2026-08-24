@@ -21,7 +21,7 @@ from adoc.ingest.schema import DocumentExtraction
 from adoc.ingest.vision import ImagePart, PdfPart, TextPart, VisionClient
 from adoc.reason.client import LlmClient, Message
 
-PROMPT_A_VERSION = "extractor-pass-a-v2"
+PROMPT_A_VERSION = "extractor-pass-a-v3"
 PROMPT_A = f"""[{PROMPT_A_VERSION}]
 You are extracting structured data from ONE scanned/printed medical
 document (a lab report, clinical note, imaging report, or other document),
@@ -38,7 +38,17 @@ Return a single DocumentExtraction:
   unit as printed (unit_raw), the reference range as printed
   (ref_range_raw), any H/L/HH/LL/A flag as printed (flag_raw), the
   specimen it was drawn from (specimen), the 1-indexed page it appears on,
-  and your confidence (high/medium/low) in this specific row.
+  and your confidence (high/medium/low) in this specific row. Give each
+  result a concise, canonical test name in name_raw - never a sentence
+  fragment and never a name ending in a verb like "... is" or "... was"
+  (e.g. write "Potassium", not "Potassium level is"). A site/location
+  prefix is fine and expected when the report distinguishes sites (e.g.
+  "LEFT HIP", "L1-L4"). For a bone-density (DEXA) result, name it
+  "<SITE> T-Score" or "<SITE> Z-Score" (e.g. "LEFT HIP femoral neck
+  T-Score"); name a FRAX result in full, exactly as its own probability
+  type is described (e.g. "FRAX 10-year probability of hip fracture",
+  "FRAX 10-year probability of major osteoporotic fracture") - always keep
+  the leading "FRAX".
 - specimen: record this PER RESULT ROW, from the report's own section
   header or label immediately governing that row (e.g. a "URINALYSIS"
   section -> urine; a "Stool"/"Stool Culture" section -> stool; a serum
@@ -61,7 +71,7 @@ value you cannot read - mark it illegible instead. Never fabricate a
 result that is not present in the document.
 """
 
-PROMPT_B_VERSION = "extractor-pass-b-v2"
+PROMPT_B_VERSION = "extractor-pass-b-v3"
 PROMPT_B = f"""[{PROMPT_B_VERSION}]
 You are independently re-transcribing ONE medical document from a sequence
 of page images (one image per page, in the order given). This is a SECOND,
@@ -77,6 +87,16 @@ interval (ref_range_raw), any abnormal flag as printed (flag_raw), the
 specimen it was drawn from (specimen), the page number matching that
 image's position in the sequence (1-indexed), and a high/medium/low
 confidence for that specific reading based on how legible the image is.
+Give each result a concise, canonical test name in name_raw - never a
+sentence fragment and never a name ending in a verb like "... is" or
+"... was" (e.g. write "Potassium", not "Potassium level is"). A
+site/location prefix is fine and expected when the report distinguishes
+sites (e.g. "LEFT HIP", "L1-L4"). For a bone-density (DEXA) result, name
+it "<SITE> T-Score" or "<SITE> Z-Score" (e.g. "LEFT HIP femoral neck
+T-Score"); name a FRAX result in full, exactly as its own probability type
+is described (e.g. "FRAX 10-year probability of hip fracture", "FRAX
+10-year probability of major osteoporotic fracture") - always keep the
+leading "FRAX".
 
 For specimen, use the section header or label on the page that governs
 that row (e.g. "URINALYSIS" -> urine; "Stool"/"Stool Culture" -> stool; a
@@ -152,7 +172,7 @@ def double_pass_extract(
 # specific in the wording, so no rename was needed.
 # --------------------------------------------------------------------------
 
-DOCX_PROMPT_A_VERSION = "docx-extractor-pass-a-v2"
+DOCX_PROMPT_A_VERSION = "docx-extractor-pass-a-v3"
 DOCX_PROMPT_A = f"""[{DOCX_PROMPT_A_VERSION}]
 You are extracting structured data from ONE .docx document, provided below
 as its full plain text (paragraphs in reading order; any tables rendered
@@ -172,7 +192,17 @@ Return a single DocumentExtraction:
   reference range as written (ref_range_raw), any H/L/HH/LL/A flag as
   written (flag_raw), the specimen it was drawn from (specimen), `page`
   set to 1 for every row (this document has no page structure to report),
-  and your confidence (high/medium/low) in this specific row.
+  and your confidence (high/medium/low) in this specific row. Give each
+  result a concise, canonical test name in name_raw - never a sentence
+  fragment and never a name ending in a verb like "... is" or "... was"
+  (e.g. write "Potassium", not "Potassium level is"). A site/location
+  prefix is fine and expected when the text distinguishes sites (e.g.
+  "LEFT HIP", "L1-L4"). For a bone-density (DEXA) result, name it
+  "<SITE> T-Score" or "<SITE> Z-Score" (e.g. "LEFT HIP femoral neck
+  T-Score"); name a FRAX result in full, exactly as its own probability
+  type is described (e.g. "FRAX 10-year probability of hip fracture",
+  "FRAX 10-year probability of major osteoporotic fracture") - always keep
+  the leading "FRAX".
 - specimen: record this PER RESULT ROW, from whichever section heading or
   label in the text governs that row (e.g. an "Urinalysis" heading ->
   urine; a "Stool"/"Stool Culture" heading -> stool; a serum chemistry
@@ -196,7 +226,7 @@ value that is not in the text - never fabricate a result that is not
 present in the document.
 """
 
-DOCX_PROMPT_B_VERSION = "docx-extractor-pass-b-v2"
+DOCX_PROMPT_B_VERSION = "docx-extractor-pass-b-v3"
 DOCX_PROMPT_B = f"""[{DOCX_PROMPT_B_VERSION}]
 You are independently re-reading the SAME .docx document's extracted text
 a SECOND, INDEPENDENT time. This is used to cross-check a separate model's
@@ -211,7 +241,17 @@ reading, the unit as written (unit_raw), the reference interval as written
 (ref_range_raw), any abnormal flag as written (flag_raw), the specimen it
 was drawn from (specimen), `page` set to 1 for every row (this document
 has no page structure to report), and a high/medium/low confidence for
-that specific reading based on how unambiguous the text is.
+that specific reading based on how unambiguous the text is. Give each
+result a concise, canonical test name in name_raw - never a sentence
+fragment and never a name ending in a verb like "... is" or "... was"
+(e.g. write "Potassium", not "Potassium level is"). A site/location
+prefix is fine and expected when the text distinguishes sites (e.g.
+"LEFT HIP", "L1-L4"). For a bone-density (DEXA) result, name it "<SITE>
+T-Score" or "<SITE> Z-Score" (e.g. "LEFT HIP femoral neck T-Score"); name
+a FRAX result in full, exactly as its own probability type is described
+(e.g. "FRAX 10-year probability of hip fracture", "FRAX 10-year
+probability of major osteoporotic fracture") - always keep the leading
+"FRAX".
 
 For specimen, use whichever section heading or label in the text governs
 that row (e.g. "Urinalysis" -> urine; "Stool"/"Stool Culture" -> stool; a

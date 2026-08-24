@@ -159,6 +159,96 @@ def test_unmapped_analyte_returns_no_issues() -> None:
 
 
 # ----------------------------------------------------------------
+# kind="score" (queue-ergonomics slice item 2): FRAX/T-score/Z-score have
+# no unit/reference range by nature.
+# ----------------------------------------------------------------
+
+
+def test_score_row_with_no_unit_is_not_flagged() -> None:
+    row = _lab(name="T-score", value=-1.2, ucum_unit=None, ref_low=None, ref_high=None)
+    assert validate_row(row) == []
+
+
+def test_score_row_with_a_real_unit_mismatch_is_flagged() -> None:
+    # T-score/Z-score are unitless - any actually-printed unit is bogus.
+    row = _lab(name="T-score", value=-1.2, ucum_unit="mg/dL", ref_low=None, ref_high=None)
+    issues = validate_row(row)
+    assert any(i.code is IssueCode.UNKNOWN_UNIT for i in issues)
+
+
+def test_t_score_out_of_bounds_is_flagged() -> None:
+    row = _lab(name="T-score", value=12.0, ucum_unit=None, ref_low=None, ref_high=None)
+    issues = validate_row(row)
+    assert any(i.code is IssueCode.OUT_OF_BOUNDS for i in issues)
+
+
+def test_t_score_in_bounds_is_not_flagged() -> None:
+    row = _lab(name="T-score", value=-2.4, ucum_unit=None, ref_low=None, ref_high=None)
+    assert validate_row(row) == []
+
+
+def test_frax_row_with_percent_unit_is_not_flagged() -> None:
+    row = _lab(
+        name="FRAX 10-year probability of hip fracture",
+        value=12.0,
+        ucum_unit="%",
+        ref_low=None,
+        ref_high=None,
+    )
+    assert validate_row(row) == []
+
+
+def test_frax_row_with_no_unit_is_not_flagged() -> None:
+    row = _lab(
+        name="FRAX 10-year probability of major osteoporotic fracture",
+        value=18.5,
+        ucum_unit=None,
+        ref_low=None,
+        ref_high=None,
+    )
+    assert validate_row(row) == []
+
+
+def test_frax_row_out_of_bounds_is_flagged() -> None:
+    row = _lab(
+        name="FRAX 10-year probability of hip fracture",
+        value=150.0,
+        ucum_unit="%",
+        ref_low=None,
+        ref_high=None,
+    )
+    issues = validate_row(row)
+    assert any(i.code is IssueCode.OUT_OF_BOUNDS for i in issues)
+
+
+# ----------------------------------------------------------------
+# canonicalize's score-kind suffix-match rule (queue-ergonomics slice item
+# 2): a site-prefixed DEXA row name resolves through the suffix, while
+# every non-score analyte stays exact-alias-only.
+# ----------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("LEFT HIP femoral neck T-Score", "T-score"),
+        ("L1-L4 Z-Score", "Z-score"),
+        ("T-Score", "T-score"),
+        ("t score", "T-score"),
+    ],
+)
+def test_canonicalize_suffix_matches_site_prefixed_score_names(raw: str, expected: str) -> None:
+    assert canonicalize(raw) == expected
+
+
+def test_canonicalize_does_not_suffix_match_non_score_analytes() -> None:
+    # "some prefix potassium" does not end in a whole-word alias match for
+    # any exact analyte name, and potassium is not a score kind - suffix
+    # matching must never kick in for it.
+    assert canonicalize("some prefix potassium") is None
+
+
+# ----------------------------------------------------------------
 # trend_outlier
 # ----------------------------------------------------------------
 

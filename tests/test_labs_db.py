@@ -463,3 +463,205 @@ def test_jsonl_export_rebuild_round_trip_preserves_specimen(db: LabsDb, tmp_path
 
     specimens = {row.specimen for row in rebuilt.series("glucose")}
     assert specimens == {"urine", "serum"}
+
+
+# --------------------------------------------------------------------------
+# resolve_with_pass (queue-ergonomics slice item 1): the confirm queue's
+# "Use reading A"/"Use reading B" actions on a disagreement row.
+# --------------------------------------------------------------------------
+
+
+def _disagreement_row(db: LabsDb, *, pass_a: dict, pass_b: dict, **overrides: object) -> int:
+    raw_json = json.dumps({"pass_a": pass_a, "pass_b": pass_b, "reasons": ["value_mismatch"]})
+    fields: dict[str, object] = {
+        "date": date(2026, 5, 2),
+        "name": "ferritin",
+        "name_raw": "ferritin",
+        "value": pass_a["value"],
+        "ucum_unit": pass_a.get("unit_raw"),
+        "source_doc": SHA_A,
+        "extraction_status": ExtractionStatus.PENDING,
+        "raw_json": raw_json,
+    }
+    fields.update(overrides)
+    (row_id,) = db.insert_results([LabResult.model_validate(fields)])
+    assert row_id is not None
+    return row_id
+
+
+def test_resolve_with_pass_a_applies_pass_as_fields(db: LabsDb) -> None:
+    row_id = _disagreement_row(
+        db,
+        pass_a={
+            "name_raw": "ferritin",
+            "value": 8.0,
+            "unit_raw": "ng/mL",
+            "ref_range_raw": "10-200",
+            "flag_raw": "L",
+            "specimen": "serum",
+        },
+        pass_b={
+            "name_raw": "ferritin",
+            "value": 9.5,
+            "unit_raw": "ng/mL",
+            "ref_range_raw": "10-200",
+            "flag_raw": None,
+            "specimen": "serum",
+        },
+    )
+
+    db.resolve_with_pass(row_id, "a")
+
+    row = db.get_row(row_id)
+    assert row is not None
+    assert row.value == 8.0
+    assert row.ucum_unit == "ng/mL"
+    assert row.ref_low == 10.0
+    assert row.ref_high == 200.0
+    assert row.flag == LabFlag.LOW
+    assert row.specimen == "serum"
+    assert row.extraction_status == ExtractionStatus.CORRECTED
+    payload = row.raw_payload()
+    assert payload["resolved_with"] == "pass_a"
+    # the original extraction (both passes) is left intact for audit
+    assert payload["pass_a"]["value"] == 8.0
+    assert payload["pass_b"]["value"] == 9.5
+
+
+def test_resolve_with_pass_b_applies_pass_bs_fields(db: LabsDb) -> None:
+    row_id = _disagreement_row(
+        db,
+        pass_a={
+            "name_raw": "ferritin",
+            "value": 8.0,
+            "unit_raw": "ng/mL",
+            "ref_range_raw": "10-200",
+            "flag_raw": "L",
+            "specimen": "serum",
+        },
+        pass_b={
+            "name_raw": "ferritin",
+            "value": 9.5,
+            "unit_raw": "ng/mL",
+            "ref_range_raw": "10-200",
+            "flag_raw": None,
+            "specimen": "serum",
+        },
+    )
+
+    db.resolve_with_pass(row_id, "b")
+
+    row = db.get_row(row_id)
+    assert row is not None
+    assert row.value == 9.5
+    assert row.flag is None
+    assert row.extraction_status == ExtractionStatus.CORRECTED
+    payload = row.raw_payload()
+    assert payload["resolved_with"] == "pass_b"
+
+
+def test_resolve_with_pass_recanonicalizes_name(db: LabsDb) -> None:
+    """The chosen pass's OWN name is what recomputes the canonical `name`
+    - not whatever the row happened to carry before (a contrived case:
+    the two passes disagreeing on the name outright, to prove
+    recanonicalization actually runs per-pass rather than being carried
+    over from the row's prior state)."""
+    row_id = _disagreement_row(
+        db,
+        pass_a={"name_raw": "Sodium", "value": 140.0, "unit_raw": "mmol/L", "specimen": "serum"},
+        pass_b={"name_raw": "Potassium", "value": 4.1, "unit_raw": "mmol/L", "specimen": "serum"},
+        name="sodium",
+        name_raw="Sodium",
+    )
+
+    db.resolve_with_pass(row_id, "b")
+
+    row = db.get_row(row_id)
+    assert row is not None
+    assert row.name == "potassium"
+    assert row.name_raw == "Potassium"
+    assert row.value == 4.1
+
+
+def test_resolve_with_pass_rejects_bad_which(db: LabsDb) -> None:
+    row_id = _disagreement_row(
+        db,
+        pass_a={"name_raw": "ferritin", "value": 8.0},
+        pass_b={"name_raw": "ferritin", "value": 9.5},
+    )
+    with pytest.raises(ValueError):
+        db.resolve_with_pass(row_id, "c")  # type: ignore[arg-type]
+
+
+def test_resolve_with_pass_raises_when_that_pass_has_no_data(db: LabsDb) -> None:
+    raw_json = json.dumps(
+        {
+            "pass_a": {"name_raw": "ferritin", "value": 8.0},
+            "pass_b": None,
+            "reasons": ["single_pass"],
+        }
+    )
+    (row_id,) = db.insert_results(
+        [
+            LabResult(
+                date=date(2026, 5, 2),
+                name="ferritin",
+                name_raw="ferritin",
+                value=8.0,
+                source_doc=SHA_A,
+                extraction_status=ExtractionStatus.PENDING,
+                raw_json=raw_json,
+            )
+        ]
+    )
+    assert row_id is not None
+    with pytest.raises(ValueError):
+        db.resolve_with_pass(row_id, "b")
+
+
+# --------------------------------------------------------------------------
+# reject_row_as_twin / resolved_rows_for_document (queue-ergonomics slice
+# item 4: the labs-dedupe-twins sweep).
+# --------------------------------------------------------------------------
+
+
+def test_reject_row_as_twin_marks_rejected_with_audit_note(db: LabsDb) -> None:
+    (auto_id,) = db.insert_results([_lab(extraction_status=ExtractionStatus.AUTO)])
+    (pending_id,) = db.insert_results(
+        [_lab(name="sodium", value=140.0, extraction_status=ExtractionStatus.PENDING)]
+    )
+    assert auto_id is not None and pending_id is not None
+
+    db.reject_row_as_twin(pending_id, twin_of=auto_id, method="rule")
+
+    row = db.get_row(pending_id)
+    assert row is not None
+    assert row.extraction_status == ExtractionStatus.REJECTED
+    payload = row.raw_payload()
+    assert payload["auto_rejected_twin_of"] == auto_id
+    assert payload["method"] == "rule"
+
+
+def test_resolved_rows_for_document_excludes_pending_and_other_documents(db: LabsDb) -> None:
+    (auto_id,) = db.insert_results([_lab(extraction_status=ExtractionStatus.AUTO)])
+    (confirmed_id,) = db.insert_results(
+        [_lab(name="sodium", value=140.0, extraction_status=ExtractionStatus.CONFIRMED)]
+    )
+    (pending_id,) = db.insert_results(
+        [_lab(name="calcium", value=9.5, extraction_status=ExtractionStatus.PENDING)]
+    )
+    (other_doc_id,) = db.insert_results(
+        [
+            _lab(
+                name="glucose",
+                value=95.0,
+                source_doc=SHA_B,
+                extraction_status=ExtractionStatus.AUTO,
+            )
+        ]
+    )
+    assert all(i is not None for i in (auto_id, confirmed_id, pending_id, other_doc_id))
+
+    resolved = db.resolved_rows_for_document(SHA_A)
+    resolved_ids = {r.id for r in resolved}
+    assert resolved_ids == {auto_id, confirmed_id}

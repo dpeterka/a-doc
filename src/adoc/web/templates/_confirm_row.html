@@ -33,7 +33,11 @@
           {% if item.row.ucum_unit %}{{ item.row.ucum_unit }}{% endif %}
           {% if item.row.flag %}<span class="chip chip-flag">{{ item.row.flag.value }}</span>{% endif %}
         </p>
-        {% if item.row.ref_text %}<p class="muted">Reference range: {{ item.row.ref_text }}</p>{% endif %}
+        {% if item.is_score %}
+          <p class="muted">Calculated score — no reference range applies.</p>
+        {% elif item.row.ref_text %}
+          <p class="muted">Reference range: {{ item.row.ref_text }}</p>
+        {% endif %}
         {% if item.friendly_reason %}
           <p class="muted confirm-why">Why we're asking: {{ item.friendly_reason }}.</p>
         {% endif %}
@@ -60,17 +64,39 @@
         {% endif %}
       {% endif %}
 
-      <div class="button-row">
-        <form hx-post="/confirm/{{ item.row.id }}/confirm" hx-target="#confirm-queue" hx-swap="outerHTML">
-          <button type="submit" class="button-primary">Confirm</button>
-        </form>
-        <form hx-post="/confirm/{{ item.row.id }}/reject" hx-target="#confirm-queue" hx-swap="outerHTML">
-          <button type="submit" class="button-danger">Reject</button>
-        </form>
-      </div>
+      {% if item.agreed %}
+        <div class="button-row">
+          <form hx-post="/confirm/{{ item.row.id }}/confirm" hx-target="#confirm-queue" hx-swap="outerHTML">
+            <button type="submit" class="button-primary">Confirm</button>
+          </form>
+          <form hx-post="/confirm/{{ item.row.id }}/reject" hx-target="#confirm-queue" hx-swap="outerHTML">
+            <button type="submit" class="button-danger">Reject</button>
+          </form>
+        </div>
+      {% else %}
+        <div class="button-row">
+          {% if item.has_pass_a %}
+            <form hx-post="/confirm/{{ item.row.id }}/resolve-pass/a" hx-target="#confirm-queue" hx-swap="outerHTML">
+              <button type="submit" class="button-primary">Use reading A</button>
+            </form>
+          {% endif %}
+          {% if item.has_pass_b %}
+            <form hx-post="/confirm/{{ item.row.id }}/resolve-pass/b" hx-target="#confirm-queue" hx-swap="outerHTML">
+              <button type="submit" class="button-primary">Use reading B</button>
+            </form>
+          {% endif %}
+          <form hx-post="/confirm/{{ item.row.id }}/reject" hx-target="#confirm-queue" hx-swap="outerHTML">
+            <button type="submit" class="button-danger">Reject</button>
+          </form>
+        </div>
+      {% endif %}
 
       <details class="correct-details">
-        <summary>Something's wrong — let me fix it</summary>
+        {% if item.agreed %}
+          <summary>Something's wrong — let me fix it</summary>
+        {% else %}
+          <summary>Edit manually</summary>
+        {% endif %}
         <form hx-post="/confirm/{{ item.row.id }}/correct" hx-target="#confirm-queue" hx-swap="outerHTML"
               class="correct-form">
           <label>

@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import sys
 from collections.abc import Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -52,6 +53,7 @@ from adoc.intake.cli import run_onboarding_session
 from adoc.intake.wizard import IntakeWizard
 from adoc.labs.db import LabsDb
 from adoc.labs.specimen import infer_unknown_specimens
+from adoc.labs.twins import sweep_twins, write_sweep_summary
 from adoc.privacy import Scrubber
 from adoc.reason.client import LlmClient, LlmError
 from adoc.reason.review import run_weekly_review
@@ -412,6 +414,63 @@ def _cmd_labs_infer_specimen(_args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_labs_dedupe_twins(args: argparse.Namespace) -> int:
+    """Queue-ergonomics slice item 4: sweep legacy single-pass PENDING rows
+    for a duplicate ("twin") already-resolved row in the same document and
+    auto-reject the duplicate half (`labs/twins.py`'s `sweep_twins`).
+    `--dry-run` computes and reports the same thing without mutating
+    anything - no rejects, no export, no commit, no summary write.
+    """
+    try:
+        settings = Settings()
+    except Exception as exc:  # noqa: BLE001 - surface any config error to the user
+        print(f"labs-dedupe-twins: configuration error: {exc}", file=sys.stderr)
+        return 1
+
+    repo = DataRepo(settings.data_dir)
+    if not repo.is_initialized:
+        print(
+            f"labs-dedupe-twins: data repo not initialized at {settings.data_dir} "
+            "- run `adoc init` first",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        client = _build_llm_client(settings)
+    except Exception as exc:  # noqa: BLE001 - surface any config error to the user
+        print(f"labs-dedupe-twins: configuration error: {exc}", file=sys.stderr)
+        return 1
+
+    db_path = settings.data_dir / "labs.sqlite"
+    with LabsDb(db_path, journal_mode=settings.sqlite_journal_mode) as db:
+        report = sweep_twins(db, client, dry_run=args.dry_run)
+
+        if args.dry_run:
+            print(f"labs-dedupe-twins: dry-run - checked {report.checked} single_pass row(s)")
+            print(
+                f"labs-dedupe-twins: dry-run - would reject {report.rejected} "
+                f"({report.rejected_rule} rule, {report.rejected_llm} llm)"
+            )
+            return 0
+
+        if report.rejected:
+            db.export_jsonl(repo.root / "labs-export.jsonl")
+            repo.commit(
+                f"labs: auto-rejected {report.rejected} twin row(s) as duplicates "
+                f"({report.rejected_rule} rule, {report.rejected_llm} llm)",
+                paths=["labs-export.jsonl"],
+            )
+        write_sweep_summary(repo.root, report, at=datetime.now(UTC))
+
+    print(f"labs-dedupe-twins: checked {report.checked} single_pass row(s)")
+    print(
+        f"labs-dedupe-twins: rejected {report.rejected} "
+        f"({report.rejected_rule} rule, {report.rejected_llm} llm)"
+    )
+    return 0
+
+
 def _cmd_review(_args: argparse.Namespace) -> int:
     try:
         settings = Settings()
@@ -561,6 +620,19 @@ def build_parser() -> argparse.ArgumentParser:
             "source document's filename/doc_type keywords (no LLM calls)"
         ),
     ).set_defaults(func=_cmd_labs_infer_specimen)
+    labs_dedupe_twins_parser = subparsers.add_parser(
+        "labs-dedupe-twins",
+        help=(
+            "sweep legacy single-pass PENDING rows for a duplicate already-resolved row in "
+            "the same document and auto-reject the duplicate half"
+        ),
+    )
+    labs_dedupe_twins_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="report what the sweep would do without mutating anything",
+    )
+    labs_dedupe_twins_parser.set_defaults(func=_cmd_labs_dedupe_twins)
     subparsers.add_parser(
         "backup",
         help="git-bundle the data repo and upload it (+ sources/, labs-export.jsonl) to S3",
