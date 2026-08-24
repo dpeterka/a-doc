@@ -180,8 +180,7 @@ SECTIONS: list[SectionSpec] = [
         schema=BasicsSection,
         intro=(
             "Let's start with the basics: your age, sex at birth, height and "
-            "weight, occupation, and any relevant exposures (e.g. chemical, "
-            "environmental, occupational)."
+            "weight, and occupation."
         ),
         extraction_system_prompt=(
             "You are the intake assistant for a personal medical case-file tool. "
