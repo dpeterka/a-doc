@@ -146,22 +146,23 @@ def find_candidate(db: LabsDb, pending: LabResult) -> LabResult | None:
     return None
 
 
-def _name_tokens(name: str) -> set[str]:
-    return set(re.findall(r"[a-z0-9]+", name.casefold()))
-
-
 def names_equivalent_by_rule(name_a: str, name_b: str) -> bool:
     """Step 2a (module docstring): deterministic name-equivalence, NO LLM.
-    Equal after `_clean_result_name` + casefold, or one's token set a
-    subset of the other's."""
+
+    Exact equality after `clean_result_name` + casefold ONLY (D3). A
+    token-SUBSET match (e.g. "Iron" subset-matching "Iron Binding
+    Capacity", "T4" subset-matching "Free T4", "Calcium" subset-matching
+    "Ionized Calcium") used to auto-decide these as twins here - but those
+    are clinically DISTINCT paired tests, not the same measurement
+    transcribed two ways. A token-subset case is no longer decided by rule
+    at all: it falls through to the LLM path (`_names_equivalent_by_llm`),
+    which judges genuine suffix/subset variants (e.g. "T-Score" vs "LEFT
+    HIP femoral neck T-Score") correctly while still rejecting the
+    clinically-distinct-pair cases above.
+    """
     a = clean_result_name(name_a).casefold()
     b = clean_result_name(name_b).casefold()
-    if a == b:
-        return True
-    tokens_a, tokens_b = _name_tokens(a), _name_tokens(b)
-    if not tokens_a or not tokens_b:
-        return False
-    return tokens_a <= tokens_b or tokens_b <= tokens_a
+    return a == b
 
 
 def _names_equivalent_by_llm(

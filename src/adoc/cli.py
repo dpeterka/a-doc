@@ -411,6 +411,16 @@ def _cmd_labs_infer_specimen(_args: argparse.Namespace) -> int:
     print(f"labs-infer-specimen: updated {report.updated} row(s)")
     for specimen, count in sorted(report.by_specimen.items()):
         print(f"  - {specimen}: {count}")
+    if report.skipped_serum_panel:
+        print(
+            f"labs-infer-specimen: {report.skipped_serum_panel} row(s) left unknown "
+            "(serum-panel analyte)"
+        )
+    if report.mixed_panel_docs:
+        print(
+            f"labs-infer-specimen: {len(report.mixed_panel_docs)} document(s) "
+            "mixed panel - left unknown"
+        )
     print(f"labs-infer-specimen: {report.remaining_unknown} row(s) remain unknown")
     return 0
 

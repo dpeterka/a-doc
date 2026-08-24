@@ -280,6 +280,25 @@ def _parse_flag(flag_raw: str | None) -> LabFlag | None:
         return None
 
 
+def _readings_identical(existing: LabResult, new: LabResult) -> bool:
+    """True iff `existing` and `new` report the same reading
+    (`value`/`value_text`/`ucum_unit`) - `insert_results`'s case (c)/(d)
+    split for a row colliding with one already occupying its UNIQUE key."""
+    return (
+        existing.value == new.value
+        and existing.value_text == new.value_text
+        and existing.ucum_unit == new.ucum_unit
+    )
+
+
+def _reading_display(row: LabResult) -> str:
+    """A short human-readable rendering of `row`'s reading, for a
+    `re_extraction_conflict` reason message."""
+    if row.value is not None:
+        return str(row.value)
+    return str(row.value_text)
+
+
 class ResolutionConvergedError(Exception):
     """`resolve_with_pass` found the chosen pass's reading already exists as
     another row of the same document - the queue item was rejected as that
@@ -393,28 +412,132 @@ class LabsDb:
     def insert_results(self, results: Sequence[LabResult]) -> list[int | None]:
         """Insert lab rows, one `id | None` per input row (in order).
 
-        Rows that collide with an existing `(date, name, source_doc)` row
-        (the UNIQUE constraint) are silently skipped (`None` in the returned
-        list) rather than raising — dedupe is expected during re-ingestion
-        of the same document.
+        A row's key is `(date, name, specimen, source_doc)` (the UNIQUE
+        constraint). Before inserting, the key is looked up so a re-
+        extraction of the same document (e.g. after a prompt/model change,
+        `adoc backfill --re-extract`) is never a silent no-op against a row
+        a human already resolved one way or another (D1):
+
+          (a) no existing row at the key -> insert normally.
+          (b) existing row is REJECTED -> a human rejected THAT reading;
+              this is a fresh extraction at the same key, so it REVIVES the
+              row instead of leaving the correction stranded behind a dead
+              rejected row: overwrite its fields with the new reading, flip
+              it back to PENDING for a fresh human look, and merge raw_json
+              (the old payload survives under `"superseded_rejection"`,
+              plus a `"re_extraction_after_rejection"` reason).
+          (c) existing row is anything else (auto/confirmed/corrected/
+              pending) and the new reading's value/value_text/ucum_unit are
+              IDENTICAL to the existing row's -> ordinary dedupe, `None`
+              (unchanged behavior).
+          (d) same as (c) but the new reading DIFFERS -> never silently
+              drop the correction: flip the existing row to PENDING and
+              merge the new reading into raw_json under
+              `"re_extraction_conflict"`, with a reason naming both
+              readings, so a human resolves the disagreement instead of it
+              vanishing.
         """
         ids: list[int | None] = []
-        cur = self._conn.cursor()
         for row in results:
-            cur.execute(
-                """
-                INSERT INTO labs (
-                    date, loinc_code, name, name_raw, value, value_text, ucum_unit,
-                    ref_low, ref_high, ref_text, flag, specimen, source_doc, source_page,
-                    extraction_status, raw_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(date, name, specimen, source_doc) DO NOTHING
-                """,
-                _lab_params(row),
-            )
-            ids.append(cur.lastrowid if cur.rowcount else None)
+            existing = self._find_at_key(row)
+            if existing is None:
+                ids.append(self._insert_new_row(row))
+            elif existing.extraction_status == ExtractionStatus.REJECTED:
+                ids.append(self._revive_rejected_row(existing, row))
+            elif _readings_identical(existing, row):
+                ids.append(None)
+            else:
+                ids.append(self._flip_to_pending_with_conflict(existing, row))
         self._conn.commit()
         return ids
+
+    def _find_at_key(self, row: LabResult) -> LabResult | None:
+        """The row (any `extraction_status`) already occupying `row`'s
+        `(date, name, specimen, source_doc)` UNIQUE key, if any."""
+        found = self._conn.execute(
+            "SELECT * FROM labs WHERE date = ? AND name = ? AND specimen = ? AND source_doc = ?",
+            (row.date.isoformat(), row.name, row.specimen, row.source_doc),
+        ).fetchone()
+        return _row_to_lab(found) if found else None
+
+    def _insert_new_row(self, row: LabResult) -> int | None:
+        cur = self._conn.execute(
+            """
+            INSERT INTO labs (
+                date, loinc_code, name, name_raw, value, value_text, ucum_unit,
+                ref_low, ref_high, ref_text, flag, specimen, source_doc, source_page,
+                extraction_status, raw_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(date, name, specimen, source_doc) DO NOTHING
+            """,
+            _lab_params(row),
+        )
+        return cur.lastrowid if cur.rowcount else None
+
+    def _revive_rejected_row(self, existing: LabResult, new: LabResult) -> int:
+        """Case (b): a prior human rejection at this key, now superseded by
+        a fresh extraction - overwrite the row's fields with the new
+        reading and requeue it PENDING rather than leaving the correction
+        stranded behind the dead rejected row."""
+        assert existing.id is not None
+        payload = new.raw_payload()
+        payload["superseded_rejection"] = existing.raw_payload()
+        reasons = list(payload.get("reasons", []))
+        if "re_extraction_after_rejection" not in reasons:
+            reasons.insert(0, "re_extraction_after_rejection")
+        payload["reasons"] = reasons
+        self._conn.execute(
+            """
+            UPDATE labs SET
+                date = ?, loinc_code = ?, name = ?, name_raw = ?, value = ?,
+                value_text = ?, ucum_unit = ?, ref_low = ?, ref_high = ?, ref_text = ?,
+                flag = ?, specimen = ?, source_page = ?, extraction_status = ?, raw_json = ?
+            WHERE id = ?
+            """,
+            (
+                new.date.isoformat(),
+                new.loinc_code,
+                new.name,
+                new.name_raw,
+                new.value,
+                new.value_text,
+                new.ucum_unit,
+                new.ref_low,
+                new.ref_high,
+                new.ref_text,
+                new.flag.value if new.flag else None,
+                new.specimen,
+                new.source_page,
+                ExtractionStatus.PENDING.value,
+                json.dumps(payload),
+                existing.id,
+            ),
+        )
+        return existing.id
+
+    def _flip_to_pending_with_conflict(self, existing: LabResult, new: LabResult) -> int:
+        """Case (d): the existing (already-resolved-one-way-or-another) row
+        at this key disagrees with a fresh extraction's reading. The
+        existing row's fields are left untouched (a confirmed/corrected
+        human decision is never silently overwritten by an unconfirmed
+        re-extraction) - only its status flips to PENDING and the new
+        reading is merged into raw_json for a human to resolve."""
+        assert existing.id is not None
+        payload = existing.raw_payload()
+        payload["re_extraction_conflict"] = new.raw_payload()
+        reasons = list(payload.get("reasons", []))
+        reason = (
+            f"re_extraction_conflict: existing={_reading_display(existing)!r} "
+            f"vs new={_reading_display(new)!r}"
+        )
+        if reason not in reasons:
+            reasons.insert(0, reason)
+        payload["reasons"] = reasons
+        self._conn.execute(
+            "UPDATE labs SET extraction_status = ?, raw_json = ? WHERE id = ?",
+            (ExtractionStatus.PENDING.value, json.dumps(payload), existing.id),
+        )
+        return existing.id
 
     def pending(self) -> list[LabResult]:
         """Rows awaiting human confirmation (the confirm queue)."""
