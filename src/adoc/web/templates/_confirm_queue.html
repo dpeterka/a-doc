@@ -3,6 +3,13 @@
     <p class="error" role="alert">{{ error }}</p>
   {% endif %}
 
+  {% if twin_sweep_note %}
+    <div class="confirm-twin-sweep-note" role="note">
+      <p>{{ twin_sweep_note }}.</p>
+      <button type="button" class="dismiss-note" aria-label="Dismiss this note">&times;</button>
+    </div>
+  {% endif %}
+
   {% set total_pending = agreed_count + disagreement_count %}
   {% if total_pending == 0 %}
     <p>Nothing waiting for review right now.</p>

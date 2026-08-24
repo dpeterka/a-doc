@@ -39,6 +39,40 @@ A row is **AUTO** only if ALL of the following gates pass (otherwise it is
 Both passes' raw extracted rows plus the computed reasons are serialized
 verbatim into `ReconciledRow.raw_json` for the confirm-queue UI and for
 audit (PLAN.md "Provenance").
+
+**RESCUE pass** (queue-ergonomics slice item 3b - root cause of the twin
+single-pass-row problem: the two extraction passes sometimes name the SAME
+measurement differently, e.g. "FRAX 10-year probability of hip fracture"
+vs. a sentence-fragment "10-year probability of hip fracture is" - so they
+never land in the same `_match_key` group and never get a chance at
+`_pair_rows` in the first place). After the normal per-group pairing
+above, every leftover single-pass `ExtractedResult` (across ALL groups) is
+run through one more greedy pairing pass, `_rescue_pair`, against a looser
+but still fully deterministic compatibility test: same page (+/-
+`PAGE_TOLERANCE`), identical value (or identical value_text), a compatible
+unit (equal once normalized, or one side simply unstated), and the same
+specimen-or-unknown. A rescued pair reconciles through the SAME checks
+`_reconcile_matched_pair` runs (value/unit/ref-range/flag/specimen/
+confidence, `validate_row`, `trend_outlier`) but ALWAYS ends up PENDING
+with `name_variant` as its first reason - the differing names are
+themselves reason enough for one quick human look, even when every other
+field lines up - and always lands in the confirm queue's "agreed" bucket
+(`name_variant` is deliberately not in `DISAGREEMENT_REASON_PREFIXES`),
+since this is "the same result, just worded differently", not a genuine
+cross-pass disagreement. The row's stored name is whichever of the two
+(cleaned) names is LONGER/more specific; both original names are kept in
+`raw_json` for audit. Every extracted name - not just rescued ones - is
+first run through `clean_result_name`, which strips a trailing sentence-
+fragment verb/punctuation (e.g. "... is", "... was", a trailing ":") an
+extractor prompt might still emit, so canonicalize/grouping/pairing/audit
+never see a raw fragment.
+
+A residual risk is accepted deliberately: two genuinely DIFFERENT analytes
+that happen to print the identical value on the same page (e.g. two
+distinct tests both reading "0.0") could be rescued together if their
+units are also compatible - this is why unit compatibility is required
+rather than dropped; a real unit mismatch (e.g. "mg/dL" vs "ng/mL") still
+blocks the rescue outright.
 """
 
 from __future__ import annotations
@@ -124,6 +158,53 @@ def _normalize_str(value: str | None) -> str | None:
     return normalized or None
 
 
+# Trailing sentence-fragment tokens `clean_result_name` strips (module
+# docstring's RESCUE-pass note): a verb an extractor prompt might still
+# tack onto a result name when transcribing a sentence like "10-year
+# probability of hip fracture is 12%" without splitting the value off
+# first, or trailing punctuation left over from a colon-terminated label.
+# Applied repeatedly (a name could end in more than one, e.g. "... is:")
+# until nothing more matches.
+_TRAILING_FRAGMENT_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\s+is$", re.IGNORECASE),
+    re.compile(r"\s+was$", re.IGNORECASE),
+    re.compile(r"\s+were$", re.IGNORECASE),
+    re.compile(r"\s*:$"),
+    re.compile(r"\s*-$"),
+)
+
+
+def clean_result_name(name_raw: str) -> str:
+    """Strip a trailing sentence-fragment verb/punctuation and collapse
+    internal whitespace (module docstring's RESCUE-pass note). Applied to
+    EVERY extracted result name at the top of `reconcile()`, not just
+    rescued ones, so canonicalize/grouping/pairing/audit never see a raw
+    fragment. Never returns an empty string - falls back to the original
+    (whitespace-collapsed) name if stripping would leave nothing.
+    """
+    cleaned = re.sub(r"\s+", " ", name_raw.strip())
+    if not cleaned:
+        return name_raw
+    changed = True
+    while changed:
+        changed = False
+        for pattern in _TRAILING_FRAGMENT_PATTERNS:
+            stripped = pattern.sub("", cleaned).strip()
+            if stripped and stripped != cleaned:
+                cleaned = stripped
+                changed = True
+    return cleaned
+
+
+def _clean_results(results: Sequence[ExtractedResult]) -> list[ExtractedResult]:
+    """`clean_result_name`, applied to a whole pass's `results` list."""
+    cleaned: list[ExtractedResult] = []
+    for row in results:
+        name = clean_result_name(row.name_raw)
+        cleaned.append(row if name == row.name_raw else row.model_copy(update={"name_raw": name}))
+    return cleaned
+
+
 def _match_key(name_raw: str) -> str:
     canonical = canonicalize(name_raw)
     if canonical:
@@ -182,6 +263,133 @@ def _pair_rows(
             pairs.append((a, None))
     pairs.extend((None, b) for b in remaining_b)
     return pairs
+
+
+def _units_rescue_compatible(a_unit: str | None, b_unit: str | None) -> bool:
+    """Compatible for the RESCUE pass (module docstring): equal once
+    normalized, or one side simply didn't state a unit at all. A real
+    mismatch (e.g. "mg/dL" vs "ng/mL") still blocks the rescue - this is
+    what keeps two different-analyte same-value coincidences on one page
+    from being wrongly rescued together (module docstring's residual-risk
+    note)."""
+    na, nb = _normalize_str(a_unit), _normalize_str(b_unit)
+    return na is None or nb is None or na == nb
+
+
+def _specimen_rescue_compatible(a_specimen: str, b_specimen: str) -> bool:
+    return a_specimen == b_specimen or a_specimen == "unknown" or b_specimen == "unknown"
+
+
+def _rescue_compatible(a: ExtractedResult, b: ExtractedResult) -> bool:
+    """The RESCUE pass's compatibility test (module docstring): same page
+    (+/- `PAGE_TOLERANCE`), identical value or identical (normalized)
+    value_text, a compatible unit, and the same specimen-or-unknown. Never
+    considers name - that is the entire point of this pass."""
+    if abs(a.page - b.page) > PAGE_TOLERANCE:
+        return False
+    value_match = a.value is not None and b.value is not None and a.value == b.value
+    value_text_match = (
+        a.value_text is not None
+        and b.value_text is not None
+        and _normalize_str(a.value_text) == _normalize_str(b.value_text)
+    )
+    if not (value_match or value_text_match):
+        return False
+    if not _units_rescue_compatible(a.unit_raw, b.unit_raw):
+        return False
+    return _specimen_rescue_compatible(a.specimen, b.specimen)
+
+
+def _rescue_pair(
+    leftover_a: list[ExtractedResult], leftover_b: list[ExtractedResult]
+) -> tuple[
+    list[tuple[ExtractedResult, ExtractedResult]], list[ExtractedResult], list[ExtractedResult]
+]:
+    """Greedy page-tolerant pairing of RESCUE candidates ACROSS different
+    name-groups (module docstring) - the counterpart to `_pair_rows`'s
+    within-group pairing, run over what it left unmatched. Returns
+    `(rescued_pairs, still_unmatched_a, still_unmatched_b)`."""
+    remaining_b = list(leftover_b)
+    rescued: list[tuple[ExtractedResult, ExtractedResult]] = []
+    still_a: list[ExtractedResult] = []
+    for a in leftover_a:
+        best_idx: int | None = None
+        for idx, b in enumerate(remaining_b):
+            if not _rescue_compatible(a, b):
+                continue
+            if best_idx is None or abs(b.page - a.page) < abs(remaining_b[best_idx].page - a.page):
+                best_idx = idx
+        if best_idx is not None:
+            rescued.append((a, remaining_b.pop(best_idx)))
+        else:
+            still_a.append(a)
+    return rescued, still_a, remaining_b
+
+
+def _longer_name(name_a: str, name_b: str) -> str:
+    """The LONGER/more specific of two (already-cleaned) result names
+    (module docstring's RESCUE-pass note) - ties keep `name_a`."""
+    return name_a if len(name_a) >= len(name_b) else name_b
+
+
+def _reconcile_rescued_pair(
+    a: ExtractedResult, b: ExtractedResult, *, doc_date: date, missing_date: bool, db: LabsDb
+) -> ReconciledRow:
+    """Reconcile one RESCUE-paired A/B row (module docstring).
+
+    Deliberately does NOT run `_reconcile_matched_pair`'s cross-pass
+    field-comparison gates (value/unit/ref-range/flag/specimen/confidence)
+    - the rescue's OWN compatibility test (`_rescue_compatible`) already
+    covers value/unit/specimen with its own, looser definitions, and
+    ref_range/flag/confidence were never part of it, so comparing them
+    here would manufacture disagreement reasons (`ref_range_mismatch`,
+    ...) for two readings the rescue pass itself judged compatible. This
+    always queues PENDING with `name_variant` first, plus whatever
+    `validate_row`/`trend_outlier` find on the representative reading
+    (the same single-source annotations `_reconcile_single_pass` would
+    add) - never a `DISAGREEMENT_REASON_PREFIXES` reason - so it always
+    lands in the confirm queue's "agreed" bucket. Field values (value/
+    unit/ref range/flag/specimen/page) are taken from whichever of the
+    two readings carries the LONGER/more specific name - the same
+    reading the stored `name_raw` comes from; the other reading's full
+    payload is still kept in `raw_json` for audit.
+    """
+    chosen_name = _longer_name(a.name_raw, b.name_raw)
+    representative = a if chosen_name == a.name_raw else b
+    canonical = canonicalize(a.name_raw) or canonicalize(b.name_raw)
+
+    reasons: list[str] = ["name_variant"]
+    if missing_date:
+        reasons.append("missing_date")
+
+    candidate = _candidate_lab_result(representative, canonical=canonical, doc_date=doc_date)
+    reasons.extend(issue.message for issue in validate_row(candidate))
+    if (outlier := trend_outlier(db, candidate)) is not None:
+        reasons.append(outlier.message)
+
+    raw_json = json.dumps(
+        {
+            "pass_a": a.model_dump(mode="json"),
+            "pass_b": b.model_dump(mode="json"),
+            "reasons": reasons,
+            "name_variant": {"pass_a_name": a.name_raw, "pass_b_name": b.name_raw},
+        }
+    )
+    return ReconciledRow(
+        name_raw=chosen_name,
+        canonical_name=canonical,
+        date=doc_date,
+        value=representative.value,
+        value_text=representative.value_text,
+        unit_raw=representative.unit_raw,
+        ref_range_raw=representative.ref_range_raw,
+        flag_raw=representative.flag_raw,
+        specimen=representative.specimen,
+        source_page=representative.page,
+        status="pending",
+        reasons=reasons,
+        raw_json=raw_json,
+    )
 
 
 # Collection dates outside this window are extraction misreads (a real
@@ -427,18 +635,28 @@ def reconcile(
 ) -> list[ReconciledRow]:
     """Reconcile two independent extraction passes into per-analyte rows.
 
-    See the module docstring for the full AUTO-gate list. `db` is used
-    read-only, for `trend_outlier`'s comparison against this patient's own
-    prior values of the same analyte.
+    See the module docstring for the full AUTO-gate list, and its
+    "RESCUE pass" note for what happens to rows still unmatched after the
+    normal per-name-group pairing below. `db` is used read-only, for
+    `trend_outlier`'s comparison against this patient's own prior values
+    of the same analyte.
     """
     resolved_date = _doc_date(pass_a, pass_b)
     missing_date = resolved_date is None
     doc_date = resolved_date or date.today()
 
-    groups_a = _group_by_key(pass_a.results)
-    groups_b = _group_by_key(pass_b.results)
+    # Every extracted name is cleaned before anything else touches it
+    # (module docstring) - canonicalize/grouping/pairing/audit only ever
+    # see `clean_result_name`'s output.
+    a_results = _clean_results(pass_a.results)
+    b_results = _clean_results(pass_b.results)
+
+    groups_a = _group_by_key(a_results)
+    groups_b = _group_by_key(b_results)
 
     rows: list[ReconciledRow] = []
+    leftover_a: list[ExtractedResult] = []
+    leftover_b: list[ExtractedResult] = []
     for key in sorted(set(groups_a) | set(groups_b)):
         for a, b in _pair_rows(groups_a.get(key, []), groups_b.get(key, [])):
             if a is not None and b is not None:
@@ -447,10 +665,26 @@ def reconcile(
                         a, b, doc_date=doc_date, missing_date=missing_date, db=db
                     )
                 )
+            elif a is not None:
+                leftover_a.append(a)
             else:
-                rows.append(
-                    _reconcile_single_pass(
-                        a, b, doc_date=doc_date, missing_date=missing_date, db=db
-                    )
-                )
+                assert b is not None  # _pair_rows never yields (None, None)
+                leftover_b.append(b)
+
+    # RESCUE pass (module docstring): try to pair what's left across
+    # different name-groups before giving up and calling each one
+    # single_pass.
+    rescued_pairs, still_a, still_b = _rescue_pair(leftover_a, leftover_b)
+    for a, b in rescued_pairs:
+        rows.append(
+            _reconcile_rescued_pair(a, b, doc_date=doc_date, missing_date=missing_date, db=db)
+        )
+    for a in still_a:
+        rows.append(
+            _reconcile_single_pass(a, None, doc_date=doc_date, missing_date=missing_date, db=db)
+        )
+    for b in still_b:
+        rows.append(
+            _reconcile_single_pass(None, b, doc_date=doc_date, missing_date=missing_date, db=db)
+        )
     return rows

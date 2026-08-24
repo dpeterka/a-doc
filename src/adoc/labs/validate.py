@@ -27,7 +27,13 @@ from adoc.labs.models import LabFlag, LabResult
 if TYPE_CHECKING:
     from adoc.labs.db import LabsDb
 
-ValueKind = Literal["numeric", "titer", "qualitative"]
+ValueKind = Literal["numeric", "titer", "qualitative", "score"]
+"""`"score"` (queue-ergonomics slice item 2) is for analytes that are a
+computed score by their nature - a DEXA T-score/Z-score or a FRAX
+fracture-probability percentage - and so legitimately carry no unit (T/Z)
+or only "%" (FRAX) and no clinical reference range at all. `validate_row`
+treats it like `"numeric"` (bounds + flag checks) but never complains
+about a missing unit - see `AnalyteSpec.allowed_units`'s docstring below."""
 
 # Trend-outlier: relative deviation from the patient's own recent median that
 # triggers a flag (PLAN.md: "decimal-error detection", e.g. K 4.1 -> 41).
@@ -61,6 +67,9 @@ class AnalyteSpec:
     canonical_name: str
     aliases: tuple[str, ...]
     kind: ValueKind
+    # For kind="score": the units a *printed* score is allowed to carry
+    # besides no unit at all (always fine for a score - see `validate_row`).
+    # T-score/Z-score: empty (unitless by nature). FRAX: `("%",)`.
     allowed_units: tuple[str, ...] = field(default_factory=tuple)
     bounds: tuple[float, float] | None = None  # hard physiologic plausibility bounds
 
@@ -265,6 +274,42 @@ ANALYTE_SPECS: dict[str, AnalyteSpec] = {
             ("%",),
             (1.0, 100.0),
         ),
+        # --- Scores (queue-ergonomics slice item 2: FRAX/T-score/Z-score
+        # have no unit/reference range by nature - `kind="score"` skips
+        # `validate_row`'s unit-whitelist complaint when the printed unit
+        # is None (or "%" for FRAX), and no ref range is ever expected).
+        # `canonicalize`'s suffix-match rule (below) lets a site-prefixed
+        # DEXA row name like "LEFT HIP femoral neck T-Score" resolve to
+        # this spec even though the alias table itself only matches whole
+        # names.
+        AnalyteSpec(
+            "T-score",
+            ("t-score", "t score"),
+            "score",
+            (),
+            (-6.0, 6.0),
+        ),
+        AnalyteSpec(
+            "Z-score",
+            ("z-score", "z score"),
+            "score",
+            (),
+            (-6.0, 6.0),
+        ),
+        AnalyteSpec(
+            "FRAX 10-year probability of hip fracture",
+            (),
+            "score",
+            ("%",),
+            (0.0, 100.0),
+        ),
+        AnalyteSpec(
+            "FRAX 10-year probability of major osteoporotic fracture",
+            (),
+            "score",
+            ("%",),
+            (0.0, 100.0),
+        ),
     )
 }
 
@@ -274,15 +319,47 @@ for _spec in ANALYTE_SPECS.values():
     for _alias in _spec.aliases:
         _ALIAS_TO_CANONICAL[_normalize(_alias)] = _spec.canonical_name
 
+# Suffix-match table for `kind="score"` analytes ONLY (queue-ergonomics
+# slice item 2): a DEXA row is commonly printed with a site prefix the
+# exact-alias table above can't see through (e.g. "LEFT HIP femoral neck
+# T-Score", "L1-L4 Z-Score"). Sorted longest-normalized-alias-first so a
+# more specific suffix always wins a match before a shorter one gets the
+# chance. Deliberately scoped to score-kind aliases only - every other
+# analyte keeps exact-alias matching, unchanged, to avoid a same-suffix
+# false positive (e.g. nothing here is short/generic enough to
+# accidentally suffix-match an unrelated test name).
+_SCORE_SUFFIX_TO_CANONICAL: list[tuple[str, str]] = sorted(
+    (
+        (_normalize(_alias), _spec.canonical_name)
+        for _spec in ANALYTE_SPECS.values()
+        if _spec.kind == "score"
+        for _alias in (_spec.canonical_name, *_spec.aliases)
+    ),
+    key=lambda pair: len(pair[0]),
+    reverse=True,
+)
+
 
 def canonicalize(name_raw: str) -> str | None:
     """Map a raw analyte name to its canonical name, or `None` if unknown.
 
-    Lookup is case/punctuation-insensitive (`_normalize`). Unknown analytes
-    return `None` rather than raising — per PLAN.md, ingestion is never
-    blocked on coding an analyte we don't yet recognize.
+    Lookup is case/punctuation-insensitive (`_normalize`). An exact
+    whole-name alias match is tried first; if that fails, a `kind="score"`
+    suffix match is tried (module-level `_SCORE_SUFFIX_TO_CANONICAL` -
+    site-prefixed DEXA rows like "LEFT HIP femoral neck T-Score" resolve
+    to the "T-score" spec this way). Every non-score analyte is exact-
+    alias-only, unchanged. Unknown analytes return `None` rather than
+    raising — per PLAN.md, ingestion is never blocked on coding an
+    analyte we don't yet recognize.
     """
-    return _ALIAS_TO_CANONICAL.get(_normalize(name_raw))
+    normalized = _normalize(name_raw)
+    exact = _ALIAS_TO_CANONICAL.get(normalized)
+    if exact is not None:
+        return exact
+    for suffix, canonical in _SCORE_SUFFIX_TO_CANONICAL:
+        if normalized.endswith(suffix):
+            return canonical
+    return None
 
 
 def _flag_issue(row: LabResult) -> ValidationIssue | None:
@@ -352,6 +429,35 @@ def validate_row(row: LabResult) -> list[ValidationIssue]:
                     "match titer format (e.g. '1:80')",
                 )
             )
+
+    elif spec.kind == "score":
+        # A score is unitless by nature (T-score/Z-score) or "%"-only
+        # (FRAX) - `row.ucum_unit is None` never complains (unlike
+        # "numeric", where a missing unit itself IS the complaint); only
+        # an actually-printed, non-whitelisted unit does. No reference
+        # range is ever expected for a score, so nothing here checks one.
+        allowed = {u.lower() for u in spec.allowed_units}
+        if row.ucum_unit is not None and row.ucum_unit.lower() not in allowed:
+            issues.append(
+                ValidationIssue(
+                    IssueCode.UNKNOWN_UNIT,
+                    f"{spec.canonical_name}: unit {row.ucum_unit!r} not in "
+                    f"whitelist {spec.allowed_units}",
+                )
+            )
+        if row.value is not None and spec.bounds is not None:
+            low, high = spec.bounds
+            if not (low <= row.value <= high):
+                issues.append(
+                    ValidationIssue(
+                        IssueCode.OUT_OF_BOUNDS,
+                        f"{spec.canonical_name}: value {row.value} outside plausible "
+                        f"bounds [{low}, {high}] - likely extraction error",
+                    )
+                )
+        flag_issue = _flag_issue(row)
+        if flag_issue is not None:
+            issues.append(flag_issue)
 
     return issues
 

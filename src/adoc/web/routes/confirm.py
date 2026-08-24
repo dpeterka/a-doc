@@ -13,7 +13,7 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import date as date_cls
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, Form, Request
 from starlette.responses import Response
@@ -21,7 +21,9 @@ from starlette.responses import Response
 from adoc.casefile.repo import DataRepo
 from adoc.ingest.reconcile import row_is_agreed
 from adoc.labs.db import LabsDb, PendingRow
-from adoc.labs.models import LabFlag
+from adoc.labs.models import LabFlag, LabResult
+from adoc.labs.twins import read_last_sweep_summary
+from adoc.labs.validate import ANALYTE_SPECS, canonicalize
 from adoc.web.casefile_helpers import page_image_url
 from adoc.web.deps import get_db, get_repo
 from adoc.web.templating import templates
@@ -140,6 +142,20 @@ def _row_reasons(pr: PendingRow) -> list[str]:
     return reasons
 
 
+def _is_score_row(row: LabResult) -> bool:
+    """True for a FRAX/T-score/Z-score-shaped row (queue-ergonomics slice
+    item 2): either its canonical spec is `kind="score"`, or - for an
+    analyte not (yet) in `ANALYTE_SPECS` at all - it simply has a value
+    but no unit and no reference range, the same shape. Drives the
+    confirm-row template's "Calculated score — no reference range
+    applies" note in place of blank unit/range lines."""
+    canonical = canonicalize(row.name) or row.name
+    spec = ANALYTE_SPECS.get(canonical)
+    if spec is not None:
+        return spec.kind == "score"
+    return row.value is not None and row.ucum_unit is None and row.ref_text is None
+
+
 def _row_view(repo: DataRepo, pr: PendingRow, *, agreed: bool) -> dict[str, Any]:
     payload = pr.row.raw_payload()
     reasons: list[str] = payload.get("reasons", [])
@@ -153,6 +169,13 @@ def _row_view(repo: DataRepo, pr: PendingRow, *, agreed: bool) -> dict[str, Any]
         "friendly_reason": _friendly_reason(reasons[0]) if reasons else None,
         "compare_rows": _compare_rows(pass_a, pass_b, diff_fields),
         "single_pass": pass_a is None or pass_b is None,
+        # Which pass(es) actually have a reading to apply - drives whether
+        # the disagreement bucket's "Use reading A"/"Use reading B"
+        # buttons render at all (queue-ergonomics slice item 1): a
+        # single_pass row only ever has one of the two.
+        "has_pass_a": pass_a is not None,
+        "has_pass_b": pass_b is not None,
+        "is_score": _is_score_row(pr.row),
     }
 
 
@@ -197,6 +220,22 @@ def _build_groups(
     return groups
 
 
+def _twin_sweep_note(repo: DataRepo) -> str | None:
+    """The confirm queue's dismissible "N duplicate readings were
+    auto-resolved" note (queue-ergonomics slice item 4) - present only
+    when the last `adoc labs-dedupe-twins` sweep actually rejected at
+    least one row (`labs/twins.py`'s persisted `work/twin-sweep.json`)."""
+    summary = read_last_sweep_summary(repo.root)
+    if not summary:
+        return None
+    rejected = summary.get("rejected", 0)
+    if not rejected:
+        return None
+    noun = "duplicate reading" if rejected == 1 else "duplicate readings"
+    verb = "was" if rejected == 1 else "were"
+    return f"{rejected} {noun} {verb} auto-resolved"
+
+
 def _pending_context(repo: DataRepo, db: LabsDb, *, error: str | None = None) -> dict[str, Any]:
     items = db.pending_grouped()
     doc_totals = db.lab_counts_by_document()
@@ -211,6 +250,7 @@ def _pending_context(repo: DataRepo, db: LabsDb, *, error: str | None = None) ->
 
     return {
         "error": error,
+        "twin_sweep_note": _twin_sweep_note(repo),
         "agreed_count": len(agreed_items),
         "agreed_groups": _build_groups(
             repo, agreed_items, agreed=True, doc_totals=doc_totals, pending_totals=pending_totals
@@ -285,6 +325,23 @@ def confirm_row(
 ) -> Response:
     db.confirm_row(row_id)
     _export_and_commit(repo, db, f"confirm: row {row_id} confirmed")
+    return templates.TemplateResponse(request, "_confirm_queue.html", _pending_context(repo, db))
+
+
+@router.post("/{row_id}/resolve-pass/{which}")
+def resolve_with_pass(
+    request: Request,
+    row_id: int,
+    which: Literal["a", "b"],
+    repo: DataRepo = Depends(get_repo),
+    db: LabsDb = Depends(get_db),
+) -> Response:
+    """A disagreement row's "Use reading A"/"Use reading B" action
+    (queue-ergonomics slice item 1): apply that pass's fields wholesale
+    (`LabsDb.resolve_with_pass`) instead of silently keeping pass A's
+    placeholder reading, as a bare Confirm used to."""
+    db.resolve_with_pass(row_id, which)
+    _export_and_commit(repo, db, f"confirm: row {row_id} resolved with pass {which.upper()}")
     return templates.TemplateResponse(request, "_confirm_queue.html", _pending_context(repo, db))
 
 

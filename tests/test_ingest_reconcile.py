@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from adoc.ingest.reconcile import reconcile
+from adoc.ingest.reconcile import clean_result_name, reconcile, row_is_agreed
 from adoc.ingest.schema import DocumentExtraction, ExtractedResult
 from adoc.labs.db import LabsDb
 from adoc.labs.models import DocumentStatus, ExtractionStatus, LabDocument, LabResult
@@ -341,3 +341,135 @@ def test_implausible_extracted_date_is_treated_as_missing(tmp_path: Path) -> Non
     assert rows[0].status == "pending"
     assert "missing_date" in rows[0].reasons
     assert rows[0].date == date.today()
+
+
+# --------------------------------------------------------------------------
+# clean_result_name (queue-ergonomics slice item 3b): strip a trailing
+# sentence-fragment verb/punctuation, collapse whitespace.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("10-year probability of hip fracture is", "10-year probability of hip fracture"),
+        ("10-year probability of hip fracture is:", "10-year probability of hip fracture"),
+        ("Potassium was", "Potassium"),
+        ("Potassium:", "Potassium"),
+        ("Potassium  level", "Potassium level"),
+        ("Potassium", "Potassium"),
+        ("FRAX 10-year probability of hip fracture", "FRAX 10-year probability of hip fracture"),
+    ],
+)
+def test_clean_result_name_strips_fragments_and_collapses_whitespace(
+    raw: str, expected: str
+) -> None:
+    assert clean_result_name(raw) == expected
+
+
+def test_clean_result_name_never_returns_empty() -> None:
+    # A name that is ENTIRELY a stripped token (pathological input) must
+    # fall back to something non-empty rather than vanish.
+    assert clean_result_name("is") == "is"
+
+
+def test_reconcile_applies_name_cleaning_to_every_extracted_name(tmp_path: Path) -> None:
+    pass_a = _doc([_result(name_raw="Potassium is")])
+    pass_b = _doc([_result(name_raw="Potassium is")])
+
+    rows = reconcile(pass_a, pass_b, _empty_db(tmp_path))
+
+    assert len(rows) == 1
+    assert rows[0].name_raw == "Potassium"
+
+
+# --------------------------------------------------------------------------
+# RESCUE pass (queue-ergonomics slice item 3b): value-anchored pairing of
+# leftover single-pass rows across DIFFERENT name-groups - the real FRAX
+# case that motivated it.
+# --------------------------------------------------------------------------
+
+
+def test_rescue_pairs_the_real_frax_naming_variant_case(tmp_path: Path) -> None:
+    pass_a = _doc(
+        [
+            _result(
+                name_raw="FRAX 10-year probability of hip fracture",
+                value=None,
+                value_text="12%",
+                unit_raw=None,
+                ref_range_raw=None,
+                page=4,
+            )
+        ]
+    )
+    pass_b = _doc(
+        [
+            _result(
+                name_raw="10-year probability of hip fracture is",
+                value=None,
+                value_text="12%",
+                unit_raw=None,
+                ref_range_raw=None,
+                page=4,
+            )
+        ]
+    )
+
+    rows = reconcile(pass_a, pass_b, _empty_db(tmp_path))
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.status == "pending"
+    assert row.reasons[0] == "name_variant"
+    assert row_is_agreed(row.reasons) is True
+    # the longer/more specific (cleaned) name wins
+    assert row.name_raw == "FRAX 10-year probability of hip fracture"
+    payload = json.loads(row.raw_json)
+    assert payload["name_variant"] == {
+        "pass_a_name": "FRAX 10-year probability of hip fracture",
+        "pass_b_name": "10-year probability of hip fracture",
+    }
+
+
+def test_rescue_requires_page_tolerance(tmp_path: Path) -> None:
+    pass_a = _doc(
+        [_result(name_raw="FRAX 10-year probability of hip fracture", value=12.0, page=1)]
+    )
+    pass_b = _doc([_result(name_raw="10-year probability of hip fracture is", value=12.0, page=9)])
+
+    rows = reconcile(pass_a, pass_b, _empty_db(tmp_path))
+
+    assert len(rows) == 2
+    assert all(row.status == "pending" for row in rows)
+    assert all("single_pass" in row.reasons for row in rows)
+
+
+def test_rescue_never_pairs_across_a_real_unit_mismatch(tmp_path: Path) -> None:
+    """Two genuinely different analytes that happen to both read 0.0 on the
+    same page must NOT be rescued together when their units are
+    incompatible - the module docstring's accepted residual risk requires
+    unit compatibility, it doesn't waive it."""
+    pass_a = _doc([_result(name_raw="Foo Test", value=0.0, unit_raw="mg/dL", page=1)])
+    pass_b = _doc([_result(name_raw="Bar Test", value=0.0, unit_raw="ng/mL", page=1)])
+
+    rows = reconcile(pass_a, pass_b, _empty_db(tmp_path))
+
+    assert len(rows) == 2
+    assert all(row.status == "pending" for row in rows)
+    assert all("single_pass" in row.reasons for row in rows)
+
+
+def test_rescue_accepts_residual_risk_when_units_are_compatible(tmp_path: Path) -> None:
+    """The flip side of the test above: when units ARE compatible (both
+    unstated), two different-analyte same-value-on-the-same-page rows DO
+    get rescued together - an accepted residual risk per the module
+    docstring."""
+    pass_a = _doc([_result(name_raw="Foo Test", value=0.0, unit_raw=None, page=1)])
+    pass_b = _doc([_result(name_raw="Bar Test", value=0.0, unit_raw=None, page=1)])
+
+    rows = reconcile(pass_a, pass_b, _empty_db(tmp_path))
+
+    assert len(rows) == 1
+    assert rows[0].status == "pending"
+    assert "name_variant" in rows[0].reasons

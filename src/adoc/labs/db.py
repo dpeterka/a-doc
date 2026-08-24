@@ -20,9 +20,10 @@ from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 from types import TracebackType
-from typing import Any
+from typing import Any, Literal
 
 from adoc.labs.models import ExtractionStatus, LabDocument, LabFlag, LabResult, Specimen
+from adoc.labs.validate import canonicalize
 
 
 @dataclass(frozen=True)
@@ -250,6 +251,33 @@ def _fts_query(text: str) -> str:
     if not tokens:
         return '""'
     return " AND ".join(f'"{t}"' for t in tokens)
+
+
+# Deliberately private copies of `ingest.reconcile`'s `parse_ref_range`/
+# `parse_flag` (queue-ergonomics slice item 1, `resolve_with_pass` below) -
+# `labs` is a lower layer than `ingest`, so it never imports from it (that
+# would invert the dependency direction even though no runtime import
+# cycle would actually result); these two are tiny and stable enough that
+# duplicating them here is simpler than restructuring either module.
+_REF_RANGE_RE = re.compile(r"^\s*([0-9]*\.?[0-9]+)\s*[-–]\s*([0-9]*\.?[0-9]+)\s*$")
+
+
+def _parse_ref_range(ref_range_raw: str | None) -> tuple[float | None, float | None]:
+    if not ref_range_raw:
+        return None, None
+    match = _REF_RANGE_RE.match(ref_range_raw)
+    if not match:
+        return None, None
+    return float(match.group(1)), float(match.group(2))
+
+
+def _parse_flag(flag_raw: str | None) -> LabFlag | None:
+    if not flag_raw:
+        return None
+    try:
+        return LabFlag(flag_raw.strip().upper())
+    except ValueError:
+        return None
 
 
 class LabsDb:
@@ -495,12 +523,113 @@ class LabsDb:
         )
         self._conn.commit()
 
+    def resolve_with_pass(self, row_id: int, which: Literal["a", "b"]) -> None:
+        """Apply pass A's or pass B's reading wholesale to a disagreement
+        row and mark it `corrected` (queue-ergonomics slice item 1: the
+        confirm queue's "Use reading A"/"Use reading B" actions).
+
+        Reads the chosen pass's payload straight out of `row_id`'s own
+        `raw_json` (`ingest.reconcile.reconcile` serializes both passes'
+        raw `ExtractedResult`s there - see that module's docstring), and
+        overwrites `name`, `name_raw`, `value`, `value_text`, `ucum_unit`,
+        `ref_low`/`ref_high`/`ref_text`, `flag`, and `specimen` with that
+        pass's fields. The original extraction (both passes) is left
+        intact in `raw_json`; only a `resolved_with: "pass_a"|"pass_b"`
+        audit marker is added alongside it.
+        """
+        if which not in ("a", "b"):
+            raise ValueError(f"resolve_with_pass: which must be 'a' or 'b', got {which!r}")
+        row = self.get_row(row_id)
+        if row is None:
+            raise ValueError(f"resolve_with_pass: no such row {row_id}")
+
+        payload = row.raw_payload()
+        pass_key = f"pass_{which}"
+        pass_data: dict[str, Any] | None = payload.get(pass_key)
+        if pass_data is None:
+            raise ValueError(f"resolve_with_pass: row {row_id} has no {pass_key!r} data to apply")
+
+        name_raw = pass_data.get("name_raw") or row.name_raw
+        canonical = canonicalize(name_raw)
+        ref_low, ref_high = _parse_ref_range(pass_data.get("ref_range_raw"))
+        flag = _parse_flag(pass_data.get("flag_raw"))
+
+        payload["resolved_with"] = f"pass_{which}"
+        new_raw_json = json.dumps(payload)
+
+        self._conn.execute(
+            """
+            UPDATE labs SET
+                name = ?, name_raw = ?, value = ?, value_text = ?, ucum_unit = ?,
+                ref_low = ?, ref_high = ?, ref_text = ?, flag = ?, specimen = ?,
+                extraction_status = ?, raw_json = ?
+            WHERE id = ?
+            """,
+            (
+                canonical or name_raw,
+                name_raw,
+                pass_data.get("value"),
+                pass_data.get("value_text"),
+                pass_data.get("unit_raw"),
+                ref_low,
+                ref_high,
+                pass_data.get("ref_range_raw"),
+                flag.value if flag else None,
+                pass_data.get("specimen") or "unknown",
+                ExtractionStatus.CORRECTED.value,
+                new_raw_json,
+                row_id,
+            ),
+        )
+        self._conn.commit()
+
     def reject_row(self, row_id: int) -> None:
         self._conn.execute(
             "UPDATE labs SET extraction_status = ? WHERE id = ?",
             (ExtractionStatus.REJECTED.value, row_id),
         )
         self._conn.commit()
+
+    def reject_row_as_twin(
+        self, row_id: int, *, twin_of: int, method: Literal["rule", "llm"]
+    ) -> None:
+        """Reject `row_id` as a duplicate ("twin") of `twin_of` - the
+        legacy-row LLM twin sweep, `labs/twins.py` / `adoc
+        labs-dedupe-twins`. Same status change as `reject_row`, plus an
+        audit note (`auto_rejected_twin_of`, `method`) merged into
+        `row_id`'s own `raw_json` so the rejection's provenance survives
+        alongside the original extraction.
+        """
+        row = self.get_row(row_id)
+        if row is None:
+            raise ValueError(f"reject_row_as_twin: no such row {row_id}")
+        payload = row.raw_payload()
+        payload["auto_rejected_twin_of"] = twin_of
+        payload["method"] = method
+        self._conn.execute(
+            "UPDATE labs SET extraction_status = ?, raw_json = ? WHERE id = ?",
+            (ExtractionStatus.REJECTED.value, json.dumps(payload), row_id),
+        )
+        self._conn.commit()
+
+    def resolved_rows_for_document(self, source_doc: str) -> list[LabResult]:
+        """Rows in `source_doc` already past human/auto review (`auto`,
+        `confirmed`, `corrected`) - the candidate pool for `labs/twins.py`'s
+        deterministic twin gate. A still-PENDING row is never compared
+        against another still-PENDING row - only against ones already
+        resolved one way or another."""
+        statuses = (
+            ExtractionStatus.AUTO.value,
+            ExtractionStatus.CONFIRMED.value,
+            ExtractionStatus.CORRECTED.value,
+        )
+        placeholders = ",".join("?" for _ in statuses)
+        rows = self._conn.execute(
+            f"SELECT * FROM labs WHERE source_doc = ? AND extraction_status IN ({placeholders}) "
+            "ORDER BY id",
+            (source_doc, *statuses),
+        ).fetchall()
+        return [_row_to_lab(row) for row in rows]
 
     # ----------------------------------------------------------------
     # Read side

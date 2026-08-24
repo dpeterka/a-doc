@@ -183,15 +183,15 @@ def test_double_pass_extract_text_sends_plain_text_to_both_roles(tmp_path: Path)
 
 
 def test_pdf_prompt_versions_are_bumped_past_v1() -> None:
-    assert PROMPT_A_VERSION == "extractor-pass-a-v2"
-    assert PROMPT_B_VERSION == "extractor-pass-b-v2"
+    assert PROMPT_A_VERSION == "extractor-pass-a-v3"
+    assert PROMPT_B_VERSION == "extractor-pass-b-v3"
     assert PROMPT_A_VERSION != "extractor-pass-a-v1"
     assert PROMPT_B_VERSION != "extractor-pass-b-v1"
 
 
 def test_docx_prompt_versions_are_bumped_past_v1() -> None:
-    assert DOCX_PROMPT_A_VERSION == "docx-extractor-pass-a-v2"
-    assert DOCX_PROMPT_B_VERSION == "docx-extractor-pass-b-v2"
+    assert DOCX_PROMPT_A_VERSION == "docx-extractor-pass-a-v3"
+    assert DOCX_PROMPT_B_VERSION == "docx-extractor-pass-b-v3"
     assert DOCX_PROMPT_A_VERSION != "docx-extractor-pass-a-v1"
     assert DOCX_PROMPT_B_VERSION != "docx-extractor-pass-b-v1"
 

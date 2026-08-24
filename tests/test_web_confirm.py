@@ -702,3 +702,274 @@ def test_confirm_queue_shows_text_fallback_when_no_page_image_exists(tmp_path: P
     assert response.status_code == 200
     assert "Text document" in response.text
     assert "no page image" in response.text
+
+
+# --------------------------------------------------------------------------
+# Explicit pass choice on disagreements (queue-ergonomics slice item 1):
+# "Use reading A" / "Use reading B" replace the bare Confirm on a
+# disagreement row; agreed rows keep plain Confirm.
+# --------------------------------------------------------------------------
+
+_FERRITIN_PASS_A = {
+    "name_raw": "ferritin",
+    "value": 8.0,
+    "unit_raw": "ng/mL",
+    "ref_range_raw": "10-200",
+    "flag_raw": "L",
+    "specimen": "serum",
+    "page": 1,
+    "confidence": "high",
+}
+_FERRITIN_PASS_B = {
+    "name_raw": "ferritin",
+    "value": 9.5,
+    "unit_raw": "ng/mL",
+    "ref_range_raw": "10-200",
+    "flag_raw": None,
+    "specimen": "serum",
+    "page": 1,
+    "confidence": "high",
+}
+
+
+def test_disagreement_row_shows_use_reading_a_and_b_buttons(tmp_path: Path) -> None:
+    app, repo, db, _calls = build_app(tmp_path)
+    _seed_document(repo, db, sha=SHA, filename="doc.pdf")
+    row_id = _seed_pending_with_raw(
+        db,
+        sha=SHA,
+        name="ferritin",
+        reasons=["value_mismatch: 8.0 vs 9.5"],
+        pass_a=_FERRITIN_PASS_A,
+        pass_b=_FERRITIN_PASS_B,
+    )
+    client = TestClient(app)
+    login(client)
+
+    response = client.get("/confirm")
+
+    assert response.status_code == 200
+    assert "Use reading A" in response.text
+    assert "Use reading B" in response.text
+    assert f"/confirm/{row_id}/resolve-pass/a" in response.text
+    assert f"/confirm/{row_id}/resolve-pass/b" in response.text
+    assert "Edit manually" in response.text
+
+
+def test_agreed_row_keeps_plain_confirm_button_not_use_reading(tmp_path: Path) -> None:
+    app, repo, db, _calls = build_app(tmp_path)
+    row_id = _seed_pending_row(repo, db)
+    client = TestClient(app)
+    login(client)
+
+    response = client.get("/confirm")
+
+    assert response.status_code == 200
+    assert f"/confirm/{row_id}/confirm" in response.text
+    assert "Use reading A" not in response.text
+    assert "Use reading B" not in response.text
+    assert "Something's wrong" in response.text
+
+
+def test_single_pass_disagreement_row_only_shows_the_available_pass_button(
+    tmp_path: Path,
+) -> None:
+    app, repo, db, _calls = build_app(tmp_path)
+    _seed_document(repo, db, sha=SHA, filename="doc.pdf")
+    row_id = _seed_pending_with_raw(
+        db,
+        sha=SHA,
+        name="ferritin",
+        reasons=["single_pass"],
+        pass_a=_FERRITIN_PASS_A,
+        pass_b=None,
+    )
+    client = TestClient(app)
+    login(client)
+
+    response = client.get("/confirm")
+
+    assert response.status_code == 200
+    assert f"/confirm/{row_id}/resolve-pass/a" in response.text
+    assert f"/confirm/{row_id}/resolve-pass/b" not in response.text
+
+
+def test_use_reading_a_applies_pass_as_fields_marks_corrected_and_commits(
+    tmp_path: Path,
+) -> None:
+    app, repo, db, _calls = build_app(tmp_path)
+    _seed_document(repo, db, sha=SHA, filename="doc.pdf")
+    row_id = _seed_pending_with_raw(
+        db,
+        sha=SHA,
+        name="ferritin",
+        reasons=["value_mismatch: 8.0 vs 9.5"],
+        pass_a=_FERRITIN_PASS_A,
+        pass_b=_FERRITIN_PASS_B,
+    )
+    client = TestClient(app)
+    login(client)
+
+    git_repo = Repo(repo.root)
+    commits_before = len(list(git_repo.iter_commits()))
+
+    response = client.post(f"/confirm/{row_id}/resolve-pass/a")
+
+    assert response.status_code == 200
+    row = db.get_row(row_id)
+    assert row is not None
+    assert row.value == 8.0
+    assert row.ucum_unit == "ng/mL"
+    assert row.ref_low == 10.0
+    assert row.ref_high == 200.0
+    assert row.extraction_status == ExtractionStatus.CORRECTED
+    payload = row.raw_payload()
+    assert payload["resolved_with"] == "pass_a"
+
+    commits_after = len(list(git_repo.iter_commits()))
+    assert commits_after == commits_before + 1
+
+
+def test_use_reading_b_applies_pass_bs_fields(tmp_path: Path) -> None:
+    app, repo, db, _calls = build_app(tmp_path)
+    _seed_document(repo, db, sha=SHA, filename="doc.pdf")
+    row_id = _seed_pending_with_raw(
+        db,
+        sha=SHA,
+        name="ferritin",
+        reasons=["value_mismatch: 8.0 vs 9.5"],
+        pass_a=_FERRITIN_PASS_A,
+        pass_b=_FERRITIN_PASS_B,
+    )
+    client = TestClient(app)
+    login(client)
+
+    response = client.post(f"/confirm/{row_id}/resolve-pass/b")
+
+    assert response.status_code == 200
+    row = db.get_row(row_id)
+    assert row is not None
+    assert row.value == 9.5
+    assert row.flag is None
+    assert row.extraction_status == ExtractionStatus.CORRECTED
+    assert row.raw_payload()["resolved_with"] == "pass_b"
+
+
+def test_resolve_pass_rejects_an_invalid_pass_letter(tmp_path: Path) -> None:
+    app, repo, db, _calls = build_app(tmp_path)
+    _seed_document(repo, db, sha=SHA, filename="doc.pdf")
+    row_id = _seed_pending_with_raw(
+        db,
+        sha=SHA,
+        name="ferritin",
+        reasons=["value_mismatch: 8.0 vs 9.5"],
+        pass_a=_FERRITIN_PASS_A,
+        pass_b=_FERRITIN_PASS_B,
+    )
+    client = TestClient(app)
+    login(client)
+
+    response = client.post(f"/confirm/{row_id}/resolve-pass/c")
+
+    assert response.status_code == 422
+
+
+# --------------------------------------------------------------------------
+# Score-kind results render properly (queue-ergonomics slice item 2)
+# --------------------------------------------------------------------------
+
+
+def test_score_row_shows_calculated_score_note_instead_of_range(tmp_path: Path) -> None:
+    app, repo, db, _calls = build_app(tmp_path)
+    _seed_document(repo, db, sha=SHA, filename="dexa.pdf")
+    [row_id] = db.insert_results(
+        [
+            LabResult(
+                date=date(2026, 5, 2),
+                name="T-score",
+                name_raw="LEFT HIP femoral neck T-Score",
+                value=-1.2,
+                source_doc=SHA,
+                source_page=1,
+                extraction_status=ExtractionStatus.PENDING,
+                raw_json=json.dumps({"reasons": ["missing_date"]}),
+            )
+        ]
+    )
+    assert row_id is not None
+    client = TestClient(app)
+    login(client)
+
+    response = client.get("/confirm")
+
+    assert response.status_code == 200
+    assert "Calculated score" in response.text
+    assert "no reference range applies" in response.text
+
+
+def test_non_score_row_does_not_show_calculated_score_note(tmp_path: Path) -> None:
+    app, repo, db, _calls = build_app(tmp_path)
+    row_id = _seed_pending_row(repo, db)
+    client = TestClient(app)
+    login(client)
+
+    response = client.get("/confirm")
+
+    assert response.status_code == 200
+    assert row_id  # seeded CRP row, has a unit - not score-shaped
+    assert "Calculated score" not in response.text
+
+
+# --------------------------------------------------------------------------
+# Twin-sweep dismissible note (queue-ergonomics slice item 4)
+# --------------------------------------------------------------------------
+
+
+def test_confirm_queue_shows_twin_sweep_note_when_last_sweep_rejected_rows(
+    tmp_path: Path,
+) -> None:
+    app, repo, db, _calls = build_app(tmp_path)
+    work_dir = repo.root / "work"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    (work_dir / "twin-sweep.json").write_text(
+        json.dumps({"checked": 3, "rejected": 2, "rejected_rule": 1, "rejected_llm": 1}),
+        encoding="utf-8",
+    )
+    client = TestClient(app)
+    login(client)
+
+    response = client.get("/confirm")
+
+    assert response.status_code == 200
+    assert "2 duplicate readings were auto-resolved" in response.text
+    assert "confirm-twin-sweep-note.js" in response.text
+
+
+def test_confirm_queue_omits_twin_sweep_note_when_no_sweep_has_run(tmp_path: Path) -> None:
+    app, repo, _db, _calls = build_app(tmp_path)
+    client = TestClient(app)
+    login(client)
+
+    response = client.get("/confirm")
+
+    assert response.status_code == 200
+    assert "auto-resolved" not in response.text
+
+
+def test_confirm_queue_omits_twin_sweep_note_when_last_sweep_rejected_nothing(
+    tmp_path: Path,
+) -> None:
+    app, repo, _db, _calls = build_app(tmp_path)
+    work_dir = repo.root / "work"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    (work_dir / "twin-sweep.json").write_text(
+        json.dumps({"checked": 3, "rejected": 0, "rejected_rule": 0, "rejected_llm": 0}),
+        encoding="utf-8",
+    )
+    client = TestClient(app)
+    login(client)
+
+    response = client.get("/confirm")
+
+    assert response.status_code == 200
+    assert "auto-resolved" not in response.text

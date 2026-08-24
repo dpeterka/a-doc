@@ -21,6 +21,7 @@ from typing import Any
 
 import pytest
 from conftest import TINY_PDF_BYTES, fake_page_renderer
+from git import Repo as GitRepo
 
 import adoc.cli as cli
 from adoc.casefile.repo import DataRepo
@@ -28,7 +29,7 @@ from adoc.cli import main
 from adoc.config import ModelBinding
 from adoc.ingest.schema import ClassifyResult, DocumentExtraction
 from adoc.labs.db import LabsDb
-from adoc.labs.models import DocumentStatus, LabDocument, LabResult
+from adoc.labs.models import DocumentStatus, ExtractionStatus, LabDocument, LabResult
 from adoc.reason.client import AnthropicProvider, LlmClient, TransportRequest, TransportResponse
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -392,6 +393,158 @@ def test_labs_infer_specimen_runs_end_to_end_and_commits(
     assert second_code == 0
     second_out = capsys.readouterr().out
     assert "updated 0 row(s)" in second_out
+
+
+# --------------------------------------------------------------------------
+# labs-dedupe-twins (queue-ergonomics slice item 4)
+# --------------------------------------------------------------------------
+
+
+def _exploding_classifier_client() -> LlmClient:
+    """A fake `LlmClient` whose `classifier` transport explodes if ever
+    called - the rule-path twin case below must never reach the LLM."""
+
+    def _transport(request: TransportRequest) -> TransportResponse:
+        raise AssertionError("the classifier LLM must not be called for a rule-path twin")
+
+    bindings = {"classifier": [ModelBinding(provider="anthropic", model="fake-haiku")]}
+    providers = {"anthropic": AnthropicProvider(api_key=None, transport=_transport)}
+    return LlmClient(bindings, providers)
+
+
+def test_labs_dedupe_twins_fails_without_data_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("ADOC_DATA_DIR", raising=False)
+
+    code = main(["labs-dedupe-twins"])
+
+    assert code == 1
+    assert "configuration error" in capsys.readouterr().err
+
+
+def test_labs_dedupe_twins_fails_if_data_repo_not_initialized(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("ADOC_DATA_DIR", str(tmp_path / "a-doc-data"))
+    monkeypatch.setenv("ADOC_MODELS_FILE", str(REPO_ROOT / "models.yaml"))
+
+    code = main(["labs-dedupe-twins"])
+
+    assert code == 1
+    assert "run `adoc init` first" in capsys.readouterr().err
+
+
+def _seed_twin_pair(data_dir: Path) -> tuple[str, int]:
+    """One AUTO row and its rule-path twin PENDING single_pass row, same
+    document/page/value - returns `(sha256, pending_row_id)`."""
+    sha = "a" * 64
+    repo = DataRepo.init_at(data_dir)
+    with LabsDb(data_dir / "labs.sqlite") as db:
+        db.upsert_document(
+            LabDocument(
+                sha256=sha,
+                filename="dexa.pdf",
+                doc_type="lab_report",
+                page_count=6,
+                ingested_at=datetime(2026, 5, 3, 12, 0, 0),
+                status=DocumentStatus.COMPLETE,
+            )
+        )
+        db.insert_results(
+            [
+                LabResult(
+                    date=date(2026, 5, 2),
+                    name="t-score",
+                    name_raw="LEFT HIP femoral neck T-Score",
+                    value=-1.2,
+                    source_doc=sha,
+                    source_page=5,
+                    raw_json=json.dumps({"reasons": []}),
+                )
+            ]
+        )
+        (pending_id,) = db.insert_results(
+            [
+                LabResult(
+                    date=date(2026, 5, 2),
+                    name="t-score-2",
+                    name_raw="T-Score",
+                    value=-1.2,
+                    source_doc=sha,
+                    source_page=5,
+                    extraction_status=ExtractionStatus.PENDING,
+                    raw_json=json.dumps({"reasons": ["single_pass"]}),
+                )
+            ]
+        )
+        db.export_jsonl(data_dir / "labs-export.jsonl")
+    repo.commit("seed twin pair", paths=["labs-export.jsonl"])
+    assert pending_id is not None
+    return sha, pending_id
+
+
+def test_labs_dedupe_twins_dry_run_reports_and_mutates_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    data_dir = tmp_path / "a-doc-data"
+    monkeypatch.setenv("ADOC_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("ADOC_MODELS_FILE", str(REPO_ROOT / "models.yaml"))
+    monkeypatch.setattr(cli, "_build_llm_client", lambda settings: _exploding_classifier_client())
+    _sha, pending_id = _seed_twin_pair(data_dir)
+
+    code = main(["labs-dedupe-twins", "--dry-run"])
+
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "dry-run" in out
+    assert "would reject 1" in out
+    assert not (data_dir / "work" / "twin-sweep.json").exists()
+
+    with LabsDb(data_dir / "labs.sqlite") as db:
+        row = db.get_row(pending_id)
+        assert row is not None
+        assert row.extraction_status == ExtractionStatus.PENDING
+
+
+def test_labs_dedupe_twins_runs_end_to_end_and_commits(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    data_dir = tmp_path / "a-doc-data"
+    monkeypatch.setenv("ADOC_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("ADOC_MODELS_FILE", str(REPO_ROOT / "models.yaml"))
+    monkeypatch.setattr(cli, "_build_llm_client", lambda settings: _exploding_classifier_client())
+    _sha, pending_id = _seed_twin_pair(data_dir)
+    repo = DataRepo(data_dir)
+    git_repo = GitRepo(repo.root)
+    commits_before = len(list(git_repo.iter_commits()))
+
+    code = main(["labs-dedupe-twins"])
+
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "rejected 1" in out
+
+    with LabsDb(data_dir / "labs.sqlite") as db:
+        row = db.get_row(pending_id)
+        assert row is not None
+        assert row.extraction_status == ExtractionStatus.REJECTED
+        assert row.raw_payload()["method"] == "rule"
+
+    commits_after = len(list(git_repo.iter_commits()))
+    assert commits_after == commits_before + 1
+
+    summary_path = data_dir / "work" / "twin-sweep.json"
+    assert summary_path.exists()
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert summary["rejected"] == 1
+
+    # idempotent: a second run finds nothing left to reject
+    second_code = main(["labs-dedupe-twins"])
+    assert second_code == 0
+    second_out = capsys.readouterr().out
+    assert "rejected 0" in second_out
 
 
 def test_eval_runs_offline_with_out_dir(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
