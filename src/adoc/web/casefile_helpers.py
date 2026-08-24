@@ -168,6 +168,43 @@ def resolve_page_image_path(repo: DataRepo, sha: str, filename: str) -> Path | N
     return resolved
 
 
+def resolve_original_document_path(repo: DataRepo, sha: str) -> Path | None:
+    """Resolve `sha` to its immutable archived original under `sources/`
+    (filenames there are `<sha>__<origname>`, see `ingest.archive`), or
+    `None` if `sha` isn't a safe bare sha256, no archived original
+    exists, or (defense in depth) the match resolves outside `sources/`.
+
+    Same traversal-defense shape as `resolve_page_image_path`: the only
+    untrusted input is `sha`, checked against `_is_safe_sha` before it
+    ever touches the filesystem, and the resolved path is re-checked
+    against the expected parent directory afterwards.
+    """
+    if not _is_safe_sha(sha):
+        return None
+    sources_dir = repo.root / "sources"
+    if not sources_dir.is_dir():
+        return None
+    try:
+        resolved_dir = sources_dir.resolve()
+    except OSError:
+        return None
+    prefix = f"{sha}__"
+    matches = [
+        entry
+        for entry in sources_dir.iterdir()
+        if entry.is_file() and entry.name.startswith(prefix)
+    ]
+    if len(matches) != 1:
+        return None
+    try:
+        resolved = matches[0].resolve()
+    except OSError:
+        return None
+    if resolved.parent != resolved_dir:
+        return None
+    return resolved
+
+
 def find_document_by_filename(db: LabsDb, filename: str) -> LabDocument | None:
     for doc in db.list_documents():
         if doc.filename == filename:

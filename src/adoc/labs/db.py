@@ -16,12 +16,32 @@ import json
 import re
 import sqlite3
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 from types import TracebackType
 from typing import Any
 
 from adoc.labs.models import ExtractionStatus, LabDocument, LabFlag, LabResult
+
+
+@dataclass(frozen=True)
+class PendingRow:
+    """One PENDING lab row joined with its source document.
+
+    Returned by `LabsDb.pending_grouped()` for the confirm-queue UI, which
+    needs to group PENDING rows by document (filename/date/type/page
+    count) without a second round trip per row (PLAN.md "Ingestion"
+    triage: "models agreed" vs. "models disagreed" buckets, each grouped
+    by document).
+    """
+
+    row: LabResult
+    doc_filename: str
+    doc_date: date | None
+    doc_type: str
+    doc_page_count: int
+
 
 # --------------------------------------------------------------------------
 # Schema (versioned migrations)
@@ -285,6 +305,55 @@ class LabsDb:
         ).fetchall()
         return [_row_to_lab(row) for row in rows]
 
+    def pending_grouped(self) -> list[PendingRow]:
+        """PENDING rows joined with their document, ordered by document
+        date descending (then by the row's own date/id).
+
+        The confirm queue's "models disagreed" bucket wants newest
+        documents surfaced first (PLAN.md "Ingestion" triage); grouping
+        the flat list by `PendingRow.row.source_doc` is left to the
+        caller so it can further split rows into buckets first (see
+        `web.routes.confirm`). SQLite orders `NULL` dates last in a
+        `DESC` sort, so documents with no resolved date sink to the
+        bottom rather than jumping to the front.
+        """
+        rows = self._conn.execute(
+            """
+            SELECT labs.*,
+                   documents.filename AS doc_filename,
+                   documents.doc_date AS doc_doc_date,
+                   documents.doc_type AS doc_doc_type,
+                   documents.page_count AS doc_page_count
+            FROM labs
+            JOIN documents ON documents.sha256 = labs.source_doc
+            WHERE labs.extraction_status = ?
+            ORDER BY documents.doc_date DESC, labs.date, labs.id
+            """,
+            (ExtractionStatus.PENDING.value,),
+        ).fetchall()
+        result: list[PendingRow] = []
+        for row in rows:
+            doc_date_raw = row["doc_doc_date"]
+            result.append(
+                PendingRow(
+                    row=_row_to_lab(row),
+                    doc_filename=row["doc_filename"],
+                    doc_date=date.fromisoformat(doc_date_raw) if doc_date_raw else None,
+                    doc_type=row["doc_doc_type"],
+                    doc_page_count=row["doc_page_count"],
+                )
+            )
+        return result
+
+    def lab_counts_by_document(self) -> dict[str, int]:
+        """Total lab-row count (any `extraction_status`) per document
+        `sha256`. The confirm queue's per-document header derives its
+        "done" count as `total - pending` from this."""
+        rows = self._conn.execute(
+            "SELECT source_doc, COUNT(*) AS n FROM labs GROUP BY source_doc"
+        ).fetchall()
+        return {row["source_doc"]: row["n"] for row in rows}
+
     def get_row(self, row_id: int) -> LabResult | None:
         row = self._conn.execute("SELECT * FROM labs WHERE id = ?", (row_id,)).fetchone()
         return _row_to_lab(row) if row else None
@@ -295,6 +364,27 @@ class LabsDb:
             (ExtractionStatus.CONFIRMED.value, row_id),
         )
         self._conn.commit()
+
+    def bulk_confirm(self, ids: Sequence[int]) -> int:
+        """Confirm every currently-PENDING row in `ids`; returns how many
+        rows were actually updated.
+
+        Rows in `ids` that are unknown or already resolved are silently
+        skipped rather than erroring - mirrors `confirm_row`'s per-row
+        idempotence, and lets a caller safely re-derive `ids` from a
+        possibly-stale read (e.g. a bulk-confirm request racing a
+        concurrent single-row action) without double-counting.
+        """
+        if not ids:
+            return 0
+        placeholders = ",".join("?" for _ in ids)
+        cur = self._conn.execute(
+            f"UPDATE labs SET extraction_status = ? "
+            f"WHERE id IN ({placeholders}) AND extraction_status = ?",
+            (ExtractionStatus.CONFIRMED.value, *ids, ExtractionStatus.PENDING.value),
+        )
+        self._conn.commit()
+        return cur.rowcount
 
     def correct_row(self, row_id: int, **fields: Any) -> None:
         """Apply a human correction to `row_id` and mark it `corrected`.
