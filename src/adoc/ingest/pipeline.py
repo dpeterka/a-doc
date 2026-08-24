@@ -1,23 +1,50 @@
 """Document ingestion pipeline (PLAN.md "Ingestion", session loop (a)).
 
 `ingest_file`/`ingest_inbox` wire together: dedupe -> archive -> route on
-`ArchivedDoc.kind`.
+kind (`ingest.filetypes.detect_intake_kind`, checked *before*
+`archive_document` so `"genomic"`/`"zip"` never reach it - see `_ingest_one`).
 
 **PDF** (unchanged): classify (`classifier` role, first page image) ->
 lab_report: vision double-pass extract -> reconcile -> `LabsDb.insert_results`
 + `labs-export.jsonl` export; non-lab document: an encounter stub.
 
-**docx** (PLAN.md docx ingestion design decision: docx = TEXT documents):
-`ingest.docx.extract_docx_text` -> classify over the text (`classifier`
-role, `LlmClient.complete`, no vision) -> lab_report: TEXT double-pass
-(`extract.double_pass_extract_text`) -> the SAME reconcile/insert/export
-path as a PDF lab report; else (narrative/other/imaging): an encounter
-whose body carries the FULL extracted text under a `## Extracted text`
-section - PLAN.md's context pack needs the full narrative, not a summary.
+**docx / text** (PLAN.md docx ingestion design decision: docx = TEXT
+documents; plain `.txt`/`.md` documents follow the identical path -
+`_ingest_text_like` is shared by both): get the document's full text
+(`ingest.docx.extract_docx_text` for docx; `path.read_text(errors=
+"replace")` for plain text - see `_ingest_text`) -> classify over the text
+(`classifier` role, `LlmClient.complete`, no vision) -> lab_report: TEXT
+double-pass (`extract.double_pass_extract_text`) -> the SAME reconcile/
+insert/export path as a PDF lab report; else (narrative/other/imaging): an
+encounter whose body carries the FULL extracted text under a `##
+Extracted text` section - PLAN.md's context pack needs the full narrative,
+not a summary.
 
-Either way, exactly one `DataRepo.commit` per document. This module
-deliberately does NOT touch `casefile.ledger` or `reason.dag`: per the task
-scope, incremental reasoning over newly-ingested rows is a later slice.
+**genomic** (CRITICAL DESIGN RULE: never enters the LLM document pipeline
+- no vision/text extraction call, ever): routed to `ingest.genomics`
+instead of `archive_document` - archived into `sources/genomics/`
+(gitignored), registered as one `documents` row (`doc_type=
+"genomic_data"`), and folded into the single regenerated
+`case/genomics-inventory.md` rather than a per-file encounter. See
+`_ingest_genomic` and `ingest.genomics`'s module docstring.
+
+**zip**: expanded, not archived (the zip itself is a container, never a
+document - see `_ingest_zip`); each member is routed through
+`detect_intake_kind` and ingested exactly as if it were its own inbox
+file (same hygiene/dedupe, one flattened `FileOutcome` per member in the
+report). Depth 1 only - a member that is itself a zip is rejected, not
+recursed into. Capped at `MAX_ZIP_MEMBERS` members and
+`MAX_ZIP_UNCOMPRESSED_BYTES` total uncompressed size; every member path is
+checked for traversal (absolute / `..`) before extraction. A hard failure
+partway through a zip leaves already-processed members' commits standing
+and reports the zip itself as `"error"` (routed to `work/failed/` by the
+usual inbox hygiene, same as any other failed file).
+
+Either way, exactly one `DataRepo.commit` per document (genomic: per
+archived file, committing only the regenerated inventory - see
+`ingest.genomics`). This module deliberately does NOT touch
+`casefile.ledger` or `reason.dag`: per the task scope, incremental
+reasoning over newly-ingested rows is a later slice.
 
 **Post-ingest inbox hygiene** applies ONLY to files a caller identifies as
 owned by the data repo's `inbox/`, via `inbox_root=` (see `_ingest_one`):
@@ -28,7 +55,9 @@ is lost), and an `error` outcome moves the file to `work/failed/` and
 records it in `work/failed/failures.jsonl` (see `ingest.failures`) so the
 web `/failed` page can surface it. `ingest_inbox` passes its own `inbox/`
 as `inbox_root`; `ingest_file` and `ingest_directory` default to
-`inbox_root=None` (no hygiene) unless a caller opts in.
+`inbox_root=None` (no hygiene) unless a caller opts in. A zip's *members*
+are never individually opted into inbox hygiene (they live in a scratch
+temp directory, not under `inbox/`) - only the zip file itself is.
 
 **Invariant**: `ingest_directory` (the engine behind `adoc backfill
 <external dir>`) never passes `inbox_root` and so NEVER deletes or moves a
@@ -43,9 +72,11 @@ hygiene. See `test_ingest_pipeline.py`'s
 from __future__ import annotations
 
 import shutil
+import tempfile
+import zipfile
 from collections.abc import Callable
 from datetime import UTC, date, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Literal
 
 from pydantic import BaseModel, Field
@@ -67,12 +98,22 @@ from adoc.ingest.archive import (
 from adoc.ingest.docx import DocxExtractionError, extract_docx_text
 from adoc.ingest.extract import double_pass_extract, double_pass_extract_text
 from adoc.ingest.failures import FAILED_DIR_RELPATH, FailureRecord, append_failure, flatten_relpath
+from adoc.ingest.filetypes import detect_intake_kind
+from adoc.ingest.genomics import (
+    GENOMIC_DOC_TYPE,
+    GENOMICS_INVENTORY_RELPATH,
+    archive_genomic_file,
+    regenerate_inventory,
+)
 from adoc.ingest.reconcile import ReconciledRow, parse_flag, parse_ref_range, reconcile
 from adoc.ingest.schema import ClassifyResult, DocType, DocumentExtraction
 from adoc.ingest.vision import ImagePart, VisionClient, VisionError
 from adoc.labs.db import LabsDb
 from adoc.labs.models import DocumentStatus, ExtractionStatus, LabDocument, LabResult
 from adoc.reason.client import LlmClient, LlmError, Message
+
+MAX_ZIP_MEMBERS = 200
+MAX_ZIP_UNCOMPRESSED_BYTES = 2 * 1024**3  # 2 GiB
 
 CLASSIFY_PROMPT_VERSION = "classifier-v1"
 CLASSIFY_PROMPT = f"""[{CLASSIFY_PROMPT_VERSION}]
@@ -84,6 +125,12 @@ guess at the document's date (the report date or visit date shown on the
 page) as doc_date, or omit it if no date is visible on this page.
 """
 
+# Shared by both TEXT-kind intake paths - a real .docx narrative/lab
+# export AND a plain .txt/.md drop (`_ingest_text_like`, used by both
+# `_ingest_docx` and `_ingest_text`) - the prompt itself is generic over
+# "full extracted text", so this is reused rather than duplicated for the
+# new plain-text path (kept under its original name; nothing docx-specific
+# in the prompt text itself).
 DOCX_CLASSIFY_PROMPT_VERSION = "classifier-docx-v1"
 DOCX_CLASSIFY_PROMPT = f"""[{DOCX_CLASSIFY_PROMPT_VERSION}]
 Read this document's full extracted text (paragraphs in reading order,
@@ -126,7 +173,10 @@ class FileOutcome(BaseModel):
     path: str
     sha256: str | None = None
     outcome: FileOutcomeKind
-    doc_type: DocType | None = None
+    # `str`, not `DocType` - a genomic file's outcome carries
+    # `GENOMIC_DOC_TYPE` ("genomic_data"), which is not one of `DocType`'s
+    # LLM-classifier values (a genomic file is never classified).
+    doc_type: str | None = None
     rows_auto: int = 0
     rows_pending: int = 0
     commit_sha: str | None = None
@@ -341,7 +391,7 @@ def _ingest_pdf(
     )
 
 
-def _ingest_docx(
+def _ingest_text_like(
     path: Path,
     *,
     repo: DataRepo,
@@ -349,18 +399,14 @@ def _ingest_docx(
     client: LlmClient,
     clock: Callable[[], datetime],
     archived: ArchivedDoc,
+    text: str,
 ) -> FileOutcome:
-    """docx flow (PLAN.md docx ingestion): TEXT extraction -> text-based
-    classify -> lab_report: TEXT double-pass into the same reconcile/
-    insert/export gates a PDF lab report uses; else: a full-text encounter.
+    """Shared TEXT-document flow (PLAN.md docx ingestion design decision,
+    now shared by both `_ingest_docx` and `_ingest_text` - item 3 of the
+    genomics/filetypes task): text-based classify -> lab_report: TEXT
+    double-pass into the same reconcile/insert/export gates a PDF lab
+    report uses; else: a full-text encounter.
     """
-    try:
-        text = extract_docx_text(archived.original_path)
-    except DocxExtractionError as exc:
-        return FileOutcome(
-            path=str(path), sha256=archived.sha256, outcome="error", issues=[str(exc)]
-        )
-
     try:
         classify_result = client.complete(
             "classifier",
@@ -376,8 +422,9 @@ def _ingest_docx(
     assert isinstance(classify, ClassifyResult)  # schema= guarantees this
 
     doc_date = classify.doc_date or clock().date()
-    # A docx has no page structure - `LabDocument.page_count` still
-    # requires >=1, so it's recorded as one logical unit.
+    # Neither a docx nor a plain text file has page structure -
+    # `LabDocument.page_count` still requires >=1, so it's recorded as one
+    # logical unit.
     page_count = 1
 
     if classify.doc_type == "lab_report":
@@ -412,6 +459,95 @@ def _ingest_docx(
         encounter_type_map=_DOCX_ENCOUNTER_TYPE_BY_DOC_TYPE,
         default_encounter_type="patient-report",
         extracted_text=text,
+    )
+
+
+def _ingest_docx(
+    path: Path,
+    *,
+    repo: DataRepo,
+    db: LabsDb,
+    client: LlmClient,
+    clock: Callable[[], datetime],
+    archived: ArchivedDoc,
+) -> FileOutcome:
+    """docx flow (PLAN.md docx ingestion): deterministic TEXT extraction,
+    then the shared `_ingest_text_like` flow."""
+    try:
+        text = extract_docx_text(archived.original_path)
+    except DocxExtractionError as exc:
+        return FileOutcome(
+            path=str(path), sha256=archived.sha256, outcome="error", issues=[str(exc)]
+        )
+    return _ingest_text_like(
+        path, repo=repo, db=db, client=client, clock=clock, archived=archived, text=text
+    )
+
+
+def _ingest_text(
+    path: Path,
+    *,
+    repo: DataRepo,
+    db: LabsDb,
+    client: LlmClient,
+    clock: Callable[[], datetime],
+    archived: ArchivedDoc,
+) -> FileOutcome:
+    """Plain `.txt`/`.md` document flow (genomics/filetypes task item 3):
+    read the archived file's text with `errors="replace"` (never raises on
+    bad encoding - a plain-text drop is not expected to always be clean
+    UTF-8), then the SAME shared `_ingest_text_like` flow docx uses -
+    reusing the docx prompts rather than duplicating them.
+    """
+    text = archived.original_path.read_text(encoding="utf-8", errors="replace")
+    return _ingest_text_like(
+        path, repo=repo, db=db, client=client, clock=clock, archived=archived, text=text
+    )
+
+
+def _ingest_genomic(
+    path: Path,
+    *,
+    repo: DataRepo,
+    db: LabsDb,
+    clock: Callable[[], datetime],
+) -> FileOutcome:
+    """Genomic flow (CRITICAL DESIGN RULE - module docstring): archive
+    byte-for-byte into `sources/genomics/` (never `archive_document`, never
+    a vision/text extraction call), register one `documents` row
+    (`doc_type=GENOMIC_DOC_TYPE`, `status=COMPLETE`, `page_count=1` - no
+    page structure), and regenerate the single `case/genomics-inventory.md`
+    summary rather than writing a per-file encounter. Only the inventory
+    file - never the genomic bytes themselves - is committed to git (see
+    `ingest.genomics`'s module docstring on why `sources/genomics/` is
+    gitignored).
+    """
+    archived = archive_genomic_file(repo.root, path, db=db)
+    if archived.already_ingested:
+        return FileOutcome(path=str(path), sha256=archived.sha256, outcome="duplicate")
+
+    db.upsert_document(
+        LabDocument(
+            sha256=archived.sha256,
+            filename=path.name,
+            doc_type=GENOMIC_DOC_TYPE,
+            doc_date=None,
+            page_count=1,
+            ingested_at=clock(),
+            status=DocumentStatus.COMPLETE,
+        )
+    )
+    regenerate_inventory(repo.root, db)
+
+    commit_sha = repo.commit(
+        f"ingest: genomic data file {path.name}", paths=[GENOMICS_INVENTORY_RELPATH]
+    )
+    return FileOutcome(
+        path=str(path),
+        sha256=archived.sha256,
+        outcome="ingested",
+        doc_type=GENOMIC_DOC_TYPE,
+        commit_sha=commit_sha,
     )
 
 
@@ -457,6 +593,149 @@ def _apply_inbox_hygiene(
     )
 
 
+def _safe_member_relpath(name: str) -> Path | None:
+    """The zip-slip guard (genomics/filetypes task item 4): `None` if
+    `name` is an absolute path, escapes via a `..` component, or looks
+    like a Windows drive-absolute path - anything that could extract
+    outside the scratch directory it's given. A directory entry (trailing
+    `/`) also returns `None` - only file members are ingested."""
+    if not name or name.endswith("/") or name.endswith("\\"):
+        return None
+    if name.startswith("/") or name.startswith("\\"):
+        return None
+    if len(name) >= 2 and name[1] == ":":  # e.g. "C:\\Windows\\..."
+        return None
+    posix = PurePosixPath(name)
+    if posix.is_absolute() or ".." in posix.parts or "" in posix.parts:
+        return None
+    return Path(*posix.parts)
+
+
+def _validate_zip_caps(zf: zipfile.ZipFile, zip_name: str) -> list[zipfile.ZipInfo]:
+    """Raises `ArchiveError` if `zf` exceeds either cap (genomics/filetypes
+    task item 4) - checked from metadata alone, before extracting a single
+    byte. Returns the non-directory members to process otherwise."""
+    infos = [info for info in zf.infolist() if not info.is_dir()]
+    if len(infos) > MAX_ZIP_MEMBERS:
+        raise ArchiveError(
+            f"{zip_name}: {len(infos)} members exceeds the {MAX_ZIP_MEMBERS}-member cap"
+        )
+    total = sum(info.file_size for info in infos)
+    if total > MAX_ZIP_UNCOMPRESSED_BYTES:
+        raise ArchiveError(
+            f"{zip_name}: {total:,} bytes uncompressed exceeds the "
+            f"{MAX_ZIP_UNCOMPRESSED_BYTES:,}-byte cap"
+        )
+    return infos
+
+
+def _ingest_zip_member(
+    info: zipfile.ZipInfo,
+    zf: zipfile.ZipFile,
+    tmp_dir: Path,
+    zip_name: str,
+    *,
+    repo: DataRepo,
+    db: LabsDb,
+    vision: VisionClient,
+    clock: Callable[[], datetime],
+    renderer: PageRenderer,
+) -> FileOutcome:
+    """Extract one zip member to `tmp_dir` and ingest it exactly as if it
+    were its own inbox file (module docstring: "same hygiene, same
+    dedupe") - reusing `_ingest_one` for the pdf/docx/text/genomic
+    dispatch, with `inbox_root=None` since the extracted copy lives in a
+    scratch temp directory, not the real `inbox/` (the zip's OWN inbox
+    hygiene, applied by the caller, covers the container)."""
+    member_label = f"{zip_name}:{info.filename}"
+    relpath = _safe_member_relpath(info.filename)
+    if relpath is None:
+        return FileOutcome(
+            path=member_label,
+            outcome="error",
+            issues=["unsafe member path (absolute or contains '..')"],
+        )
+
+    extracted_path = tmp_dir / relpath
+    extracted_path.parent.mkdir(parents=True, exist_ok=True)
+    with zf.open(info) as src, extracted_path.open("wb") as dst:
+        shutil.copyfileobj(src, dst)
+
+    # Depth 1 only (module docstring): a member that is itself a zip is
+    # rejected outright, never recursed into.
+    if detect_intake_kind(extracted_path) == "zip":
+        return FileOutcome(
+            path=member_label, outcome="error", issues=["nested zip archives are not supported"]
+        )
+
+    outcomes = _ingest_one(
+        extracted_path,
+        repo=repo,
+        db=db,
+        vision=vision,
+        clock=clock,
+        renderer=renderer,
+        inbox_root=None,
+    )
+    outcome = outcomes[0]
+    return outcome.model_copy(update={"path": member_label})
+
+
+def _ingest_zip(
+    path: Path,
+    *,
+    repo: DataRepo,
+    db: LabsDb,
+    vision: VisionClient,
+    clock: Callable[[], datetime],
+    renderer: PageRenderer,
+) -> tuple[list[FileOutcome], str | None]:
+    """Expand `path` and ingest each member (module docstring: "the zip
+    itself is not archived; its members are"). Returns
+    `(member_outcomes, zip_level_error)` - `zip_level_error` is set only
+    when the *whole zip* is rejected (bad zip file, over a cap) or a hard
+    failure stops processing partway through (genomics/filetypes task item
+    4: "already-processed members stand; the zip moves to work/failed/
+    with reason") - a single bad/unsafe/unsupported MEMBER does not stop
+    the rest of the zip; it is just one more `"error"` `FileOutcome`.
+    """
+    try:
+        zf = zipfile.ZipFile(path)
+    except zipfile.BadZipFile as exc:
+        return [], f"{path.name}: not a valid zip archive: {exc}"
+
+    with zf:
+        try:
+            infos = _validate_zip_caps(zf, path.name)
+        except ArchiveError as exc:
+            return [], str(exc)
+
+        outcomes: list[FileOutcome] = []
+        with tempfile.TemporaryDirectory(prefix="adoc-zip-") as tmp_dir_name:
+            tmp_dir = Path(tmp_dir_name)
+            try:
+                for info in infos:
+                    outcomes.append(
+                        _ingest_zip_member(
+                            info,
+                            zf,
+                            tmp_dir,
+                            path.name,
+                            repo=repo,
+                            db=db,
+                            vision=vision,
+                            clock=clock,
+                            renderer=renderer,
+                        )
+                    )
+            except Exception as exc:  # noqa: BLE001 - a hard mid-zip failure: keep
+                # what's already committed, stop, and report the zip itself as
+                # failed (already-appended member outcomes are untouched).
+                return outcomes, f"{path.name}: zip processing stopped part-way through: {exc}"
+
+        return outcomes, None
+
+
 def _ingest_one(
     path: Path,
     *,
@@ -466,28 +745,54 @@ def _ingest_one(
     clock: Callable[[], datetime],
     renderer: PageRenderer,
     inbox_root: Path | None = None,
-) -> FileOutcome:
+) -> list[FileOutcome]:
+    kind = detect_intake_kind(path)
+
+    if kind == "zip":
+        member_outcomes, zip_error = _ingest_zip(
+            path, repo=repo, db=db, vision=vision, clock=clock, renderer=renderer
+        )
+        zip_outcome = FileOutcome(
+            path=str(path),
+            outcome="error" if zip_error else "ingested",
+            issues=[zip_error] if zip_error else [],
+        )
+        _apply_inbox_hygiene(path, zip_outcome, repo=repo, inbox_root=inbox_root, clock=clock)
+        # The zip container itself is never a "document" in the report
+        # (module docstring) - its own outcome only needs surfacing when
+        # it failed; a clean expansion just reports its members.
+        return [*member_outcomes, zip_outcome] if zip_error else member_outcomes
+
+    if kind == "genomic":
+        outcome = _ingest_genomic(path, repo=repo, db=db, clock=clock)
+        _apply_inbox_hygiene(path, outcome, repo=repo, inbox_root=inbox_root, clock=clock)
+        return [outcome]
+
     try:
         archived = archive_document(repo.root, path, db=db, renderer=renderer)
     except ArchiveError as exc:
         outcome = FileOutcome(path=str(path), outcome="error", issues=[str(exc)])
         _apply_inbox_hygiene(path, outcome, repo=repo, inbox_root=inbox_root, clock=clock)
-        return outcome
+        return [outcome]
 
     if archived.already_ingested:
         outcome = FileOutcome(path=str(path), sha256=archived.sha256, outcome="duplicate")
         _apply_inbox_hygiene(path, outcome, repo=repo, inbox_root=inbox_root, clock=clock)
-        return outcome
+        return [outcome]
 
     if archived.kind == "docx":
         outcome = _ingest_docx(
+            path, repo=repo, db=db, client=vision.client, clock=clock, archived=archived
+        )
+    elif archived.kind == "text":
+        outcome = _ingest_text(
             path, repo=repo, db=db, client=vision.client, clock=clock, archived=archived
         )
     else:
         outcome = _ingest_pdf(path, repo=repo, db=db, vision=vision, clock=clock, archived=archived)
 
     _apply_inbox_hygiene(path, outcome, repo=repo, inbox_root=inbox_root, clock=clock)
-    return outcome
+    return [outcome]
 
 
 def ingest_file(
@@ -515,17 +820,15 @@ def ingest_file(
     by surprise.
     """
     return IngestReport(
-        files=[
-            _ingest_one(
-                path,
-                repo=repo,
-                db=db,
-                vision=vision,
-                clock=clock,
-                renderer=renderer,
-                inbox_root=inbox_root,
-            )
-        ]
+        files=_ingest_one(
+            path,
+            repo=repo,
+            db=db,
+            vision=vision,
+            clock=clock,
+            renderer=renderer,
+            inbox_root=inbox_root,
+        )
     )
 
 
@@ -560,14 +863,14 @@ def ingest_inbox(
     if not inbox.is_dir():
         return IngestReport(files=[])
     files = _scan_files(inbox)
-    return IngestReport(
-        files=[
+    outcomes: list[FileOutcome] = []
+    for p in files:
+        outcomes.extend(
             _ingest_one(
                 p, repo=repo, db=db, vision=vision, clock=clock, renderer=renderer, inbox_root=inbox
             )
-            for p in files
-        ]
-    )
+        )
+    return IngestReport(files=outcomes)
 
 
 def ingest_directory(
@@ -586,12 +889,12 @@ def ingest_directory(
     never delete or move a file in it, whatever the outcome.
     """
     files = _scan_files(directory)
-    return IngestReport(
-        files=[
+    outcomes: list[FileOutcome] = []
+    for p in files:
+        outcomes.extend(
             _ingest_one(p, repo=repo, db=db, vision=vision, clock=clock, renderer=renderer)
-            for p in files
-        ]
-    )
+        )
+    return IngestReport(files=outcomes)
 
 
 __all__ = [
