@@ -194,24 +194,63 @@ def _render_ledger_for_prompt(ledger: Ledger) -> str:
     return "\n".join(lines)
 
 
+# How many completions composer_stage may spend on one reply: the first
+# attempt plus one gate-guided rewrite. Found live (baseline-vs-DAG
+# experiment): a case file that legitimately records supplement doses
+# ("5000 IU") leads the Composer to restate them, tripping the dosage
+# detector - `GateResult.rewrite_instruction` was designed for exactly
+# this feedback loop but had never been wired in, so every such turn died
+# as a ContractViolation instead of being rewritten.
+_COMPOSER_GATE_ATTEMPTS = 2
+
+
 def composer_stage(client: LlmClient, ledger: Ledger, ctx: ContextPack) -> PatientReply:
     """Composer/Steward stage (role `primary_reasoner`, schema `PatientReply`).
-    Renders the post-challenge ledger for the patient. The output gate
-    (`safety.treatment_gate`) is applied as a DAG postcondition by
-    `build_diagnostic_dag`, not inside this function, so a gate failure
-    surfaces as a `ContractViolation` with the run stopped in place."""
+    Renders the post-challenge ledger for the patient.
+
+    The output gate (`safety.treatment_gate`) is consulted here to give the
+    model ONE rewrite pass when its draft trips the gate (fed back via
+    `GateResult.rewrite_instruction` plus the offending spans). This is a
+    quality loop, not the enforcement point: `build_diagnostic_dag` still
+    applies the same gate as a DAG postcondition on whatever this function
+    returns, so a reply that is still gated after the rewrite surfaces as a
+    `ContractViolation` with the run stopped in place (CLAUDE.md rule 5 -
+    the deterministic gate remains the final, unbypassable authority)."""
     prompt = load_prompt("composer")
     ledger_text = _render_ledger_for_prompt(ledger)
     user_content = f"{ctx.render()}\n\n## Current Ledger (post-challenge)\n\n{ledger_text}\n"
 
-    result = client.complete(
-        "primary_reasoner",
-        system=prompt.text,
-        messages=[Message(role="user", content=user_content)],
-        schema=PatientReply,
-    )
-    reply = result.parsed
-    assert isinstance(reply, PatientReply)
+    messages = [Message(role="user", content=user_content)]
+    reply: PatientReply | None = None
+    for _attempt in range(_COMPOSER_GATE_ATTEMPTS):
+        result = client.complete(
+            "primary_reasoner",
+            system=prompt.text,
+            messages=messages,
+            schema=PatientReply,
+        )
+        parsed = result.parsed
+        assert isinstance(parsed, PatientReply)
+        reply = parsed
+        gate = treatment_gate(reply.tiers_rendered)
+        if gate.passed:
+            return reply
+        offending = "; ".join(f"{span.text!r} ({span.reason})" for span in gate.spans)
+        messages = [
+            *messages,
+            Message(role="assistant", content=reply.tiers_rendered),
+            Message(
+                role="user",
+                content=(
+                    f"{gate.rewrite_instruction} The blocked phrases were: "
+                    f"{offending}. Reporting a dose the patient already takes "
+                    "counts as blocked dosing language - describe the "
+                    "medication or supplement WITHOUT its dose. Return the "
+                    "complete corrected reply in the same schema."
+                ),
+            ),
+        ]
+    assert reply is not None
     return reply
 
 
