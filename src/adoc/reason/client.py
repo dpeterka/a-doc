@@ -324,6 +324,18 @@ def _openai_strict_schema(schema: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _unwrap_tool_input(tool_input: dict[str, Any]) -> dict[str, Any]:
+    """Unwrap a single-key dict whose value is itself a dict (see the
+    flat-first fallback at the validation site); anything else passes
+    through untouched.
+    """
+    if len(tool_input) == 1:
+        (only_value,) = tool_input.values()
+        if isinstance(only_value, dict):
+            return only_value
+    return tool_input
+
+
 def _extract_json_object(text: str) -> str:
     """Return the first top-level JSON object in `text`.
 
@@ -565,7 +577,15 @@ class LlmClient:
                 )
                 raise LlmError(f"role {role!r}: provider returned no structured output")
             try:
-                parsed = schema.model_validate(response.tool_input)
+                try:
+                    parsed = schema.model_validate(response.tool_input)
+                except Exception:
+                    # Known Claude tool-use quirk: complex-schema input
+                    # occasionally arrives nested under a single wrapper key
+                    # (e.g. {"parameters": {...}}). Flat-first, unwrap-on-
+                    # failure so a legitimate single-field payload is never
+                    # misinterpreted.
+                    parsed = schema.model_validate(_unwrap_tool_input(response.tool_input))
             except Exception as exc:
                 self._audit(
                     _AuditRecord(
