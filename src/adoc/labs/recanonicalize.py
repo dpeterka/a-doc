@@ -109,7 +109,8 @@ class RecanonicalizeReport:
     """Outcome of one `recanonicalize_rows` pass.
 
     `checked` counts every non-rejected row examined; `renamed` +
-    `merged_duplicates` + `conflicts_queued` + `untouched` == `checked`.
+    `merged_duplicates` + `conflicts_queued` + `untouched` +
+    `blocked_by_tombstone` == `checked`.
     """
 
     checked: int = 0
@@ -117,6 +118,7 @@ class RecanonicalizeReport:
     merged_duplicates: int = 0
     conflicts_queued: int = 0
     untouched: int = 0
+    blocked_by_tombstone: int = 0
     renamed_ids: list[int] = field(default_factory=list)
 
 
@@ -163,6 +165,24 @@ def recanonicalize_rows(db: LabsDb, *, dry_run: bool = False) -> RecanonicalizeR
         assert row.id is not None  # rows read back from the db always have one
         planned_name[row.id] = _new_name_for(row)
 
+    # Phase 1b (tombstone check): the table's UNIQUE constraint spans
+    # REJECTED rows too, so a planned rename whose target key a tombstone
+    # still occupies would raise IntegrityError despite no LIVE row
+    # sitting there (found live: curation-rejected FRAX duplicates already
+    # held the canonical-name key their kept siblings were being renamed
+    # to). Such a rename simply doesn't happen - the row keeps its stored
+    # name (read-time `canonicalize` still groups it correctly) and is
+    # counted in `blocked_by_tombstone`. Reverting the plan BEFORE phase 2
+    # keeps grouping faithful to the keys rows will actually occupy.
+    rejected_keys = db.rejected_row_keys()
+    blocked_ids: set[int] = set()
+    for row in rows:
+        assert row.id is not None
+        target = planned_name[row.id]
+        if target != row.name and _group_key(row, target) in rejected_keys:
+            planned_name[row.id] = row.name
+            blocked_ids.add(row.id)
+
     # Phase 2 (group): bucket every row by the FINAL key it would occupy
     # once the plan is applied - collisions (including a to-be-renamed
     # row landing on a key an untouched row already holds) fall out of
@@ -188,7 +208,10 @@ def recanonicalize_rows(db: LabsDb, *, dry_run: bool = False) -> RecanonicalizeR
         survivor = rows_by_id[survivor_id]
         survivor_name = planned_name[survivor_id]
         if survivor_name == survivor.name:
-            report.untouched += 1
+            if survivor_id in blocked_ids:
+                report.blocked_by_tombstone += 1
+            else:
+                report.untouched += 1
         else:
             report.renamed += 1
             report.renamed_ids.append(survivor_id)
