@@ -21,7 +21,7 @@ from adoc.ingest.schema import DocumentExtraction
 from adoc.ingest.vision import ImagePart, PdfPart, TextPart, VisionClient
 from adoc.reason.client import LlmClient, Message
 
-PROMPT_A_VERSION = "extractor-pass-a-v3"
+PROMPT_A_VERSION = "extractor-pass-a-v4"
 PROMPT_A = f"""[{PROMPT_A_VERSION}]
 You are extracting structured data from ONE scanned/printed medical
 document (a lab report, clinical note, imaging report, or other document),
@@ -48,7 +48,13 @@ Return a single DocumentExtraction:
   T-Score"); name a FRAX result in full, exactly as its own probability
   type is described (e.g. "FRAX 10-year probability of hip fracture",
   "FRAX 10-year probability of major osteoporotic fracture") - always keep
-  the leading "FRAX".
+  the leading "FRAX". Do NOT emit derived interpretation/severity
+columns as their own result rows: when a panel prints both a
+measurement and an interpretation band for the same item (e.g. an
+allergen IgE panel's "Class" column of 0-VI bands beside each
+allergen's kU/L value), emit ONLY the measured row (the allergen's
+IgE in kU/L, with its flag) - the band is derivable from the value
+and is not a measurement.
 - specimen: record this PER RESULT ROW, from the report's own section
   header or label immediately governing that row (e.g. a "URINALYSIS"
   section -> urine; a "Stool"/"Stool Culture" section -> stool; a serum
@@ -71,7 +77,7 @@ value you cannot read - mark it illegible instead. Never fabricate a
 result that is not present in the document.
 """
 
-PROMPT_B_VERSION = "extractor-pass-b-v3"
+PROMPT_B_VERSION = "extractor-pass-b-v4"
 PROMPT_B = f"""[{PROMPT_B_VERSION}]
 You are independently re-transcribing ONE medical document from a sequence
 of page images (one image per page, in the order given). This is a SECOND,
@@ -96,7 +102,13 @@ it "<SITE> T-Score" or "<SITE> Z-Score" (e.g. "LEFT HIP femoral neck
 T-Score"); name a FRAX result in full, exactly as its own probability type
 is described (e.g. "FRAX 10-year probability of hip fracture", "FRAX
 10-year probability of major osteoporotic fracture") - always keep the
-leading "FRAX".
+leading "FRAX". Do NOT emit derived interpretation/severity
+columns as their own result rows: when a panel prints both a
+measurement and an interpretation band for the same item (e.g. an
+allergen IgE panel's "Class" column of 0-VI bands beside each
+allergen's kU/L value), emit ONLY the measured row (the allergen's
+IgE in kU/L, with its flag) - the band is derivable from the value
+and is not a measurement.
 
 For specimen, use the section header or label on the page that governs
 that row (e.g. "URINALYSIS" -> urine; "Stool"/"Stool Culture" -> stool; a
@@ -172,7 +184,7 @@ def double_pass_extract(
 # specific in the wording, so no rename was needed.
 # --------------------------------------------------------------------------
 
-DOCX_PROMPT_A_VERSION = "docx-extractor-pass-a-v3"
+DOCX_PROMPT_A_VERSION = "docx-extractor-pass-a-v4"
 DOCX_PROMPT_A = f"""[{DOCX_PROMPT_A_VERSION}]
 You are extracting structured data from ONE .docx document, provided below
 as its full plain text (paragraphs in reading order; any tables rendered
@@ -202,7 +214,13 @@ Return a single DocumentExtraction:
   T-Score"); name a FRAX result in full, exactly as its own probability
   type is described (e.g. "FRAX 10-year probability of hip fracture",
   "FRAX 10-year probability of major osteoporotic fracture") - always keep
-  the leading "FRAX".
+  the leading "FRAX". Do NOT emit derived interpretation/severity
+columns as their own result rows: when a panel prints both a
+measurement and an interpretation band for the same item (e.g. an
+allergen IgE panel's "Class" column of 0-VI bands beside each
+allergen's kU/L value), emit ONLY the measured row (the allergen's
+IgE in kU/L, with its flag) - the band is derivable from the value
+and is not a measurement.
 - specimen: record this PER RESULT ROW, from whichever section heading or
   label in the text governs that row (e.g. an "Urinalysis" heading ->
   urine; a "Stool"/"Stool Culture" heading -> stool; a serum chemistry
@@ -226,7 +244,7 @@ value that is not in the text - never fabricate a result that is not
 present in the document.
 """
 
-DOCX_PROMPT_B_VERSION = "docx-extractor-pass-b-v3"
+DOCX_PROMPT_B_VERSION = "docx-extractor-pass-b-v4"
 DOCX_PROMPT_B = f"""[{DOCX_PROMPT_B_VERSION}]
 You are independently re-reading the SAME .docx document's extracted text
 a SECOND, INDEPENDENT time. This is used to cross-check a separate model's
@@ -251,7 +269,13 @@ T-Score" or "<SITE> Z-Score" (e.g. "LEFT HIP femoral neck T-Score"); name
 a FRAX result in full, exactly as its own probability type is described
 (e.g. "FRAX 10-year probability of hip fracture", "FRAX 10-year
 probability of major osteoporotic fracture") - always keep the leading
-"FRAX".
+"FRAX". Do NOT emit derived interpretation/severity
+columns as their own result rows: when a panel prints both a
+measurement and an interpretation band for the same item (e.g. an
+allergen IgE panel's "Class" column of 0-VI bands beside each
+allergen's kU/L value), emit ONLY the measured row (the allergen's
+IgE in kU/L, with its flag) - the band is derivable from the value
+and is not a measurement.
 
 For specimen, use whichever section heading or label in the text governs
 that row (e.g. "Urinalysis" -> urine; "Stool"/"Stool Culture" -> stool; a
