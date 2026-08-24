@@ -362,6 +362,12 @@ Resources:
                 Fn::ImportValue: !Sub "${BackupStackName}-BucketName"
             - Name: ADOC_TRUST_FORWARDED_FOR
               Value: "true"
+            # The real Dropbox app-folder backend nests the inbox one level
+            # deeper than the remote name alone suggests
+            # (deploy/container/run-ingest.sh reads this to build its
+            # `rclone move` source; defaults to this same value if unset).
+            - Name: ADOC_RCLONE_SOURCE
+              Value: dropbox:a-doc/a-doc-inbox
           Secrets:
             - Name: ANTHROPIC_API_KEY
               ValueFrom: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/a-doc/anthropic-api-key"
