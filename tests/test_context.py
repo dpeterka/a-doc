@@ -189,3 +189,19 @@ def test_missing_case_files_fall_back_to_placeholders(tmp_path: Path, db: LabsDb
     open_questions = next(s.content for s in pack.sections if s.key == "open_questions")
     assert case_summary == "_Not yet populated._"
     assert open_questions == "_None yet._"
+
+
+def test_genomics_inventory_section_included_when_present(repo: DataRepo, db: LabsDb) -> None:
+    repo.write("case/genomics-inventory.md", "# Genomic data\n\n| file | kind |\n")
+
+    pack = build_context(repo, db, include_ledger=False)
+
+    assert "genomics_inventory" in pack.keys
+    assert "Genomic Data On File" in pack.render()
+
+
+def test_genomics_inventory_section_absent_when_missing(repo: DataRepo, db: LabsDb) -> None:
+
+    pack = build_context(repo, db, include_ledger=False)
+
+    assert "genomics_inventory" not in pack.keys

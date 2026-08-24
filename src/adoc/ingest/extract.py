@@ -123,6 +123,12 @@ def double_pass_extract(
 # bound models, claude-sonnet-5 and gpt-5.2, both handle plain text
 # natively, so this goes through `LlmClient.complete` rather than
 # `VisionClient.extract`).
+#
+# Reused as-is (not duplicated) for plain `.txt`/`.md` text documents too
+# (genomics/filetypes task, item 3) - `ingest.pipeline._ingest_text_like`
+# calls `double_pass_extract_text` for both docx and plain-text intake; the
+# prompts below are already generic over "plain text", nothing docx-
+# specific in the wording, so no rename was needed.
 # --------------------------------------------------------------------------
 
 DOCX_PROMPT_A_VERSION = "docx-extractor-pass-a-v1"

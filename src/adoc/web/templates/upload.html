@@ -7,9 +7,10 @@
     and add anything it finds to your case file — some rows may need your confirmation.
   </p>
   <p class="muted">
-    Supported files: PDF and Word (.docx) files — lab reports, doctor letters, imaging reports,
-    health summaries.
+    Supported files: PDF, Word (.docx), text (.txt), and zip (.zip) files — lab reports, doctor
+    letters, imaging reports, health summaries.
   </p>
+  <p class="muted">{{ genomics_note }}</p>
 
   {% if error %}
     <p class="error" role="alert">{{ error }}</p>
@@ -17,7 +18,7 @@
 
   <form method="post" action="/upload" enctype="multipart/form-data">
     <label for="upload-file">Choose a file</label>
-    <input id="upload-file" type="file" name="file" accept=".pdf,.docx" required>
+    <input id="upload-file" type="file" name="file" accept=".pdf,.docx,.txt,.zip" required>
     <div class="button-row">
       <button type="submit">Add to my case file</button>
     </div>
