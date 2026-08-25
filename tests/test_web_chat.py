@@ -115,6 +115,29 @@ def test_red_flag_message_returns_urgent_template_with_zero_llm_calls(
     assert calls == []
 
 
+def test_red_flag_message_during_intake_gives_next_step_guidance_not_a_dead_end(
+    tmp_path: Path,
+) -> None:
+    """Defect fix (live blocker): during an (incomplete) intake conversation,
+    the urgent message must not strand a patient recounting past history --
+    it gets extra next-step guidance on top of the untouched
+    `red_flag_screen` message, still with zero LLM calls."""
+    app, _repo, _db, calls = build_app(tmp_path)  # intake incomplete by default
+    client = TestClient(app)
+    login(client)
+
+    response = client.post(
+        "/chat/send", data={"text": "I have crushing chest pain radiating to my left arm"}
+    )
+
+    assert response.status_code == 200
+    body_lower = response.text.lower()
+    assert "call 911" in body_lower or "emergency" in body_lower
+    assert "please get care first" in body_lower
+    assert "one thing at a time" in body_lower
+    assert calls == []
+
+
 def test_diagnostic_turn_renders_the_three_tiers(tmp_path: Path) -> None:
     calls = []
     primary = make_primary_transport([_SLE_MOST_LIKELY_OP, _PE_CANT_MISS_OP], _PATIENT_REPLY, calls)
