@@ -673,44 +673,147 @@ def _analyte_value_index(db: LabsDb) -> dict[str, set[float]]:
     return index
 
 
-def _known_unit_tokens(db: LabsDb) -> set[str]:
-    """Every distinct `ucum_unit` actually recorded in `labs.sqlite`,
-    lowercased — the unit vocabulary `_quoted_number_looks_like_a_value`
-    treats as direct positive evidence a quoted number is a lab value
-    ("8.5 mg/L" is a value because "mg/L" is a unit this patient's own data
-    actually uses)."""
-    units: set[str] = set()
+def _analyte_unit_index(db: LabsDb) -> dict[str, set[str]]:
+    """Every distinct `ucum_unit` recorded for each analyte label (both
+    `name` and `name_raw`, lowercased) — PER-ANALYTE, unlike a single global
+    unit vocabulary. This is what lets `_quoted_number_is_value_evidence`
+    decide the "is this analyte itself a percent-unit analyte?" question
+    (`% SATURATION`, a differential count, ...) from this patient's own
+    stored data rather than a hardcoded analyte-name list."""
+    index: dict[str, set[str]] = {}
     for row in db.all_non_rejected_rows():
-        if row.ucum_unit:
-            units.add(row.ucum_unit.strip().lower())
-    return units
+        if not row.ucum_unit:
+            continue
+        for label in {row.name, row.name_raw}:
+            key = label.strip().lower()
+            if not key:
+                continue
+            index.setdefault(key, set()).add(row.ucum_unit.strip().lower())
+    return index
 
 
-def _quoted_number_looks_like_a_value(tail: str, unit_tokens: set[str]) -> bool:
+# Positive-evidence design (2026-08-25, second pass). The first pass
+# (above: `_COUNT_CONTEXT_WORDS`/`_COUNT_CONTEXT_FILLER_WORDS`) defaulted
+# every number sitting near a known analyte name to "is a value" and tried
+# to enumerate what to exclude (a count, a frequency, a duration). That
+# design kept losing: a live diagnostic run was lost when "Ferritin dropped
+# by 40% since 2024" flagged BOTH "40" (a percent CHANGE, not a value) and
+# "2024" (a YEAR, not a value) as claimed Ferritin readings — ordinary
+# clinical prose is full of numbers near an analyte name that are not its
+# value (percentages, years, dates, durations, counts, ratios), and
+# enumerating every such shape is an unbounded, always-losing game.
+#
+# Inverted here: a number counts as a candidate VALUE only when something
+# in the text actually TIES it to the analyte —
+#   - it is immediately followed by a unit THIS analyte is actually
+#     recorded under (per-analyte, via `_analyte_unit_index` — never a
+#     unit that merely exists somewhere else in the patient's data), or
+#   - it is immediately preceded (skipping a short filler word such as
+#     "back"/"in"/"up"/"down"/"out") by a copula/preposition that ties a
+#     number to a measurement ("was 15 ng/mL", "at 22", "reading of 8.5").
+# A number with neither kind of positive evidence is left unflagged by
+# construction — no exclusion list required.
+#
+# Even a number WITH positive evidence is still vetoed when:
+#   - it is immediately followed by "%" and this analyte's own recorded
+#     unit is not itself "%" — a percentage attached to an analyte whose
+#     real unit is something else (ng/mL, mg/dL, ...) is a percent CHANGE
+#     or a percentage OF something, not the analyte's value. When the
+#     analyte genuinely IS a percent-unit analyte ("% SATURATION", a
+#     differential count), a %-suffixed number is checked exactly like any
+#     other value — decided from `_analyte_unit_index`, never a hardcoded
+#     analyte name;
+#   - it is a bare 4-digit integer in a plausible calendar-year range
+#     ("since 2024" is a date, not a measurement) AND its only positive
+#     evidence was a copula, not a unit — a unit directly attached (e.g.
+#     "B12 was 2024 pg/mL") is unambiguous regardless of magnitude, so the
+#     year veto only guards the copula-only case, where common English date
+#     phrasing ("...was 2024") can otherwise borrow a copula word. Accepted,
+#     documented tradeoff: a genuine unit-less 4-digit reading that happens
+#     to fall in this numeric range is a rare false negative traded off
+#     against the much more common false positive this fixes;
+#   - it is immediately followed (skipping a short qualifier) by an
+#     explicit count/frequency/duration word from `_COUNT_CONTEXT_WORDS`
+#     ("at 6 weeks" is a duration, not a value, even though "at" is a
+#     copula) — kept from the first pass.
+_VALUE_COPULA_WORDS = {
+    "was",
+    "is",
+    "were",
+    "are",
+    "at",
+    "of",
+    "reading",
+    "read",
+    "measured",
+    "resulted",
+    "reached",
+    "recorded",
+    "value",
+    "came",
+}
+_COPULA_SKIPPABLE_FILLERS = {"back", "in", "up", "down", "out"}
+_HEAD_WORD_RE = re.compile(r"[A-Za-z]+")
+
+_YEAR_MIN = 1900
+_YEAR_MAX = 2099
+
+
+def _has_preceding_copula(head: str) -> bool:
+    """True iff the closest real word before the number (skipping a short
+    filler word like "back"/"in"/"up"/"down"/"out") is a copula/preposition
+    from `_VALUE_COPULA_WORDS`. Only the CLOSEST non-filler word counts —
+    "CRP was elevated on 2 occasions" must not fire just because "was"
+    appears earlier in the clause; the word immediately governing "2" is
+    "on", which is neither a filler nor a copula, so this returns `False`
+    there (the count-word veto is a second, independent guard for exactly
+    that shape, not the only one)."""
+    words = [w.lower() for w in _HEAD_WORD_RE.findall(head)]
+    for word in reversed(words[-4:]):
+        if word in _COPULA_SKIPPABLE_FILLERS:
+            continue
+        return word in _VALUE_COPULA_WORDS
+    return False
+
+
+def _looks_like_bare_year(number_text: str) -> bool:
+    """True iff `number_text` is a plain integer (no decimal point) whose
+    value falls in a plausible calendar-year range — "since 2024" is a
+    date, not a measurement. Only consulted for copula-only evidence (see
+    the module-level design comment above)."""
+    if "." in number_text:
+        return False
+    try:
+        value = int(number_text)
+    except ValueError:
+        return False
+    return _YEAR_MIN <= value <= _YEAR_MAX
+
+
+def _quoted_number_is_value_evidence(
+    number_text: str, head: str, tail: str, analyte_units: set[str]
+) -> bool:
     """Positive-evidence check for whether a quoted number sitting near a
-    known analyte name is plausibly THAT analyte's value, rather than an
-    unrelated count/frequency/duration — the false-positive over-block a
-    code review caught alongside the entailment-verifier one (ADR 0016
-    revised, 2026-08-25): "Your CRP has been elevated across 3 separate
-    panels" quotes "3", which sits in the same clause as "CRP", but "3" is
-    a COUNT OF PANELS, not a CRP value.
+    known analyte name is plausibly THAT analyte's value (see the
+    module-level design comment above for the full rationale). `head`/
+    `tail` are the (date/titer/range-stripped) clause text immediately
+    before/after the quoted number; `analyte_units` are the units THIS
+    analyte is actually recorded under."""
+    stripped_tail = tail.lstrip()
+    lowered_tail = stripped_tail.lower()
+    lowered_units = {u.lower() for u in analyte_units if u}
 
-    `tail` is the text immediately following the quoted number in its
-    (date/titer/range-stripped) clause. Deliberately NOT an exhaustive
-    non-value blacklist: a number immediately followed by one of this
-    patient's own recorded units ("8.5 mg/L") is a value by direct positive
-    evidence, and — because the genuine catch this check exists for (a
-    fabricated value with no unit at all, e.g. "12.0, notably elevated")
-    must never regress — a number with no recognizable count/frequency/
-    duration word immediately after it is ALSO still treated as a value
-    candidate by default. Only a number directly followed (skipping a
-    short qualifier like "separate" or "additional") by an explicit count/
-    frequency/duration word from `_COUNT_CONTEXT_WORDS` is excluded."""
-    stripped = tail.lstrip()
-    lowered = stripped.lower()
-    if any(unit and lowered.startswith(unit) for unit in unit_tokens):
-        return True
-    for word in _VALUE_TOKEN_RE.findall(stripped)[:2]:
+    has_unit_evidence = any(lowered_tail.startswith(unit) for unit in lowered_units)
+    has_copula_evidence = _has_preceding_copula(head)
+    if not (has_unit_evidence or has_copula_evidence):
+        return False
+
+    if lowered_tail.startswith("%") and "%" not in lowered_units:
+        return False
+    if not has_unit_evidence and _looks_like_bare_year(number_text):
+        return False
+
+    for word in _VALUE_TOKEN_RE.findall(stripped_tail)[:2]:
         word_l = word.lower()
         if word_l in _COUNT_CONTEXT_FILLER_WORDS:
             continue
@@ -755,17 +858,21 @@ def check_composer_numbers(text: str, db: LabsDb) -> ComposerNumberCheck:
     quoted result value (mirrors `reason.citations._extract_quoted_numbers`
     exactly, including reusing its `_RANGE_RE`).
 
-    ADR 0016 revised (2026-08-25): sharing a clause with an analyte name is
-    NOT enough on its own — a number is also checked against
-    `_quoted_number_looks_like_a_value` so a COUNT sitting in the same
-    clause ("elevated across 3 separate panels") is never mistaken for that
-    analyte's value. A number that clears both gates and still fails to
-    match any stored value for the analyte it sits next to is exactly the
-    fabrication this check exists to catch."""
+    ADR 0016 revised (2026-08-25, second pass): sharing a clause with an
+    analyte name is NOT enough on its own — a number is also required to
+    carry POSITIVE evidence it is that analyte's value (a directly-attached
+    unit, or a copula/preposition tying it to the analyte), via
+    `_quoted_number_is_value_evidence` (see that function's module-level
+    design comment for the full rationale and the false positives it
+    fixes: a percent CHANGE and a bare YEAR both wrongly flagged as a
+    claimed analyte value under the first-pass exclusion-list design). A
+    number that clears that gate and still fails to match any stored value
+    for the analyte it sits next to is exactly the fabrication this check
+    exists to catch."""
     index = _analyte_value_index(db)
     if not index:
         return ComposerNumberCheck()
-    unit_tokens = _known_unit_tokens(db)
+    unit_index = _analyte_unit_index(db)
 
     mismatches: list[ComposerNumberMismatch] = []
     for clause in _split_clauses(text):
@@ -785,9 +892,13 @@ def check_composer_numbers(text: str, db: LabsDb) -> ComposerNumberCheck:
 
         for label in matched_labels:
             stored = index[label]
+            analyte_units = unit_index.get(label, set())
             for number_match in number_matches:
+                head = cleaned[: number_match.start()]
                 tail = cleaned[number_match.end() :]
-                if not _quoted_number_looks_like_a_value(tail, unit_tokens):
+                if not _quoted_number_is_value_evidence(
+                    number_match.group(), head, tail, analyte_units
+                ):
                     continue
                 number = float(number_match.group())
                 if not any(abs(number - v) <= 1e-9 for v in stored):

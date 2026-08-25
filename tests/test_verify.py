@@ -713,3 +713,72 @@ def test_composer_numbers_a_real_value_and_a_count_in_the_same_reply(db: LabsDb)
         "Your CRP was 8.5 mg/L, checked on 3 separate occasions this year.", db
     )
     assert check.passed
+
+
+# --- check_composer_numbers: positive-evidence design (ADR 0016 revised, second pass) ---------
+#
+# A live diagnostic run was lost when the first-pass exclusion-list design
+# flagged BOTH "40" (a percent CHANGE) and "2024" (a YEAR) in "Ferritin
+# dropped by 40% since 2024" as claimed Ferritin values. These cases pin
+# the inverted, positive-evidence design that fixes it.
+
+
+def test_composer_numbers_ignores_a_percent_change_and_a_bare_year(db: LabsDb) -> None:
+    """The exact production regression: neither the percent CHANGE nor the
+    YEAR is the analyte's value, and neither carries positive evidence
+    (no unit, no copula tying it to Ferritin)."""
+    _seed_lab_row(db, name="Ferritin", value=150.0, ucum_unit="ng/mL")
+    check = check_composer_numbers("Ferritin dropped by 40% since 2024.", db)
+    assert check.passed
+
+
+def test_composer_numbers_checks_a_percent_unit_analyte_and_catches_fabrication(
+    db: LabsDb,
+) -> None:
+    """A `%`-suffixed number is NOT unconditionally excluded — when the
+    analyte's own recorded unit genuinely is '%' (e.g. an iron saturation
+    or a differential count), a %-suffixed number is still checked, and a
+    fabricated one is still caught, decided from stored data rather than a
+    hardcoded analyte name."""
+    _seed_lab_row(db, name="Iron Saturation", value=25.0, ucum_unit="%")
+    check = check_composer_numbers("Your Iron Saturation was 40%, notably elevated.", db)
+    assert not check.passed
+    assert check.mismatches[0].quoted_number == 40.0
+    assert check.mismatches[0].stored_values == [25.0]
+
+
+def test_composer_numbers_percent_unit_analyte_correct_value_passes(db: LabsDb) -> None:
+    _seed_lab_row(db, name="Iron Saturation", value=25.0, ucum_unit="%")
+    check = check_composer_numbers("Your Iron Saturation was 25%, within range.", db)
+    assert check.passed
+
+
+def test_composer_numbers_ignores_a_duration_even_after_the_copula_at(db: LabsDb) -> None:
+    """ "at" is a copula word ("at 22" is the canonical positive-evidence
+    example), but "at 6 weeks" must still be excluded by the trailing
+    duration-word veto — a copula alone does not override it."""
+    _seed_lab_row(db, name="Ferritin", value=150.0, ucum_unit="ng/mL")
+    check = check_composer_numbers("Your Ferritin was drawn at 6 weeks.", db)
+    assert check.passed
+
+
+def test_composer_numbers_ignores_a_year_after_a_copula_with_no_unit(db: LabsDb) -> None:
+    """Common English date phrasing can borrow a copula word ("...reading
+    was 2024") with no unit attached — the year veto guards exactly this
+    copula-only case."""
+    _seed_lab_row(db, name="Ferritin", value=150.0, ucum_unit="ng/mL")
+    check = check_composer_numbers("Your Ferritin reading was 2024 this visit.", db)
+    assert check.passed
+
+
+def test_composer_numbers_still_catches_a_year_range_value_when_a_unit_is_attached(
+    db: LabsDb,
+) -> None:
+    """The year veto only guards copula-only evidence: a number directly
+    followed by this analyte's own unit is unambiguous regardless of
+    magnitude, so a fabricated 4-digit-looking value with a real unit is
+    still caught."""
+    _seed_lab_row(db, name="B12", value=500.0, ucum_unit="pg/mL")
+    check = check_composer_numbers("Your B12 was 2024 pg/mL, dramatically high.", db)
+    assert not check.passed
+    assert check.mismatches[0].quoted_number == 2024.0

@@ -706,6 +706,13 @@ def _abstention_probes(tmp_root: Path) -> tuple[list[SuiteCaseResult], float]:
 # wrongly flagging: a COUNT/frequency/duration sitting in the same clause as
 # an analyte name ("elevated across 3 separate panels") is not that
 # analyte's value. The exact sentence from the review is the first case.
+#
+# The second pass (ADR 0016 revised, second pass, 2026-08-25) added the
+# percent-change/bare-year cases below after a live diagnostic run was lost
+# to "Ferritin dropped by 40% since 2024" flagging BOTH "40" (a percent
+# CHANGE) and "2024" (a YEAR) as claimed Ferritin values — see
+# `reason.verify._quoted_number_is_value_evidence`'s module-level design
+# comment for the full positive-evidence rationale this suite pins.
 _COMPOSER_NUMBER_LEGITIMATE_SENTENCES = [
     "Your CRP has been elevated across 3 separate panels.",
     "Your CRP was elevated on 2 occasions this year.",
@@ -713,6 +720,13 @@ _COMPOSER_NUMBER_LEGITIMATE_SENTENCES = [
     "Your CRP has been checked 4 times this year.",
     "Your CRP remains above the reference range of 0.0-5.0 mg/L.",
     "Your CRP was 8.5 mg/L, checked on 3 separate occasions this year.",
+    # ADR 0016 revised, second pass: the exact production regression —
+    # neither the percent CHANGE nor the YEAR is a Ferritin value.
+    "Ferritin dropped by 40% since 2024.",
+    # A copula word ("at") alone must not override the duration-word veto.
+    "Your Ferritin was drawn at 6 weeks.",
+    # Common date phrasing can borrow a copula word with no unit attached.
+    "Your Ferritin reading was 2024 this visit.",
 ]
 
 # The genuine catch this check exists for must never regress: a fabricated
@@ -720,23 +734,77 @@ _COMPOSER_NUMBER_LEGITIMATE_SENTENCES = [
 _COMPOSER_NUMBER_FABRICATED_SENTENCES = [
     "Your CRP was 12.0 mg/L, notably elevated.",
     "Your CRP was 12.0, notably elevated.",
+    # ADR 0016 revised, second pass: a fabricated 4-digit-looking value is
+    # still caught when a real unit is directly attached (the year veto
+    # only guards copula-only evidence, not a unit-attached one).
+    "Your B12 was 2024 pg/mL, dramatically high.",
 ]
+
+# A percent-unit analyte (e.g. an iron saturation, a differential count) is
+# the "must still check %" direction: a %-suffixed number is only checked
+# when the analyte's OWN recorded unit is genuinely '%', decided from
+# stored data, never a hardcoded analyte name — so this probe seeds a
+# dedicated percent-unit analyte rather than reusing the CRP row.
+_COMPOSER_NUMBER_PERCENT_ANALYTE_NAME = "Iron Saturation"
+_COMPOSER_NUMBER_PERCENT_ANALYTE_STORED_VALUE = 25.0
+_COMPOSER_NUMBER_PERCENT_ANALYTE_LEGITIMATE_SENTENCE = "Your Iron Saturation was 25%, within range."
+_COMPOSER_NUMBER_PERCENT_ANALYTE_FABRICATED_SENTENCE = (
+    "Your Iron Saturation was 40%, notably elevated."
+)
+
+
+def _seed_analyte_row(
+    db: LabsDb, *, sha: str, name: str, value: float, unit: str | None = None
+) -> None:
+    db.upsert_document(
+        LabDocument(
+            sha256=sha,
+            filename=f"{name.lower().replace(' ', '-')}.pdf",
+            doc_type="lab-result",
+            page_count=1,
+        )
+    )
+    db.insert_results(
+        [
+            LabResult(
+                date=date(2026, 5, 2),
+                name=name,
+                name_raw=name,
+                value=value,
+                ucum_unit=unit,
+                source_doc=sha,
+                raw_json=json.dumps({"name_raw": name}),
+            )
+        ]
+    )
 
 
 def _composer_number_false_positive_probes(tmp_root: Path) -> tuple[list[SuiteCaseResult], float]:
     """Deterministic, no LLM — `check_composer_numbers` is pure code.
     Reports `composer_number_legitimate_phrasing_pass_rate`: the fraction
-    of ordinary count/frequency/duration phrasing correctly left
-    unflagged, pinned at 1.0 alongside the fabrication-still-caught cases
-    (a code review found this check over-blocking the same shape of
-    correct reply the entailment verifier was over-blocking, ADR 0016
-    revised, 2026-08-25)."""
+    of ordinary non-value phrasing (counts/frequencies/durations, percent
+    changes, bare years) correctly left unflagged, pinned at 1.0 alongside
+    the fabrication-still-caught cases and the percent-unit-analyte
+    must-still-check case (ADR 0016 revised, both passes, 2026-08-25)."""
     _repo, db = _fresh_repo_and_db(tmp_root / "composer_number_false_positives")
     _seed_crp_row(db)
+    _seed_analyte_row(db, sha="2" * 64, name="Ferritin", value=150.0, unit="ng/mL")
+    _seed_analyte_row(db, sha="3" * 64, name="B12", value=500.0, unit="pg/mL")
+    _seed_analyte_row(
+        db,
+        sha="4" * 64,
+        name=_COMPOSER_NUMBER_PERCENT_ANALYTE_NAME,
+        value=_COMPOSER_NUMBER_PERCENT_ANALYTE_STORED_VALUE,
+        unit="%",
+    )
 
     cases: list[SuiteCaseResult] = []
     legitimate_passed = 0
-    for i, sentence in enumerate(_COMPOSER_NUMBER_LEGITIMATE_SENTENCES):
+    legitimate_sentences = [
+        *_COMPOSER_NUMBER_LEGITIMATE_SENTENCES,
+        _COMPOSER_NUMBER_PERCENT_ANALYTE_LEGITIMATE_SENTENCE,
+    ]
+    for i, sentence in enumerate(legitimate_sentences):
         passed = check_composer_numbers(sentence, db).passed
         if passed:
             legitimate_passed += 1
@@ -756,8 +824,22 @@ def _composer_number_false_positive_probes(tmp_root: Path) -> tuple[list[SuiteCa
                 detail="" if caught else f"fabricated value NOT caught: {sentence!r}",
             )
         )
+    percent_check = check_composer_numbers(_COMPOSER_NUMBER_PERCENT_ANALYTE_FABRICATED_SENTENCE, db)
+    percent_caught = not percent_check.passed
+    cases.append(
+        SuiteCaseResult(
+            case_id="composer_number_percent_unit_analyte_fabrication_still_caught",
+            passed=percent_caught,
+            detail=(
+                ""
+                if percent_caught
+                else "percent-unit analyte fabricated value NOT caught: "
+                f"{_COMPOSER_NUMBER_PERCENT_ANALYTE_FABRICATED_SENTENCE!r}"
+            ),
+        )
+    )
 
-    legitimate_pass_rate = legitimate_passed / len(_COMPOSER_NUMBER_LEGITIMATE_SENTENCES)
+    legitimate_pass_rate = legitimate_passed / len(legitimate_sentences)
     return cases, legitimate_pass_rate
 
 
