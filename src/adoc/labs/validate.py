@@ -4,25 +4,25 @@ Three layers, per PLAN.md's ingestion loop ("deterministic validation:
 per-analyte unit whitelist, physiologic bounds, trend-outlier check"):
 
 1. `canonicalize` — alias-table name normalization for this patient's
-   recurring analytes (a starter set of ~25; PLAN.md: "canonical-name
-   mapping table ... never block ingestion on coding" — unknown analytes
-   simply skip validation, they are not rejected).
+   recurring analytes (PLAN.md: "canonical-name mapping table ... never
+   block ingestion on coding" — unknown analytes simply skip validation,
+   they are not rejected).
 2. `validate_row` — unit whitelist, physiologic plausibility bounds,
    flag/value-vs-reference-range consistency, titer format.
 3. `trend_outlier` — flags a >40% jump vs. the patient's own recent median
    once >=3 priors exist (catches decimal-shift extraction errors, e.g. a
    potassium of 4.1 misread as 41).
 
-## Matching vs. renaming (feature/taxonomy-distinctions)
+## Matching vs. renaming
 
-A real-data sweep found `canonicalize`'s permissive suffix-strip and
-score-suffix rules had been used to *rename* stored rows, silently
-discarding a site/side ("LEFT HIP" vs "RIGHT HIP" hip BMD), specimen
-("Manganese, Plasma" vs "..., RBC"), or stratification ("eGFR If Africn
-Am" vs "...NonAfricn Am") those rules were never meant to erase - two
-CLINICALLY DISTINCT measurements ended up sharing one trend series. The
-fix splits "how do I group/validate/trend-scope this row" from "may I
-overwrite this row's stored name" into two functions:
+`canonicalize`'s permissive suffix-strip and score-suffix rules are safe
+for read-time matching but NOT for renaming a stored row: applied to a
+rename, they can silently discard a site/side ("LEFT HIP" vs "RIGHT HIP"
+BMD), specimen ("Manganese, Plasma" vs "..., RBC"), or stratification
+("eGFR If Africn Am" vs "...NonAfricn Am") distinction, merging two
+CLINICALLY DISTINCT measurements onto one trend series. So "how do I
+group/validate/trend-scope this row" and "may I overwrite this row's
+stored name" are two separate functions:
 
 - `canonicalize(name) -> spec-or-None` stays fully permissive (exact
   alias; the generic suffix-strip retry; the score-suffix rule) - it
@@ -55,8 +55,8 @@ if TYPE_CHECKING:
     from adoc.labs.db import LabsDb
 
 ValueKind = Literal["numeric", "titer", "qualitative", "score"]
-"""`"score"` (queue-ergonomics slice item 2) is for analytes that are a
-computed score by their nature - a DEXA T-score/Z-score or a FRAX
+"""`"score"` is for analytes that are a computed score by their nature - a
+DEXA T-score/Z-score or a FRAX
 fracture-probability percentage - and so legitimately carry no unit (T/Z)
 or only "%" (FRAX) and no clinical reference range at all. `validate_row`
 treats it like `"numeric"` (bounds + flag checks) but never complains
@@ -132,8 +132,7 @@ def _normalize(text: str) -> str:
 
 _TITER_PATTERN = re.compile(r"^1\s*:\s*\d+$")
 
-# Unit spelling families (feature/semantic-compare): real-corpus reconcile
-# false-positives showed extraction passes printing the SAME unit in
+# Unit spelling families: an extraction pass may print the SAME unit in
 # different, equally-valid spellings (e.g. "Million/uL" vs "M/uL" vs
 # "x10^6/uL"). Each inner tuple is one family of interchangeable spellings,
 # pre-normalized (casefold, no internal whitespace - see `_normalize_unit_text`).
@@ -184,9 +183,9 @@ def canonical_unit(raw: str | None) -> str | None:
 
 def _unit_in_whitelist(unit: str | None, allowed: tuple[str, ...]) -> bool:
     """`unit` matches one of `allowed`'s printed spellings, or shares its
-    `canonical_unit` family (feature/semantic-compare: `validate_row`'s
-    whitelist accepts any synonym of a whitelisted unit, not just the exact
-    spellings enumerated in `AnalyteSpec.allowed_units`)."""
+    `canonical_unit` family (`validate_row`'s whitelist accepts any synonym
+    of a whitelisted unit, not just the exact spellings enumerated in
+    `AnalyteSpec.allowed_units`)."""
     if unit is None:
         return False
     unit_key = canonical_unit(unit) or _normalize_unit_text(unit)
@@ -371,11 +370,9 @@ _HAND_CURATED_SPECS: tuple[AnalyteSpec, ...] = (
     ),
     # Random urine creatinine (used to normalize a spot urine protein/
     # albumin ratio) is a different specimen, on a wildly different
-    # numeric scale, from serum creatinine above - a real collision-
-    # family finding (feature/taxonomy-distinctions) showed both merging
-    # onto one bare "creatinine" canonical via a shared alias list, which
-    # would have applied serum creatinine's plausibility bounds to urine
-    # values and silently combined two different trend series.
+    # numeric scale, from serum creatinine above. Keep it a separate spec:
+    # a shared "creatinine" alias would apply serum plausibility bounds to
+    # urine values and silently combine two distinct trend series.
     AnalyteSpec(
         "Creatinine, Urine",
         ("creatinine, random urine",),
@@ -538,12 +535,11 @@ _HAND_CURATED_SPECS: tuple[AnalyteSpec, ...] = (
     ),
     # Race-stratified eGFR variants report DIFFERENT computed values from
     # the same creatinine/demographic inputs (different equation
-    # coefficients) - a real collision-family finding (feature/taxonomy-
-    # distinctions) showed both LabCorp abbreviated spellings merging onto
-    # plain "eGFR" via one shared alias list, silently overwriting one
-    # stratified value's trend series with the other's. Each
-    # stratification gets its own canonical and its own exact alias for
-    # the LabCorp abbreviated spelling.
+    # coefficients). A shared "eGFR" alias would merge both LabCorp
+    # abbreviated spellings onto one trend series, overwriting one
+    # stratified value with the other's. Each stratification gets its own
+    # canonical and its own exact alias for the LabCorp abbreviated
+    # spelling.
     AnalyteSpec(
         "eGFR (African American)",
         ("egfr if africn am",),
@@ -1084,10 +1080,8 @@ _HAND_CURATED_SPECS: tuple[AnalyteSpec, ...] = (
         panel="Vitamins & Nutrition",
     ),
     # Plasma and RBC (intracellular) manganese are distinct assays with
-    # different reference ranges (same shape as "Magnesium, RBC" above) -
-    # a real collision-family finding (feature/taxonomy-distinctions)
-    # showed both merging onto one bare "Manganese" canonical via a
-    # shared alias list, silently combining two different trend series.
+    # different reference ranges (same shape as "Magnesium, RBC" above). A
+    # shared "Manganese" alias would combine two distinct trend series.
     AnalyteSpec(
         "Manganese, Plasma",
         ("manganese, plasma",),
@@ -1816,8 +1810,8 @@ _HAND_CURATED_SPECS: tuple[AnalyteSpec, ...] = (
     AnalyteSpec(
         "RMSF Antibody IgM", ("rmsf igm",), "numeric", (), None, panel="Tick-Borne Serology"
     ),
-    # --- Scores (queue-ergonomics slice item 2: FRAX/T-score/Z-score
-    # have no unit/reference range by nature - `kind="score"` skips
+    # --- Scores (FRAX/T-score/Z-score have no unit/reference range by
+    # nature - `kind="score"` skips
     # `validate_row`'s unit-whitelist complaint when the printed unit
     # is None (or "%" for FRAX), and no ref range is ever expected).
     # `canonicalize`'s suffix-match rule (below) lets a site-prefixed
@@ -1860,10 +1854,8 @@ _HAND_CURATED_SPECS: tuple[AnalyteSpec, ...] = (
         panel="Bone Density",
     ),
     # Left/right hip BMD are different anatomic measurements with their
-    # own independent trend series - a real collision-family finding
-    # (feature/taxonomy-distinctions) showed both sides merging onto one
-    # bare "Total Hip BMD"/"Femoral Neck BMD" canonical via a shared alias
-    # list, silently overwriting one hip's series with the other's. Note
+    # own independent trend series. A shared "Total Hip BMD"/"Femoral Neck
+    # BMD" alias would overwrite one hip's series with the other's. Note
     # score-kind DEXA rows ("... T-Score"/"... Z-Score") are unaffected by
     # this split - those resolve via `_SCORE_SUFFIX_TO_CANONICAL` (below),
     # a `canonicalize`-only (read-time) rule that `canonical_rename_target`
@@ -2222,9 +2214,9 @@ for _spec in ANALYTE_SPECS.values():
     for _alias in _spec.aliases:
         _ALIAS_TO_CANONICAL[_normalize(_alias)] = _spec.canonical_name
 
-# Suffix-match table for `kind="score"` analytes ONLY (queue-ergonomics
-# slice item 2): a DEXA row is commonly printed with a site prefix the
-# exact-alias table above can't see through (e.g. "LEFT HIP femoral neck
+# Suffix-match table for `kind="score"` analytes ONLY: a DEXA row is
+# commonly printed with a site prefix the exact-alias table above can't
+# see through (e.g. "LEFT HIP femoral neck
 # T-Score", "L1-L4 Z-Score"). Sorted longest-normalized-alias-first so a
 # more specific suffix always wins a match before a shorter one gets the
 # chance. Deliberately scoped to score-kind aliases only - every other

@@ -84,6 +84,7 @@ from adoc.reason.dag import (
     run,
 )
 from adoc.reason.prompts import load_prompt
+from adoc.reason.tools import redact_gated_text
 
 # --------------------------------------------------------------------------
 # Stage-IO models
@@ -657,6 +658,14 @@ def render_review_markdown(
     """Render the review report: plain-language "what changed"/"what to
     ask your doctor" up top for a non-technical reader, a metrics
     appendix at the bottom for anyone who wants the detail.
+
+    Every model-written free-text field interpolated below — divergence
+    names, adjudication rationales, test-chooser items — is passed through
+    `reason.tools.redact_gated_text` first (CLAUDE.md rule 5): none of
+    this text flows through the Composer's gated path, so nothing else
+    screens it before it lands in a committed, patient-facing markdown
+    file. `web/routes/reviews.py`'s `reviews_detail` re-gates at render
+    time too, so a review written before this fix is still covered.
     """
     decisions_by_id = {d.divergence: d for d in adjudication.decisions}
     accepted = [
@@ -677,19 +686,17 @@ def render_review_markdown(
         )
     else:
         for divergence, decision in accepted:
+            name = redact_gated_text(divergence.name)
+            rationale = redact_gated_text(decision.rationale)
             if divergence.kind == "panel_only":
                 lines.append(
                     f"- A new possibility was added to your case for further discussion: "
-                    f"**{divergence.name}**. {decision.rationale}"
+                    f"**{name}**. {rationale}"
                 )
             elif divergence.kind == "probability_mismatch":
-                lines.append(
-                    f"- How likely **{divergence.name}** seems was updated. {decision.rationale}"
-                )
+                lines.append(f"- How likely **{name}** seems was updated. {rationale}")
             else:
-                lines.append(
-                    f"- **{divergence.name}** was flagged for extra scrutiny. {decision.rationale}"
-                )
+                lines.append(f"- **{name}** was flagged for extra scrutiny. {rationale}")
     lines.append("")
 
     if trend_findings:
@@ -705,7 +712,7 @@ def render_review_markdown(
     lines.append("")
     if test_chooser.items:
         for item in test_chooser.items:
-            lines.append(f"- {item.text}")
+            lines.append(f"- {redact_gated_text(item.text)}")
     else:
         lines.append("_Nothing new to bring to your next appointment this week._")
     lines.append("")
@@ -749,13 +756,12 @@ def render_review_markdown(
 # --------------------------------------------------------------------------
 
 
-# S4 remediation: both completeness postconditions below previously accepted
-# ANY non-empty string ("." satisfied them) as a covering note/rationale — a
-# model (or a bug) that stamps the same placeholder sentence across every
-# hypothesis/divergence sailed straight through. Both now require SUBSTANCE:
-# at least this many characters after stripping, AND not identical across
-# every item being covered (a single repeated sentence is not a substantive,
-# per-item review even if it happens to be long enough).
+# Both completeness postconditions below require SUBSTANCE in each covering
+# note/rationale, not just a non-empty string: at least this many characters
+# after stripping, AND not identical across every item being covered — a
+# model that stamps the same placeholder sentence across every
+# hypothesis/divergence must not pass ("." or one repeated sentence is not a
+# substantive, per-item review).
 MIN_SUBSTANTIVE_LENGTH = 20
 
 

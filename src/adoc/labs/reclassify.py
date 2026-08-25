@@ -1,18 +1,15 @@
 """Retro-reclassification of already-PENDING rows under the current
-reconcile comparators (feature/semantic-compare) — NO new LLM calls (this
-is a maintenance pass over already-extracted `raw_json`, not a new
-extraction).
+reconcile comparators — NO new LLM calls (this is a maintenance pass over
+already-extracted `raw_json`, not a new extraction).
 
-Real-corpus finding motivating this module: 1,153 of 1,159 queued PENDING
-rows turned out to be false "disagreements" from `ingest.reconcile`'s old
-literal (`_normalize_str`-only) field comparisons — the same printed
-reading, transcribed with a cosmetic difference (a trailing unit token on a
-reference range, a unicode dash, `None` vs. `""` for an unflagged result,
-...) one extraction pass happened to introduce. `ingest.reconcile` now
-compares ref_range/unit/flag semantically going forward
-(`ref_ranges_equivalent`/`units_equivalent`/`flags_equivalent`); this module
-is `adoc labs-reclassify`'s one-time/periodic sweep to fix up rows that
-queued BEFORE that change under the old, stricter comparison.
+A double-pass extraction can print the same reading with a cosmetic
+difference between the two passes (a trailing unit token on a reference
+range, a unicode dash, `None` vs. `""` for an unflagged result, ...).
+`ingest.reconcile` compares ref_range/unit/flag semantically
+(`ref_ranges_equivalent`/`units_equivalent`/`flags_equivalent`) so these no
+longer queue at ingest time, but a row queued under an older or stricter
+comparator still sits PENDING with a stale reason. `adoc labs-reclassify`
+is the sweep that recomputes those reasons under the current comparators.
 
 For every still-PENDING row whose `raw_json` holds BOTH extraction passes'
 full payloads (`pass_a` and `pass_b` - i.e. a row `ingest.reconcile.

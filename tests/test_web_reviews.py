@@ -64,6 +64,30 @@ def test_reviews_detail_renders_markdown(tmp_path: Path) -> None:
     assert "<li>churn: low</li>" in response.text
 
 
+def test_reviews_detail_redacts_dosing_language_in_persisted_markdown(tmp_path: Path) -> None:
+    """Violation 2 regression: `reviews_detail` used to render
+    `case/reviews/*.md` verbatim, with no gate on either the write path
+    (`reason.review.render_review_markdown`, model-written adjudication
+    rationale/test-chooser text) or the read path — so an already-persisted
+    review containing dosing language rendered straight to the patient."""
+    app, repo, _db, _calls = build_app(tmp_path)
+    reviews_dir = repo.root / "case" / "reviews"
+    reviews_dir.mkdir(parents=True, exist_ok=True)
+    (reviews_dir / "2026-06-01-weekly.md").write_text(
+        "# Weekly review\n\n- Take 20 mg prednisone daily as discussed at your last visit.\n",
+        encoding="utf-8",
+    )
+    client = TestClient(app)
+    login(client)
+
+    response = client.get("/reviews/2026-06-01-weekly.md")
+
+    assert response.status_code == 200
+    assert "20 mg prednisone" not in response.text
+    assert "withheld" in response.text.lower()
+    assert "last visit" in response.text
+
+
 def test_reviews_detail_refuses_path_traversal(tmp_path: Path) -> None:
     app, repo, _db, _calls = build_app(tmp_path)
     (repo.root / "case" / "secret.md").write_text("top secret", encoding="utf-8")

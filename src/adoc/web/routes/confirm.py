@@ -152,8 +152,8 @@ def _row_reasons(pr: PendingRow) -> list[str]:
 
 
 def _is_score_row(row: LabResult) -> bool:
-    """True for a FRAX/T-score/Z-score-shaped row (queue-ergonomics slice
-    item 2): either its canonical spec is `kind="score"`, or - for an
+    """True for a FRAX/T-score/Z-score-shaped row: either its canonical
+    spec is `kind="score"`, or - for an
     analyte not (yet) in `ANALYTE_SPECS` at all - it simply has a value
     but no unit and no reference range, the same shape. Drives the
     confirm-row template's "Calculated score — no reference range
@@ -182,8 +182,8 @@ def _row_view(
         "single_pass": pass_a is None or pass_b is None,
         # Which pass(es) actually have a reading to apply - drives whether
         # the disagreement bucket's "Use reading A"/"Use reading B"
-        # buttons render at all (queue-ergonomics slice item 1): a
-        # single_pass row only ever has one of the two.
+        # buttons render at all: a single_pass row only ever has one of
+        # the two.
         "has_pass_a": pass_a is not None,
         "has_pass_b": pass_b is not None,
         "is_score": _is_score_row(pr.row),
@@ -234,9 +234,9 @@ def _build_groups(
 
 def _twin_sweep_note(repo: DataRepo) -> str | None:
     """The confirm queue's dismissible "N duplicate readings were
-    auto-resolved" note (queue-ergonomics slice item 4) - present only
-    when the last `adoc labs-dedupe-twins` sweep actually rejected at
-    least one row (`labs/twins.py`'s persisted `work/twin-sweep.json`)."""
+    auto-resolved" note - present only when the last `adoc
+    labs-dedupe-twins` sweep actually rejected at least one row
+    (`labs/twins.py`'s persisted `work/twin-sweep.json`)."""
     summary = read_last_sweep_summary(repo.root)
     if not summary:
         return None
@@ -361,10 +361,10 @@ def resolve_with_pass(
     repo: DataRepo = Depends(get_repo),
     db: LabsDb = Depends(get_db),
 ) -> Response:
-    """A disagreement row's "Use reading A"/"Use reading B" action
-    (queue-ergonomics slice item 1): apply that pass's fields wholesale
-    (`LabsDb.resolve_with_pass`) instead of silently keeping pass A's
-    placeholder reading, as a bare Confirm used to."""
+    """A disagreement row's "Use reading A"/"Use reading B" action: applies
+    that pass's fields wholesale (`LabsDb.resolve_with_pass`) rather than
+    silently keeping pass A's placeholder reading, which a bare Confirm
+    would do."""
     try:
         db.resolve_with_pass(row_id, which)
         message = None

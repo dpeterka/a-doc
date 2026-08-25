@@ -1,6 +1,18 @@
 """Ledger surface (PLAN.md "UI"): a read-only view of the full differential
 ledger with status/origin/tier chips, and evidence source-refs linked back
 to their documents where a link is resolvable (`labs:`, `doc:`, `pmid:`).
+
+Evidence claims, discriminators, and challenger notes are all model-written
+free text with no gate on their write path (`casefile/ledger.py`'s
+`apply_diff` never runs `safety.treatment_gate`) — so a hypothesis added
+before this fix, or one added by a code path outside this repo's own
+gate-guided composer/challenger loops, can carry ungated text at rest.
+`_gate_hypothesis_text` re-gates it at render time (CLAUDE.md rule 5),
+via `reason.tools.redact_gated_text`, so every render is covered
+regardless of when or how the text was written. This mutates only the
+in-memory `Ledger` built by this one request's `load_ledger` call — never
+saved back, so the on-disk ledger and its evidence/provenance are
+untouched.
 """
 
 from __future__ import annotations
@@ -14,8 +26,10 @@ from starlette.responses import Response
 
 from adoc.casefile.ledger import load_ledger
 from adoc.casefile.repo import LEDGER_RELPATH, DataRepo
+from adoc.casefile.schema import Ledger
 from adoc.labs.db import LabsDb
 from adoc.labs.models import LabDocument
+from adoc.reason.tools import redact_gated_text
 from adoc.web.casefile_helpers import find_document_by_filename, page_image_url
 from adoc.web.deps import get_db, get_repo
 from adoc.web.templating import templates
@@ -47,13 +61,26 @@ def _source_ref_href(
     return None
 
 
+def _gate_hypothesis_text(ledger: Ledger) -> Ledger:
+    """Redact any dosing/treatment-instruction span out of every
+    model-written free-text field the template renders — evidence claims,
+    discriminators, challenger notes — in place, on this request's
+    in-memory `Ledger` only (see module docstring)."""
+    for h in ledger.hypotheses:
+        for evidence in (*h.evidence_for, *h.evidence_against):
+            evidence.claim = redact_gated_text(evidence.claim)
+        h.discriminators = [redact_gated_text(d) for d in h.discriminators]
+        h.challenger_notes = redact_gated_text(h.challenger_notes)
+    return ledger
+
+
 @router.get("")
 def ledger_view(
     request: Request,
     repo: DataRepo = Depends(get_repo),
     db: LabsDb = Depends(get_db),
 ) -> Response:
-    ledger = load_ledger(repo.root / LEDGER_RELPATH)
+    ledger = _gate_hypothesis_text(load_ledger(repo.root / LEDGER_RELPATH))
 
     # Fetched/listed once per page render, not once per evidence source-ref:
     # a ledger with many hypotheses/evidence items would otherwise re-run

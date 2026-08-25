@@ -1,15 +1,14 @@
-"""LLM-assisted twin sweep for legacy single-pass PENDING rows
-(queue-ergonomics slice item 4).
+"""LLM-assisted twin sweep for legacy single-pass PENDING rows.
 
-Before `ingest/reconcile.py`'s RESCUE pass existed (item 3b of the same
-slice), a document whose two extraction passes named the same measurement
-differently (the real FRAX case: "FRAX 10-year probability of hip
-fracture" vs. a sentence-fragment "10-year probability of hip fracture
-is") could leave BOTH readings stranded as separate `single_pass` PENDING
-rows - twins of each other that reconcile.py never had a chance to pair.
-`adoc labs-dedupe-twins` (`sweep_twins` below) is the one-time/periodic
-maintenance pass that finds and auto-rejects the duplicate half of such a
-pair among rows already ingested before the RESCUE pass existed.
+Before `ingest/reconcile.py`'s RESCUE pass existed, a document whose two
+extraction passes named the same measurement differently (e.g. "FRAX
+10-year probability of hip fracture" vs. a sentence-fragment "10-year
+probability of hip fracture is") could leave BOTH readings stranded as
+separate `single_pass` PENDING rows - twins of each other that
+reconcile.py never had a chance to pair. `adoc labs-dedupe-twins`
+(`sweep_twins` below) is the one-time/periodic maintenance pass that finds
+and auto-rejects the duplicate half of such a pair among rows already
+ingested before the RESCUE pass existed.
 
 For each still-PENDING row whose `reasons` include `single_pass`:
 

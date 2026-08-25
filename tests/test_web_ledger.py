@@ -36,6 +36,51 @@ def test_ledger_view_empty_state_explains_instead_of_claiming_a_record(tmp_path:
     assert 'href="/chat"' in body
 
 
+def test_ledger_view_redacts_dosing_language_but_keeps_surrounding_content(tmp_path: Path) -> None:
+    """Violation 2 regression: `web/routes/ledger.py` never gated
+    `evidence_for[].claim`, `discriminators`, or `challenger_notes` — all
+    model-written free text with no gate on their write path. Only the
+    offending span should be replaced; the rest of the record stays
+    visible and legible."""
+    app, repo, _db, _calls = build_app(tmp_path)
+    hyp = Hypothesis(
+        id="sle-01",
+        name="Systemic lupus erythematosus",
+        tier="most-likely",
+        probability="moderate",
+        status="active",
+        origin="model",
+        first_proposed=date(2026, 1, 1),
+        evidence_for=[
+            Evidence(
+                claim="Patient should take 20 mg prednisone daily per prior records",
+                source="labs:ana-titer:2026-05-02",
+                strength="strong",
+            )
+        ],
+        discriminators=["Consider tapering prednisone 10 mg to confirm the flare pattern"],
+        challenger_notes="Recommend starting 500 mg metformin twice daily",
+    )
+    ledger = Ledger(version=1, updated=datetime.now(UTC), schema_version=1, hypotheses=[hyp])
+    save_ledger(repo.root / LEDGER_RELPATH, ledger)
+
+    client = TestClient(app)
+    login(client)
+
+    response = client.get("/ledger")
+
+    assert response.status_code == 200
+    body = response.text
+    assert "20 mg prednisone" not in body
+    assert "10 mg" not in body
+    assert "500 mg metformin" not in body
+    assert "withheld" in body.lower()
+    # Surrounding, non-offending content is preserved, not blanked.
+    assert "Systemic lupus erythematosus" in body
+    assert "per prior records" in body
+    assert "confirm the flare pattern" in body
+
+
 def test_ledger_view_shows_origin_patient_chip(tmp_path: Path) -> None:
     app, repo, _db, _calls = build_app(tmp_path)
     hyp = Hypothesis(

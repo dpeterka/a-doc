@@ -51,9 +51,8 @@ DocKind = Literal["pdf", "docx", "text"]
 elsewhere - see the module docstring)."""
 
 DEFAULT_TEXT_MAX_BYTES = 1024 * 1024
-"""Size cap for a `"text"`-kind document (item 1 of the genomics/filetypes
-task spec): "larger non-genomic text is rejected with a clear reason
-rather than silently truncated"."""
+"""Size cap for a `"text"`-kind document: larger non-genomic text is
+rejected with a clear reason rather than silently truncated."""
 
 PageRenderer = Callable[[Path, Path], list[Path]]
 """`(pdf_path, out_dir) -> sorted page PNG paths, one per page, 1-indexed."""

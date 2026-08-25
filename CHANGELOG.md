@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-08-25
+
+### Added
+- **Document text corpus** (ADR 0015). Every non-genomic ingested document's full text is extracted (`pdftotext` for PDFs, python-docx for `.docx`, verbatim for text — no LLM calls), stored as a committed `doc-text/<sha256>.txt`, and indexed in SQLite FTS5. This makes the narrative content of the record usable for the first time: the patient's own written history, plus the interpretive comments on lab reports and the impressions in imaging and consult reports, none of which ever became lab rows. Retrieval is capped, ranked, verbatim snippets with source refs — fed to diagnostic turns, intake turns, and a new `search_documents` tool — so the intake conversation can reference what she already wrote instead of asking her to retype it. Genomic files are structurally excluded: the extraction dispatcher's type has no genomic member. New `adoc backfill-doc-text` covers already-ingested documents; Documents → Consumed gains a read-only text view.
+- **Phase 2 complete** (ADR 0016). A cross-family entailment verifier (a third model family, distinct from both the ledger-maintainer's and the challenger's) judges each evidence claim against its resolved source text; `doc:` refs resolve against the document corpus, page-scoped where the citation names a page. Non-entailed claims bounce back with the verifier's objection, one retry, then a DAG contract rejects the diff. Composer output gets a deterministic (no-model) check that every number near an analyte name matches a value actually stored in the lab database. Abstention is a first-class typed signal with a contract preventing an unsupported hypothesis from reaching the most-likely tier. A hallucination eval suite runs in CI: planted-fact containment and fabricated-citation detection both at 1.0, entailment precision/recall measured on hand-labeled pairs, plus an abstention-rate probe.
+
 ## [0.7.2] - 2026-08-25
 
 ### Fixed
