@@ -141,8 +141,15 @@ def labs_index(request: Request, db: LabsDb = Depends(get_db)) -> Response:
     # own row here instead of one silently hiding the other's latest
     # value. Each analyte's sparkline is scoped to its own specimen for
     # the same reason - a mixed-specimen sparkline would be meaningless.
+    # One bulk fetch of every series up front, instead of a `trend_series`
+    # query per analyte: `labs.sqlite` lives on EFS/NFS in the deployed app,
+    # where each query costs milliseconds of round-trip, so ~450 analytes
+    # meant seconds of latency on this page (invisible locally, where the
+    # same queries hit page cache at ~0.02 ms). Identical rows, order, and
+    # rejected-row filtering - see `LabsDb.series_by_key`.
+    series_by_key = db.series_by_key()
     for latest in db.latest_panel():
-        series = trend_series(db, latest.name, latest.specimen)
+        series = series_by_key.get((latest.name, latest.specimen), [])
         values = _numeric_values(series)
         analytes.append(
             {
