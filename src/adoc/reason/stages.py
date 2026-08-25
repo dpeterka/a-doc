@@ -912,7 +912,7 @@ def run_diagnostic_turn(
     for callers that still pattern-match on it."""
 
     def _proceed() -> PatientReply:
-        context_pack = build_context(repo, db, include_ledger=True)
+        context_pack = build_context(repo, db, include_ledger=True, query=text)
         prior_ledger = load_ledger(ledger_path)
         sink: dict[str, BaseModel] = {}
         dag = build_diagnostic_dag(client, repo, ledger_path, db, sink)

@@ -26,10 +26,26 @@ def test_init_at_creates_expected_layout(tmp_path: Path) -> None:
     assert (root / "case" / "encounters").is_dir()
     assert (root / "case" / "reviews").is_dir()
     assert (root / "sources").is_dir()
+    assert (root / "doc-text").is_dir()
     assert (root / "inbox").is_dir()
     assert (root / "work").is_dir()
     assert (root / "logs").is_dir()
     assert (root / ".gitignore").exists()
+
+
+def test_init_at_commits_doc_text_dir_not_gitignored(tmp_path: Path) -> None:
+    """docs/adr/0015-document-text-corpus.md: `doc-text/` is committed at
+    init (a `.gitkeep`, like `sources/`) and is NOT listed in `.gitignore`
+    - unlike `sources/genomics/`, it must be tracked."""
+    root = tmp_path / "a-doc-data"
+    DataRepo.init_at(root)
+
+    gitignore = (root / ".gitignore").read_text(encoding="utf-8")
+    assert "doc-text" not in gitignore
+
+    git_repo = Repo(root)
+    tracked = {entry.path for entry in git_repo.head.commit.tree.traverse() if entry.type == "blob"}
+    assert "doc-text/.gitkeep" in tracked
 
 
 def test_init_at_gitignore_covers_generated_and_working_dirs(tmp_path: Path) -> None:

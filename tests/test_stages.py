@@ -10,7 +10,7 @@ end-to-end here.
 from __future__ import annotations
 
 import json
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -23,7 +23,7 @@ from adoc.casefile.repo import LEDGER_RELPATH, DataRepo
 from adoc.casefile.schema import LedgerDiff
 from adoc.config import ModelBinding
 from adoc.intake.agent import red_flag_warning_prefix
-from adoc.labs.db import LabsDb
+from adoc.labs.db import DocumentTextPage, LabsDb
 from adoc.labs.models import LabDocument, LabResult
 from adoc.reason.client import (
     AnthropicProvider,
@@ -254,6 +254,36 @@ def test_full_diagnostic_dag_happy_path(repo: DataRepo, db: LabsDb) -> None:
     new_ledger = load_ledger(repo.root / LEDGER_RELPATH)
     assert new_ledger.version == 1
     assert {h.id for h in new_ledger.hypotheses} == {"sle-01", "pe-01"}
+
+
+def test_diagnostic_turn_context_includes_matching_document_excerpts(
+    repo: DataRepo, db: LabsDb
+) -> None:
+    """docs/adr/0015-document-text-corpus.md: `run_diagnostic_turn` passes
+    the patient's turn text as `build_context`'s `query`, so a relevant
+    document excerpt reaches the ledger-maintainer's prompt."""
+    db.replace_document_text(
+        SHA,
+        [DocumentTextPage(page=2, text="Impression: findings consistent with early arthritis.")],
+        extracted_at=datetime(2026, 5, 3),
+    )
+    calls: list[TransportRequest] = []
+    patient_reply = {"tiers_rendered": "leads to discuss with your doctor", "framing_ack": True}
+    primary_transport = _make_primary_transport([], patient_reply, calls)
+    challenger_transport = _make_challenger_transport(
+        counter_arguments=[], additional_ops=[], calls=calls
+    )
+    client = _build_client(primary_transport, challenger_transport)
+
+    run_diagnostic_turn(
+        client, repo, db, repo.root / LEDGER_RELPATH, "How is my arthritis doing lately?"
+    )
+
+    ledger_maintainer_request = calls[0]
+    sent = "\n".join(m.content for m in ledger_maintainer_request.messages)
+    assert "Relevant Document Excerpts" in sent
+    assert "arthritis" in sent.lower()
+    assert "doc:doc.pdf#p2" in sent
 
 
 # --- red-team (a): patient-theory anchoring --------------------------------------------------

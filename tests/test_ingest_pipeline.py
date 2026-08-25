@@ -16,6 +16,7 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
+import pytest
 from conftest import TINY_PDF_BYTES, fake_page_renderer
 from docx import Document
 from git import Repo
@@ -936,3 +937,177 @@ def test_ingest_inbox_moves_a_bad_zip_to_failed(tmp_path: Path) -> None:
     assert report.files[0].outcome == "error"
     assert not bad_zip.exists()
     assert (repo.root / "work" / "failed" / "corrupt.zip").exists()
+
+
+# --------------------------------------------------------------------------
+# document-TEXT layer wiring (docs/adr/0015-document-text-corpus.md)
+# --------------------------------------------------------------------------
+
+
+def test_ingest_pdf_stores_extracted_text(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`_extract_and_store_text_best_effort` is exercised via an injected
+    `extract_text_for_kind` (mirrors the rest of this file's no-real-binary
+    convention) — proves the pdf path is wired, not that `pdftotext` works."""
+    import adoc.ingest.pipeline as pipeline_module
+
+    monkeypatch.setattr(
+        pipeline_module,
+        "extract_text_for_kind",
+        lambda kind, path, **kw: "Impression: unremarkable." if kind == "pdf" else None,
+    )
+
+    repo = DataRepo.init_at(tmp_path / "data-repo")
+    db = LabsDb(tmp_path / "labs.sqlite")
+    doc_path = tmp_path / "quest-2026-05-02.pdf"
+    doc_path.write_bytes(TINY_PDF_BYTES)
+    vision = FakeVisionClient("clean_agreement.json")
+
+    report = ingest_file(
+        doc_path,
+        repo=repo,
+        db=db,
+        vision=vision,
+        clock=_fixed_clock,
+        renderer=fake_page_renderer(1),
+    )
+    sha = report.files[0].sha256
+    assert sha is not None
+
+    text_path = repo.root / "doc-text" / f"{sha}.txt"
+    assert text_path.read_text(encoding="utf-8") == "Impression: unremarkable."
+    assert db.get_document_text(sha) == "Impression: unremarkable."
+
+    # The new doc-text file is part of the commit, not left untracked.
+    git_repo = Repo(repo.root)
+    assert git_repo.head.commit.hexsha == report.files[0].commit_sha
+    committed_paths = {
+        entry.path for entry in git_repo.head.commit.tree.traverse() if entry.type == "blob"
+    }
+    assert f"doc-text/{sha}.txt" in committed_paths
+
+
+def test_ingest_docx_stores_extracted_text_for_real(tmp_path: Path) -> None:
+    """No monkeypatching here: `python-docx` extraction needs no external
+    binary, so this exercises the real `ingest.doctext.extract_text_for_kind`
+    dispatch end to end."""
+    repo = DataRepo.init_at(tmp_path / "data-repo")
+    db = LabsDb(tmp_path / "labs.sqlite")
+    doc_path = tmp_path / "history.docx"
+    _make_narrative_docx(doc_path)
+
+    calls: list[str] = []
+    client = _build_docx_llm_client(
+        classify_payload={"doc_type": "clinical_note", "doc_date": "2026-08-01"},
+        pass_a_payload=None,
+        pass_b_payload=None,
+        calls=calls,
+    )
+    vision = VisionClient(client)
+
+    report = ingest_file(doc_path, repo=repo, db=db, vision=vision, clock=_fixed_clock)
+    sha = report.files[0].sha256
+    assert sha is not None
+
+    stored = db.get_document_text(sha)
+    assert stored is not None
+    assert "Patient-authored clinical history." in stored
+    assert (repo.root / "doc-text" / f"{sha}.txt").exists()
+
+
+def test_ingest_text_stores_extracted_text_for_real(tmp_path: Path) -> None:
+    repo = DataRepo.init_at(tmp_path / "data-repo")
+    db = LabsDb(tmp_path / "labs.sqlite")
+    doc_path = tmp_path / "history.txt"
+    doc_path.write_text("A plain-text patient history.", encoding="utf-8")
+
+    calls: list[str] = []
+    client = _build_docx_llm_client(
+        classify_payload={"doc_type": "clinical_note", "doc_date": "2026-08-01"},
+        pass_a_payload=None,
+        pass_b_payload=None,
+        calls=calls,
+    )
+    vision = VisionClient(client)
+
+    report = ingest_file(doc_path, repo=repo, db=db, vision=vision, clock=_fixed_clock)
+    sha = report.files[0].sha256
+    assert sha is not None
+    assert db.get_document_text(sha) == "A plain-text patient history."
+
+
+def test_text_extraction_failure_never_fails_the_ingest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Lab-row extraction stays the primary job (module docstring): a
+    blown-up text-extraction call must never surface as a failed ingest."""
+    import adoc.ingest.pipeline as pipeline_module
+
+    def _exploding_extract_text_for_kind(kind: str, path: Path, **kw: object) -> str | None:
+        raise RuntimeError("simulated text-extraction failure")
+
+    monkeypatch.setattr(pipeline_module, "extract_text_for_kind", _exploding_extract_text_for_kind)
+
+    repo = DataRepo.init_at(tmp_path / "data-repo")
+    db = LabsDb(tmp_path / "labs.sqlite")
+    doc_path = tmp_path / "quest-2026-05-02.pdf"
+    doc_path.write_bytes(TINY_PDF_BYTES)
+    vision = FakeVisionClient("clean_agreement.json")
+
+    report = ingest_file(
+        doc_path,
+        repo=repo,
+        db=db,
+        vision=vision,
+        clock=_fixed_clock,
+        renderer=fake_page_renderer(1),
+    )
+
+    outcome = report.files[0]
+    assert outcome.outcome == "ingested"
+    assert outcome.rows_auto > 0
+    sha = outcome.sha256
+    assert sha is not None
+    assert db.get_document_text(sha) is None  # extraction failed - nothing stored
+    assert not (repo.root / "doc-text" / f"{sha}.txt").exists()
+
+
+def test_duplicate_document_does_not_re_run_text_extraction(tmp_path: Path) -> None:
+    repo = DataRepo.init_at(tmp_path / "data-repo")
+    db = LabsDb(tmp_path / "labs.sqlite")
+    doc_path = tmp_path / "quest-2026-05-02.pdf"
+    doc_path.write_bytes(TINY_PDF_BYTES)
+    vision = FakeVisionClient("clean_agreement.json")
+
+    first = ingest_file(
+        doc_path,
+        repo=repo,
+        db=db,
+        vision=vision,
+        clock=_fixed_clock,
+        renderer=fake_page_renderer(1),
+    )
+    sha = first.files[0].sha256
+    assert sha is not None
+    first_text = db.get_document_text(sha)
+
+    import adoc.ingest.pipeline as pipeline_module
+
+    def _exploding_extract_text_for_kind(kind: str, path: Path, **kw: object) -> str | None:
+        raise AssertionError("text extraction must not run again for a duplicate document")
+
+    original = pipeline_module.extract_text_for_kind
+    pipeline_module.extract_text_for_kind = _exploding_extract_text_for_kind  # type: ignore[assignment]
+    try:
+        second = ingest_file(
+            doc_path,
+            repo=repo,
+            db=db,
+            vision=vision,
+            clock=_fixed_clock,
+            renderer=fake_page_renderer(1),
+        )
+    finally:
+        pipeline_module.extract_text_for_kind = original  # type: ignore[assignment]
+
+    assert second.files[0].outcome == "duplicate"
+    assert db.get_document_text(sha) == first_text

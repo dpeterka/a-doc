@@ -641,6 +641,15 @@ body.lightbox-active {
   margin: 0.75rem 0;
 }
 
+.document-text {
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.9rem;
+  line-height: 1.4;
+  max-width: 100%;
+}
+
 .labs-readings-table,
 .documents-table {
   width: 100%;

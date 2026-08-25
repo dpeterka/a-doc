@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block title %}{{ filename }} — extracted text — a-doc{% endblock %}
+{% block content %}
+  <h1>{{ filename }}</h1>
+  <p class="muted"><a href="/documents/consumed">&larr; back to documents</a></p>
+  <p class="muted">
+    The plain text a-doc extracted from this document (no interpretation — a
+    verbatim transcription). Read-only.
+  </p>
+  <div class="table-wrap">
+    <pre class="document-text">{{ text }}</pre>
+  </div>
+{% endblock %}

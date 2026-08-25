@@ -20,7 +20,11 @@ the seam tests override with a fake); `restore` runs its inverse,
 is the decide-and-run command `docker-entrypoint.sh` delegates to at
 container start (restore if `ADOC_BACKUP_BUCKET` is set and a backup
 exists, `init` otherwise) — kept in Python rather than shell so the
-decision logic is unit-testable. No stubs remain.
+decision logic is unit-testable. `backfill-doc-text` extracts and stores
+plain text for already-ingested, non-genomic documents that don't have it
+yet (`ingest.doctext.backfill_document_text`,
+docs/adr/0015-document-text-corpus.md) — no LLM calls, idempotent. No
+stubs remain.
 """
 
 from __future__ import annotations
@@ -47,6 +51,7 @@ from adoc.config import Settings, load_model_bindings
 from adoc.evals.report import write_comparison_report, write_report
 from adoc.evals.runner import known_suites, run_suite
 from adoc.ingest.archive import PageRenderer, pdftoppm_renderer
+from adoc.ingest.doctext import backfill_document_text
 from adoc.ingest.pipeline import IngestReport, ingest_directory, ingest_inbox
 from adoc.ingest.vision import VisionClient
 from adoc.intake.cli import run_conversational_onboarding_session, run_onboarding_session
@@ -268,6 +273,7 @@ def _cmd_restore(args: argparse.Namespace) -> int:
     print(f"restore: cloned bundle (commit {report.bundle_commit_sha[:12]}) into {report.data_dir}")
     print(f"restore: sources/ - {report.sources_restored} restored")
     print(f"restore: labs.sqlite rebuilt from labs-export.jsonl - {report.lab_rows_rebuilt} rows")
+    print(f"restore: document text index rebuilt for {report.doc_text_rebuilt} document(s)")
     for warning in report.warnings:
         print(f"restore: warning: {warning}")
     return 0
@@ -669,6 +675,47 @@ def _cmd_intake_corroborate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_backfill_doc_text(_args: argparse.Namespace) -> int:
+    """Extract and store text (docs/adr/0015-document-text-corpus.md) for
+    every already-ingested, non-genomic document that doesn't have it yet
+    (`ingest.doctext.backfill_document_text`; NO LLM calls — `pdftotext`/
+    `python-docx`/plain reads only). Idempotent — a document already
+    covered is never reprocessed, so re-running this after adding a
+    `pdftotext` binary (or after a fresh backfill of historical documents)
+    only does the newly-possible/newly-added work.
+    """
+    try:
+        settings = Settings()
+    except Exception as exc:  # noqa: BLE001 - surface any config error to the user
+        print(f"backfill-doc-text: configuration error: {exc}", file=sys.stderr)
+        return 1
+
+    repo = DataRepo(settings.data_dir)
+    if not repo.is_initialized:
+        print(
+            f"backfill-doc-text: data repo not initialized at {settings.data_dir} "
+            "- run `adoc init` first",
+            file=sys.stderr,
+        )
+        return 1
+
+    db_path = settings.data_dir / "labs.sqlite"
+    with LabsDb(db_path, journal_mode=settings.sqlite_journal_mode) as db:
+        report = backfill_document_text(repo, db)
+        if report.extracted:
+            repo.commit(
+                f"ingest: backfilled text for {report.extracted} document(s)",
+                paths=["doc-text"],
+            )
+
+    print(f"backfill-doc-text: checked {report.total_non_genomic} non-genomic document(s)")
+    print(f"backfill-doc-text: already covered {report.already_covered}")
+    print(f"backfill-doc-text: extracted {report.extracted}")
+    print(f"backfill-doc-text: skipped (no/unsupported source) {report.skipped_no_source}")
+    print(f"backfill-doc-text: skipped (genomic) {report.skipped_genomic}")
+    return 0
+
+
 def _cmd_review(_args: argparse.Namespace) -> int:
     try:
         settings = Settings()
@@ -819,6 +866,13 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("review", help="run the weekly deep review").set_defaults(
         func=_cmd_review
     )
+    subparsers.add_parser(
+        "backfill-doc-text",
+        help=(
+            "extract and store text for already-ingested documents that lack it "
+            "(no LLM calls; genomic documents are always excluded)"
+        ),
+    ).set_defaults(func=_cmd_backfill_doc_text)
     subparsers.add_parser(
         "labs-infer-specimen",
         help=(
