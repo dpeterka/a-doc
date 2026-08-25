@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-08-25
+
+### Added
+- **The initial visit follows a clinician's progression** (ADR 0018, refining 0012 — no visible sections, still). It opens by asking age and sex at birth rather than "what's been bothering you", then moves through family history, geography, a review of the record already on file, and only then what's recent. The order is internal steering read off the coverage map, not a stepper: anything volunteered out of order is still captured immediately.
+- **Geography is a new intake topic** — residences, travel, and environmental/occupational exposure. It was missing, and it matters here: the record includes tick-borne and regional infectious panels.
+- **The record-review stage uses the document corpus for its intended purpose** — walking the history already on file and asking the patient to confirm or correct it, citing what it references, instead of asking her to retype what her own documents say.
+- **Visits now have continuity.** An explicitly persisted follow-up marker (set by the model through typed ops, never inferred) plus a code-authored greeting that opens a new visit with when you last spoke, what is unresolved, and what was flagged to revisit. The same three things appear on the Intake record page.
+
+### Changed
+- `entailment_verifier` rebound from DeepSeek R1 to DeepSeek V3 on live evidence (ADR 0016): over 20 labelled pairs, R1 took 78s at 85% agreement while V3 took 20s at 95%. The reasoning model was both slower and less accurate, and it skewed toward rejection — so the earlier over-blocking incident was not purely a prompt problem as first concluded. V3 keeps the verifier on a third family, distinct from the proposer (Anthropic) and the challenger (OpenAI).
+
+### Fixed
+- **A diagnostic turn no longer takes 23 minutes.** Measured at 1410s with the entailment verifier consuming 66% of it across four calls to strip a single claim. The now-pointless retry is gone (the consequence is stripping that claim, not losing the turn), verdicts are cached across a turn's contract re-checks, and only most-likely-tier evidence is verified synchronously — the rest is queued and swept by the weekly review, which provably picks it up. Verifier calls per turn: four to one, pinned by a CI guard on the model-call count.
+- The composer's number check no longer reads percentages or years as lab values ("Ferritin dropped by 40% since 2024" flagged both 40 and 2024). It now requires positive evidence that a number *is* a value, while still checking percent-suffixed numbers when the analyte's own unit is a percent — a blanket percent exclusion would have opened a fabrication hole.
+- **Deploys take about a minute instead of six.** The ALB target group's deregistration delay was never set, so it defaulted to 300s: the load balancer drained the old task for five minutes before ECS could start its replacement, and because the service runs single-writer (max 100% / min 0%) nothing could overlap. Now 30s, with the health-check interval dropped to 10s.
+
 ## [0.8.1] - 2026-08-25
 
 A code review of the whole codebase produced these; each fix has a test verified to fail without it.
