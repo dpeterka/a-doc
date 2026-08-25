@@ -291,6 +291,27 @@ class DataRepo:
     def _relpath(self, path: Path) -> str:
         return path.relative_to(self.root).as_posix()
 
+    def latest_tag_time(self, prefix: str) -> datetime | None:
+        """The most recent commit time among tags whose name starts with
+        `prefix` (e.g. `"review-"`), or `None` if there are none yet.
+
+        `reason.review`'s floor-window check (docs/adr/0019-event-triggered-
+        review.md) uses this to find when the last FULL weekly review ran,
+        without needing any separate persisted state: `tag()` below already
+        stamps one `review-*` tag per full review, committed and durable
+        across an EFS restore — unlike anything under the gitignored
+        `work/` directory (see `reason.review_trigger`'s marker, which is
+        deliberately NOT the source of truth for "when did a full review
+        last run" for exactly this reason). `Commit.committed_datetime` is
+        timezone-aware, so it compares directly against
+        `datetime.now(UTC)`."""
+        with self._lock:
+            repo = Repo(self.root)
+            matching = [t for t in repo.tags if t.name.startswith(prefix)]
+            if not matching:
+                return None
+            return max(t.commit.committed_datetime for t in matching)
+
     def tag(self, name: str, *, ref: str | None = None, message: str | None = None) -> str:
         """Create a git tag named `name` (PLAN.md "State": "weekly reviews
         tagged"), pointing at `ref` (default: `HEAD`). An annotated tag is

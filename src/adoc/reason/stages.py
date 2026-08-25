@@ -50,6 +50,7 @@ from adoc.reason.client import LlmClient, LlmResult, Message
 from adoc.reason.context import ContextPack, build_context
 from adoc.reason.dag import Contract, Ctx, Dag, Node, require_prior_node, run
 from adoc.reason.prompts import Prompt, load_prompt
+from adoc.reason.review_trigger import mark_review_wanted
 from adoc.reason.safety import GateResult, treatment_gate
 from adoc.reason.verify import (
     ENTAILMENT_CACHE_RELPATH,
@@ -1161,6 +1162,31 @@ def build_diagnostic_dag(
 # --------------------------------------------------------------------------
 
 
+def _mark_review_wanted_if_ledger_changed(repo: DataRepo, sink: dict[str, BaseModel]) -> None:
+    """Set the "review wanted" marker (`reason.review_trigger`,
+    docs/adr/0019-event-triggered-review.md) exactly when a diagnostic
+    turn's `apply` node actually committed a ledger diff — the "diff
+    applied, not merely a question answered" contrast the task draws
+    between a diagnostic turn (this DAG, `apply` mandatory) and an
+    informational turn (`run_informational_turn`, never calls this DAG at
+    all, so never reaches this function either).
+
+    `"apply" in sink` is the precise signal: it is populated if and only if
+    `apply_stage`/`DataRepo.apply_ledger_diff` actually ran (see the
+    `finally`-block comment at this function's only call site for why
+    "`run()` didn't raise" is not the same thing)."""
+    if "apply" not in sink:
+        return
+    op_count = 0
+    diff = sink.get("ledger_maintainer")
+    if isinstance(diff, LedgerDiff):
+        op_count += len(diff.ops)
+    verdict = sink.get("challenger")
+    if isinstance(verdict, ChallengerVerdict):
+        op_count += len(verdict.additional_ops)
+    mark_review_wanted(repo, f"chat turn applied a ledger diff ({op_count} op(s))")
+
+
 def run_diagnostic_turn(
     client: LlmClient,
     repo: DataRepo,
@@ -1178,14 +1204,27 @@ def run_diagnostic_turn(
     sink: dict[str, BaseModel] = {}
     dag = build_diagnostic_dag(client, repo, ledger_path, db, sink)
 
-    run(
-        dag,
-        {
-            "context_pack": context_pack,
-            "patient_turn": PatientTurn(text=text),
-            "ledger": prior_ledger,
-        },
-    )
+    try:
+        run(
+            dag,
+            {
+                "context_pack": context_pack,
+                "patient_turn": PatientTurn(text=text),
+                "ledger": prior_ledger,
+            },
+        )
+    finally:
+        # docs/adr/0019-event-triggered-review.md: gated on `sink["apply"]`
+        # being populated, NOT on `run()` completing without error.
+        # `apply`'s own preconditions (citation/entailment/abstention) can
+        # block it from ever executing, in which case earlier nodes produced
+        # output but the ledger was never touched — marking then would be a
+        # false positive. Conversely a LATER node's postcondition (the
+        # composer's treatment gate) can raise after `apply` already
+        # committed, since apply always runs before composer; running this
+        # in `finally` means that turn still marks correctly, because the
+        # ledger genuinely changed even though the reply was withheld.
+        _mark_review_wanted_if_ledger_changed(repo, sink)
 
     reply = sink["composer"]
     assert isinstance(reply, PatientReply)
@@ -1257,6 +1296,14 @@ def run_post_ingest_dag(
     Returns the applied `Ledger` (the DAG's `apply` node output); the
     Composer's rendered reply is also produced (the DAG contract requires
     it) but is not the point of this entry point and is discarded.
+
+    Deliberately does NOT call `_mark_review_wanted_if_ledger_changed`
+    (docs/adr/0019-event-triggered-review.md) the way `run_diagnostic_turn`
+    does: this is only ever reached from `adoc ingest --reason`, and
+    `ingest.pipeline`'s `_mark_review_wanted_for_report` already marked the
+    "review wanted" signal for the SAME ingested rows before this function
+    is even called — marking again here would just be a redundant,
+    differently-worded reason entry for the identical underlying event.
     """
     context_pack = build_context(repo, db, include_ledger=True)
     prior_ledger = load_ledger(ledger_path)

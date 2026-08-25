@@ -32,12 +32,14 @@ from adoc.reason.client import (
 )
 from adoc.reason.context import ContextPack, build_context
 from adoc.reason.dag import ContractViolation, Ctx, Dag, Node, require_prior_node, run
+from adoc.reason.review_trigger import load_review_marker
 from adoc.reason.stages import (
     PatientReply,
     PatientTurn,
     build_diagnostic_dag,
     ledger_maintainer_stage,
     run_diagnostic_turn,
+    run_informational_turn,
 )
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "redteam.yaml"
@@ -1408,3 +1410,58 @@ def test_patient_reply_insufficient_evidence_field_round_trips(repo: DataRepo, d
 
     assert isinstance(result, PatientReply)
     assert result.insufficient_evidence == ["No thyroid function data is on file yet."]
+
+
+# --- "review wanted" marker (docs/adr/0019-event-triggered-review.md) -------------------------
+
+
+def test_diagnostic_turn_that_changes_the_ledger_sets_the_review_marker(
+    repo: DataRepo, db: LabsDb
+) -> None:
+    """A diagnostic turn always runs `apply` (CLAUDE.md rule 3) — that IS
+    "a diff applied", the contrast the task draws against an informational
+    turn "merely answering a question"."""
+    calls: list[TransportRequest] = []
+    patient_reply = {"tiers_rendered": "leads to discuss with your doctor", "framing_ack": True}
+    primary_transport = _make_primary_transport(
+        [_SLE_MOST_LIKELY_OP, _PE_CANT_MISS_OP], patient_reply, calls
+    )
+    challenger_transport = _make_challenger_transport(
+        counter_arguments=[
+            {"hypothesis_id": "sle-01", "argument": "Anti-dsDNA has not been checked yet."}
+        ],
+        additional_ops=[],
+        calls=calls,
+    )
+    client = _build_client(primary_transport, challenger_transport)
+
+    assert load_review_marker(repo) is None
+
+    run_diagnostic_turn(
+        client, repo, db, repo.root / LEDGER_RELPATH, "My joints have been aching for weeks."
+    )
+
+    marker = load_review_marker(repo)
+    assert marker is not None
+    assert len(marker.reasons) == 1
+    assert "chat turn applied a ledger diff" in marker.reasons[0].reason
+
+
+def test_informational_turn_never_sets_the_review_marker(repo: DataRepo, db: LabsDb) -> None:
+    """An informational turn never runs the diagnostic DAG's `apply` node
+    at all — it must never be mistaken for "the ledger changed"."""
+
+    def transport(request: TransportRequest) -> TransportResponse:
+        return TransportResponse(
+            text="Your potassium has been stable.", tool_input=None, input_tokens=5, output_tokens=5
+        )
+
+    bindings: dict[str, list[ModelBinding]] = {
+        "primary_reasoner": [ModelBinding(provider="anthropic", model="fake-primary")],
+    }
+    providers = {"anthropic": AnthropicProvider(api_key=None, transport=transport)}
+    client = LlmClient(bindings, providers)
+
+    run_informational_turn(client, repo, db, "How has my potassium been lately?")
+
+    assert load_review_marker(repo) is None
