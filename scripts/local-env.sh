@@ -235,7 +235,7 @@ run_experiment() {
 
 top_usage() {
   cat <<'EOF'
-usage: local-env.sh <start|stop|restart|user-create|user-list> [options]
+usage: local-env.sh <start|logs|stop|restart|user-create|user-list> [options]
 
 Shared implementation behind scripts/start-local, stop-local, restart-local,
 user-create-local, user-list-local. Run `local-env.sh <verb> --help` for a
@@ -509,10 +509,63 @@ cmd_start() {
       exit 1
     fi
     out "start: up at http://127.0.0.1:$port/ (pid $server_pid, dir $workdir_abs)"
+    # Always name the log. The server runs detached, so without this a 500
+    # in the browser leaves no discoverable way to reach the traceback.
+    out "start: log  $log_file"
+    out "start:      ./scripts/logs-local --dir '$workdir_abs'          # last 200 lines"
+    out "start:      ./scripts/logs-local --dir '$workdir_abs' --follow  # tail -f"
+    out "start:      ./scripts/logs-local --dir '$workdir_abs' --errors  # tracebacks only"
   fi
 
   if [ "$follow" -eq 1 ]; then
     exec tail -f "$log_file"
+  fi
+}
+
+cmd_logs() {
+  local workdir="$DEFAULT_WORKDIR" lines=200 follow=0 errors=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dir) workdir="${2:-}"; [ -n "$workdir" ] || die "--dir needs a path"; shift 2 ;;
+      --lines|-n) lines="${2:-}"; [ -n "$lines" ] || die "--lines needs a count"; shift 2 ;;
+      --follow|-f) follow=1; shift ;;
+      --errors|-e) errors=1; shift ;;
+      -h|--help)
+        cat <<'USAGE'
+usage: logs-local [--dir PATH] [--lines N] [--follow] [--errors]
+
+Show the detached local server's log — where a browser 500's traceback
+lands, since the server does not run in your terminal.
+
+  --dir PATH     working data dir (default: the standard one)
+  --lines N      how many trailing lines (default 200)
+  --follow, -f   tail -f
+  --errors, -e   only tracebacks and error lines
+USAGE
+        exit 0 ;;
+      *) die "logs: unknown option '$1'" ;;
+    esac
+  done
+
+  local workdir_abs state_dir log_file
+  workdir_abs=$(abs_path "$workdir")
+  state_dir=$(instance_state_dir "$workdir_abs")
+  log_file="$state_dir/adoc.log"
+
+  if [ ! -f "$log_file" ]; then
+    err "logs: no log at $log_file — has a server run for '$workdir_abs'?"
+    exit 1
+  fi
+
+  out "logs: $log_file"
+  if [ "$errors" -eq 1 ]; then
+    # Show each traceback with its exception line, which is the part worth
+    # reading; -A keeps the frames after the header.
+    grep -n -A 40 "Traceback (most recent call last)" "$log_file" | tail -n "$lines"
+  elif [ "$follow" -eq 1 ]; then
+    tail -n "$lines" -f "$log_file"
+  else
+    tail -n "$lines" "$log_file"
   fi
 }
 
@@ -726,6 +779,10 @@ main() {
     stop)
       shift
       cmd_stop "$@"
+      ;;
+    logs)
+      shift
+      cmd_logs "$@"
       ;;
     restart)
       shift

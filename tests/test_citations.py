@@ -453,3 +453,26 @@ def test_eutils_verifier_network_failure_is_error_and_never_cached(tmp_path: Pat
     assert verifier.verify("444") == "error"
     assert verifier.verify("444") == "error"  # never cached; re-tried every time
     assert not cache_path.exists()
+
+
+def test_doc_ref_without_a_page_resolves_for_an_unpaginated_document(tmp_path: Path) -> None:
+    """`#p<int>` is optional. Requiring it assumed every citable document is
+    a paginated scan; the document-text corpus made `.docx`/`.txt` records
+    citable, and a real run died rejecting a ref to the patient's own
+    narrative history document because it has no pages."""
+    db = LabsDb(tmp_path / "labs.sqlite")
+    db.upsert_document(
+        LabDocument(
+            sha256="d" * 64,
+            filename="Longitudinal Health History.docx",
+            doc_type="clinical-note",
+            page_count=1,
+        )
+    )
+    repo = DataRepo.init_at(tmp_path / "data")
+
+    ok = check_ops_citations([_evidence_op("doc:Longitudinal Health History.docx")], db, repo)
+    assert not ok.failing
+
+    missing = check_ops_citations([_evidence_op("doc:Never Ingested.docx")], db, repo)
+    assert missing.failing

@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Show the detached local server's log (where a browser 500's traceback lands).
+set -euo pipefail
+exec "$(dirname "$0")/local-env.sh" logs "$@"

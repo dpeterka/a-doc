@@ -18,7 +18,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 # --- 1. Basics ----------------------------------------------------------------------
 
@@ -88,9 +88,24 @@ class PriorDiagnosesSection(BaseModel):
 class Relative(BaseModel):
     relation: str
     conditions: list[str] = Field(default_factory=list)
-    age_at_onset: int | None = None
+    # Free-form, like `MedicalEvent.date_approx`: people answer "late 30s"
+    # or "around 5 years old", which is MORE informative than a number
+    # invented to satisfy a type. Typing these as `int` crashed a live
+    # intake turn and lost the patient's family history. A plain number is
+    # still perfectly valid input and is simply kept as its own text.
+    age_at_onset: str | None = None
     deceased: bool = False
-    age_at_death: int | None = None
+    age_at_death: str | None = None
+
+    @field_validator("age_at_onset", "age_at_death", mode="before")
+    @classmethod
+    def _accept_numeric_ages(cls, value: object) -> object:
+        """Keep a numeric age working: `45` becomes `"45"` rather than a
+        validation error, so both a precise number and "late 30s" are
+        accepted from either the model or an older caller."""
+        if isinstance(value, int | float):
+            return str(value)
+        return value
 
 
 class FamilyHistorySection(BaseModel):

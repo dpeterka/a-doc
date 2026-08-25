@@ -739,6 +739,33 @@ def _render_wrapup_refusal(coverage: CoverageState, blockers_anywhere: list[str]
     return "\n".join(lines)
 
 
+def _safe_write_section_from_facts(
+    repo: DataRepo, facts_store: IntakeFactsStore, topic_key: str
+) -> list[str]:
+    """`_write_section_from_facts`, but a failure never escapes the turn.
+
+    The case files are DERIVED from `intake-facts.yaml`; the facts are the
+    source of truth and can regenerate them at any time. So a rendering
+    failure must cost at most that one artifact — never the patient's
+    reply and never her facts, which are not yet persisted at this point.
+
+    This exists because the opposite happened live: a relative's
+    `age_at_onset` of "late 30s" failed the section schema, the exception
+    escaped `run_intake_turn`, and the turn 500'd before `facts_store.save()`
+    — so she lost the whole message rather than one field.
+    """
+    try:
+        return _write_section_from_facts(repo, facts_store, topic_key)
+    except Exception as exc:  # noqa: BLE001 - deliberately broad: see docstring
+        logger.warning(
+            "intake: could not render case-file artifact for topic %r (facts are kept and the "
+            "artifact can be regenerated): %s",
+            topic_key,
+            exc,
+        )
+        return []
+
+
 def _write_section_from_facts(
     repo: DataRepo, facts_store: IntakeFactsStore, section_key: str
 ) -> list[str]:
@@ -899,7 +926,7 @@ def run_intake_turn(client: LlmClient, repo: DataRepo, db: LabsDb, text: str) ->
     # at any time, during AND after the initial visit).
     for topic_key in touched_topics:
         if _is_covered(coverage, topic_key):
-            artifacts.extend(_write_section_from_facts(repo, facts_store, topic_key))
+            artifacts.extend(_safe_write_section_from_facts(repo, facts_store, topic_key))
 
     # --- deterministic topic-coverage veto: code, not the model, decides ---
     for topic_key in turn.topics_covered:
@@ -907,7 +934,7 @@ def run_intake_turn(client: LlmClient, repo: DataRepo, db: LabsDb, text: str) ->
             continue
         if section_completion_blockers(facts_store.facts, topic_key):
             continue  # vetoed silently — routine turns never surface gate mechanics
-        artifacts.extend(_write_section_from_facts(repo, facts_store, topic_key))
+        artifacts.extend(_safe_write_section_from_facts(repo, facts_store, topic_key))
         _mark_covered(coverage, topic_key, when=now)
 
     # --- wrap-up: intake_complete is accepted only when every topic is
@@ -1245,7 +1272,7 @@ def run_visit_capture(client: LlmClient, repo: DataRepo, db: LabsDb, text: str) 
     artifacts: list[str] = []
     for topic_key in touched_topics:
         if _is_covered(coverage, topic_key):
-            artifacts.extend(_write_section_from_facts(repo, facts_store, topic_key))
+            artifacts.extend(_safe_write_section_from_facts(repo, facts_store, topic_key))
 
     corroboration_updates = corroborate_facts(facts_store.facts, db, repo)
     facts_store.apply_corroboration(corroboration_updates, at=now)

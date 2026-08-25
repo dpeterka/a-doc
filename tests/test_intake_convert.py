@@ -127,7 +127,9 @@ def test_family_history_conversion_splits_comma_separated_conditions() -> None:
     section = FamilyHistorySection.model_validate(data)
     assert section.relatives[0].relation == "mother"
     assert section.relatives[0].conditions == ["Hashimoto's", "vitiligo"]
-    assert section.relatives[0].age_at_onset == 35
+    # Ages are free-form text now (people say "late 30s"); a numeric input
+    # is accepted and kept as its own text rather than rejected.
+    assert section.relatives[0].age_at_onset == "35"
 
 
 def test_geography_conversion_splits_residences_travel_and_exposures() -> None:
