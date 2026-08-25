@@ -1,0 +1,28 @@
+{% if on_file.doc_count == 0 %}
+  <p class="muted">
+    Nothing has been added yet.
+    <a href="/upload">Add your first document &rarr;</a>
+  </p>
+{% else %}
+  <ul>
+    <li>
+      <strong>{{ on_file.doc_count }}</strong> document{{ "s" if on_file.doc_count != 1 else "" }}
+      ingested
+    </li>
+    {% if on_file.lab_row_count > 0 %}
+      <li>
+        <strong>{{ on_file.lab_row_count }}</strong>
+        lab result{{ "s" if on_file.lab_row_count != 1 else "" }}
+        across <strong>{{ on_file.analyte_count }}</strong>
+        analyte{{ "s" if on_file.analyte_count != 1 else "" }},
+        {{ on_file.date_span[0] | friendly_date }} &ndash; {{ on_file.date_span[1] | friendly_date }}
+      </li>
+    {% endif %}
+    {% if on_file.encounter_count > 0 %}
+      <li>
+        <strong>{{ on_file.encounter_count }}</strong>
+        encounter{{ "s" if on_file.encounter_count != 1 else "" }} on file
+      </li>
+    {% endif %}
+  </ul>
+{% endif %}

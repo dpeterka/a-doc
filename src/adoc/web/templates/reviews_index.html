@@ -2,15 +2,32 @@
 {% block title %}Weekly reviews — a-doc{% endblock %}
 {% block content %}
   <h1>Weekly reviews</h1>
-  <p class="muted">A deeper look a-doc takes periodically, with a second opinion built in.</p>
 
   {% if filenames %}
+    <p class="muted">A deeper look a-doc takes periodically, with a second opinion built in.</p>
     <ul>
       {% for filename in filenames %}
         <li><a href="/reviews/{{ filename }}">{{ filename }}</a></li>
       {% endfor %}
     </ul>
   {% else %}
-    <p>No reviews yet.</p>
+    <section class="card">
+      <h2>What a weekly review is</h2>
+      <p>
+        A weekly review is a <strong>blind re-differential panel</strong>: several
+        independent models each work up a fresh differential from your case file
+        <em>without</em> seeing a-doc's current ledger, so they can't simply agree with
+        what's already there. Anywhere their fresh take diverges from the existing
+        picture gets adjudicated with an explicit, recorded rationale — a genuine second
+        (and third) opinion, built into the product rather than left to chance.
+      </p>
+      <p class="muted">The next review is scheduled for {{ review_schedule_phrase }}.</p>
+      <p>
+        The first review needs at least one diagnostic conversation on file — once
+        you've talked with a-doc about what's going on, reviews will start appearing
+        here on their own schedule.
+        <a href="/chat">Start a conversation &rarr;</a>
+      </p>
+    </section>
   {% endif %}
 {% endblock %}

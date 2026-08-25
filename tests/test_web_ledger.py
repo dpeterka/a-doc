@@ -1,6 +1,8 @@
 """Ledger surface tests: the read-only full ledger view renders tier/
 status/origin chips (including an `origin: patient` chip) and links
-evidence source-refs back to their documents where resolvable.
+evidence source-refs back to their documents where resolvable — and, when
+no hypotheses exist yet, an explanation state instead of the "complete,
+unfiltered record" framing (which is only true once there's a record).
 """
 
 from __future__ import annotations
@@ -14,6 +16,21 @@ from web_support import build_app, login
 from adoc.casefile.ledger import save_ledger
 from adoc.casefile.repo import LEDGER_RELPATH
 from adoc.casefile.schema import Evidence, Hypothesis, Ledger
+
+
+def test_ledger_view_empty_state_explains_instead_of_claiming_a_record(tmp_path: Path) -> None:
+    app, _repo, _db, _calls = build_app(tmp_path)
+    client = TestClient(app)
+    login(client)
+
+    response = client.get("/ledger")
+
+    assert response.status_code == 200
+    body = response.text
+    assert "Nothing recorded yet." not in body
+    assert "read-only." not in body
+    assert "diagnostic conversation" in body
+    assert 'href="/chat"' in body
 
 
 def test_ledger_view_shows_origin_patient_chip(tmp_path: Path) -> None:
