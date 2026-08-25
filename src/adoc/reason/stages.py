@@ -1,11 +1,13 @@
 """Stage functions and DAG assembly for the diagnostic chat turn (PLAN.md
 "Session loops (b)"): Ledger-Maintainer -> Challenger -> apply -> Composer.
 
-Entry points (`run_diagnostic_turn`, `run_informational_turn`) route every
-turn through `safety.guarded_turn` first, so the deterministic red-flag
-screen runs before any client call, ever — CLAUDE.md rule 3 ("stage order
-is enforced by code, not prompts") starts here, at the very first thing a
-turn does.
+The deterministic red-flag screen runs in the entry points that own the
+patient conversation (`web/routes/chat.py`, `intake/agent.py`), before any
+client call, and a match prepends a fixed warning to the reply rather than
+replacing the turn (ADR 0014, warn-not-block). It is deliberately NOT run
+again here — doing so would re-introduce the block those callers removed.
+CLAUDE.md rule 3 ("stage order is enforced by code, not prompts") still
+governs everything below.
 
 `dag.run()` only returns an audit `DagRun`, not the node outputs
 themselves (dag.py is deliberately a thin, unopinionated runner). The DAG
@@ -48,7 +50,7 @@ from adoc.reason.client import LlmClient, LlmResult, Message
 from adoc.reason.context import ContextPack, build_context
 from adoc.reason.dag import Contract, Ctx, Dag, Node, require_prior_node, run
 from adoc.reason.prompts import Prompt, load_prompt
-from adoc.reason.safety import RedFlagResult, guarded_turn, treatment_gate
+from adoc.reason.safety import RedFlagResult, treatment_gate
 
 # --------------------------------------------------------------------------
 # Stage-IO models
@@ -640,9 +642,13 @@ def run_diagnostic_turn(
 ) -> PatientReply | RedFlagResult:
     """Entry point for one diagnostic chat turn (PLAN.md loop (b)).
 
-    `guarded_turn` runs the deterministic red-flag screen before anything
-    else: on a flagged turn, this returns the `RedFlagResult` immediately
-    and `client.complete` is never called (zero API calls)."""
+    The red-flag screen is NOT applied here (ADR 0014, warn-not-block): the
+    entry points that own the patient conversation — `web/routes/chat.py`
+    and `intake/agent.py` — run `safety.red_flag_screen` first, before any
+    model call, and prepend a deterministic warning to the reply on a match.
+    Screening here as well would re-introduce the block this stage's callers
+    deliberately removed. The `RedFlagResult` arm of the return type is kept
+    for callers that still pattern-match on it."""
 
     def _proceed() -> PatientReply:
         context_pack = build_context(repo, db, include_ledger=True)
@@ -663,7 +669,7 @@ def run_diagnostic_turn(
         assert isinstance(reply, PatientReply)
         return reply
 
-    return guarded_turn(text, _proceed)
+    return _proceed()
 
 
 def run_informational_turn(
@@ -686,7 +692,7 @@ def run_informational_turn(
     # committing to an import-order assumption between the two modules.
     from adoc.reason.tools import informational_llm_result
 
-    return guarded_turn(text, lambda: informational_llm_result(client, repo, db, text))
+    return informational_llm_result(client, repo, db, text)
 
 
 def render_new_evidence_note(report: IngestReport) -> str | None:

@@ -48,6 +48,7 @@ from adoc.casefile.repo import LEDGER_RELPATH, DataRepo
 from adoc.intake.agent import (
     INTAKE_OPENER_MESSAGE,
     intake_is_complete,
+    red_flag_warning_prefix,
     run_intake_turn,
     run_visit_capture,
 )
@@ -91,6 +92,20 @@ _LEDGER_INVARIANT_MESSAGE = (
 )
 
 
+def _with_red_flag_warning(screen: RedFlagResult, reply: str) -> str:
+    """Prepend the deterministic red-flag warning to `reply` on a match.
+
+    Warn-not-block (ADR 0014): the screen still runs before any model call,
+    but a match annotates the turn instead of replacing it. The warning text
+    is fixed in code (`intake.agent.red_flag_warning_prefix`) and applied
+    after the model has spoken, so nothing the model returns can drop or
+    soften it.
+    """
+    if not screen.flagged:
+        return reply
+    return red_flag_warning_prefix(screen.category) + reply
+
+
 def _wants_sse(request: Request) -> bool:
     accept = request.headers.get("accept", "")
     return "text/event-stream" in accept
@@ -121,9 +136,12 @@ def _handle_turn(text: str, *, client: LlmClient, repo: DataRepo, db: LabsDb) ->
     expected, safety-driven outcomes of the diagnostic DAG (CLAUDE.md rules
     2/3/5) — never a reason to let a bare 500/traceback reach the patient.
     """
+    # Warn, don't block (ADR 0014): the screen still runs first, before any
+    # model call, and its match is surfaced verbatim by code at the end of
+    # this function - but it no longer replaces the turn.
     screen = red_flag_screen(text)
     if screen.flagged:
-        return {"kind": "urgent", "text": screen.message or "", "tests_to_request": []}
+        logger.info("red-flag screen matched: category=%s", screen.category)
 
     try:
         route = route_turn(client, text)
@@ -145,7 +163,11 @@ def _handle_turn(text: str, *, client: LlmClient, repo: DataRepo, db: LabsDb) ->
         if isinstance(outcome, RedFlagResult):
             return {"kind": "urgent", "text": outcome.message or "", "tests_to_request": []}
         run_visit_capture(client, repo, db, text)
-        return {"kind": "informational", "text": outcome.text, "tests_to_request": []}
+        return {
+            "kind": "informational",
+            "text": _with_red_flag_warning(screen, outcome.text),
+            "tests_to_request": [],
+        }
 
     try:
         outcome = run_diagnostic_turn(client, repo, db, repo.root / LEDGER_RELPATH, text)
@@ -166,7 +188,7 @@ def _handle_turn(text: str, *, client: LlmClient, repo: DataRepo, db: LabsDb) ->
     run_visit_capture(client, repo, db, text)
     return {
         "kind": "diagnostic",
-        "text": outcome.tiers_rendered,
+        "text": _with_red_flag_warning(screen, outcome.tiers_rendered),
         "tests_to_request": outcome.tests_to_request,
     }
 
