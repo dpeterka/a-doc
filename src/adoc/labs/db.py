@@ -1356,6 +1356,21 @@ class LabsDb:
         return "\f".join(row[0] for row in rows)
 
     @_synchronized
+    def get_document_page_text(self, source_doc: str, page: int) -> str | None:
+        """One page's stored text, or `None` when this document's text was
+        stored whole (no per-page split) or that page has none.
+
+        Used by `reason.verify`'s source resolution so a `doc:<file>#p<n>`
+        evidence ref is entailment-checked against the page it actually
+        cites rather than the whole document — a claim is much easier to
+        judge against one page than against thirty."""
+        row = self._conn.execute(
+            "SELECT text FROM document_text WHERE source_doc = ? AND page = ?",
+            (source_doc, page),
+        ).fetchone()
+        return str(row[0]) if row is not None else None
+
+    @_synchronized
     def search_document_text(self, query: str, *, limit: int = 5) -> list[DocumentTextHit]:
         """Ranked FTS5 snippet search over every document's extracted text
         (`reason.tools.search_documents`/`reason.context`'s document-excerpts

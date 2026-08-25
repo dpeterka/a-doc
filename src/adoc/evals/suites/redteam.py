@@ -13,6 +13,7 @@ pytest; it does not replace those pytest tests.
 
 from __future__ import annotations
 
+import json
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -182,15 +183,34 @@ def _make_challenger_transport(
     return transport
 
 
+def _entailed_entailment_transport(request: TransportRequest) -> TransportResponse:
+    """Default fake transport for role `entailment_verifier`: always judges
+    every claim it is sent as `entailed` — this suite's red-team scenarios
+    are about citation/gate/anchoring behavior, not entailment quality, so
+    the verifier is a scripted pass-through here (mirrors
+    `tests/test_stages.py`'s identical helper)."""
+    _preamble, _blank, payload_text = request.messages[-1].content.partition("\n\n")
+    pairs = json.loads(payload_text)
+    judgments = [
+        {"claim_index": pair["claim_index"], "judgment": "entailed", "rationale": "matches"}
+        for pair in pairs
+    ]
+    return TransportResponse(
+        text="", tool_input={"judgments": judgments}, input_tokens=5, output_tokens=5
+    )
+
+
 def _build_fake_client(primary_transport: Any, challenger_transport: Any) -> LlmClient:
     bindings: dict[str, list[ModelBinding]] = {
         "primary_reasoner": [ModelBinding(provider="anthropic", model="fake-primary")],
         "challenger": [ModelBinding(provider="openai", model="fake-challenger")],
         "classifier": [ModelBinding(provider="anthropic", model="fake-primary")],
+        "entailment_verifier": [ModelBinding(provider="featherless", model="fake-verifier")],
     }
     providers: dict[str, Provider] = {
         "anthropic": AnthropicProvider(api_key=None, transport=primary_transport),
         "openai": OpenAIProvider(api_key=None, transport=challenger_transport),
+        "featherless": OpenAIProvider(api_key=None, transport=_entailed_entailment_transport),
     }
     return LlmClient(bindings, providers)
 

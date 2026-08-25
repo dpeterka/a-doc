@@ -20,6 +20,19 @@ roles:
     params:
       effort: high
 
+  # Entailment Verifier (PLAN.md Phase 2, "Grounding & anti-hallucination
+  # hardening"): judges whether a claim's cited source text actually
+  # supports the claim. Bound to a THIRD family, distinct from both
+  # `primary_reasoner` (Anthropic) and `challenger` (OpenAI) - the whole
+  # point (mirrors ADR 0005's Challenger cross-family rule) is that the
+  # verifier must not share the Ledger-Maintainer's blind spots. Featherless
+  # is already paid flat-rate for the blind panel, so this adds no
+  # incremental per-token cost.
+  entailment_verifier:
+    provider: featherless
+    model: deepseek-ai/DeepSeek-R1-0528
+    params: {}
+
   blind_panel:
     - provider: anthropic
       model: claude-opus-5
