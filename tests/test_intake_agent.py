@@ -8,7 +8,7 @@ pattern as `test_intake_wizard.py`.
 from __future__ import annotations
 
 import json
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -23,11 +23,15 @@ from adoc.intake.agent import (
     INTAKE_OPENER_MESSAGE,
     INTAKE_TRANSCRIPT_RELPATH,
     LONG_MESSAGE_THRESHOLD_CHARS,
+    ContinuityInfo,
     IntakeTurnResult,
+    active_follow_ups,
+    build_continuity_info,
     build_doc_digest,
     intake_is_complete,
     read_intake_transcript,
     red_flag_warning_prefix,
+    render_continuity_note,
     run_intake_turn,
 )
 from adoc.intake.coverage import (
@@ -300,7 +304,63 @@ def test_intake_turn_context_excerpts_absent_when_nothing_matches(tmp_path: Path
 
 
 def test_intake_agent_prompt_version_bumped_for_document_excerpts() -> None:
-    assert INTAKE_AGENT_PROMPT_VERSION == "5"
+    assert INTAKE_AGENT_PROMPT_VERSION == "6"
+
+
+# --- intended arc: "Suggested next step" steering hint (never a gate) -----------------
+
+
+def test_turn_context_includes_a_suggested_next_step_hint(tmp_path: Path) -> None:
+    repo = DataRepo.init_at(tmp_path / "data")
+    db = LabsDb(":memory:")
+    client, transport = _make_client([_turn("Got it.")])
+
+    run_intake_turn(client, repo, db, "I'm 41, female.")
+
+    sent_content = transport.calls[0].messages[-1].content
+    assert "Suggested next step" in sent_content
+    # basics isn't covered yet at the very start of a fresh intake, so
+    # basics is still the arc's first stop.
+    assert "a few basics about you" in sent_content
+
+
+def test_record_review_stage_surfaces_arc_guidance_and_document_excerpts_together(
+    tmp_path: Path,
+) -> None:
+    """docs/adr/0018: once basics/family_history/geography are covered, the
+    arc points the model at the record-review cluster (events/prior
+    diagnoses/document drop) -- and the SAME turn's context still carries
+    whatever document excerpts matched her message, so the model has both
+    "what to steer toward" and "her own prior words to cite" at once."""
+    repo = DataRepo.init_at(tmp_path / "data")
+    db = LabsDb(":memory:")
+    _seed_document_text(
+        db,
+        "a" * 64,
+        "er-note.docx",
+        "Hospitalization in early 2024 followed by an ER visit for chest pain.",
+    )
+    _seed_all_topics_covered_except(
+        repo,
+        "events",
+        "prior_diagnoses",
+        "document_drop",
+        "medications",
+        "supplements",
+        "allergies",
+        "care_team",
+        "symptoms",
+    )
+    client, transport = _make_client([_turn("Sure, let's go through those.")])
+
+    run_intake_turn(client, repo, db, "What does my record show about that hospitalization?")
+
+    sent_content = transport.calls[0].messages[-1].content
+    assert "Suggested next step" in sent_content
+    assert "record-review stage" in sent_content
+    assert "Relevant excerpts from her own prior documents" in sent_content
+    assert "doc:er-note.docx" in sent_content
+    assert "hospitalization" in sent_content.lower()
 
 
 # --- topics_covered: vetoed by each blocker rule, honored once clear -------------------
@@ -785,17 +845,29 @@ def test_invalid_op_rejected_after_retry_still_yields_a_normal_reply(tmp_path: P
 
 
 def test_opener_message_is_a_plain_constant() -> None:
-    # The opener DRIVES with one focused question instead of inviting a wall
-    # of text, and points at records that are ALREADY on file rather than
-    # asking her to add what she has already provided. It carries no
-    # emergency disclaimer: this is a single-patient tool whose operator
-    # knows what is and is not an emergency, and the red-flag screen still
-    # warns on the input that warrants it (ADR 0014).
-    assert "What's been bothering you the most lately, or what brings you in?" in (
-        INTAKE_OPENER_MESSAGE
-    )
+    # The opener DRIVES with one focused, concrete question -- age and sex
+    # at birth, the same first thing a clinician asks a new patient -- and
+    # points at records that are ALREADY on file rather than asking her to
+    # add what she has already provided. It carries no emergency disclaimer:
+    # this is a single-patient tool whose operator knows what is and is not
+    # an emergency, and the red-flag screen still warns on the input that
+    # warrants it (ADR 0014).
+    lowered = INTAKE_OPENER_MESSAGE.lower()
+    assert "old are you" in lowered
+    assert "sex at birth" in lowered
     assert "already on file" in INTAKE_OPENER_MESSAGE
-    assert "emergency" not in INTAKE_OPENER_MESSAGE.lower()
+    assert "emergency" not in lowered
+
+
+def test_opener_message_drops_the_old_open_ended_question(tmp_path: Path) -> None:
+    """docs/adr/0018-intake-clinical-progression-and-continuity.md: the old
+    opener asked "what's been bothering you" FIRST -- exactly the
+    wall-of-text-inviting question the owner's feedback flagged. That
+    question belongs at the END of the intended arc now, never the opener."""
+    lowered = INTAKE_OPENER_MESSAGE.lower()
+    assert "what's been bothering you" not in lowered
+    assert "what brings you in" not in lowered
+    assert "start wherever you like" not in lowered
 
 
 # --- doc digest ---------------------------------------------------------------------------
@@ -977,3 +1049,174 @@ def test_new_fact_gets_reported_on_stamped_to_todays_date(tmp_path: Path) -> Non
     fact = store.get("basic-age")
     assert fact is not None
     assert fact.reported_on == datetime.now(UTC).date()
+
+
+# --- follow_up flows through run_intake_turn's ops ------------------------------------
+
+
+def test_run_intake_turn_can_flag_a_fact_follow_up(tmp_path: Path) -> None:
+    repo = DataRepo.init_at(tmp_path / "data")
+    db = LabsDb(":memory:")
+    client, _t = _make_client(
+        [
+            _turn(
+                "Got it -- I'll check back on that rash next time.",
+                [
+                    {
+                        "op": "add_fact",
+                        "fact": {
+                            "id": "rash-followup",
+                            "section": "symptoms",
+                            "kind": "symptom",
+                            "statement": "Rash spreading on her forearm.",
+                            "follow_up": True,
+                        },
+                    }
+                ],
+            )
+        ]
+    )
+
+    run_intake_turn(client, repo, db, "I've had a rash spreading on my forearm.")
+
+    store = IntakeFactsStore(repo.root)
+    fact = store.get("rash-followup")
+    assert fact is not None
+    assert fact.follow_up is True
+    assert [f.id for f in active_follow_ups(store)] == ["rash-followup"]
+
+
+# --- post-intake continuity: docs/adr/0018-intake-clinical-progression-and-continuity.md ---
+
+
+def _seed_follow_up_fact(repo: DataRepo, *, statement: str, fact_id: str = "follow-me") -> None:
+    from adoc.casefile.schema import Provenance
+    from adoc.intake.facts import AddFact, NewFact
+
+    store = IntakeFactsStore(repo.root)
+    provenance = Provenance(
+        app_version="0.0.0-test",
+        prompt_template_version="1",
+        model_id="fake",
+        dag_node="intake-agent",
+        timestamp=datetime.now(UTC),
+    )
+    store.apply_ops(
+        [
+            AddFact(
+                fact=NewFact(
+                    id=fact_id,
+                    section="symptoms",
+                    kind="symptom",
+                    statement=statement,
+                    follow_up=True,
+                )
+            )
+        ],
+        provenance,
+    )
+    store.save()
+
+
+def test_build_continuity_info_collects_follow_ups_unresolved_and_recent_facts(
+    tmp_path: Path,
+) -> None:
+    repo = DataRepo.init_at(tmp_path / "data")
+    now = datetime.now(UTC)
+    _seed_follow_up_fact(repo, statement="Rash spreading on her forearm.")
+    store = IntakeFactsStore(repo.root)
+
+    info = build_continuity_info(repo, store, last_visit_at=now - timedelta(days=3), now=now)
+
+    assert isinstance(info, ContinuityInfo)
+    assert len(info.follow_ups) == 1
+    assert info.follow_ups[0].statement == "Rash spreading on her forearm."
+    assert len(info.recent_facts) == 1  # reported_on == today, within the window
+
+
+def test_build_continuity_info_with_no_prior_visit_has_no_last_visit_at(tmp_path: Path) -> None:
+    repo = DataRepo.init_at(tmp_path / "data")
+    store = IntakeFactsStore(repo.root)
+
+    info = build_continuity_info(repo, store, last_visit_at=None, now=datetime.now(UTC))
+
+    assert info.last_visit_at is None
+
+
+def test_render_continuity_note_is_none_with_no_prior_visit() -> None:
+    info = ContinuityInfo(last_visit_at=None)
+    assert render_continuity_note(info, now=datetime.now(UTC)) is None
+
+
+def test_render_continuity_note_leads_with_the_flagged_follow_up() -> None:
+    now = datetime.now(UTC)
+    store_fact_statement = "Rash spreading on her forearm."
+    from adoc.casefile.schema import Provenance
+    from adoc.intake.facts import IntakeFact
+
+    fact = IntakeFact(
+        id="rash-followup",
+        section="symptoms",
+        kind="symptom",
+        statement=store_fact_statement,
+        follow_up=True,
+        provenance=Provenance(
+            app_version="0.0.0-test",
+            prompt_template_version="1",
+            model_id="fake",
+            dag_node="intake-agent",
+            timestamp=now,
+        ),
+    )
+    info = ContinuityInfo(last_visit_at=now - timedelta(days=21), follow_ups=[fact])
+
+    note = render_continuity_note(info, now=now)
+
+    assert note is not None
+    assert "3 week" in note or "weeks ago" in note
+    assert "Rash spreading on her forearm" in note
+    assert "how has that been" in note.lower()
+
+
+def test_render_continuity_note_never_dumps_everything_at_once() -> None:
+    """Never a status dump (docs/adr/0018): even with both a follow-up AND
+    unresolved facts on file, the note names at most ONE open item."""
+    now = datetime.now(UTC)
+    from adoc.casefile.schema import Provenance
+    from adoc.intake.facts import IntakeFact
+
+    prov = Provenance(
+        app_version="0.0.0-test",
+        prompt_template_version="1",
+        model_id="fake",
+        dag_node="intake-agent",
+        timestamp=now,
+    )
+    follow_up = IntakeFact(
+        id="f1",
+        section="symptoms",
+        kind="symptom",
+        statement="The rash.",
+        follow_up=True,
+        provenance=prov,
+    )
+    unresolved = IntakeFact(
+        id="f2",
+        section="family_history",
+        kind="relative",
+        statement="Dad's allergies.",
+        clarification_status="needs_probe",
+        provenance=prov,
+    )
+    info = ContinuityInfo(
+        last_visit_at=now - timedelta(days=1),
+        follow_ups=[follow_up],
+        unresolved_facts=[unresolved],
+    )
+
+    note = render_continuity_note(info, now=now)
+
+    assert note is not None
+    assert "rash" in note.lower()
+    assert "allergies" not in note.lower()  # the unresolved fact is NOT also mentioned
+    assert note.count("\n") == 0  # short -- one or two sentences, not a multi-line dump

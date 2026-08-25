@@ -153,6 +153,15 @@ FAMILY_HISTORY = {
     ]
 }
 
+GEOGRAPHY = {
+    "residences": [
+        {"place": "rural Connecticut", "date_approx": "2015-2020", "current": False},
+        {"place": "Boston, MA", "date_approx": "2020-present", "current": True},
+    ],
+    "travel": ["annual camping trips in upstate New York"],
+    "exposures": ["frequent tick exposure while hiking"],
+}
+
 MEDICATIONS_1 = {
     "medications": [
         {
@@ -213,6 +222,7 @@ def _full_script() -> dict[str, list[dict[str, Any]]]:
         "EventsSection": [EVENTS],
         "PriorDiagnosesSection": [PRIOR_DIAGNOSES],
         "FamilyHistorySection": [FAMILY_HISTORY],
+        "GeographySection": [GEOGRAPHY],
         "MedicationsSection": [MEDICATIONS_1, MEDICATIONS_2_WITH_ADDITION],
         "SupplementsSection": [SUPPLEMENTS],
         "AllergiesSection": [ALLERGIES],
@@ -265,6 +275,13 @@ def test_full_onboarding_run_produces_complete_committed_baseline_case_file(
     wizard.submit("My mother has Hashimoto's. My maternal aunt had RA and died at 72.")
     wizard.confirm()
 
+    assert wizard.current_section().key == "geography"  # type: ignore[union-attr]
+    wizard.submit(
+        "I lived in rural Connecticut from 2015-2020, now in Boston. We go camping in "
+        "upstate New York every year and I get a lot of tick exposure hiking."
+    )
+    wizard.confirm()
+
     assert wizard.current_section().key == "medications"  # type: ignore[union-attr]
     wizard.submit("I take Levothyroxine 50mcg daily.")
     wizard.confirm()
@@ -288,7 +305,7 @@ def test_full_onboarding_run_produces_complete_committed_baseline_case_file(
     # --- wizard-level completion state -----------------------------------------------
     assert wizard.current_section() is None
     assert wizard.baseline_incomplete() is False
-    assert wizard.progress() == (10, 10)
+    assert wizard.progress() == (11, 11)
 
     # --- every target artifact exists with expected content --------------------------
     case_summary = repo.read("case/case-summary.md")
@@ -319,6 +336,12 @@ def test_full_onboarding_run_produces_complete_committed_baseline_case_file(
     assert "mother" in family
     assert "Hashimoto's thyroiditis" in family
     assert "maternal aunt" in family
+
+    geography = repo.read("case/geography.md")
+    assert "rural Connecticut" in geography
+    assert "Boston, MA" in geography
+    assert "upstate New York" in geography
+    assert "tick exposure" in geography
 
     medications_md = repo.read("case/medications.md")
     assert "Levothyroxine" in medications_md
@@ -364,7 +387,7 @@ def test_resumability_new_wizard_instance_continues_mid_flow(tmp_path: Path) -> 
     second_client, _ = _make_client({})  # no further calls expected
     resumed = IntakeWizard(second_repo, second_client)
 
-    assert resumed.progress() == (1, 10)
+    assert resumed.progress() == (1, 11)
     section = resumed.current_section()
     assert section is not None and section.key == "symptoms"
     assert resumed.current_status() == "awaiting_confirmation"

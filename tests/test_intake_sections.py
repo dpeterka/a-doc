@@ -10,6 +10,7 @@ from adoc.intake.sections import (
     DocumentDropSection,
     EventsSection,
     FamilyHistorySection,
+    GeographySection,
     MedicationsSection,
     PriorDiagnosesSection,
     SupplementsSection,
@@ -22,6 +23,7 @@ _EXPECTED_ORDER = [
     "events",
     "prior_diagnoses",
     "family_history",
+    "geography",
     "medications",
     "supplements",
     "allergies",
@@ -30,9 +32,9 @@ _EXPECTED_ORDER = [
 ]
 
 
-def test_sections_registry_has_ten_sections_in_plan_order() -> None:
+def test_sections_registry_has_eleven_sections_in_plan_order() -> None:
     assert [spec.key for spec in SECTIONS] == _EXPECTED_ORDER
-    assert len(SECTIONS) == 10
+    assert len(SECTIONS) == 11
 
 
 def test_sections_registry_keys_are_unique() -> None:
@@ -159,3 +161,20 @@ def test_care_team_section_round_trip() -> None:
 def test_document_drop_section_defaults_to_unacknowledged() -> None:
     section = DocumentDropSection.model_validate({})
     assert section.acknowledged is False
+
+
+def test_geography_section_round_trip() -> None:
+    section = GeographySection.model_validate(
+        {
+            "residences": [
+                {"place": "rural Connecticut", "date_approx": "2015-2020", "current": False},
+                {"place": "Boston, MA", "date_approx": "2020-present", "current": True},
+            ],
+            "travel": ["annual camping trips in upstate New York"],
+            "exposures": ["frequent tick exposure while hiking"],
+        }
+    )
+    assert section.residences[0].place == "rural Connecticut"
+    assert section.residences[1].current is True
+    assert section.travel == ["annual camping trips in upstate New York"]
+    assert section.exposures == ["frequent tick exposure while hiking"]
