@@ -19,7 +19,7 @@ import threading
 from collections import defaultdict
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from functools import wraps
 from pathlib import Path
 from types import TracebackType
@@ -365,8 +365,8 @@ def _fts_query_any(text: str) -> str:
 
 
 # Deliberately private copies of `ingest.reconcile`'s `parse_ref_range`/
-# `parse_flag` (queue-ergonomics slice item 1, `resolve_with_pass` below) -
-# `labs` is a lower layer than `ingest`, so it never imports from it (that
+# `parse_flag`, used by `resolve_with_pass` below - `labs` is a lower layer
+# than `ingest`, so it never imports from it (that
 # would invert the dependency direction even though no runtime import
 # cycle would actually result); these two are tiny and stable enough that
 # duplicating them here is simpler than restructuring either module.
@@ -875,8 +875,8 @@ class LabsDb:
     @_synchronized
     def resolve_with_pass(self, row_id: int, which: Literal["a", "b"]) -> None:
         """Apply pass A's or pass B's reading wholesale to a disagreement
-        row and mark it `corrected` (queue-ergonomics slice item 1: the
-        confirm queue's "Use reading A"/"Use reading B" actions).
+        row and mark it `corrected` (the confirm queue's "Use reading A"/
+        "Use reading B" actions).
 
         Reads the chosen pass's payload straight out of `row_id`'s own
         `raw_json` (`ingest.reconcile.reconcile` serializes both passes'
@@ -1015,7 +1015,14 @@ class LabsDb:
 
     @_synchronized
     def reject_row_as_twin(
-        self, row_id: int, *, twin_of: int, method: Literal["rule", "llm"]
+        self,
+        row_id: int,
+        *,
+        twin_of: int,
+        method: Literal["rule", "llm"],
+        model_id: str | None = None,
+        prompt_template_version: str | None = None,
+        at: datetime | None = None,
     ) -> None:
         """Reject `row_id` as a duplicate ("twin") of `twin_of` - the
         legacy-row LLM twin sweep, `labs/twins.py` / `adoc
@@ -1023,6 +1030,26 @@ class LabsDb:
         audit note (`auto_rejected_twin_of`, `method`) merged into
         `row_id`'s own `raw_json` so the rejection's provenance survives
         alongside the original extraction.
+
+        CONFIRMED bug fix (CLAUDE.md "Every persisted LLM-derived artifact
+        carries provenance"): a `method="llm"` rejection used to persist
+        only `method` - no `model_id`, no `prompt_template_version`, no
+        timestamp - so PLAN.md's staleness/re-evaluation policy had
+        nothing to key on: rebinding the `classifier` role or bumping
+        `labs.twins.TWIN_CLASSIFY_PROMPT_VERSION` couldn't tell which
+        already-rejected rows were decided under the old binding/prompt.
+        `model_id`/`prompt_template_version` are optional here (`None` for
+        `method="rule"`, where no LLM was ever called - see
+        `resolve_with_pass`'s internal `method="rule"` call above, and
+        `labs/twins.py`'s deterministic `names_equivalent_by_rule` path -
+        stamping a model/prompt version on a decision no model made would
+        fabricate provenance, not record it) but REQUIRED in practice for
+        every `method="llm"` call site (`labs/twins.py`'s
+        `sweep_twins`/`_retro_pair_pending_twins`, which now thread
+        `LlmClient.complete`'s returned `LlmResult.model_id` and
+        `TWIN_CLASSIFY_PROMPT_VERSION` through). `at` defaults to
+        `datetime.now(UTC)` - a caller may pass an explicit value for
+        deterministic tests.
         """
         row = self.get_row(row_id)
         if row is None:
@@ -1030,6 +1057,11 @@ class LabsDb:
         payload = row.raw_payload()
         payload["auto_rejected_twin_of"] = twin_of
         payload["method"] = method
+        if model_id is not None:
+            payload["model_id"] = model_id
+        if prompt_template_version is not None:
+            payload["prompt_template_version"] = prompt_template_version
+        payload["rejected_at"] = (at or datetime.now(UTC)).isoformat()
         self._conn.execute(
             "UPDATE labs SET extraction_status = ?, raw_json = ? WHERE id = ?",
             (ExtractionStatus.REJECTED.value, json.dumps(payload), row_id),

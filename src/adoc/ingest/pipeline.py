@@ -36,9 +36,15 @@ report). Depth 1 only - a member that is itself a zip is rejected, not
 recursed into. Capped at `MAX_ZIP_MEMBERS` members and
 `MAX_ZIP_UNCOMPRESSED_BYTES` total uncompressed size; every member path is
 checked for traversal (absolute / `..`) before extraction. A hard failure
-partway through a zip leaves already-processed members' commits standing
-and reports the zip itself as `"error"` (routed to `work/failed/` by the
-usual inbox hygiene, same as any other failed file).
+partway through a zip, OR any single member that itself comes back
+`outcome="error"` (an unsafe path, a nested zip, a corrupt/unreadable
+document, ...), leaves already-processed members' commits standing but
+makes the zip's OWN outcome `"error"` too (routed to `work/failed/` and
+logged by the usual inbox hygiene, same as any other failed file) -
+otherwise a failed member inside an all-successful-looking zip would have
+its zip deleted from `inbox/` with no operator-visible record at all (see
+`_ingest_zip`'s docstring). The zip-level failure record names which
+member(s) failed so the operator can act on the right file.
 
 **Document text** (docs/adr/0015-document-text-corpus.md): for a *new*
 (non-duplicate) document, `_ingest_pdf`/`_ingest_text_like` extract the full
@@ -90,12 +96,14 @@ from __future__ import annotations
 import logging
 import shutil
 import tempfile
+import time
 import zipfile
 from collections.abc import Callable
 from datetime import UTC, date, datetime
 from pathlib import Path, PurePosixPath
 from typing import Literal
 
+from git.exc import GitCommandError
 from pydantic import BaseModel, Field
 
 from adoc.casefile.encounters import (
@@ -245,6 +253,67 @@ def _commit_message(*, label: str, doc_date: date | None, rows_auto: int, rows_p
     return f"ingest: {label} {date_part} ({rows_auto} rows, {rows_pending} queued)"
 
 
+# CONFIRMED bug fix (code review item 4): retry-with-backoff for
+# cross-process git index/ref-lock contention on commit.
+_COMMIT_RETRY_ATTEMPTS = 4
+_COMMIT_RETRY_BASE_DELAY_SECONDS = 0.25
+
+
+def _commit_with_retry(
+    repo: DataRepo,
+    message: str,
+    *,
+    paths: list[str],
+    sleep: Callable[[float], None] = time.sleep,
+) -> str:
+    """`repo.commit(message, paths=paths)`, retrying with exponential
+    backoff on cross-process git index/ref-lock contention.
+
+    `DataRepo._lock` (a `threading.RLock`, `casefile.repo`) already
+    serializes `commit()` calls from multiple THREADS within one process -
+    the fix for the earlier `sqlite3.InterfaceError`-shaped bug in that
+    module. But this pipeline is *also* driven from its own separate OS
+    PROCESS (the scheduled ingest task, PLAN.md), sharing the same
+    EFS-mounted data repo with the web task and other scheduled jobs. An
+    in-process lock cannot serialize across processes: two OS processes
+    committing to the same `.git` at the same moment can collide on git's
+    own index/ref lock files - GitPython surfaces that as `OSError`
+    ("Lock at ... could not be obtained", from `IndexFile.write()`'s
+    internal `LockedFD`) or `GitCommandError` (if a future call path ever
+    shells out via `repo.git.add`). Previously there was no retry at all
+    here, so a single unlucky cross-process collision raised straight out
+    of `_ingest_one` - which, pre-fix, also aborted every remaining file in
+    the batch (see `ingest_inbox`'s per-file try/except, added alongside
+    this).
+
+    This retry lives at the pipeline's own commit call sites rather than
+    inside `DataRepo.commit()` itself: `casefile/repo.py` is owned by a
+    different workstream for this change, and a shared retry belongs
+    there for every caller of `commit()`, not just ingest - noted in the
+    task report rather than added here.
+    """
+    delay = _COMMIT_RETRY_BASE_DELAY_SECONDS
+    last_exc: OSError | GitCommandError | None = None
+    for attempt in range(1, _COMMIT_RETRY_ATTEMPTS + 1):
+        try:
+            return repo.commit(message, paths=paths)
+        except (OSError, GitCommandError) as exc:
+            last_exc = exc
+            if attempt == _COMMIT_RETRY_ATTEMPTS:
+                break
+            logger.warning(
+                "git commit lock contention (attempt %d/%d), retrying in %.2fs: %s",
+                attempt,
+                _COMMIT_RETRY_ATTEMPTS,
+                delay,
+                exc,
+            )
+            sleep(delay)
+            delay *= 2
+    assert last_exc is not None  # the loop only exits via `break` after setting it
+    raise last_exc
+
+
 def _commit_paths_with_doc_text(base: list[str], repo: DataRepo) -> list[str]:
     """`base` plus `"doc-text"` when that directory actually has something
     to stage. `doc-text/` may not exist at all yet (extraction never
@@ -341,8 +410,8 @@ def _ingest_lab_report(
     message = _commit_message(
         label=facility, doc_date=doc_date, rows_auto=rows_auto, rows_pending=rows_pending
     )
-    commit_sha = repo.commit(
-        message, paths=_commit_paths_with_doc_text(["sources", "labs-export.jsonl"], repo)
+    commit_sha = _commit_with_retry(
+        repo, message, paths=_commit_paths_with_doc_text(["sources", "labs-export.jsonl"], repo)
     )
 
     return FileOutcome(
@@ -403,8 +472,8 @@ def _ingest_non_lab(
         _store_text_best_effort(repo, db, sha256, doc_text)
 
     message = _commit_message(label=path.name, doc_date=doc_date, rows_auto=0, rows_pending=0)
-    commit_sha = repo.commit(
-        message, paths=_commit_paths_with_doc_text(["sources", "case/encounters"], repo)
+    commit_sha = _commit_with_retry(
+        repo, message, paths=_commit_paths_with_doc_text(["sources", "case/encounters"], repo)
     )
 
     return FileOutcome(
@@ -629,8 +698,8 @@ def _ingest_genomic(
     )
     regenerate_inventory(repo.root, db)
 
-    commit_sha = repo.commit(
-        f"ingest: genomic data file {path.name}", paths=[GENOMICS_INVENTORY_RELPATH]
+    commit_sha = _commit_with_retry(
+        repo, f"ingest: genomic data file {path.name}", paths=[GENOMICS_INVENTORY_RELPATH]
     )
     return FileOutcome(
         path=str(path),
@@ -782,12 +851,30 @@ def _ingest_zip(
 ) -> tuple[list[FileOutcome], str | None]:
     """Expand `path` and ingest each member (module docstring: "the zip
     itself is not archived; its members are"). Returns
-    `(member_outcomes, zip_level_error)` - `zip_level_error` is set only
-    when the *whole zip* is rejected (bad zip file, over a cap) or a hard
-    failure stops processing partway through (genomics/filetypes task item
-    4: "already-processed members stand; the zip moves to work/failed/
-    with reason") - a single bad/unsafe/unsupported MEMBER does not stop
-    the rest of the zip; it is just one more `"error"` `FileOutcome`.
+    `(member_outcomes, zip_level_error)`.
+
+    `zip_level_error` is set when the *whole zip* is rejected (bad zip
+    file, over a cap), when a hard failure stops processing partway
+    through (genomics/filetypes task item 4: "already-processed members
+    stand; the zip moves to work/failed/ with reason"), OR when one or
+    more members individually came back `outcome="error"` (unsafe path,
+    nested zip, corrupt/unreadable document, ...) - CONFIRMED bug fix: a
+    member failing through its own `_ingest_one` used to be recorded only
+    as that member's own `FileOutcome`, which left `zip_error` `None` and
+    the zip's own outcome `"ingested"` - so `_apply_inbox_hygiene` deleted
+    the zip from `inbox/` as if everything in it had succeeded, and the
+    failed member never reached `work/failed/failures.jsonl` at all (no
+    operator-visible record, and if the source had already been removed
+    upstream - e.g. `rclone move` already cleared it out of Dropbox - the
+    content was simply gone). Any member `outcome="error"` now also makes
+    the ZIP's own outcome `"error"`, so the whole zip routes to
+    `work/failed/` and gets logged (module docstring) - the failure
+    reason names every failed member by its `path` (`<zip
+    name>:<member name>`) so the operator knows exactly what to go fix,
+    while every member that DID succeed is left exactly as ingested: its
+    document row, lab rows, and git commit all stand untouched (this
+    function never rolls anything back - only the zip's OWN outcome and
+    inbox-hygiene routing changes).
     """
     try:
         zf = zipfile.ZipFile(path)
@@ -822,6 +909,14 @@ def _ingest_zip(
                 # what's already committed, stop, and report the zip itself as
                 # failed (already-appended member outcomes are untouched).
                 return outcomes, f"{path.name}: zip processing stopped part-way through: {exc}"
+
+        failed_members = [o for o in outcomes if o.outcome == "error"]
+        if failed_members:
+            names = ", ".join(o.path for o in failed_members)
+            return (
+                outcomes,
+                f"{path.name}: {len(failed_members)} member(s) failed to ingest: {names}",
+            )
 
         return outcomes, None
 
@@ -958,6 +1053,23 @@ def ingest_inbox(
     order. Every file scanned here IS the patient's own inbox copy, so each
     one is opted into post-ingest inbox hygiene (module docstring):
     ingested/duplicate deletes it, error moves it to `work/failed/`.
+
+    CONFIRMED bug fix (code review item 4): each file is now ingested
+    inside its own `try`/`except`, so an unexpected exception from
+    `_ingest_one` (not one of the specific, already-handled types raised
+    inside its helpers - `ArchiveError`/`VisionError`/`LlmError`/
+    `DocxExtractionError`/git-lock contention exhausting its retries) no
+    longer aborts the whole batch. Before this fix, this loop had no
+    try/except at all: a single unexpected exception (e.g. a cross-process
+    git index-lock collision on `DataRepo.commit()` - this pipeline's
+    10-minute scheduled ingest task shares the EFS data repo with the web
+    task and other scheduled jobs, and `DataRepo._lock` is a
+    `threading.RLock`, which cannot serialize across separate OS
+    processes) propagated straight out of `ingest_inbox` and abandoned
+    every remaining file in the batch, however many were left. The failing
+    file now routes through the SAME `work/failed/` +
+    `failures.jsonl` path a normal `outcome="error"` result would, and the
+    loop moves on to the next file.
     """
     inbox = repo.root / "inbox"
     if not inbox.is_dir():
@@ -965,11 +1077,28 @@ def ingest_inbox(
     files = _scan_files(inbox)
     outcomes: list[FileOutcome] = []
     for p in files:
-        outcomes.extend(
-            _ingest_one(
-                p, repo=repo, db=db, vision=vision, clock=clock, renderer=renderer, inbox_root=inbox
+        try:
+            outcomes.extend(
+                _ingest_one(
+                    p,
+                    repo=repo,
+                    db=db,
+                    vision=vision,
+                    clock=clock,
+                    renderer=renderer,
+                    inbox_root=inbox,
+                )
             )
-        )
+        except Exception as exc:  # noqa: BLE001 - an unexpected failure must never abort
+            # the rest of the batch (module docstring / CLAUDE.md ingest
+            # robustness invariant) - route this file through the normal
+            # error/hygiene path and keep going.
+            logger.exception(
+                "ingest_inbox: unexpected error ingesting %s; continuing with remaining files", p
+            )
+            outcome = FileOutcome(path=str(p), outcome="error", issues=[f"unexpected error: {exc}"])
+            _apply_inbox_hygiene(p, outcome, repo=repo, inbox_root=inbox, clock=clock)
+            outcomes.append(outcome)
     return IngestReport(files=outcomes)
 
 

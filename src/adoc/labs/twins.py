@@ -1,15 +1,14 @@
-"""LLM-assisted twin sweep for legacy single-pass PENDING rows
-(queue-ergonomics slice item 4).
+"""LLM-assisted twin sweep for legacy single-pass PENDING rows.
 
-Before `ingest/reconcile.py`'s RESCUE pass existed (item 3b of the same
-slice), a document whose two extraction passes named the same measurement
-differently (the real FRAX case: "FRAX 10-year probability of hip
-fracture" vs. a sentence-fragment "10-year probability of hip fracture
-is") could leave BOTH readings stranded as separate `single_pass` PENDING
-rows - twins of each other that reconcile.py never had a chance to pair.
-`adoc labs-dedupe-twins` (`sweep_twins` below) is the one-time/periodic
-maintenance pass that finds and auto-rejects the duplicate half of such a
-pair among rows already ingested before the RESCUE pass existed.
+Before `ingest/reconcile.py`'s RESCUE pass existed, a document whose two
+extraction passes named the same measurement differently (e.g. "FRAX
+10-year probability of hip fracture" vs. a sentence-fragment "10-year
+probability of hip fracture is") could leave BOTH readings stranded as
+separate `single_pass` PENDING rows - twins of each other that
+reconcile.py never had a chance to pair. `adoc labs-dedupe-twins`
+(`sweep_twins` below) is the one-time/periodic maintenance pass that finds
+and auto-rejects the duplicate half of such a pair among rows already
+ingested before the RESCUE pass existed.
 
 For each still-PENDING row whose `reasons` include `single_pass`:
 
@@ -30,8 +29,16 @@ For each still-PENDING row whose `reasons` include `single_pass`:
         measurement, given their shared value/page context.
   3. a twin (rule- or LLM-confirmed) is rejected via
      `LabsDb.reject_row_as_twin`, with an audit note recording which
-     method decided it. A non-twin, or a row with no candidate at all, is
-     left completely untouched.
+     method decided it. A `method="llm"` rejection also carries the
+     resolved `model_id` (`LlmResult.model_id` from the `LlmClient.
+     complete` call that decided it) and `TWIN_CLASSIFY_PROMPT_VERSION`
+     (CLAUDE.md: every persisted LLM-derived artifact carries provenance -
+     without this, rebinding the `classifier` role or bumping this
+     module's prompt version leaves PLAN.md's staleness/re-evaluation
+     sweep with no way to tell which already-rejected rows were decided
+     under a stale binding/prompt). A `method="rule"` rejection carries
+     neither (no model was ever called). A non-twin, or a row with no
+     candidate at all, is left completely untouched.
 
 `write_sweep_summary`/`read_last_sweep_summary` persist the outcome of the
 most recent REAL (non-dry-run) sweep to `work/twin-sweep.json` under the
@@ -184,9 +191,18 @@ def names_equivalent_by_rule(name_a: str, name_b: str) -> bool:
 
 def _names_equivalent_by_llm(
     client: LlmClient, name_a: str, name_b: str, *, value: str, page: int
-) -> bool:
+) -> tuple[bool, str | None]:
     """Step 2b (module docstring): ONE `LlmClient.complete` call, only
-    reached when the rule-based check above didn't already decide it."""
+    reached when the rule-based check above didn't already decide it.
+
+    Returns `(same_measurement, model_id)` - `model_id` is `LlmResult.
+    model_id` (the resolved `models.yaml` binding actually used for this
+    call, per `reason.client.LlmClient.complete`), threaded back so the
+    caller can stamp it into `LabsDb.reject_row_as_twin`'s provenance
+    (CLAUDE.md "every persisted LLM-derived artifact carries provenance").
+    `model_id` is `None` only on an `LlmError` (no call actually
+    completed - never a twin either way).
+    """
     prompt = (
         f"Name 1: {name_a!r}\nName 2: {name_b!r}\n"
         f"Both were read as value {value!r} on/near page {page} of the same document."
@@ -201,10 +217,10 @@ def _names_equivalent_by_llm(
     except LlmError:
         # A false negative here just leaves the row in the human queue -
         # never treat an LLM failure as a twin.
-        return False
+        return False, None
     parsed = result.parsed
     assert isinstance(parsed, _SameMeasurement)  # schema= guarantees this
-    return parsed.same_measurement
+    return parsed.same_measurement, result.model_id
 
 
 def sweep_twins(db: LabsDb, client: LlmClient, *, dry_run: bool = False) -> TwinSweepReport:
@@ -234,18 +250,21 @@ def sweep_twins(db: LabsDb, client: LlmClient, *, dry_run: bool = False) -> Twin
         if candidate is None:
             continue
 
+        model_id: str | None = None
         if names_equivalent_by_rule(row.name_raw, candidate.name_raw):
             method: str = "rule"
-        elif _names_equivalent_by_llm(
-            client,
-            row.name_raw,
-            candidate.name_raw,
-            value=str(row.value if row.value is not None else row.value_text),
-            page=row.source_page or 0,
-        ):
-            method = "llm"
         else:
-            continue
+            llm_same, model_id = _names_equivalent_by_llm(
+                client,
+                row.name_raw,
+                candidate.name_raw,
+                value=str(row.value if row.value is not None else row.value_text),
+                page=row.source_page or 0,
+            )
+            if llm_same:
+                method = "llm"
+            else:
+                continue
 
         assert row.id is not None  # rows read back from the db always have one
         assert candidate.id is not None
@@ -256,7 +275,13 @@ def sweep_twins(db: LabsDb, client: LlmClient, *, dry_run: bool = False) -> Twin
         else:
             report.rejected_llm += 1
         if not dry_run:
-            db.reject_row_as_twin(row.id, twin_of=candidate.id, method=method)  # type: ignore[arg-type]
+            db.reject_row_as_twin(
+                row.id,
+                twin_of=candidate.id,
+                method=method,  # type: ignore[arg-type]
+                model_id=model_id,
+                prompt_template_version=TWIN_CLASSIFY_PROMPT_VERSION if method == "llm" else None,
+            )
 
     _retro_pair_pending_twins(db, client, report, dry_run=dry_run)
     return report
@@ -323,18 +348,21 @@ def _retro_pair_pending_twins(
                 if not _specimen_compatible(row_a.specimen, row_b.specimen):
                     continue
 
+                model_id: str | None = None
                 if names_equivalent_by_rule(row_a.name_raw, row_b.name_raw):
                     method: str = "rule"
-                elif _names_equivalent_by_llm(
-                    client,
-                    row_a.name_raw,
-                    row_b.name_raw,
-                    value=str(row_a.value if row_a.value is not None else row_a.value_text),
-                    page=row_a.source_page,
-                ):
-                    method = "llm"
                 else:
-                    continue
+                    llm_same, model_id = _names_equivalent_by_llm(
+                        client,
+                        row_a.name_raw,
+                        row_b.name_raw,
+                        value=str(row_a.value if row_a.value is not None else row_a.value_text),
+                        page=row_a.source_page,
+                    )
+                    if llm_same:
+                        method = "llm"
+                    else:
+                        continue
 
                 longer, shorter = (
                     (row_a, row_b)
@@ -352,7 +380,15 @@ def _retro_pair_pending_twins(
                 else:
                     report.rejected_llm += 1
                 if not dry_run:
-                    db.reject_row_as_twin(shorter.id, twin_of=longer.id, method=method)  # type: ignore[arg-type]
+                    db.reject_row_as_twin(
+                        shorter.id,
+                        twin_of=longer.id,
+                        method=method,  # type: ignore[arg-type]
+                        model_id=model_id,
+                        prompt_template_version=(
+                            TWIN_CLASSIFY_PROMPT_VERSION if method == "llm" else None
+                        ),
+                    )
                     db.mark_single_pass_as_name_variant(longer.id, other_name=shorter.name_raw)
                 used.add(shorter.id)
                 used.add(longer.id)

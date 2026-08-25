@@ -23,8 +23,12 @@ exists, `init` otherwise) — kept in Python rather than shell so the
 decision logic is unit-testable. `backfill-doc-text` extracts and stores
 plain text for already-ingested, non-genomic documents that don't have it
 yet (`ingest.doctext.backfill_document_text`,
-docs/adr/0015-document-text-corpus.md) — no LLM calls, idempotent. No
-stubs remain.
+docs/adr/0015-document-text-corpus.md) — no LLM calls, idempotent.
+`identifiers show|add|remove` inspects/populates `case/identifiers.yaml`
+(`privacy.py`), the direct-identifier list every outbound model call is
+scrubbed against (docs/adr/0017-default-scrubber-and-identifiers-file.md);
+`init` scaffolds an empty template of this file automatically. No stubs
+remain.
 """
 
 from __future__ import annotations
@@ -63,7 +67,15 @@ from adoc.labs.recanonicalize import recanonicalize_rows
 from adoc.labs.reclassify import reclassify_pending
 from adoc.labs.specimen import infer_unknown_specimens
 from adoc.labs.twins import sweep_twins, write_sweep_summary
-from adoc.privacy import Scrubber
+from adoc.privacy import (
+    IDENTIFIER_FIELDS,
+    IDENTIFIERS_RELPATH,
+    PatientIdentifiers,
+    Scrubber,
+    add_identifier,
+    remove_identifier,
+    scaffold_identifiers_file,
+)
 from adoc.reason.client import LlmClient, LlmError
 from adoc.reason.review import run_weekly_review
 from adoc.reason.stages import render_new_evidence_note, run_post_ingest_dag
@@ -83,7 +95,8 @@ def _cmd_init(_args: argparse.Namespace) -> int:
     print(f"init: loaded {len(bindings)} model role bindings from {settings.models_file}")
 
     try:
-        already_initialized = DataRepo(settings.data_dir).is_initialized
+        data_repo = DataRepo(settings.data_dir)
+        already_initialized = data_repo.is_initialized
         DataRepo.init_at(settings.data_dir)
     except OSError as exc:
         print(f"init: configuration error: cannot create data dir: {exc}", file=sys.stderr)
@@ -92,6 +105,21 @@ def _cmd_init(_args: argparse.Namespace) -> int:
         print(f"init: data repo already initialized at {settings.data_dir}")
     else:
         print(f"init: initialized data repo at {settings.data_dir}")
+
+    identifiers_path = settings.data_dir / IDENTIFIERS_RELPATH
+    if scaffold_identifiers_file(identifiers_path):
+        data_repo.commit(
+            "chore: scaffold case/identifiers.yaml privacy scrub template",
+            paths=[str(IDENTIFIERS_RELPATH)],
+        )
+        print(
+            f"init: scaffolded identifier scrub template at {identifiers_path} - populate it "
+            'with `adoc identifiers add name "Patient Name"` (and dob/address/phone/email) '
+            "before running `serve`/`onboard`/`ingest` - until then the patient's name/DOB/"
+            "address are NOT scrubbed from outbound model calls"
+        )
+    else:
+        print(f"init: identifiers file already present at {identifiers_path}")
     return 0
 
 
@@ -159,6 +187,76 @@ def _cmd_user_remove(args: argparse.Namespace) -> int:
     return 1
 
 
+def _identifiers_path(settings: Settings) -> Path:
+    return settings.data_dir / IDENTIFIERS_RELPATH
+
+
+def _cmd_identifiers_show(_args: argparse.Namespace) -> int:
+    try:
+        settings = Settings()
+    except Exception as exc:  # noqa: BLE001 - surface any config error to the user
+        print(f"identifiers show: configuration error: {exc}", file=sys.stderr)
+        return 1
+
+    path = _identifiers_path(settings)
+    if not path.exists():
+        print(f"identifiers show: no identifiers file at {path} - run `adoc init` to scaffold one")
+        return 0
+
+    identifiers = PatientIdentifiers.load(path)
+    print(f"identifiers show: {path}")
+    print(f"  names: {identifiers.names}")
+    print(f"  dob: {identifiers.dob}")
+    print(f"  mrn: {identifiers.mrn}")
+    print(f"  address_fragments: {identifiers.address_fragments}")
+    print(f"  phone: {identifiers.phone}")
+    print(f"  email: {identifiers.email}")
+    if not identifiers.names:
+        print(
+            "identifiers show: WARNING: no 'names' entries - the patient's name will NOT be "
+            "scrubbed from outbound model calls",
+            file=sys.stderr,
+        )
+    return 0
+
+
+def _cmd_identifiers_add(args: argparse.Namespace) -> int:
+    try:
+        settings = Settings()
+    except Exception as exc:  # noqa: BLE001 - surface any config error to the user
+        print(f"identifiers add: configuration error: {exc}", file=sys.stderr)
+        return 1
+
+    path = _identifiers_path(settings)
+    try:
+        add_identifier(path, args.field, args.value)
+    except ValueError as exc:
+        print(f"identifiers add: {exc}", file=sys.stderr)
+        return 1
+    print(f"identifiers add: added {args.field}={args.value!r} to {path}")
+    return 0
+
+
+def _cmd_identifiers_remove(args: argparse.Namespace) -> int:
+    try:
+        settings = Settings()
+    except Exception as exc:  # noqa: BLE001 - surface any config error to the user
+        print(f"identifiers remove: configuration error: {exc}", file=sys.stderr)
+        return 1
+
+    path = _identifiers_path(settings)
+    try:
+        _identifiers, removed = remove_identifier(path, args.field, args.value)
+    except ValueError as exc:
+        print(f"identifiers remove: {exc}", file=sys.stderr)
+        return 1
+    if removed:
+        print(f"identifiers remove: removed {args.field}={args.value!r} from {path}")
+        return 0
+    print(f"identifiers remove: no matching {args.field}={args.value!r} in {path}", file=sys.stderr)
+    return 1
+
+
 def _cmd_onboard(args: argparse.Namespace) -> int:
     """Default: the conversational onboarding engine (docs/adr/0011). Pass
     `--legacy-wizard` to run the original state-machine wizard loop instead
@@ -181,6 +279,8 @@ def _cmd_onboard(args: argparse.Namespace) -> int:
     except Exception as exc:  # noqa: BLE001 - surface any config error to the user
         print(f"onboard: configuration error: {exc}", file=sys.stderr)
         return 1
+    if client.privacy_warning:
+        print(f"onboard: WARNING: {client.privacy_warning}", file=sys.stderr)
 
     # `input`/`print` are looked up here (not bound as a default parameter
     # value at import time) so tests can monkeypatch `builtins.input`.
@@ -197,11 +297,20 @@ def _cmd_onboard(args: argparse.Namespace) -> int:
 
 def _build_llm_client(settings: Settings) -> LlmClient:
     """Real wiring for `LlmClient`: bindings from `models.yaml`, scrubbing,
-    and an audit log under the data repo's (gitignored) `logs/` dir.
+    and an audit log under the data repo's (gitignored) `logs/` dir. Passing
+    `scrubber` explicitly here is redundant with `from_settings`'s own
+    default (same file) but kept for clarity at this call site; if the
+    identifiers file is missing/has no names configured, that is printed
+    loudly rather than left silent — every caller of this function
+    (`ingest`/`backfill`, `labs-dedupe-twins`, `review`) gets the warning
+    for free.
     """
-    scrubber = Scrubber.from_file(settings.data_dir / "case" / "identifiers.yaml")
+    scrubber = Scrubber.from_file(settings.data_dir / IDENTIFIERS_RELPATH)
     audit_log_path = settings.data_dir / "logs" / "api-audit.jsonl"
-    return LlmClient.from_settings(settings, scrubber=scrubber, audit_log_path=audit_log_path)
+    client = LlmClient.from_settings(settings, scrubber=scrubber, audit_log_path=audit_log_path)
+    if client.privacy_warning:
+        print(f"adoc: WARNING: {client.privacy_warning}", file=sys.stderr)
+    return client
 
 
 def _build_vision_client(llm_client: LlmClient) -> VisionClient:
@@ -442,8 +551,8 @@ def _cmd_labs_infer_specimen(_args: argparse.Namespace) -> int:
 
 
 def _cmd_labs_dedupe_twins(args: argparse.Namespace) -> int:
-    """Queue-ergonomics slice item 4: sweep legacy single-pass PENDING rows
-    for a duplicate ("twin") already-resolved row in the same document and
+    """Sweep legacy single-pass PENDING rows for a duplicate ("twin")
+    already-resolved row in the same document and
     auto-reject the duplicate half (`labs/twins.py`'s `sweep_twins`).
     `--dry-run` computes and reports the same thing without mutating
     anything - no rejects, no export, no commit, no summary write.
@@ -993,6 +1102,35 @@ def build_parser() -> argparse.ArgumentParser:
     user_remove_parser = user_subparsers.add_parser("remove", help="remove a web login user")
     user_remove_parser.add_argument("username")
     user_remove_parser.set_defaults(func=_cmd_user_remove)
+
+    identifiers_parser = subparsers.add_parser(
+        "identifiers",
+        help=(
+            "inspect/populate case/identifiers.yaml - the direct identifiers "
+            "(name/dob/mrn/address/phone/email) scrubbed from every outbound LLM call"
+        ),
+    )
+    identifiers_subparsers = identifiers_parser.add_subparsers(
+        dest="identifiers_command", required=True
+    )
+    identifiers_show_parser = identifiers_subparsers.add_parser(
+        "show", help="print the current identifiers file"
+    )
+    identifiers_show_parser.set_defaults(func=_cmd_identifiers_show)
+    identifiers_add_parser = identifiers_subparsers.add_parser(
+        "add", help="add an identifier value"
+    )
+    identifiers_add_parser.add_argument("field", choices=list(IDENTIFIER_FIELDS))
+    identifiers_add_parser.add_argument("value")
+    identifiers_add_parser.set_defaults(func=_cmd_identifiers_add)
+    identifiers_remove_parser = identifiers_subparsers.add_parser(
+        "remove", help="remove an identifier value"
+    )
+    identifiers_remove_parser.add_argument("field", choices=list(IDENTIFIER_FIELDS))
+    identifiers_remove_parser.add_argument(
+        "value", nargs="?", default=None, help="value to remove (omit to clear 'dob')"
+    )
+    identifiers_remove_parser.set_defaults(func=_cmd_identifiers_remove)
 
     return parser
 

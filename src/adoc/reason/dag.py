@@ -274,9 +274,9 @@ def forbid_context_key(key: str) -> Contract:
     and passed under a different context key, such as
     `"blind_context_pack"`) sails past this check untouched, because that
     payload's ledger content was never a `ctx["ledger"]` entry in the first
-    place (this was a real gap found in `reason.review`'s blind-panel
-    wiring — see `edge_payload_lacks_section` below, which is the
-    content-aware check for that case).
+    place — see `edge_payload_lacks_section` below, which is the
+    content-aware check for that case (needed because `reason.review`'s
+    blind-panel wiring passes ledger content this way).
 
     Kept for this original, narrower purpose (and to avoid weakening its
     existing tests): a defense-in-depth check that nothing ever smuggles a
@@ -297,14 +297,14 @@ def edge_payload_lacks_section(section_key: str) -> Contract:
     `forbid_context_key` for nodes whose blindness must be verified against
     what they were actually handed, not against the run-context dict.
 
-    Motivating bug (ADR 0002 amendment): the weekly review's blind-panel
-    nodes are wired with `depends_on="blind_context_pack"`, so their real
-    input is a `ContextPack`, never a `ctx["ledger"]` entry.
-    `forbid_context_key("ledger")` therefore had nothing to catch even in a
-    genuine regression where the pack itself was built with
-    `include_ledger=True` — the ledger section would be sitting right in
-    the pack the model reads, and the old contract would still pass. This
-    contract inspects the validated payload directly: for any `value`
+    Needed because the weekly review's blind-panel nodes are wired with
+    `depends_on="blind_context_pack"`, so their real input is a
+    `ContextPack`, never a `ctx["ledger"]` entry (ADR 0002 amendment).
+    `forbid_context_key("ledger")` alone has nothing to catch even if the
+    pack itself were built with `include_ledger=True` — the ledger section
+    would sit right in the pack the model reads, and that contract would
+    still pass. This contract inspects the validated payload directly: for
+    any `value`
     exposing a `.keys` collection (e.g. `reason.context.ContextPack.keys`),
     it fails when `section_key` is present in it. A payload with no `.keys`
     attribute (most `Node` input models) is not this contract's concern and

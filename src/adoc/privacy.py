@@ -1,4 +1,4 @@
-"""Deterministic PHI scrubbing applied to all outbound text.
+"""Deterministic PHI scrubbing applied to all outbound TEXT.
 
 Every string sent to a model provider (system prompt, chat messages) passes
 through a `Scrubber` first (see `reason/client.py`). Scrubbing is plain,
@@ -8,14 +8,31 @@ identifiers (name/DOB/MRN/address/phone/email) it can positively match,
 never clinical values (lab names, values, units, symptoms, diagnoses).
 
 Two identifier sources feed the same `Scrubber`:
-- `PatientIdentifiers` — literal values specific to this patient, optionally
-  loaded from a file in the (gitignored, no-remote) data repo. These are
-  matched as whole-word/whole-phrase, case-insensitive literals so a name
-  can never match as a substring inside an unrelated word.
+- `PatientIdentifiers` — literal values specific to this patient, loaded
+  from `case/identifiers.yaml` in the (gitignored, no-remote) data repo —
+  see `IDENTIFIERS_RELPATH`/`scaffold_identifiers_file`/`add_identifier`/
+  `remove_identifier` below, and `adoc identifiers show|add|remove`. These
+  are matched as whole-word/whole-phrase, case-insensitive literals so a
+  name can never match as a substring inside an unrelated word.
 - A fixed set of regex classes (SSN, phone, email, MRN-like) that catch
   identifiers of a recognizable *shape* even when they aren't in the
   `PatientIdentifiers` list (e.g. a phone number appearing in a scanned
   report's letterhead).
+
+`LlmClient.from_settings` (`reason/client.py`) builds a real `Scrubber` from
+this file by default — a caller must explicitly opt into `Scrubber.noop()`
+to skip scrubbing (tests/dev only), rather than getting it by omission.
+
+**Scope boundary — text only, not images.** This module scrubs *text*
+content (system prompts, chat messages). It has no effect on the binary
+document/page-image path (`ingest/vision.py`'s `VisionClient`, which sends
+PDF blocks and rendered page PNGs to a vision-capable model): a scanned lab
+report's letterhead shows the patient's name/DOB/address as *pixels*, which
+no text regex or literal match can touch. This is a deliberate, accepted
+limitation (docs/adr/0017-default-scrubber-and-identifiers-file.md) — OCR-
+then-redact was considered and rejected as fragile and liable to damage the
+very values the pipeline exists to extract — not an oversight, and nothing
+in this module should be assumed to cover that path.
 """
 
 from __future__ import annotations
@@ -130,21 +147,59 @@ class Scrubber:
     """
 
     def __init__(
-        self, identifiers: PatientIdentifiers | None = None, *, enabled: bool = True
+        self,
+        identifiers: PatientIdentifiers | None = None,
+        *,
+        enabled: bool = True,
+        source_path: Path | None = None,
     ) -> None:
         self._enabled = enabled
         self._identifiers = identifiers if identifiers is not None else PatientIdentifiers.empty()
         self._literal_patterns = self._build_literal_patterns(self._identifiers)
+        # Tracked only so `coverage_warning` can name the exact file to
+        # populate; `None` for a `Scrubber` built directly from in-memory
+        # `PatientIdentifiers` (no file involved, e.g. `noop()` or a caller
+        # constructing identifiers programmatically) rather than via
+        # `from_file`.
+        self._source_path = source_path
 
     @classmethod
     def from_file(cls, path: Path | None) -> Scrubber:
         """Build a `Scrubber` from an optional data-repo identifiers file."""
-        return cls(PatientIdentifiers.load(path))
+        return cls(PatientIdentifiers.load(path), source_path=path)
 
     @classmethod
     def noop(cls) -> Scrubber:
-        """A `Scrubber` that never modifies text (for tests/dev only)."""
+        """A `Scrubber` that never modifies text (for tests/dev only) — an
+        explicit, obvious opt-out. Never the default for a real outbound
+        call path; see `reason/client.py`'s `LlmClient.from_settings`."""
         return cls(PatientIdentifiers.empty(), enabled=False)
+
+    @property
+    def coverage_warning(self) -> str | None:
+        """`None` if this scrubber is either an explicit no-op (`noop()` —
+        deliberate, tests/dev only) or was built `from_file` against a file
+        that exists and has at least one `names` entry configured.
+        Otherwise, a human-readable warning naming the exact file to
+        create/populate — for a caller about to talk to an external
+        provider to surface loudly rather than silently degrade (see
+        `cli.py`/`web/app.py`)."""
+        if not self._enabled or self._source_path is None:
+            return None
+        if not self._source_path.exists():
+            return (
+                f"the identifiers file {self._source_path} does not exist - the patient's "
+                "name/DOB/address will NOT be scrubbed from outbound model calls. Create it "
+                'with `adoc identifiers add name "Patient Name"` (`adoc init` scaffolds an '
+                "empty template automatically)."
+            )
+        if not self._identifiers.names:
+            return (
+                f"{self._source_path} has no 'names' entries - the patient's name will NOT "
+                "be scrubbed from outbound model calls. Run `adoc identifiers add name "
+                '"Patient Name"` to add one (see `adoc identifiers show`).'
+            )
+        return None
 
     @staticmethod
     def _build_literal_patterns(identifiers: PatientIdentifiers) -> tuple[_LiteralPattern, ...]:
@@ -188,3 +243,126 @@ class Scrubber:
 
     def __call__(self, text: str) -> tuple[str, int]:
         return self.scrub(text)
+
+
+# --------------------------------------------------------------------------
+# `case/identifiers.yaml` scaffolding + CLI-facing read/write helpers.
+#
+# `adoc init` (cli.py) calls `scaffold_identifiers_file` so a fresh data repo
+# always has this file (even though it starts empty — `Scrubber.
+# coverage_warning` is what makes the empty-until-populated state loud
+# rather than silent). `adoc identifiers show|add|remove` (cli.py) call the
+# rest so the owner is never hand-editing YAML blind.
+# --------------------------------------------------------------------------
+
+IDENTIFIERS_RELPATH = Path("case") / "identifiers.yaml"
+"""Location of the per-patient identifiers file inside the data repo,
+relative to `Settings.data_dir`."""
+
+IDENTIFIERS_TEMPLATE = """\
+# case/identifiers.yaml -- direct identifiers for THIS patient.
+#
+# Every value listed here is stripped from text sent to an external LLM
+# provider (Anthropic/OpenAI/Featherless) before the request leaves the
+# process -- see privacy.py and reason/client.py. Matching is whole-word/
+# whole-phrase and case-insensitive, so list every form an identifier might
+# appear in: full legal name, nicknames, a maiden name, "Last, First", etc.
+#
+# NOTE: this covers TEXT only. Scanned document images/PDFs sent for vision
+# extraction (ingest/vision.py) are NOT covered -- the identifiers printed
+# on the page are pixels, not text. See privacy.py's module docstring.
+#
+# This file lives only in the data repo (ADOC_DATA_DIR, no git remote) --
+# never copy real values into the a-doc source repo or its test fixtures.
+#
+# Edit by hand, or use:
+#   adoc identifiers show
+#   adoc identifiers add    <name|dob|mrn|address|phone|email> <value>
+#   adoc identifiers remove <name|dob|mrn|address|phone|email> <value>
+#
+# This file starts EMPTY. Until at least one name is added, the patient's
+# name/DOB/address are NOT scrubbed from outbound model calls -- `adoc`
+# warns loudly about this on every run until it's populated.
+
+names: []               # e.g. ["Jane Q. Public", "Jane Public", "Janie"]
+dob: null                # e.g. "1985-03-14"
+mrn: []                  # e.g. ["123456", "MRN 123456"]
+address_fragments: []    # e.g. ["123 Main St", "Springfield, IL 62704"]
+phone: []                # e.g. ["217-555-0134"]
+email: []                # e.g. ["jane.public@example.com"]
+"""
+
+
+def scaffold_identifiers_file(path: Path) -> bool:
+    """Write the commented `IDENTIFIERS_TEMPLATE` at `path` if nothing is
+    there yet. Returns `True` if it created the file, `False` if one
+    already existed there (left untouched either way — this never
+    overwrites real values)."""
+    if path.exists():
+        return False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(IDENTIFIERS_TEMPLATE, encoding="utf-8")
+    return True
+
+
+_LIST_FIELDS: dict[str, str] = {
+    "name": "names",
+    "mrn": "mrn",
+    "address": "address_fragments",
+    "phone": "phone",
+    "email": "email",
+}
+IDENTIFIER_FIELDS: tuple[str, ...] = (*sorted(_LIST_FIELDS), "dob")
+"""Every field name `adoc identifiers add|remove` accepts."""
+
+
+def _save_identifiers_file(path: Path, identifiers: PatientIdentifiers) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    yaml = YAML(typ="safe")
+    yaml.default_flow_style = False
+    with path.open("w", encoding="utf-8") as fh:
+        yaml.dump(identifiers.model_dump(mode="json"), fh)
+
+
+def _unknown_field_error(field: str) -> ValueError:
+    return ValueError(f"unknown identifiers field {field!r} (expected one of {IDENTIFIER_FIELDS})")
+
+
+def add_identifier(path: Path, field: str, value: str) -> PatientIdentifiers:
+    """Add `value` to `field` (one of `IDENTIFIER_FIELDS`) in the
+    identifiers file at `path`, creating the file first if needed. `dob` is
+    a scalar (this replaces any existing value); every other field is a
+    list (adding a value already present is a no-op). Raises `ValueError`
+    for an unknown field."""
+    identifiers = PatientIdentifiers.load(path)
+    if field == "dob":
+        identifiers.dob = value
+    elif field in _LIST_FIELDS:
+        values = getattr(identifiers, _LIST_FIELDS[field])
+        if value not in values:
+            values.append(value)
+    else:
+        raise _unknown_field_error(field)
+    _save_identifiers_file(path, identifiers)
+    return identifiers
+
+
+def remove_identifier(path: Path, field: str, value: str | None) -> tuple[PatientIdentifiers, bool]:
+    """Remove `value` from `field` in the identifiers file at `path`.
+    Returns `(identifiers, removed)`. `dob` ignores `value` and clears the
+    field if it was set. Raises `ValueError` for an unknown field."""
+    identifiers = PatientIdentifiers.load(path)
+    removed = False
+    if field == "dob":
+        removed = identifiers.dob is not None
+        identifiers.dob = None
+    elif field in _LIST_FIELDS:
+        values = getattr(identifiers, _LIST_FIELDS[field])
+        if value is not None and value in values:
+            values.remove(value)
+            removed = True
+    else:
+        raise _unknown_field_error(field)
+    if removed:
+        _save_identifiers_file(path, identifiers)
+    return identifiers, removed

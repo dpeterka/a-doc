@@ -57,11 +57,14 @@ from adoc.reason.safety import RedFlagResult, treatment_gate
 from adoc.reason.verify import (
     DefaultSourceTextResolver,
     SourceTextResolver,
+    VerificationReport,
     build_composer_number_retry_feedback,
     build_entailment_retry_feedback,
     check_composer_numbers,
     claims_from_ops,
+    log_stripped_claims,
     log_verification_report,
+    strip_not_entailed_ops,
     verify_claims,
 )
 
@@ -197,16 +200,30 @@ def ledger_maintainer_stage(
        DIFFERENT model family) judges whether each claim's cited source
        TEXT actually supports it; a `not_entailed` claim retries with the
        verifier's objection fed back.
-    Both are quality loops, not the enforcement point — the
-    `citation_check`/`entailment_check` contracts on this node
-    (`build_diagnostic_dag`) still re-check whatever this function returns
-    and fail the run if either is still bad."""
+    The citation loop is still a pure quality loop, not the enforcement
+    point — `citation_check_ledger_maintainer` re-checks whatever this
+    function returns and fails the run if it is still bad.
+
+    The entailment loop is different (ADR 0016 revised, 2026-08-25, "strip,
+    don't reject"): once the retry budget is spent, a still-`not_entailed`
+    claim is no longer fed forward to fail the whole diff. Unless EVERY
+    claim in the diff is `not_entailed` (`VerificationReport.
+    all_not_entailed` — nothing survives, the one case treated as the
+    pipeline having produced garbage rather than an imprecise claim), the
+    offending evidence item(s) are stripped from `diff.ops` right here,
+    before the diff is returned, and logged
+    (`reason.verify.log_stripped_claims`) — the turn proceeds on the
+    remaining, verified evidence. `entailment_check_ledger_maintainer`
+    still independently re-checks whatever this function returns and
+    raises a `ContractViolation` in the all-`not_entailed` case."""
     prompt = load_prompt("ledger_maintainer")
     user_content = f"{ctx.render()}\n\n## Patient Message\n\n{patient_message}\n"
     messages = [Message(role="user", content=user_content)]
 
     diff: LedgerDiff | None = None
+    verification_report: VerificationReport | None = None
     for _attempt in range(_CITATION_RETRY_ATTEMPTS):
+        verification_report = None
         result = client.complete(
             "primary_reasoner",
             system=prompt.text,
@@ -246,6 +263,14 @@ def ledger_maintainer_stage(
         break
 
     assert diff is not None
+    if (
+        verification_report is not None
+        and verification_report.failing
+        and not verification_report.all_not_entailed
+    ):
+        stripped_ops, removed = strip_not_entailed_ops(diff.ops, verification_report)
+        log_stripped_claims(repo, removed, dag_node="ledger_maintainer")
+        diff = diff.model_copy(update={"ops": stripped_ops})
     return diff
 
 
@@ -266,17 +291,23 @@ def challenger_stage(
     The Challenger's own `additional_ops` can carry evidence (e.g. a
     `record_challenge`-adjacent `add_hypothesis`/`add_evidence`), so it gets
     the same citation-then-entailment retry loop as `ledger_maintainer_
-    stage` — see that function's docstring. On a clean verdict (no evidence
-    in `additional_ops`, the common case) this never spends a second
-    completion, and never calls the entailment verifier at all (nothing to
-    verify)."""
+    stage` — see that function's docstring for the shape, but NOT its
+    all-`not_entailed`-is-a-hard-failure exception: any still-`not_entailed`
+    claim left after the retry is UNCONDITIONALLY stripped from
+    `verdict.additional_ops` here (see the inline comment where that
+    stripping happens for why this one differs from the Ledger-Maintainer's
+    diff). On a clean verdict (no evidence in `additional_ops`, the common
+    case) this never spends a second completion, and never calls the
+    entailment verifier at all (nothing to verify)."""
     prompt = load_prompt("challenger")
     diff_json = proposed_diff.model_dump_json(indent=2)
     user_content = f"{ctx.render()}\n\n## Proposed Ledger Diff\n\n```json\n{diff_json}\n```\n"
     messages = [Message(role="user", content=user_content)]
 
     verdict: ChallengerVerdict | None = None
+    verification_report: VerificationReport | None = None
     for _attempt in range(_CITATION_RETRY_ATTEMPTS):
+        verification_report = None
         result = client.complete(
             "challenger",
             system=prompt.text,
@@ -314,6 +345,23 @@ def challenger_stage(
         break
 
     assert verdict is not None
+    if verification_report is not None and verification_report.failing:
+        # Unconditional, unlike `ledger_maintainer_stage`'s strip: the
+        # Ledger-Maintainer's diff IS the primary artifact its own
+        # `entailment_check_ledger_maintainer` postcondition checks 1:1, so
+        # leaving an all-`not_entailed` diff unstripped there is exactly
+        # what makes that postcondition catch it. `additional_ops` has no
+        # such 1:1 postcondition of its own — the closest equivalent,
+        # `entailment_check_apply`, checks it MERGED with the (already
+        # resolved) diff, so a not_entailed claim confined to this small
+        # `additional_ops` set would be "all failing" from THIS function's
+        # narrow vantage point while the merged set is not, and never reach
+        # the contract that would otherwise catch it. Always stripping here
+        # closes that gap: a Challenger-introduced misrepresentation is
+        # simply dropped, never a reason to fail the whole verdict.
+        stripped_ops, removed = strip_not_entailed_ops(verdict.additional_ops, verification_report)
+        log_stripped_claims(repo, removed, dag_node="challenger")
+        verdict = verdict.model_copy(update={"additional_ops": stripped_ops})
     return verdict
 
 
@@ -565,12 +613,32 @@ def entailment_check_contract(
 ) -> Contract:
     """A DAG contract (pre- or postcondition, per `ops_extractor`) that runs
     `reason.verify.verify_claims` over whatever `ops_extractor` pulls out of
-    `(ctx, value)` and fails closed on any `not_entailed` claim (PLAN.md
-    Phase 2: "non-entailed claims bounce the diff back ... with the
-    verifier's objection"). `insufficient_source` (no source TEXT available
-    yet, e.g. a `doc:` ref before the document-text corpus lands) is
-    deliberately NOT a rejection — same principle as the citation checker's
-    `unverifiable`.
+    `(ctx, value)` — an independent re-check of whatever `ledger_maintainer_
+    stage`/`challenger_stage` already did, exactly like
+    `citation_check_contract`.
+
+    ADR 0016 revised (2026-08-25, "strip, don't reject"): a `not_entailed`
+    claim on its own no longer fails this contract. By the time this
+    contract runs, `ledger_maintainer_stage` has already stripped any
+    `not_entailed` claim it found from the diff it returned
+    (`reason.verify.strip_not_entailed_ops`) — UNLESS every claim in that
+    diff was `not_entailed`, in which case it deliberately left the diff
+    untouched precisely so THIS contract's postcondition instance
+    (`entailment_check_ledger_maintainer`) catches it; `challenger_stage`
+    strips unconditionally (see its own docstring for why its
+    `additional_ops` doesn't get the same all-`not_entailed` exception). So
+    the one condition this contract still fails closed on is
+    `VerificationReport.all_not_entailed`: every claim in the ops it
+    re-checks judged `not_entailed`, nothing surviving — that is evidence
+    the pipeline produced garbage, not an imprecise claim a strip can fix.
+    In practice this fires only via the `ledger_maintainer` postcondition
+    instance; the `apply` precondition instance mostly re-confirms an
+    already-clean merged set and exists as defense-in-depth (independent of
+    whatever the stage functions already did, exactly like
+    `citation_check_apply`'s role for citations). `insufficient_source` (no
+    source TEXT available yet, e.g. a `doc:` ref before the document-text
+    corpus lands) is deliberately never treated as failing, same principle
+    as the citation checker's `unverifiable`.
 
     Wired the same way `citation_check_contract` is, immediately after it:
     as the `ledger_maintainer` node's postcondition (checks its own diff)
@@ -581,10 +649,10 @@ def entailment_check_contract(
         ops = ops_extractor(ctx, value)
         report = verify_claims(client, claims_from_ops(ops), db=db, repo=repo, resolver=resolver)
         log_verification_report(repo, report, dag_node=name)
-        if not report.failing:
+        if not report.all_not_entailed:
             return None
         details = "; ".join(f"{c.source} [{c.judgment}]: {c.rationale}" for c in report.failing)
-        return f"non-entailed evidence claim(s): {details}"
+        return f"every evidence claim was judged not_entailed (nothing survives): {details}"
 
     return Contract(name=name, predicate=predicate)
 

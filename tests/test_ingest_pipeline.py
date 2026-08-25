@@ -1111,3 +1111,178 @@ def test_duplicate_document_does_not_re_run_text_extraction(tmp_path: Path) -> N
 
     assert second.files[0].outcome == "duplicate"
     assert db.get_document_text(sha) == first_text
+
+
+# --------------------------------------------------------------------------
+# CONFIRMED bug fix (code review item 3): a failed zip MEMBER must make the
+# zip's own outcome "error" too, so it is routed to work/failed/ and logged
+# - not silently deleted from inbox/ as if fully successful.
+# --------------------------------------------------------------------------
+
+
+def test_ingest_inbox_zip_with_one_failed_member_is_itself_moved_to_failed(
+    tmp_path: Path,
+) -> None:
+    """Before this fix: `_ingest_zip` only set `zip_error` for a
+    whole-zip rejection or a hard mid-loop exception - a member that
+    failed through its own `_ingest_one` (here: an unsafe path) was only
+    ever recorded as that member's own `FileOutcome`, so `zip_error` stayed
+    `None`. `_ingest_one` then reported the ZIP itself as `"ingested"`, and
+    `_apply_inbox_hygiene` deleted it from `inbox/` - the failed member
+    never reached `work/failed/`/`failures.jsonl` at all, with no
+    operator-visible record. Now any member `outcome="error"` makes the
+    zip's own outcome `"error"`, so the zip is moved to `work/failed/` and
+    logged (naming the failed member) - while the member that DID succeed
+    is left ingested untouched.
+    """
+    repo = DataRepo.init_at(tmp_path / "data-repo")
+    db = LabsDb(tmp_path / "labs.sqlite")
+    inbox_dir = repo.root / "inbox"
+    inbox_dir.mkdir(parents=True, exist_ok=True)
+    zip_path = _make_zip(
+        inbox_dir / "bundle.zip",
+        {
+            "../../etc/passwd": b"malicious content",
+            "quest.pdf": TINY_PDF_BYTES,
+        },
+    )
+    vision = FakeVisionClient("clean_agreement.json")
+
+    report = ingest_inbox(
+        repo=repo, db=db, vision=vision, clock=_fixed_clock, renderer=fake_page_renderer(1)
+    )
+
+    # the successfully-ingested member's document stands - not rolled back.
+    assert len(db.list_documents()) == 1
+
+    # the zip itself was moved to work/failed/, NOT silently deleted.
+    assert not zip_path.exists()
+    failed_zip = repo.root / "work" / "failed" / "bundle.zip"
+    assert failed_zip.exists()
+
+    failures_log = repo.root / "work" / "failed" / "failures.jsonl"
+    lines = failures_log.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 1
+    record = json.loads(lines[0])
+    assert record["filename"] == "bundle.zip"
+    # the failure reason identifies WHICH member failed.
+    assert "bundle.zip:../../etc/passwd" in record["reason"]
+
+    zip_outcome = next(f for f in report.files if f.path == str(zip_path))
+    assert zip_outcome.outcome == "error"
+
+
+# --------------------------------------------------------------------------
+# CONFIRMED bug fix (code review item 4): an unexpected exception from one
+# file must not abort the rest of the `ingest_inbox` batch.
+# --------------------------------------------------------------------------
+
+
+def test_ingest_inbox_continues_the_batch_after_an_unexpected_exception(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Before this fix, `ingest_inbox`'s `for p in files:` loop had no
+    try/except at all - only `ArchiveError`/`VisionError`/`LlmError`/
+    `DocxExtractionError` were handled INSIDE `_ingest_one`'s own helpers;
+    anything else (e.g. a cross-process git index-lock collision on
+    `DataRepo.commit()` exhausting its retries) propagated straight out of
+    `ingest_inbox` and abandoned every remaining file in the batch. Now
+    each file is isolated: an unexpected exception routes THAT file
+    through the normal error/hygiene path (`work/failed/` +
+    `failures.jsonl`) and the loop continues to the next file.
+    """
+    import adoc.ingest.pipeline as pipeline_module
+
+    repo = DataRepo.init_at(tmp_path / "data-repo")
+    db = LabsDb(tmp_path / "labs.sqlite")
+    inbox_dir = repo.root / "inbox"
+    inbox_dir.mkdir(parents=True, exist_ok=True)
+    # `_scan_files` sorts by name - "a-exploding.pdf" is processed (and
+    # explodes) before "b-quest.pdf".
+    exploding_path = inbox_dir / "a-exploding.pdf"
+    exploding_path.write_bytes(TINY_PDF_BYTES)
+    good_path = inbox_dir / "b-quest.pdf"
+    good_path.write_bytes(TINY_PDF_BYTES)
+    vision = FakeVisionClient("clean_agreement.json")
+
+    real_ingest_one = pipeline_module._ingest_one
+
+    def _exploding_ingest_one(path: Path, **kwargs: object) -> list:  # type: ignore[type-arg]
+        if path.name == "a-exploding.pdf":
+            raise RuntimeError("boom - simulated unexpected failure")
+        return real_ingest_one(path, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(pipeline_module, "_ingest_one", _exploding_ingest_one)
+
+    report = ingest_inbox(
+        repo=repo, db=db, vision=vision, clock=_fixed_clock, renderer=fake_page_renderer(1)
+    )
+
+    assert len(report.files) == 2
+    by_path = {f.path: f for f in report.files}
+
+    exploded = by_path[str(exploding_path)]
+    assert exploded.outcome == "error"
+    assert "unexpected error" in exploded.issues[0]
+    assert "boom" in exploded.issues[0]
+
+    good = by_path[str(good_path)]
+    assert good.outcome == "ingested"
+    assert len(db.list_documents()) == 1
+
+    # the exploding file was moved to work/failed/ and logged, not left
+    # dangling in inbox/.
+    assert not exploding_path.exists()
+    assert (repo.root / "work" / "failed" / "a-exploding.pdf").exists()
+    failures_log = repo.root / "work" / "failed" / "failures.jsonl"
+    lines = failures_log.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 1
+    assert "boom" in lines[0]
+
+
+def test_commit_with_retry_retries_on_lock_contention_then_succeeds() -> None:
+    """`_commit_with_retry` retries a transient cross-process git
+    index/ref-lock collision (`OSError`) with backoff rather than raising
+    immediately."""
+    from adoc.ingest.pipeline import _commit_with_retry
+
+    calls: list[str] = []
+    sleeps: list[float] = []
+
+    class _FlakyRepo:
+        def commit(self, message: str, paths: list[str] | None = None) -> str:
+            calls.append(message)
+            if len(calls) < 3:
+                raise OSError("Lock at '.git/index.lock' could not be obtained")
+            return "deadbeef"
+
+    sha = _commit_with_retry(
+        _FlakyRepo(),  # type: ignore[arg-type]
+        "test commit",
+        paths=["x"],
+        sleep=sleeps.append,
+    )
+
+    assert sha == "deadbeef"
+    assert len(calls) == 3
+    # slept between attempt 1->2 and 2->3, never after the final success.
+    assert len(sleeps) == 2
+
+
+def test_commit_with_retry_raises_after_exhausting_attempts() -> None:
+    """Once every retry attempt is exhausted, the original exception
+    propagates (routing the file to `work/failed/` via `ingest_inbox`'s
+    own per-file try/except, not silently swallowed here)."""
+    from adoc.ingest.pipeline import _commit_with_retry
+
+    class _AlwaysLockedRepo:
+        def commit(self, message: str, paths: list[str] | None = None) -> str:
+            raise OSError("Lock at '.git/index.lock' could not be obtained")
+
+    with pytest.raises(OSError, match="Lock at"):
+        _commit_with_retry(
+            _AlwaysLockedRepo(),  # type: ignore[arg-type]
+            "test commit",
+            paths=["x"],
+            sleep=lambda _seconds: None,
+        )

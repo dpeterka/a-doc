@@ -864,9 +864,12 @@ def test_not_entailed_claim_triggers_retry_and_second_pass_applies(
 def test_still_not_entailed_after_retry_raises_contract_violation_ledger_unchanged(
     repo: DataRepo, db: LabsDb
 ) -> None:
-    """Acceptance: a claim still judged `not_entailed` after the one retry
-    raises a `ContractViolation` naming the objection, and the on-disk
-    ledger is left completely unchanged (`apply` never runs)."""
+    """Acceptance: when EVERY claim in the diff is still judged
+    `not_entailed` after the one retry (`VerificationReport.
+    all_not_entailed` - here, the diff's one and only evidence claim),
+    that is the "nothing survives" case (ADR 0016 revised) and still
+    raises a `ContractViolation` naming the objection, with the on-disk
+    ledger left completely unchanged (`apply` never runs)."""
     calls: list[TransportRequest] = []
     diff_ops = [_sle_op("labs:ana-titer:2026-05-02"), _PE_CANT_MISS_OP]
     primary_transport = _make_primary_transport(diff_ops, _CLEAN_REPLY, calls)
@@ -889,11 +892,223 @@ def test_still_not_entailed_after_retry_raises_contract_violation_ledger_unchang
 
     assert excinfo.value.contract_name == "entailment_check_ledger_maintainer"
     assert "labs:ana-titer:2026-05-02" in excinfo.value.message
+    assert "nothing survives" in excinfo.value.message
     # Exactly the one retry - the challenger/composer are never reached.
     assert len(calls) == 2
 
     ledger_after = load_ledger(repo.root / LEDGER_RELPATH)
     assert ledger_after == ledger_before
+
+
+def _make_claim_scripted_entailment_transport(judgment_by_claim: dict[str, str]):
+    """Fake transport for role `entailment_verifier` that judges each claim
+    by its OWN text (`judgment_by_claim`), defaulting to `entailed` for any
+    claim not named — lets a test script a MIX of judgments within one
+    call, unlike `_make_scripted_entailment_transport`'s per-call uniform
+    judgment (needed to exercise "strip, don't reject": ADR 0016 revised
+    only strips a `not_entailed` claim, not the whole diff, when at least
+    one OTHER claim in the same check is not `not_entailed`)."""
+
+    def transport(request: TransportRequest) -> TransportResponse:
+        _preamble, _blank, payload_text = request.messages[-1].content.partition("\n\n")
+        pairs = json.loads(payload_text)
+        judgments = [
+            {
+                "claim_index": p["claim_index"],
+                "judgment": judgment_by_claim.get(p["claim"], "entailed"),
+                "rationale": "scripted",
+            }
+            for p in pairs
+        ]
+        return TransportResponse(
+            text="", tool_input={"judgments": judgments}, input_tokens=5, output_tokens=5
+        )
+
+    return transport
+
+
+def test_some_not_entailed_claims_are_stripped_and_turn_proceeds(
+    repo: DataRepo, db: LabsDb
+) -> None:
+    """Acceptance (ADR 0016 revised, "strip, don't reject"): when SOME but
+    not ALL evidence claims in a diff are judged `not_entailed`, the bad
+    claim is dropped from the diff and the turn proceeds with the
+    remaining, verified evidence - no `ContractViolation`."""
+    _seed_crp_row(db)
+    calls: list[TransportRequest] = []
+    op = json.loads(json.dumps(_SLE_MOST_LIKELY_OP))
+    op["hypothesis"]["evidence_for"] = [
+        {"claim": "ANA elevated", "source": "labs:ana-titer:2026-05-02", "strength": "strong"},
+        {
+            "claim": "CRP was sky-high, indicating severe inflammation",
+            "source": "labs:crp:2026-05-02",
+            "strength": "moderate",
+        },
+    ]
+    primary_transport = _make_primary_transport([op, _PE_CANT_MISS_OP], _CLEAN_REPLY, calls)
+    challenger_transport = _make_challenger_transport(
+        counter_arguments=[
+            {"hypothesis_id": "sle-01", "argument": "Anti-dsDNA has not been checked yet."}
+        ],
+        additional_ops=[],
+        calls=calls,
+    )
+    entailment_transport = _make_claim_scripted_entailment_transport(
+        {"CRP was sky-high, indicating severe inflammation": "not_entailed"}
+    )
+    client = _build_client(primary_transport, challenger_transport, entailment_transport)
+
+    result = run_diagnostic_turn(
+        client, repo, db, repo.root / LEDGER_RELPATH, "My joints ache and I'm exhausted."
+    )
+
+    assert isinstance(result, PatientReply)
+    # ledger_maintainer (mixed judgment, retries), ledger_maintainer retry
+    # (same mixed judgment again - the fake never self-corrects), challenger,
+    # composer. The strip happens AFTER the retry budget is spent, not
+    # instead of it.
+    assert len(calls) == 4
+
+    new_ledger = load_ledger(repo.root / LEDGER_RELPATH)
+    sle = next(h for h in new_ledger.hypotheses if h.id == "sle-01")
+    assert [e.claim for e in sle.evidence_for] == ["ANA elevated"]
+
+
+def test_insufficient_source_claim_survives_and_reaches_ledger(repo: DataRepo, db: LabsDb) -> None:
+    """Acceptance: an `insufficient_source` claim (source text not yet
+    resolvable, e.g. a `doc:` ref before its text is extracted) is KEPT,
+    never stripped and never blocks - unresolvable is not the same as
+    wrong, same principle as the citation checker's `unverifiable`."""
+    doc_sha = "d" * 64
+    db.upsert_document(
+        LabDocument(sha256=doc_sha, filename="scan.pdf", doc_type="imaging", page_count=1)
+    )
+    calls: list[TransportRequest] = []
+    op = json.loads(json.dumps(_SLE_MOST_LIKELY_OP))
+    op["hypothesis"]["evidence_for"] = [
+        {"claim": "ANA elevated", "source": "labs:ana-titer:2026-05-02", "strength": "strong"},
+        {
+            "claim": "Imaging findings support inflammatory changes",
+            "source": "doc:scan.pdf#p1",
+            "strength": "moderate",
+        },
+    ]
+    primary_transport = _make_primary_transport([op, _PE_CANT_MISS_OP], _CLEAN_REPLY, calls)
+    challenger_transport = _make_challenger_transport(
+        counter_arguments=[
+            {"hypothesis_id": "sle-01", "argument": "Anti-dsDNA has not been checked yet."}
+        ],
+        additional_ops=[],
+        calls=calls,
+    )
+    client = _build_client(primary_transport, challenger_transport)
+
+    result = run_diagnostic_turn(
+        client, repo, db, repo.root / LEDGER_RELPATH, "My joints ache and I'm exhausted."
+    )
+
+    assert isinstance(result, PatientReply)
+    assert len(calls) == 3  # no retry - nothing was not_entailed
+
+    new_ledger = load_ledger(repo.root / LEDGER_RELPATH)
+    sle = next(h for h in new_ledger.hypotheses if h.id == "sle-01")
+    assert {e.claim for e in sle.evidence_for} == {
+        "ANA elevated",
+        "Imaging findings support inflammatory changes",
+    }
+
+
+def test_stripping_composes_with_abstention_contract(repo: DataRepo, db: LabsDb) -> None:
+    """Acceptance: the abstention contract keeps its teeth after stripping -
+    if dropping a not_entailed claim leaves a most-likely hypothesis with NO
+    resolved supporting evidence, `most_likely_requires_resolved_evidence`
+    still fires, even though the entailment check itself does not (this
+    diff's claims are not ALL not_entailed - pe-01's claim is entailed - so
+    it strips rather than hard-fails)."""
+    calls: list[TransportRequest] = []
+    pe_op = json.loads(json.dumps(_PE_CANT_MISS_OP))
+    pe_op["hypothesis"]["evidence_for"] = [
+        {"claim": "ANA elevated", "source": "labs:ana-titer:2026-05-02", "strength": "moderate"}
+    ]
+    sle_op = json.loads(json.dumps(_SLE_MOST_LIKELY_OP))
+    sle_op["hypothesis"]["evidence_for"] = [
+        {
+            "claim": "A fabricated finding not actually in any source",
+            "source": "labs:ana-titer:2026-05-02",
+            "strength": "strong",
+        }
+    ]
+    primary_transport = _make_primary_transport([sle_op, pe_op], _CLEAN_REPLY, calls)
+    challenger_transport = _make_challenger_transport(
+        counter_arguments=[
+            {"hypothesis_id": "sle-01", "argument": "Anti-dsDNA has not been checked yet."}
+        ],
+        additional_ops=[],
+        calls=calls,
+    )
+    entailment_transport = _make_claim_scripted_entailment_transport(
+        {"A fabricated finding not actually in any source": "not_entailed"}
+    )
+    client = _build_client(primary_transport, challenger_transport, entailment_transport)
+
+    ledger_before = load_ledger(repo.root / LEDGER_RELPATH)
+
+    with pytest.raises(ContractViolation) as excinfo:
+        run_diagnostic_turn(
+            client, repo, db, repo.root / LEDGER_RELPATH, "My joints ache and I'm exhausted."
+        )
+
+    assert excinfo.value.contract_name == "most_likely_requires_resolved_evidence"
+    assert "sle-01" in excinfo.value.message
+
+    ledger_after = load_ledger(repo.root / LEDGER_RELPATH)
+    assert ledger_after == ledger_before
+
+
+def test_challenger_not_entailed_additional_evidence_is_stripped(
+    repo: DataRepo, db: LabsDb
+) -> None:
+    """Acceptance: a not_entailed claim in the Challenger's OWN
+    `additional_ops` is stripped by `challenger_stage` itself before the
+    verdict is returned - it never reaches `apply`, and (since the
+    Ledger-Maintainer's own diff still has good evidence) the turn proceeds
+    without a `ContractViolation`."""
+    calls: list[TransportRequest] = []
+    clean_diff_ops = [_SLE_MOST_LIKELY_OP, _PE_CANT_MISS_OP]
+    primary_transport = _make_primary_transport(clean_diff_ops, _CLEAN_REPLY, calls)
+    bad_additional_ops = [
+        {
+            "op": "add_evidence",
+            "id": "pe-01",
+            "for_or_against": "against",
+            "evidence": {
+                "claim": "D-dimer disproves this outright",
+                "source": "labs:ana-titer:2026-05-02",
+                "strength": "moderate",
+            },
+        }
+    ]
+    challenger_transport = _make_challenger_transport(
+        counter_arguments=[
+            {"hypothesis_id": "sle-01", "argument": "Anti-dsDNA has not been checked yet."}
+        ],
+        additional_ops=bad_additional_ops,
+        calls=calls,
+    )
+    entailment_transport = _make_claim_scripted_entailment_transport(
+        {"D-dimer disproves this outright": "not_entailed"}
+    )
+    client = _build_client(primary_transport, challenger_transport, entailment_transport)
+
+    result = run_diagnostic_turn(
+        client, repo, db, repo.root / LEDGER_RELPATH, "My joints ache and I'm exhausted."
+    )
+
+    assert isinstance(result, PatientReply)
+
+    new_ledger = load_ledger(repo.root / LEDGER_RELPATH)
+    pe = next(h for h in new_ledger.hypotheses if h.id == "pe-01")
+    assert pe.evidence_against == []
 
 
 # --- Phase 2 Composer quantitative check: retry loop + DAG contract gate -----------------------

@@ -232,6 +232,22 @@ def test_binding_index_out_of_range_raises_llm_error() -> None:
         client.complete("primary_reasoner", system="s", messages=[], binding_index=1)
 
 
+def test_bare_constructor_default_scrubber_reports_no_privacy_warning() -> None:
+    """The bare `LlmClient(bindings, providers)` constructor's `Scrubber.
+    noop()` default (no `Settings`/`data_dir` to build a real one from —
+    every non-test caller only ever wires fake transports, see client.py's
+    module docstring) is an explicit no-op, so it must not nag."""
+    provider = AnthropicProvider(
+        api_key=None,
+        transport=lambda r: TransportResponse(
+            text="ok", tool_input=None, input_tokens=1, output_tokens=1
+        ),
+    )
+    client = LlmClient(_bindings(primary_reasoner=[_binding()]), {"anthropic": provider})
+
+    assert client.privacy_warning is None
+
+
 def test_unknown_role_raises_llm_error() -> None:
     client = LlmClient({}, {})
 
@@ -292,6 +308,110 @@ def test_from_settings_injects_fake_transports_so_no_sdk_client_is_built(
     result = client.complete("primary_reasoner", system="s", messages=[])
 
     assert result.text == "fake"
+
+
+# --------------------------------------------------------------------------
+# from_settings' default scrubber (the web-app/onboard defect this fixes:
+# neither ever passed a scrubber, so LlmClient.__init__'s Scrubber.noop()
+# fallback meant every real outbound call went out unscrubbed).
+# --------------------------------------------------------------------------
+
+
+def _settings_with_models_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Settings:
+    models_file = tmp_path / "models.yaml"
+    models_file.write_text(
+        "roles:\n  primary_reasoner:\n    provider: anthropic\n    model: claude-opus-5\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("ADOC_DATA_DIR", str(tmp_path))
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    return Settings(models_file=models_file)
+
+
+def test_from_settings_scrubs_by_default_when_no_scrubber_is_passed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression test for the web-app/onboard defect: this MUST fail on
+    current `develop`, where `from_settings` never built a scrubber of its
+    own and every caller that omitted `scrubber=` (`web/app.py`, `cli.py`'s
+    onboard) silently got `Scrubber.noop()` — unscrubbed text reaching an
+    external provider."""
+    identifiers_path = tmp_path / "case" / "identifiers.yaml"
+    identifiers_path.parent.mkdir(parents=True)
+    identifiers_path.write_text(
+        "names: ['Jane Q. Public']\ndob: '1980-05-12'\naddress_fragments: ['123 Main St']\n",
+        encoding="utf-8",
+    )
+    settings = _settings_with_models_file(tmp_path, monkeypatch)
+
+    seen: dict[str, object] = {}
+
+    def fake_transport(request: TransportRequest) -> TransportResponse:
+        seen["system"] = request.system
+        seen["messages"] = list(request.messages)
+        return TransportResponse(text="ok", tool_input=None, input_tokens=1, output_tokens=1)
+
+    # No `scrubber=` passed - this is exactly what web/app.py's create_app
+    # and cli.py's onboard command do.
+    client = LlmClient.from_settings(settings, transports={"anthropic": fake_transport})
+
+    client.complete(
+        "primary_reasoner",
+        system="Patient is Jane Q. Public, DOB 1980-05-12, lives at 123 Main St.",
+        messages=[Message(role="user", content="Jane Q. Public reports fatigue. CRP 8.5 mg/L.")],
+    )
+
+    assert "Jane Q. Public" not in str(seen["system"])
+    assert "1980-05-12" not in str(seen["system"])
+    assert "123 Main St" not in str(seen["system"])
+    assert "[NAME]" in str(seen["system"])
+    assert "Jane Q. Public" not in str(seen["messages"])
+    # Clinical content is untouched.
+    assert "CRP 8.5 mg/L" in str(seen["messages"])
+    assert client.privacy_warning is None
+
+
+def test_from_settings_default_scrubber_warns_when_identifiers_file_is_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings_with_models_file(tmp_path, monkeypatch)
+
+    client = LlmClient.from_settings(
+        settings,
+        transports={
+            "anthropic": lambda r: TransportResponse(
+                text="ok", tool_input=None, input_tokens=1, output_tokens=1
+            )
+        },
+    )
+
+    assert client.privacy_warning is not None
+    assert "identifiers.yaml" in client.privacy_warning
+    # Still runs - a missing identifiers file must never block the app.
+    result = client.complete("primary_reasoner", system="s", messages=[])
+    assert result.text == "ok"
+
+
+def test_from_settings_honors_an_explicit_noop_scrubber(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A caller that deliberately wants no scrubbing must say so
+    explicitly; `from_settings` must not silently override that choice."""
+    settings = _settings_with_models_file(tmp_path, monkeypatch)
+    seen: dict[str, object] = {}
+
+    def fake_transport(request: TransportRequest) -> TransportResponse:
+        seen["system"] = request.system
+        return TransportResponse(text="ok", tool_input=None, input_tokens=1, output_tokens=1)
+
+    client = LlmClient.from_settings(
+        settings, scrubber=Scrubber.noop(), transports={"anthropic": fake_transport}
+    )
+
+    client.complete("primary_reasoner", system="Jane Q. Public was here.", messages=[])
+
+    assert seen["system"] == "Jane Q. Public was here."
+    assert client.privacy_warning is None
 
 
 def test_anthropic_default_transport_disables_sdk_retries_and_sets_a_timeout(

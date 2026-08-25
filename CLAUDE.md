@@ -8,12 +8,12 @@ a-doc is a single-patient, longitudinal medical-diagnostic assistant (Python). R
 - Test: `uv run pytest` (coverage gate enforced in CI)
 - Lint/format: `uv run ruff check --fix . && uv run ruff format .`
 - Types: `uv run mypy src`
-- App CLI: `uv run adoc <init|onboard|ingest|review|serve|backfill|backfill-doc-text|eval|user|backup|restore|bootstrap-data|labs-infer-specimen|labs-dedupe-twins|labs-reclassify|labs-recanonicalize|intake-corroborate>` (17 subcommands; `user` has `add`/`list`/`remove`)
+- App CLI: `uv run adoc <init|onboard|ingest|review|serve|backfill|backfill-doc-text|eval|user|identifiers|backup|restore|bootstrap-data|labs-infer-specimen|labs-dedupe-twins|labs-reclassify|labs-recanonicalize|intake-corroborate>` (18 subcommands; `user` has `add`/`list`/`remove`; `identifiers` has `show`/`add`/`remove`)
 
 ## Hard rules
 
 1. **PHI boundary**: patient data lives ONLY in the separate data repo (`ADOC_DATA_DIR`, no git remote). Never read real patient data into context, never commit it here, never add it to fixtures. Tests and CI use synthetic fixtures under `tests/fixtures/` only.
-2. **Safety behavior is pinned by tests**: the red-team transcript, ledger invariants, and DAG node-contract tests are required CI checks. Never weaken, skip, or delete these tests to make a change pass. Prompt template edits (`src/adoc/reason/prompts/`) are code — they require the safety suite to pass. Changing *which* property is pinned is a deliberate, owner-approved decision recorded in an ADR (see ADR 0014, which replaced the red-flag "zero API calls" contract with "the warning always reaches the patient and the model cannot suppress it") — never a silent edit to make a diff go green.
+2. **Safety behavior is pinned by tests**: the red-team transcript, ledger invariants, and DAG node-contract tests are required CI checks. Never weaken, skip, or delete these tests to make a change pass. Prompt template edits (`src/adoc/reason/prompts/`) are code — they require the safety suite to pass. Changing *which* property a test pins requires an ADR (example: ADR 0014) — never a silent edit to make a diff go green.
 3. **Stage order is enforced by code, not prompts**: diagnostic outputs must flow through the DAG (Ledger-Maintainer → Challenger → apply → Composer). Never add a code path that lets model output reach the ledger or the patient UI without its contract checks.
 4. **Model bindings live in `models.yaml`**, never hardcoded. Changing a binding requires an `adoc eval` comparison report and a PR.
 5. **No treatment/dosing advice paths.** The output gate in `reason/safety.py` is deterministic; anything patient-facing goes through it.
@@ -29,7 +29,7 @@ a-doc is a single-patient, longitudinal medical-diagnostic assistant (Python). R
 ## Infrastructure
 
 - All AWS resources are CloudFormation in `deploy/cfn/` (network, backup, alb, ecs, ci). No console-created resources; changes go through PRs and change sets. Deploys run from GitHub Actions via the OIDC role, which also builds/pushes the application image to ECR.
-- The app runs as ECS Fargate tasks (`deploy/cfn/ecs.yaml`) on a shared EFS filesystem — not EC2 (see ADR 0006; this superseded the original EC2 + `install.sh` + systemd design). No direct public ingress: the service security group admits only the ALB's security group, on the app port. A shell is reachable via `aws ecs execute-command` only (`EnableExecuteCommand: true`). The app is reached through a public ALB (`deploy/cfn/alb.yaml`) at `https://adoc.petabloc.io`, with username/password auth + in-app rate limiting in `src/adoc/web` (explicit user decision, superseding the earlier Tailscale-only design — see PLAN.md).
+- The app runs as ECS Fargate tasks (`deploy/cfn/ecs.yaml`) on a shared EFS filesystem, not EC2 (ADR 0006). No direct public ingress: the service security group admits only the ALB's security group, on the app port. A shell is reachable via `aws ecs execute-command` only (`EnableExecuteCommand: true`). The app is reached through a public ALB (`deploy/cfn/alb.yaml`) at `https://adoc.petabloc.io`, with username/password auth + in-app rate limiting in `src/adoc/web` (ADR 0007).
 - `labs.sqlite`'s journal mode is `TRUNCATE` in the deployed environment (`ADOC_SQLITE_JOURNAL_MODE`, `config.Settings.sqlite_journal_mode`) because WAL is unsafe on EFS/NFS — see `labs/db.py`'s `LabsDb.__init__` docstring. The web service only ever runs one task at a time (`DeploymentConfiguration` max 100%/min 0%) — SQLite + git still want a single writer.
 
 ## Code conventions
