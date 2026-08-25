@@ -123,11 +123,8 @@ INTAKE_OPENER_MESSAGE = (
     "file together, so anything you share becomes part of the record you and your "
     "doctors can rely on. What's been bothering you the most lately, or what brings "
     "you in?\n\n"
-    "You don't need to type everything at once -- if you've already got a written "
-    "history or records, you can add them as documents instead and we'll work from "
-    "those together.\n\n"
-    "And if something is happening right now and feels urgent, please seek emergency "
-    "care first rather than typing it here -- we can pick this back up once you're safe."
+    "You don't need to type everything at once -- your existing records and documents "
+    "are already on file, so we can work from those together as we go."
 )
 
 _WITHHELD_MESSAGE = (
@@ -137,20 +134,39 @@ _WITHHELD_MESSAGE = (
     "wrong with your case file. Please try rephrasing, and we'll pick this back up."
 )
 
-# Defect fix (live blocker): the red-flag screen's message
-# (`reason.safety.red_flag_screen`, never edited here — see that module's
-# docstring) reads, on its own, as a conversation-ending instruction. During
-# an INTAKE turn that strands a patient who was merely recounting past
-# history rather than describing a live emergency, with no obvious way to
-# continue. This note is appended ONLY in the intake path (never touches
-# `red_flag_screen` itself, its rules, its matching, or the zero-API-call
-# invariant — CLAUDE.md rule 2) to make the next step obvious either way.
-_INTAKE_URGENT_NEXT_STEP_NOTE = (
-    "\n\nIf what you just described is happening right now, please get care first "
-    "before continuing here. If you were describing something from your past, you're "
-    "welcome to keep going -- tell me about it one thing at a time whenever you're "
-    "ready, or add your written history as a document instead."
+# Red-flag handling is WARN-NOT-BLOCK (ADR 0014, explicit product-owner
+# decision for this single-patient tool). `reason.safety.red_flag_screen`
+# still runs first on every turn, deterministically, before any model call,
+# and its rules/terms/matching are untouched. What changed is the RESPONSE:
+# a match no longer replaces the turn. The warning below is prepended to the
+# reply by code -- the model cannot suppress, soften, or reword it -- and the
+# conversation continues normally.
+#
+# Why: as a hard block it made intake unusable. Recounting medical history is
+# the entire point of an initial visit, so historical mentions of past
+# emergencies matched constantly (the screen deliberately does no negation or
+# tense detection -- "chest pain years ago" matches). Every match cost the
+# patient her whole turn, and a warning that fires on nearly every message
+# stops being read at all. The operator here is a single informed adult who
+# knows what is and is not an emergency; a visible warning serves her, an
+# unskippable gate does not.
+_RED_FLAG_WARNING_PREFIX = (
+    "⚠️ Heads up: something you wrote matches a pattern a-doc watches for "
+    "({category}). If any of it is happening right now, please get medical care "
+    "first -- I'm not able to help with an emergency. If you were describing "
+    "your history, carry on and I'll keep recording it.\n\n---\n\n"
 )
+
+
+def red_flag_warning_prefix(category: str | None) -> str:
+    """The deterministic warning prepended to a flagged turn's reply.
+
+    Code-inserted, never model-generated, so it cannot be suppressed or
+    softened by anything the model returns (see `_RED_FLAG_WARNING_PREFIX`).
+    """
+    label = (category or "possible emergency").replace("_", " ")
+    return _RED_FLAG_WARNING_PREFIX.format(category=label)
+
 
 # Human phrasing for each internal topic key — used ONLY in the
 # deterministic wrap-up steering line (never shown as a list/checklist;
@@ -621,10 +637,12 @@ def run_intake_turn(client: LlmClient, repo: DataRepo, db: LabsDb, text: str) ->
     call that itself fails) are simply dropped and logged; the turn still
     replies normally either way.
     """
+    # Warn, don't block (ADR 0014): the screen still runs first, before any
+    # model call, and a match is still surfaced to the patient verbatim by
+    # code below -- but the turn proceeds so her history still gets recorded.
     screen = red_flag_screen(text)
     if screen.flagged:
-        urgent_text = (screen.message or "") + _INTAKE_URGENT_NEXT_STEP_NOTE
-        return IntakeOutcome(kind="urgent", text=urgent_text)
+        logger.info("red-flag screen matched during intake: category=%s", screen.category)
 
     now = datetime.now(UTC)
     coverage = load_coverage_state(repo.root / INTAKE_STATE_RELPATH)
@@ -736,6 +754,11 @@ def run_intake_turn(client: LlmClient, repo: DataRepo, db: LabsDb, text: str) ->
             wrapup_note = "\n\n" + _render_wrapup_refusal(coverage, blockers_anywhere)
 
     reply_text = turn.message + wrapup_note
+    # Prepended AFTER the model has produced its reply and OUTSIDE the
+    # treatment gate's rewrite concerns: the warning is fixed text chosen by
+    # code, so nothing the model returns can drop or soften it (ADR 0014).
+    if screen.flagged:
+        reply_text = red_flag_warning_prefix(screen.category) + reply_text
     gate = treatment_gate(reply_text)
     outcome = (
         IntakeOutcome(kind="reply", text=reply_text)

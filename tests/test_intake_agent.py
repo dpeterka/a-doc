@@ -27,6 +27,7 @@ from adoc.intake.agent import (
     build_doc_digest,
     intake_is_complete,
     read_intake_transcript,
+    red_flag_warning_prefix,
     run_intake_turn,
 )
 from adoc.intake.coverage import (
@@ -109,39 +110,61 @@ def _turn(
     }
 
 
-# --- red-flag screen: zero client calls ------------------------------------------------
+# --- red-flag screen: warns, does not block (ADR 0014) ---------------------------------
 
 
-def test_red_flag_turn_makes_zero_client_calls_and_returns_urgent(tmp_path: Path) -> None:
+def test_red_flag_turn_warns_but_still_records_the_history(tmp_path: Path) -> None:
+    """A flagged intake turn is annotated, not replaced (ADR 0014).
+
+    Recounting history is the whole point of an initial visit, and the
+    screen deliberately does no tense/negation detection, so historical
+    mentions of past emergencies match constantly. Blocking cost the
+    patient her entire turn each time. Now the warning rides along and the
+    facts still get captured.
+    """
     repo = DataRepo.init_at(tmp_path / "data")
     db = LabsDb(":memory:")
-    client = _exploding_client()
+    client, _transport = _make_client(
+        [
+            _turn(
+                "Noted — I've recorded that.",
+                ops=[
+                    {
+                        "op": "add_fact",
+                        "fact": {
+                            "id": "chest-pain-2019",
+                            "section": "events",
+                            "kind": "event",
+                            "statement": "Chest pain episode treated in the ER in 2019.",
+                            "date_approx": "2019",
+                            "precision": "approx",
+                        },
+                    }
+                ],
+            )
+        ]
+    )
+
+    outcome = run_intake_turn(
+        client, repo, db, "Back in 2019 I had crushing chest pain and pressure and went to the ER"
+    )
+
+    assert outcome.kind == "reply"
+    assert outcome.text.startswith(red_flag_warning_prefix("cardiac_chest_pain"))
+    assert "Noted — I've recorded that." in outcome.text
+    # The turn was NOT thrown away: her history is on file.
+    assert (repo.root / INTAKE_FACTS_RELPATH).exists()
+
+
+def test_red_flag_warning_names_the_matched_category(tmp_path: Path) -> None:
+    repo = DataRepo.init_at(tmp_path / "data")
+    db = LabsDb(":memory:")
+    client, _transport = _make_client([_turn("Understood.")])
 
     outcome = run_intake_turn(client, repo, db, "I'm having crushing chest pain and pressure")
 
-    assert outcome.kind == "urgent"
-    assert "911" in outcome.text or "emergency" in outcome.text.lower()
-    # nothing persisted for a red-flagged turn
-    assert not (repo.root / INTAKE_FACTS_RELPATH).exists()
-
-
-def test_red_flag_turn_during_intake_adds_next_step_guidance_not_a_dead_end(
-    tmp_path: Path,
-) -> None:
-    """Defect fix (live blocker): the urgent message must not strand a
-    patient merely recounting history -- the intake path appends a next-step
-    note on top of the (untouched) `red_flag_screen` message, still with
-    zero client calls."""
-    repo = DataRepo.init_at(tmp_path / "data")
-    db = LabsDb(":memory:")
-    client = _exploding_client()
-
-    outcome = run_intake_turn(client, repo, db, "I'm having crushing chest pain and pressure")
-
-    assert outcome.kind == "urgent"
-    assert "911" in outcome.text or "emergency" in outcome.text.lower()  # unchanged screen message
-    assert "please get care first" in outcome.text.lower()
-    assert "one thing at a time" in outcome.text.lower()
+    assert "cardiac chest pain" in outcome.text
+    assert "Understood." in outcome.text
 
 
 # --- ops applied and persisted; provenance stamped -------------------------------------
@@ -705,15 +728,17 @@ def test_invalid_op_rejected_after_retry_still_yields_a_normal_reply(tmp_path: P
 
 
 def test_opener_message_is_a_plain_constant() -> None:
-    # Defect fix (live blocker): the opener now DRIVES with one focused
-    # question instead of inviting a wall of text, notes that documents can
-    # stand in for retyping everything, and gives a clear emergency-care
-    # steer -- see `INTAKE_OPENER_MESSAGE`'s definition.
+    # The opener DRIVES with one focused question instead of inviting a wall
+    # of text, and points at records that are ALREADY on file rather than
+    # asking her to add what she has already provided. It carries no
+    # emergency disclaimer: this is a single-patient tool whose operator
+    # knows what is and is not an emergency, and the red-flag screen still
+    # warns on the input that warrants it (ADR 0014).
     assert "What's been bothering you the most lately, or what brings you in?" in (
         INTAKE_OPENER_MESSAGE
     )
-    assert "add them as documents instead" in INTAKE_OPENER_MESSAGE
-    assert "seek emergency care first" in INTAKE_OPENER_MESSAGE
+    assert "already on file" in INTAKE_OPENER_MESSAGE
+    assert "emergency" not in INTAKE_OPENER_MESSAGE.lower()
 
 
 # --- doc digest ---------------------------------------------------------------------------

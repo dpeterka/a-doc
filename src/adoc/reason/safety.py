@@ -255,13 +255,13 @@ def red_flag_screen(text: str) -> RedFlagResult:
 
 
 def guarded_turn[T](text: str, on_pass: Callable[[], T]) -> T | RedFlagResult:
-    """Run `red_flag_screen(text)` and only call `on_pass()` if it passes.
+    """DEPRECATED — block-on-flag wiring, no longer used by any entry point.
 
-    This is the reusable "check before any API call" wiring PLAN.md
-    requires for every chat turn (loop (b)): callers in `reason/stages.py`
-    (and any future entry point) should route every turn through this
-    helper rather than calling a reasoner directly. `on_pass` is never
-    invoked when the screen flags the turn — zero API calls on a red flag.
+    Superseded by warn-not-block (ADR 0014): `red_flag_screen` still runs
+    first on every turn, but a match now prepends a deterministic warning to
+    the reply instead of replacing the turn. Kept only so an external caller
+    that wants fail-closed behavior still has it; `reason/stages.py` and the
+    chat/intake entry points deliberately do NOT use it.
     """
     result = red_flag_screen(text)
     if result.flagged:

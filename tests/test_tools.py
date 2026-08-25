@@ -215,12 +215,23 @@ def test_run_informational_turn_delegates_to_tools_with_ledger_and_retrieval(
     assert "Differential Ledger" in sent  # include_ledger=True, unlike the old bare implementation
 
 
-def test_run_informational_turn_red_flag_short_circuits(repo: DataRepo, db: LabsDb) -> None:
-    def _explode(request: TransportRequest) -> TransportResponse:
-        raise AssertionError("must never call the transport on a red flag")
+def test_run_informational_turn_no_longer_screens_internally(repo: DataRepo, db: LabsDb) -> None:
+    """The stage entry points do NOT screen (ADR 0014, warn-not-block).
 
-    client = _fake_client(_explode)
+    Screening moved to the entry points that own the patient conversation
+    (`web/routes/chat.py`, `intake/agent.py`), which run it before any model
+    call and prepend a mandatory warning to the reply. Screening here as
+    well would re-introduce the block those callers deliberately removed —
+    see `tests/test_web_chat.py` for the end-to-end warning contract.
+    """
+    calls: list[TransportRequest] = []
+
+    def _record(request: TransportRequest) -> TransportResponse:
+        calls.append(request)
+        return TransportResponse(text="ok", tool_input=None, input_tokens=1, output_tokens=1)
+
+    client = _fake_client(_record)
     result = run_informational_turn(client, repo, db, "I want to kill myself")
 
-    assert isinstance(result, RedFlagResult)
-    assert result.flagged is True
+    assert not isinstance(result, RedFlagResult)
+    assert calls, "the stage runs the turn; the caller owns the screen and the warning"
