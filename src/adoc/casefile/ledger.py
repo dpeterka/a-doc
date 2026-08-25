@@ -201,9 +201,9 @@ def apply_diff(ledger: Ledger, diff: LedgerDiff) -> Ledger:
                         "most-likely: it must be substantively challenged "
                         "(RecordChallenge) in an earlier diff first"
                     )
-                # S3 remediation: a challenge from long ago must not license a
-                # promotion today — the challenge must still be RECENT, not
-                # merely non-None. Same staleness horizon as invariant (c).
+                # A challenge from long ago must not license a promotion
+                # today — the challenge must still be RECENT, not merely
+                # non-None. Same staleness horizon as invariant (c).
                 if (
                     original.last_challenged_version is None
                     or original.last_challenged_version < new_version - STALENESS_HORIZON

@@ -187,7 +187,7 @@ class RecordChallenge(BaseModel):
     @field_validator("note")
     @classmethod
     def _check_note_is_substantive(cls, value: str) -> str:
-        """S3 remediation: a challenge note must carry actual substance —
+        """A challenge note must carry actual substance —
         schema-level `min_length` alone can't express "after stripping
         whitespace", so this validator does the strip-then-length check.
         A model (or test double) stamping "." or "reviewed" across every

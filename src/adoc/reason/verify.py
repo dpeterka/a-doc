@@ -15,13 +15,12 @@ never sent to the model at all and is deliberately NOT a rejection — same
 principle as the citation checker's `unverifiable`: a turn must never be
 hostage to missing infrastructure. Only `not_entailed` blocks.
 
-Source-text resolution is injectable (`SourceTextResolver`) so this module
-never hard-depends on the parallel document-text-corpus workstream:
+Source-text resolution is injectable (`SourceTextResolver`).
 `DefaultSourceTextResolver` builds `labs:` source text deterministically
-from the stored row, and returns `encounter:` file text where an encounter
-file already exists — everything else (`doc:`, `pmid:`, `patient-report:`)
-resolves to `None` today. The moment a document-text corpus lands, a richer
-resolver can be injected without this module changing.
+from the stored row, returns `encounter:` file text where an encounter file
+already exists, and resolves `doc:` refs against the document-text corpus
+(ADR 0015); `pmid:` and `patient-report:` refs resolve to `None` (see
+`DefaultSourceTextResolver`'s docstring for why).
 
 `check_composer_numbers` is a separate, purely deterministic check (no LLM):
 every number in the Composer's patient-facing text that sits near a known
@@ -178,18 +177,13 @@ class DefaultSourceTextResolver:
       once the row exists (no external dependency).
     - `encounter:<file>` — the encounter file's own text (frontmatter-free:
       summary + new findings + plan + any full extracted text), when that
-      file already exists on disk. This is the seam for the parallel
-      document-text-corpus workstream: encounter files already carry real
-      narrative text today (PLAN.md docx ingestion), so this resolver
-      starts working the moment more encounters exist, without this module
-      changing.
+      file already exists on disk.
     - `doc:<file>#p<page>` — the cited document's extracted text (ADR 0015's
-      document-text corpus, which has now landed): the page's own text when
-      the ref names a page and that page was stored separately, otherwise
-      the whole document's text. `None` when nothing was ever extracted for
-      it (e.g. a scan with no text layer, or a genomic file, which by
-      construction never has text) — which yields `insufficient_source`,
-      never a rejection.
+      document-text corpus): the page's own text when the ref names a page
+      and that page was stored separately, otherwise the whole document's
+      text. `None` when nothing was ever extracted for it (e.g. a scan with
+      no text layer, or a genomic file, which by construction never has
+      text) — which yields `insufficient_source`, never a rejection.
     - `pmid:<id>` / `patient-report:<date>` — `None`. A PMID's abstract is
       not stored locally (the citation checker verifies only that the id
       exists), and a patient-report ref cites the patient's own statement,

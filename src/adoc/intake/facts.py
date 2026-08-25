@@ -9,19 +9,18 @@ unit-tested code — CLAUDE.md's "deterministic logic ... never delegated to
 a model" applies to the gate every bit as much as it does to the ledger
 invariants in `casefile.ledger`.
 
-**Op-level tolerance (live intake blocker fix).** A malformed op must never
-cost the patient her whole turn: `apply_ops` applies every op that is valid
-given the store's current state and collects everything else — a duplicate
-`add_fact` id, an `update_fact`/`retract_fact` referencing an id that
-doesn't exist — into `AppliedResult.rejected` instead of raising. The
-closed-vocabulary fields (`kind`, `precision`, `attribution`,
-`clarification_status`, and now `section`, derived from `SECTIONS` so it
-cannot drift) are `Literal`s specifically so the *shape* of a bad op (an
-unrecognized topic key, e.g. the live incident where a model emitted
-`section="note"` — a valid `kind`, not a section) is rejected by structured-
-output validation before it ever reaches this module at all; the tolerance
-here is the second, defense-in-depth layer for whatever a closed
-vocabulary can't prevent (duplicate/unknown ids are inherently
+**Op-level tolerance.** A malformed op must never cost the patient her
+whole turn: `apply_ops` applies every op that is valid given the store's
+current state and collects everything else — a duplicate `add_fact` id, an
+`update_fact`/`retract_fact` referencing an id that doesn't exist — into
+`AppliedResult.rejected` instead of raising. The closed-vocabulary fields
+(`kind`, `precision`, `attribution`, `clarification_status`, and `section`,
+derived from `SECTIONS` so it cannot drift) are `Literal`s specifically so
+the *shape* of a bad op (an unrecognized topic key, e.g. a model emitting
+`section="note"` — a valid `kind`, not a section) is rejected by
+structured-output validation before it ever reaches this module at all;
+the tolerance here is the second, defense-in-depth layer for whatever a
+closed vocabulary can't prevent (duplicate/unknown ids are inherently
 free-form). `intake.agent.run_intake_turn` is what spends the one
 feedback-guided retry this enables — see that function's docstring.
 
@@ -67,13 +66,12 @@ MIN_UPDATE_NOTE_LENGTH = 10
 SECTION_KEYS: frozenset[str] = frozenset(spec.key for spec in SECTIONS)
 
 # Derived from `SECTIONS` (never hand-maintained) so the closed vocabulary
-# can't drift from the section registry it mirrors. This is what closes the
-# live incident's loophole: the model emitted `section="note"` — a valid
-# `kind`, not a section — and because `section` used to be a bare `str`,
-# that value sailed through structured-output validation and only blew up
-# deep in `apply_ops`, losing the whole turn (see module docstring).  A
-# `Literal` makes the provider's own structured-output validation reject
-# the mistake before it ever reaches this module.
+# can't drift from the section registry it mirrors. A `Literal`, not a bare
+# `str`: the model can emit an invalid section (e.g. `"note"`, which is a
+# valid `kind` but not a section) — with a `Literal`, the provider's own
+# structured-output validation rejects that before it ever reaches this
+# module, instead of failing deep inside `apply_ops` and losing the whole
+# turn (see module docstring).
 _SECTION_KEY_VALUES: tuple[str, ...] = tuple(spec.key for spec in SECTIONS)
 SectionKey = Literal[_SECTION_KEY_VALUES]  # type: ignore[valid-type]
 

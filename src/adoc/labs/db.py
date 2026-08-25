@@ -365,8 +365,8 @@ def _fts_query_any(text: str) -> str:
 
 
 # Deliberately private copies of `ingest.reconcile`'s `parse_ref_range`/
-# `parse_flag` (queue-ergonomics slice item 1, `resolve_with_pass` below) -
-# `labs` is a lower layer than `ingest`, so it never imports from it (that
+# `parse_flag`, used by `resolve_with_pass` below - `labs` is a lower layer
+# than `ingest`, so it never imports from it (that
 # would invert the dependency direction even though no runtime import
 # cycle would actually result); these two are tiny and stable enough that
 # duplicating them here is simpler than restructuring either module.
@@ -875,8 +875,8 @@ class LabsDb:
     @_synchronized
     def resolve_with_pass(self, row_id: int, which: Literal["a", "b"]) -> None:
         """Apply pass A's or pass B's reading wholesale to a disagreement
-        row and mark it `corrected` (queue-ergonomics slice item 1: the
-        confirm queue's "Use reading A"/"Use reading B" actions).
+        row and mark it `corrected` (the confirm queue's "Use reading A"/
+        "Use reading B" actions).
 
         Reads the chosen pass's payload straight out of `row_id`'s own
         `raw_json` (`ingest.reconcile.reconcile` serializes both passes'
