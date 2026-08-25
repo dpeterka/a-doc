@@ -5,9 +5,26 @@
 stage) is allowed to mutate a `Ledger`, and it enforces the five invariants
 below as code, never as a prompt. `load_ledger`/`save_ledger` round-trip
 `differential-ledger.yaml` via ruamel.yaml so the file stays human-diffable
-in git. `apply_and_save` is the thin persistence wrapper used by real
-callers (DAG nodes, `repo.py`): it loads, applies, saves, and appends the
-diff to `ledger-history.jsonl` in one call.
+in git. `apply_and_save` loads, applies, saves, and appends the diff to
+`ledger-history.jsonl` in one call — but does NO locking and NO commit of
+its own.
+
+**`apply_and_save` is a lock-free internal primitive, not a safe public
+entry point.** CONFIRMED durability defect (fixed by `casefile.repo.
+DataRepo.apply_ledger_diff`, which wraps this function in `DataRepo._lock`
+and commits the result): calling `apply_and_save` directly from a
+concurrent context (two overlapping diagnostic turns — `web/routes/
+chat.py`'s `chat_send` is a sync route Starlette thread-pools) lets both
+callers `load_ledger` the same version, both validate against that same
+stale snapshot, and both `save_ledger` — the second silently clobbers the
+first's applied diff (last writer wins) even though `append_history`
+(append-mode) records both, permanently desyncing the ledger from its own
+audit trail. It is safe to call directly only from a single-threaded,
+non-concurrent context (tests, and `DataRepo.apply_ledger_diff` itself,
+which is exactly this call held under a lock). Every real DAG node or
+route (`reason/stages.py`'s `apply_stage`, `reason/review.py`'s weekly
+apply) must go through `DataRepo.apply_ledger_diff` instead — see that
+method's docstring.
 
 Invariants enforced by `apply_diff` (raise `LedgerInvariantError`):
   a. Can't-miss non-empty while any hypothesis is active.
