@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
@@ -107,6 +108,72 @@ def read_recent_chat(repo: DataRepo, *, max_files: int = 3, max_turns: int = 100
     return entries[-max_turns:]
 
 
+def last_chat_date(repo: DataRepo) -> date | None:
+    """The date of the most recent chat-transcript entry (patient or
+    assistant turn, whichever landed last), for the home dashboard's "last
+    conversation" line — `None` if no chat has happened yet. Only the
+    single newest entry is needed, so `max_turns=1` regardless of
+    `max_files`'s default (the newest entry always lives in the newest
+    day-file)."""
+    entries = read_recent_chat(repo, max_turns=1)
+    if not entries:
+        return None
+    timestamp = entries[-1].get("timestamp")
+    if not timestamp:
+        return None
+    try:
+        return datetime.fromisoformat(timestamp).date()
+    except ValueError:
+        return None
+
+
+# --- "what's already on file" strip (home dashboard, empty-state fix) --------------------
+
+
+@dataclass(frozen=True)
+class OnFileSummary:
+    """Server-computed "what's already on file" counts for the home
+    dashboard. Owner-observed feedback: a fresh install with documents and
+    labs already ingested (a seeded/restored deployment, or a local repo
+    that ran a backfill) but no diagnostic conversation yet must not render
+    as if nothing exists — this is what lets the home page say so.
+    `doc_count == 0` is the signal the template uses to show an "add
+    documents" pointer instead of the strip."""
+
+    doc_count: int
+    lab_row_count: int
+    analyte_count: int
+    date_span: tuple[date, date] | None
+    encounter_count: int
+
+
+def on_file_summary(repo: DataRepo, db: LabsDb) -> OnFileSummary:
+    """Compute `OnFileSummary` from the labs DB + data repo — read-only
+    queries only, no schema changes, safe to call on every home-page
+    request."""
+    doc_count = len(db.documents_overview())
+
+    rows = db.all_non_rejected_rows()
+    lab_row_count = len(rows)
+    analyte_count = len({row.name for row in rows})
+    date_span = (min(row.date for row in rows), max(row.date for row in rows)) if rows else None
+
+    encounters_dir = repo.root / "case" / "encounters"
+    encounter_count = (
+        sum(1 for p in encounters_dir.iterdir() if p.suffix == ".md")
+        if encounters_dir.is_dir()
+        else 0
+    )
+
+    return OnFileSummary(
+        doc_count=doc_count,
+        lab_row_count=lab_row_count,
+        analyte_count=analyte_count,
+        date_span=date_span,
+        encounter_count=encounter_count,
+    )
+
+
 # --- page images (confirm queue, ledger doc: refs) ---------------------------------------
 
 
@@ -123,22 +190,40 @@ def page_images_dir(repo: DataRepo, sha: str) -> Path:
     return repo.root / "sources" / "pages" / sha
 
 
-def list_page_images(repo: DataRepo, sha: str) -> list[Path]:
+def list_page_images(
+    repo: DataRepo, sha: str, *, cache: dict[str, list[Path]] | None = None
+) -> list[Path]:
+    """`cache`, when given, memoizes this directory listing per `sha` -
+    a confirm-queue page or ledger view commonly calls this once per row/
+    evidence-ref, and several of those often share one document's `sha`.
+    Without a cache each call re-lists the same directory (a filesystem
+    `iterdir()`/stat) on every one of those calls; on the deployed app's
+    EFS/NFS-backed data repo that round trip costs real milliseconds, same
+    as a `labs.sqlite` query. Defaults to `None`, which lists fresh exactly
+    as before.
+    """
+    if cache is not None and sha in cache:
+        return cache[sha]
     if not _is_safe_sha(sha):
-        return []
-    directory = page_images_dir(repo, sha)
-    if not directory.is_dir():
-        return []
-    return sorted(p for p in directory.iterdir() if p.is_file())
+        result: list[Path] = []
+    else:
+        directory = page_images_dir(repo, sha)
+        result = sorted(p for p in directory.iterdir() if p.is_file()) if directory.is_dir() else []
+    if cache is not None:
+        cache[sha] = result
+    return result
 
 
-def page_image_url(repo: DataRepo, sha: str, page: int | None) -> str | None:
+def page_image_url(
+    repo: DataRepo, sha: str, page: int | None, *, cache: dict[str, list[Path]] | None = None
+) -> str | None:
     """The `/files/pages/<sha>/<filename>` URL for `page` (1-indexed), or
     `None` if the document has no rendered page images / the page is out
-    of range."""
+    of range. `cache` is forwarded to `list_page_images` unchanged - see
+    its docstring."""
     if page is None or page < 1:
         return None
-    images = list_page_images(repo, sha)
+    images = list_page_images(repo, sha, cache=cache)
     if page > len(images):
         return None
     filename = images[page - 1].name
@@ -205,8 +290,15 @@ def resolve_original_document_path(repo: DataRepo, sha: str) -> Path | None:
     return resolved
 
 
-def find_document_by_filename(db: LabsDb, filename: str) -> LabDocument | None:
-    for doc in db.list_documents():
+def find_document_by_filename(
+    db: LabsDb, filename: str, *, documents: list[LabDocument] | None = None
+) -> LabDocument | None:
+    """`documents`, when given, is searched instead of calling
+    `db.list_documents()` - the ledger view calls this once per `doc:`
+    evidence ref, and without a pre-fetched list each call re-runs the
+    same full-table `labs.sqlite` query. Defaults to `None`, which queries
+    fresh exactly as before."""
+    for doc in documents if documents is not None else db.list_documents():
         if doc.filename == filename:
             return doc
     return None

@@ -11,6 +11,8 @@ onboarding itself (that gets its own tests further down).
 
 from __future__ import annotations
 
+import json
+from datetime import date
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -26,7 +28,36 @@ from web_support import (
 from adoc.casefile.ledger import load_ledger
 from adoc.casefile.repo import LEDGER_RELPATH
 from adoc.intake.agent import INTAKE_OPENER_MESSAGE, IntakeTurnResult, VisitCaptureResult
+from adoc.labs.db import LabsDb
+from adoc.labs.models import LabDocument, LabResult
 from adoc.reason.client import TransportRequest, TransportResponse
+
+_ANA_SOURCE_DOC_SHA = "c" * 64
+
+
+def _seed_ana_titer_row(db: LabsDb) -> None:
+    """Seed the `labs:ana-titer:2026-05-02` row `_SLE_MOST_LIKELY_OP` cites
+    so the Phase-2 citation checker (`reason.citations`) resolves it —
+    without this, the citation-check DAG contract correctly rejects the
+    diff as an unresolved evidence source ref."""
+    db.upsert_document(
+        LabDocument(
+            sha256=_ANA_SOURCE_DOC_SHA, filename="quest.pdf", doc_type="lab-result", page_count=1
+        )
+    )
+    db.insert_results(
+        [
+            LabResult(
+                date=date(2026, 5, 2),
+                name="ana-titer",
+                name_raw="ANA",
+                value_text="1:640",
+                source_doc=_ANA_SOURCE_DOC_SHA,
+                raw_json=json.dumps({"name_raw": "ANA"}),
+            )
+        ]
+    )
+
 
 _SLE_MOST_LIKELY_OP = {
     "op": "add_hypothesis",
@@ -84,6 +115,29 @@ def test_red_flag_message_returns_urgent_template_with_zero_llm_calls(
     assert calls == []
 
 
+def test_red_flag_message_during_intake_gives_next_step_guidance_not_a_dead_end(
+    tmp_path: Path,
+) -> None:
+    """Defect fix (live blocker): during an (incomplete) intake conversation,
+    the urgent message must not strand a patient recounting past history --
+    it gets extra next-step guidance on top of the untouched
+    `red_flag_screen` message, still with zero LLM calls."""
+    app, _repo, _db, calls = build_app(tmp_path)  # intake incomplete by default
+    client = TestClient(app)
+    login(client)
+
+    response = client.post(
+        "/chat/send", data={"text": "I have crushing chest pain radiating to my left arm"}
+    )
+
+    assert response.status_code == 200
+    body_lower = response.text.lower()
+    assert "call 911" in body_lower or "emergency" in body_lower
+    assert "please get care first" in body_lower
+    assert "one thing at a time" in body_lower
+    assert calls == []
+
+
 def test_diagnostic_turn_renders_the_three_tiers(tmp_path: Path) -> None:
     calls = []
     primary = make_primary_transport([_SLE_MOST_LIKELY_OP, _PE_CANT_MISS_OP], _PATIENT_REPLY, calls)
@@ -94,10 +148,11 @@ def test_diagnostic_turn_renders_the_three_tiers(tmp_path: Path) -> None:
         additional_ops=[],
         calls=calls,
     )
-    app, repo, _db, _calls = build_app(
+    app, repo, db, _calls = build_app(
         tmp_path, primary_transport=primary, challenger_transport=challenger
     )
     mark_intake_complete(repo)
+    _seed_ana_titer_row(db)
     client = TestClient(app)
     login(client)
 

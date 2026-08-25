@@ -161,7 +161,12 @@ def test_llm_error_is_swallowed_and_reported_as_capture_error(tmp_path: Path) ->
     assert not (repo.root / INTAKE_FACTS_RELPATH).exists()
 
 
-def test_duplicate_fact_id_op_error_is_swallowed_and_persists_nothing(tmp_path: Path) -> None:
+def test_duplicate_fact_id_op_is_rejected_not_an_error_and_persists_nothing(
+    tmp_path: Path,
+) -> None:
+    """Defect fix (live blocker): a duplicate id is a tolerated rejection,
+    not a raised/swallowed error -- the capture pass simply has nothing new
+    to record and touches disk not at all."""
     repo = DataRepo.init_at(tmp_path / "data")
     db = LabsDb(":memory:")
     add_op = {
@@ -177,9 +182,12 @@ def test_duplicate_fact_id_op_error_is_swallowed_and_persists_nothing(tmp_path: 
     run_visit_capture(client, repo, db, "First mention.")
     before = (repo.root / INTAKE_FACTS_RELPATH).read_text(encoding="utf-8")
 
-    client2 = _make_client([add_op])  # same id again -> IntakeError inside apply_ops
+    client2 = _make_client([add_op])  # same id again -> rejected, not raised
     result = run_visit_capture(client2, repo, db, "Same mention again.")
 
-    assert result.error is not None
+    assert result.error is None
+    assert result.applied.added == []
+    assert len(result.applied.rejected) == 1
+    assert "duplicate fact id" in result.applied.rejected[0]
     after = (repo.root / INTAKE_FACTS_RELPATH).read_text(encoding="utf-8")
     assert before == after

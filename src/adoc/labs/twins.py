@@ -123,13 +123,30 @@ def _values_match(pending: LabResult, candidate: LabResult) -> bool:
     return False
 
 
-def find_candidate(db: LabsDb, pending: LabResult) -> LabResult | None:
+def find_candidate(
+    db: LabsDb, pending: LabResult, *, resolved_cache: dict[str, list[LabResult]] | None = None
+) -> LabResult | None:
     """The deterministic candidate gate (module docstring, step 1): the
     first already-resolved row in the same document that could plausibly
     be `pending`'s other-pass twin. Returns `None` - never triggering an
     LLM call - when no such row exists, in particular whenever every
-    same-document resolved row's value genuinely differs."""
-    for candidate in db.resolved_rows_for_document(pending.source_doc):
+    same-document resolved row's value genuinely differs.
+
+    `resolved_cache`, when given, memoizes `db.resolved_rows_for_document`
+    per `source_doc` across repeated calls - `sweep_twins`'s loop over
+    every PENDING `single_pass` row commonly calls this several times for
+    rows sharing one document, and each call would otherwise re-run the
+    identical `labs.sqlite` query for that document's resolved rows.
+    Rejecting a PENDING row (this sweep's only mutation) never changes the
+    resolved set, so the cache never goes stale across one sweep.
+    """
+    if resolved_cache is not None:
+        if pending.source_doc not in resolved_cache:
+            resolved_cache[pending.source_doc] = db.resolved_rows_for_document(pending.source_doc)
+        candidates = resolved_cache[pending.source_doc]
+    else:
+        candidates = db.resolved_rows_for_document(pending.source_doc)
+    for candidate in candidates:
         if candidate.id == pending.id:
             continue
         if pending.source_page is None or candidate.source_page is None:
@@ -201,13 +218,19 @@ def sweep_twins(db: LabsDb, client: LlmClient, *, dry_run: bool = False) -> Twin
     so a second run's `db.pending()` simply won't see it again.
     """
     report = TwinSweepReport()
+    # Shared across every PENDING row this sweep checks - multiple
+    # single_pass rows commonly come from the same document, and without
+    # this `find_candidate` would re-run the identical
+    # `resolved_rows_for_document` query once per row instead of once per
+    # document (see `find_candidate`'s docstring).
+    resolved_cache: dict[str, list[LabResult]] = {}
     for row in db.pending():
         reasons = row.raw_payload().get("reasons", [])
         if "single_pass" not in reasons:
             continue
         report.checked += 1
 
-        candidate = find_candidate(db, row)
+        candidate = find_candidate(db, row, resolved_cache=resolved_cache)
         if candidate is None:
             continue
 

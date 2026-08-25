@@ -675,6 +675,33 @@ def test_compute_pair_reasons_reports_a_genuine_mismatch(tmp_path: Path) -> None
     assert any("value_mismatch" in reason for reason in reasons)
 
 
+def test_compute_pair_reasons_queries_trend_once_per_candidate(tmp_path: Path) -> None:
+    """Perf regression guard: `_evaluate_pair` used to call
+    `labs.validate.trend_deviation` TWICE per candidate for one matched
+    pair - once (indirectly) via `trend_outlier`'s outlier gate, and once
+    again directly for the cross-pass decimal-signature check - each a
+    separate `labs.sqlite` query. `outlier_issue_from_deviation` lets both
+    checks share a single `trend_deviation` call per candidate, so one
+    matched pair (two candidates: pass A, pass B) must issue exactly two
+    `labs` queries, not four - real cost on the deployed app, where
+    `labs.sqlite` lives on EFS/NFS and every query is a network round trip,
+    on every document ingested (and every row `labs.reclassify`'s sweep
+    re-checks)."""
+    db = _empty_db(tmp_path)
+    a = _result(value=4.1)
+    b = _result(value=4.1)
+
+    selects: list[str] = []
+    db._conn.set_trace_callback(lambda stmt: selects.append(stmt))
+    try:
+        compute_pair_reasons(a, b, doc_date=date(2026, 5, 2), missing_date=False, db=db)
+    finally:
+        db._conn.set_trace_callback(None)
+
+    labs_selects = [s for s in selects if "FROM labs" in s]
+    assert len(labs_selects) == 2, f"expected 2 labs queries (one per candidate), got {selects}"
+
+
 def test_rescue_accepts_residual_risk_when_units_are_compatible(tmp_path: Path) -> None:
     """The flip side of the test above: when units ARE compatible (both
     unstated), two different-analyte same-value-on-the-same-page rows DO

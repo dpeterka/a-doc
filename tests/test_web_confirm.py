@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 from datetime import date
 from pathlib import Path
+from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
@@ -1102,3 +1103,57 @@ def test_resolve_pass_converging_on_existing_row_rejects_as_duplicate(tmp_path: 
     row = db.get_row(row_id)
     assert row is not None and row.extraction_status is ExtractionStatus.REJECTED
     assert row.raw_payload()["auto_rejected_twin_of"] is not None
+
+
+# --------------------------------------------------------------------------
+# Perf regression guard: page-image directory listing is memoized per
+# request, not repeated per row.
+# --------------------------------------------------------------------------
+
+
+def test_confirm_queue_lists_page_images_once_per_document_not_per_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`page_image_url` used to call `list_page_images` (a filesystem
+    `iterdir()`) fresh for every PENDING row - a document with many
+    pending rows (the confirm queue's whole reason for grouping by
+    document) re-listed the identical page-images directory once per row
+    instead of once per document. The data repo lives on EFS/NFS in the
+    deployed app, where each directory listing costs milliseconds, same
+    as a `labs.sqlite` query."""
+    app, repo, db, _calls = build_app(tmp_path)
+    _seed_document(repo, db, sha=SHA, filename="doc.pdf")
+    page_dir = repo.root / "sources" / "pages" / SHA
+    rows = [
+        LabResult(
+            date=date(2026, 5, 2),
+            name=f"analyte-{i}",
+            name_raw=f"Analyte {i}",
+            value=float(i),
+            source_doc=SHA,
+            source_page=1,
+            extraction_status=ExtractionStatus.PENDING,
+            raw_json=json.dumps({}),
+        )
+        for i in range(20)
+    ]
+    db.insert_results(rows)
+
+    listings: list[Path] = []
+    original_iterdir = Path.iterdir
+
+    def counting_iterdir(self: Path) -> Any:
+        if self == page_dir:
+            listings.append(self)
+        return original_iterdir(self)
+
+    monkeypatch.setattr(Path, "iterdir", counting_iterdir)
+
+    client = TestClient(app)
+    login(client)
+    response = client.get("/confirm")
+
+    assert response.status_code == 200
+    # 20 pending rows sharing ONE document: a per-row implementation lists
+    # the directory 20 times. The cached implementation lists it once.
+    assert len(listings) == 1, f"expected 1 page-image directory listing, got {len(listings)}"

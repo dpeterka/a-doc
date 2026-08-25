@@ -918,6 +918,36 @@ class LabsDb:
         ).fetchall()
         return [_row_to_lab(row) for row in rows]
 
+    def series_by_key(
+        self, *, include_rejected: bool = False
+    ) -> dict[tuple[str, str], list[LabResult]]:
+        """Every analyte's trend series at once, keyed by `(name, specimen)`.
+
+        Same rows, same order (`date, id`), and same rejected-row filtering
+        as calling `series(name, specimen)` once per analyte — but in ONE
+        query instead of one per analyte.
+
+        This exists because the labs index page renders a sparkline for
+        every analyte: on local disk the per-analyte version was invisible
+        (~0.02 ms/query), but the deployed app reads `labs.sqlite` over
+        EFS/NFS, where each query costs milliseconds of round-trip. At ~450
+        analytes that turned into seconds of pure latency on one page load.
+        """
+        clauses = []
+        params: list[Any] = []
+        if not include_rejected:
+            clauses.append("extraction_status != ?")
+            params.append(ExtractionStatus.REJECTED.value)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self._conn.execute(
+            f"SELECT * FROM labs {where} ORDER BY date, id", params
+        ).fetchall()
+        grouped: dict[tuple[str, str], list[LabResult]] = defaultdict(list)
+        for row in rows:
+            result = _row_to_lab(row)
+            grouped[(result.name, result.specimen)].append(result)
+        return dict(grouped)
+
     def latest_panel(self) -> list[LabResult]:
         """Most recent non-rejected row per distinct (analyte name, specimen).
 

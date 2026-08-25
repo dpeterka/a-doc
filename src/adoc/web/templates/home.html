@@ -3,14 +3,6 @@
 {% block content %}
   <h1>Your case file</h1>
 
-  {% if baseline_incomplete %}
-    <div class="banner banner-warning">
-      <strong>Baseline incomplete</strong> — we're still getting to know your history.
-      These leads may shift as we talk more.
-      <a href="/chat">Continue the conversation &rarr;</a>
-    </div>
-  {% endif %}
-
   {% if pending_count > 0 %}
     <div class="banner banner-info">
       <strong>{{ pending_count }}</strong> document row{{ "s" if pending_count != 1 else "" }}
@@ -41,43 +33,82 @@
     </section>
   {% endif %}
 
-  <section class="card">
-    <h2>Your current picture</h2>
-    <p class="muted">
-      These are leads to bring up with your doctor — not a diagnosis.
-    </p>
-    {% for tier, hypotheses in tiers %}
-      <div class="tier-block tier-{{ tier }}">
-        <h3>{{ tier | tier_label }}</h3>
-        {% if hypotheses %}
-          <ul class="hypothesis-list">
-            {% for h in hypotheses %}
-              <li class="hypothesis">
-                <div class="hypothesis-name">{{ h.name }}</div>
-                <div class="chips">
-                  <span class="chip chip-status">{{ h.status | status_label }}</span>
-                  <span class="chip chip-origin chip-origin-{{ h.origin }}">{{ h.origin | origin_label }}</span>
-                  <span class="chip chip-probability">confidence: {{ h.probability }}</span>
-                </div>
-                {% if h.evidence_for %}
-                  <ul class="evidence-list evidence-for">
-                    {% for e in h.evidence_for %}
-                      <li>{{ e.claim }} <span class="muted">({{ e.source }})</span></li>
-                    {% endfor %}
-                  </ul>
-                {% endif %}
-              </li>
-            {% endfor %}
-          </ul>
-        {% else %}
-          <p class="muted">Nothing here yet.</p>
-        {% endif %}
+  {% if baseline_incomplete %}
+    <section class="card">
+      <h2>Welcome to a-doc</h2>
+      <p>
+        a-doc helps you build one longitudinal case file from your records and
+        conversations, turning them into leads to bring to your own doctor — never a
+        diagnosis.
+      </p>
+      <div class="banner banner-warning">
+        <strong>Baseline incomplete</strong> — we're still getting to know your history.
+        These leads may shift as we talk more.
       </div>
-    {% endfor %}
-  </section>
+      <p><strong><a href="/chat">Start your first visit &rarr;</a></strong></p>
+    </section>
 
-  <section class="card">
-    <h2>Open questions for your next appointment</h2>
-    {{ open_questions_text | markdown_lite | safe }}
-  </section>
+    <section class="card">
+      <h2>What's already on file</h2>
+      {% include "_on_file_strip.html" %}
+    </section>
+  {% else %}
+    <section class="card">
+      <h2>Your overview</h2>
+      {% if last_chat_date %}
+        <p>
+          Last conversation: {{ last_chat_date | friendly_date }}.
+          <a href="/chat">Continue the conversation &rarr;</a>
+        </p>
+      {% endif %}
+      {% if fact_count > 0 %}
+        <p>
+          <strong>{{ fact_count }}</strong> patient-reported fact{{ "s" if fact_count != 1 else "" }}
+          on file{% if recent_fact_count > 0 %}, <strong>{{ recent_fact_count }}</strong> new in the
+          last {{ recent_fact_window_days }} days{% endif %}.
+          <a href="/onboard/review">View your intake record &rarr;</a>
+        </p>
+      {% endif %}
+    </section>
+
+    {% if ledger_summary %}
+      <section class="card">
+        <h2>Current differential</h2>
+        <p class="muted">
+          Version {{ ledger_summary.version }}, last updated
+          {{ ledger_summary.updated | friendly_date }}.
+        </p>
+        <ul>
+          {% for tier, count in ledger_summary.tier_counts %}
+            <li>{{ tier | tier_label }}: {{ count }}</li>
+          {% endfor %}
+        </ul>
+        <p><a href="/ledger">See the full picture &rarr;</a></p>
+      </section>
+    {% endif %}
+
+    {% if open_questions_nontrivial %}
+      <section class="card">
+        <h2>Open questions for your next appointment</h2>
+        {{ open_questions_text | markdown_lite | safe }}
+      </section>
+    {% endif %}
+
+    {% if latest_review %}
+      <section class="card">
+        <h2>Weekly reviews</h2>
+        <p>
+          Latest review:
+          {% if latest_review.date %}{{ latest_review.date | friendly_date }}
+          {% else %}{{ latest_review.filename }}{% endif %}.
+          <a href="/reviews/{{ latest_review.filename }}">Read it &rarr;</a>
+        </p>
+      </section>
+    {% endif %}
+
+    <section class="card">
+      <h2>What's on file</h2>
+      {% include "_on_file_strip.html" %}
+    </section>
+  {% endif %}
 {% endblock %}

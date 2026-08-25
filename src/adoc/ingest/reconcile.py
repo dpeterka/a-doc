@@ -106,6 +106,7 @@ from adoc.labs.validate import (
     canonical_rename_target,
     canonical_unit,
     canonicalize,
+    outlier_issue_from_deviation,
     trend_deviation,
     trend_outlier,
     validate_row,
@@ -934,9 +935,20 @@ def _evaluate_pair(
     candidate_b = _candidate_lab_result(b, canonical=canonical, doc_date=doc_date)
     issues = validate_row(candidate_a) + validate_row(candidate_b)
     reasons.extend(issue.message for issue in issues)
+    # `trend_deviation` is a `labs.sqlite` query (per candidate) when no
+    # pre-fetched series is supplied — compute it ONCE per candidate here
+    # and derive both the outlier gate (`outlier_issue_from_deviation`)
+    # and the raw ratio (for the decimal-signature check below) from that
+    # single result, instead of querying once via `trend_outlier` and
+    # again via a direct `trend_deviation` call for the same row.
+    deviation_a = trend_deviation(db, candidate_a)
+    deviation_b = trend_deviation(db, candidate_b)
     outliers = [
         outlier
-        for outlier in (trend_outlier(db, candidate_a), trend_outlier(db, candidate_b))
+        for outlier in (
+            outlier_issue_from_deviation(candidate_a, deviation_a),
+            outlier_issue_from_deviation(candidate_b, deviation_b),
+        )
         if outlier is not None
     ]
     reasons.extend(outlier.message for outlier in outliers)
@@ -946,11 +958,7 @@ def _evaluate_pair(
     # extraction-correctness signal) — they annotate the row but do not
     # block AUTO. The one exception: a >=10x-class shift, the decimal-
     # misread signature both passes could plausibly share, still queues.
-    deviations = [
-        d
-        for d in (trend_deviation(db, candidate_a), trend_deviation(db, candidate_b))
-        if d is not None
-    ]
+    deviations = [d for d in (deviation_a, deviation_b) if d is not None]
     decimal_signature = any(d >= DECIMAL_SIGNATURE_RATIO for d in deviations)
 
     gates_pass = (

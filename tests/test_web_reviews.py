@@ -1,4 +1,8 @@
-"""Weekly review surface tests: list + render of `case/reviews/*.md`."""
+"""Weekly review surface tests: list + render of `case/reviews/*.md`, and
+(when none exist yet) an explanation of what a weekly review is, when the
+next one runs, and that the first one needs a diagnostic conversation on
+file first.
+"""
 
 from __future__ import annotations
 
@@ -6,6 +10,25 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 from web_support import build_app, login
+
+from adoc.web.routes.reviews import REVIEW_SCHEDULE_PHRASE
+
+
+def test_reviews_index_empty_state_explains_the_mechanism_and_schedule(tmp_path: Path) -> None:
+    app, _repo, _db, _calls = build_app(tmp_path)
+    client = TestClient(app)
+    login(client)
+
+    response = client.get("/reviews")
+
+    assert response.status_code == 200
+    body = response.text
+    assert "No reviews yet." not in body
+    assert "blind re-differential panel" in body
+    assert "without" in body.lower()
+    assert REVIEW_SCHEDULE_PHRASE in body
+    assert "at least one diagnostic conversation" in body
+    assert 'href="/chat"' in body
 
 
 def test_reviews_index_lists_review_files(tmp_path: Path) -> None:

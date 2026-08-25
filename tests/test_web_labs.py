@@ -458,3 +458,71 @@ def test_labs_detail_handles_a_single_reading_analyte_gracefully(tmp_path: Path)
 
     assert response.status_code == 200
     assert "42.0" in response.text
+
+
+def test_labs_index_does_not_issue_a_query_per_analyte(tmp_path: Path) -> None:
+    """Perf regression guard: the index used to call `trend_series` once per
+    analyte. Locally that was invisible (~0.02 ms/query against page cache),
+    but the deployed app reads `labs.sqlite` over EFS/NFS where each query
+    costs milliseconds of round-trip - ~450 analytes made the page take
+    ~11 s in production. The whole page must now stay O(1) in queries, not
+    O(analytes)."""
+    app, _repo, db, _calls = build_app(tmp_path)
+    db.upsert_document(
+        LabDocument(sha256=SHA, filename="doc.pdf", doc_type="lab_report", page_count=1)
+    )
+    rows = []
+    for i in range(40):
+        for day in (1, 2):
+            rows.append(
+                LabResult(
+                    date=date(2026, 5, day),
+                    name=f"analyte-{i}",
+                    name_raw=f"Analyte {i}",
+                    value=float(i + day),
+                    source_doc=SHA,
+                    raw_json=json.dumps({}),
+                )
+            )
+    db.insert_results(rows)
+
+    selects: list[str] = []
+    db._conn.set_trace_callback(lambda stmt: selects.append(stmt))
+    try:
+        client = TestClient(app)
+        login(client)
+        response = client.get("/labs")
+    finally:
+        db._conn.set_trace_callback(None)
+
+    assert response.status_code == 200
+    labs_selects = [s for s in selects if "FROM labs" in s]
+    # 40 analytes: a per-analyte implementation issues 40+ of these. The
+    # bulk implementation needs only a handful regardless of analyte count.
+    assert len(labs_selects) < 10, f"expected O(1) labs queries, got {len(labs_selects)}"
+
+
+def test_series_by_key_matches_per_analyte_series(tmp_path: Path) -> None:
+    """`series_by_key` must be a drop-in for calling `series()` per analyte:
+    same rows, same order, same rejected-row filtering."""
+    app, _repo, db, _calls = build_app(tmp_path)
+    _seed_series(db)
+    db.insert_results(
+        [
+            LabResult(
+                date=date(2026, 6, 2),
+                name="glucose",
+                name_raw="GLUCOSE",
+                value_text="NEGATIVE",
+                specimen="urine",
+                source_doc=SHA,
+                raw_json=json.dumps({}),
+            )
+        ]
+    )
+
+    bulk = db.series_by_key()
+    for latest in db.latest_panel():
+        key = (latest.name, latest.specimen)
+        expected = db.series(latest.name, latest.specimen)
+        assert [r.id for r in bulk[key]] == [r.id for r in expected]
