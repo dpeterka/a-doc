@@ -7,7 +7,7 @@ No network, ever — `verify_claims`'s model call always goes through a fake
 from __future__ import annotations
 
 import json
-from datetime import date
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 import pytest
@@ -27,7 +27,7 @@ from adoc.casefile.schema import (
     RecordChallenge,
 )
 from adoc.config import ModelBinding
-from adoc.labs.db import LabsDb
+from adoc.labs.db import DocumentTextPage, LabsDb
 from adoc.labs.models import LabDocument, LabResult
 from adoc.reason.client import (
     LlmClient,
@@ -191,11 +191,51 @@ def test_resolver_encounter_ref_missing_file_is_none(db: LabsDb, repo: DataRepo)
     assert resolver.resolve("encounter:does-not-exist.md") is None
 
 
-def test_resolver_doc_pmid_patient_report_refs_are_none_today(db: LabsDb, repo: DataRepo) -> None:
-    """PLAN.md Phase 2 seam: these resolve to `None` until the parallel
-    document-text-corpus workstream lands a richer resolver."""
+def test_resolver_doc_ref_resolves_against_stored_document_text(db: LabsDb, repo: DataRepo) -> None:
+    """The document-text corpus (ADR 0015) has landed, so a `doc:` ref now
+    resolves to the cited document's real extracted text — and to the cited
+    PAGE's text when the corpus stored pages separately, since a claim is
+    far easier to judge against one page than against the whole document."""
+    _seed_document(db)
+    db.replace_document_text(
+        SHA,
+        [
+            DocumentTextPage(page=1, text="Impression: findings consistent with thyroiditis."),
+            DocumentTextPage(page=2, text="Addendum: no evidence of malignancy."),
+        ],
+        extracted_at=datetime(2026, 5, 2, tzinfo=UTC),
+    )
+    resolver = DefaultSourceTextResolver(db, repo)
+
+    page1 = resolver.resolve("doc:quest.pdf#p1")
+    assert page1 is not None
+    assert "thyroiditis" in page1
+    assert "malignancy" not in page1  # scoped to the cited page, not the whole doc
+
+    page2 = resolver.resolve("doc:quest.pdf#p2")
+    assert page2 is not None
+    assert "malignancy" in page2
+
+    whole = resolver.resolve("doc:quest.pdf")
+    assert whole is not None
+    assert "thyroiditis" in whole and "malignancy" in whole
+
+
+def test_resolver_doc_ref_is_none_when_no_text_was_extracted(db: LabsDb, repo: DataRepo) -> None:
+    """An image-only scan with no text layer — and, by construction, every
+    genomic file (ADR 0015 never extracts their text) — yields
+    `insufficient_source`, never a rejection."""
+    _seed_document(db)
     resolver = DefaultSourceTextResolver(db, repo)
     assert resolver.resolve("doc:quest.pdf#p1") is None
+    assert resolver.resolve("doc:never-ingested.pdf#p1") is None
+
+
+def test_resolver_pmid_and_patient_report_refs_stay_none(db: LabsDb, repo: DataRepo) -> None:
+    """A PMID's abstract is not stored locally (the citation checker only
+    proves the id exists), and a patient-report ref cites the patient's own
+    statement — there is no external source text to entail against."""
+    resolver = DefaultSourceTextResolver(db, repo)
     assert resolver.resolve("pmid:12345678") is None
     assert resolver.resolve("patient-report:2026-05-02") is None
 

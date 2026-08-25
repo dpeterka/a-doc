@@ -1,4 +1,4 @@
-# 0015. Cross-family entailment verifier + code-enforced abstention
+# 0016. Cross-family entailment verifier + code-enforced abstention
 
 Status: Accepted (2026-08-25)
 

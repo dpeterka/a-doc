@@ -183,9 +183,17 @@ class DefaultSourceTextResolver:
       narrative text today (PLAN.md docx ingestion), so this resolver
       starts working the moment more encounters exist, without this module
       changing.
-    - `doc:<file>#p<page>` / `pmid:<id>` / `patient-report:<date>` — `None`
-      today. A future resolver (once the document-text corpus lands) can
-      extend or replace this default without any caller here changing.
+    - `doc:<file>#p<page>` — the cited document's extracted text (ADR 0015's
+      document-text corpus, which has now landed): the page's own text when
+      the ref names a page and that page was stored separately, otherwise
+      the whole document's text. `None` when nothing was ever extracted for
+      it (e.g. a scan with no text layer, or a genomic file, which by
+      construction never has text) — which yields `insufficient_source`,
+      never a rejection.
+    - `pmid:<id>` / `patient-report:<date>` — `None`. A PMID's abstract is
+      not stored locally (the citation checker verifies only that the id
+      exists), and a patient-report ref cites the patient's own statement,
+      which has no external source text to entail against.
     """
 
     def __init__(self, db: LabsDb, repo: DataRepo) -> None:
@@ -197,7 +205,36 @@ class DefaultSourceTextResolver:
             return self._resolve_labs(source)
         if source.startswith("encounter:"):
             return self._resolve_encounter(source)
+        if source.startswith("doc:"):
+            return self._resolve_doc(source)
         return None
+
+    def _resolve_doc(self, source: str) -> str | None:
+        """`doc:<filename>#p<page>` -> that document's extracted text.
+
+        Page-scoped when the corpus stored per-page text and the ref names a
+        page; whole-document otherwise. A document with no stored text at all
+        returns `None` (-> `insufficient_source`), which is the honest answer
+        for an image-only scan and the only possible answer for a genomic
+        file, whose text is never extracted by construction (ADR 0015).
+        """
+        ref = source[len("doc:") :]
+        filename, _, page_part = ref.partition("#p")
+        document = next(
+            (doc for doc in self._db.list_documents() if doc.filename == filename), None
+        )
+        if document is None:
+            return None
+        if page_part:
+            try:
+                page = int(page_part)
+            except ValueError:
+                page = 0
+            if page > 0:
+                page_text = self._db.get_document_page_text(document.sha256, page)
+                if page_text is not None:
+                    return page_text
+        return self._db.get_document_text(document.sha256)
 
     def _resolve_labs(self, source: str) -> str | None:
         _, slug, date_str = source.split(":", 2)
