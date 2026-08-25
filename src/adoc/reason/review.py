@@ -71,7 +71,7 @@ from adoc.casefile.schema import (
 )
 from adoc.labs.db import LabsDb
 from adoc.labs.queries import abnormal_summary
-from adoc.labs.validate import trend_outlier
+from adoc.labs.validate import canonicalize, trend_outlier
 from adoc.reason.client import LlmClient, Message
 from adoc.reason.context import ContextPack, build_context
 from adoc.reason.dag import (
@@ -260,14 +260,25 @@ class ReviewReport(BaseModel):
 def deterministic_trend_scan(db: LabsDb) -> TrendScanResult:
     """Deterministic trend scan (PLAN.md loop (c) step (a)): every
     currently-flagged result plus each analyte's latest reading, checked
-    against `labs.validate.trend_outlier`. No LLM call."""
+    against `labs.validate.trend_outlier`. No LLM call.
+
+    One bulk fetch of every analyte's series up front
+    (`LabsDb.series_by_key()`), instead of `trend_outlier` querying
+    `labs.sqlite` once per candidate row: this scan runs weekly over EVERY
+    current analyte (~450 in the deployed corpus), and `labs.sqlite` lives
+    on EFS/NFS in production, where each query costs milliseconds of round
+    trip — see `web.routes.labs`' `labs_index` fix for the same pattern.
+    """
     candidates = {row.id: row for row in db.latest_panel()}
     for row in abnormal_summary(db):
         candidates[row.id] = row
 
+    series_by_key = db.series_by_key()
     findings: list[TrendFinding] = []
     for row in candidates.values():
-        issue = trend_outlier(db, row)
+        canonical = canonicalize(row.name) or row.name
+        series = series_by_key.get((canonical, row.specimen), [])
+        issue = trend_outlier(db, row, series=series)
         if issue is not None:
             findings.append(
                 TrendFinding(

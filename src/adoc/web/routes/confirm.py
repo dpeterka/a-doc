@@ -13,6 +13,7 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import date as date_cls
+from pathlib import Path
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, Form, Request
@@ -164,7 +165,9 @@ def _is_score_row(row: LabResult) -> bool:
     return row.value is not None and row.ucum_unit is None and row.ref_text is None
 
 
-def _row_view(repo: DataRepo, pr: PendingRow, *, agreed: bool) -> dict[str, Any]:
+def _row_view(
+    repo: DataRepo, pr: PendingRow, *, agreed: bool, image_cache: dict[str, list[Path]]
+) -> dict[str, Any]:
     payload = pr.row.raw_payload()
     reasons: list[str] = payload.get("reasons", [])
     pass_a: dict[str, Any] | None = payload.get("pass_a")
@@ -172,7 +175,7 @@ def _row_view(repo: DataRepo, pr: PendingRow, *, agreed: bool) -> dict[str, Any]
     diff_fields = _diff_fields_from_reasons(reasons)
     return {
         "row": pr.row,
-        "image_url": page_image_url(repo, pr.row.source_doc, pr.row.source_page),
+        "image_url": page_image_url(repo, pr.row.source_doc, pr.row.source_page, cache=image_cache),
         "agreed": agreed,
         "friendly_reason": _friendly_reason(reasons[0]) if reasons else None,
         "compare_rows": _compare_rows(pass_a, pass_b, diff_fields),
@@ -194,6 +197,7 @@ def _build_groups(
     agreed: bool,
     doc_totals: dict[str, int],
     pending_totals: dict[str, int],
+    image_cache: dict[str, list[Path]],
 ) -> list[DocumentGroup]:
     """Group `items` (already-classified rows, one bucket) by document,
     preserving `items`' own ordering across documents (callers rely on
@@ -222,7 +226,7 @@ def _build_groups(
                 page_count=first.doc_page_count,
                 pending_count=len(prs),
                 done_count=max(total - total_pending, 0),
-                rows=[_row_view(repo, pr, agreed=agreed) for pr in prs],
+                rows=[_row_view(repo, pr, agreed=agreed, image_cache=image_cache) for pr in prs],
             )
         )
     return groups
@@ -256,12 +260,24 @@ def _pending_context(repo: DataRepo, db: LabsDb, *, error: str | None = None) ->
     for pr in items:
         (agreed_items if row_is_agreed(_row_reasons(pr)) else disagreement_items).append(pr)
 
+    # Shared across both buckets' rows for this one request: rows commonly
+    # share a source document (that's the whole point of grouping by
+    # document), so without this each row would re-list that document's
+    # page-image directory from scratch (see `list_page_images`'s
+    # docstring).
+    image_cache: dict[str, list[Path]] = {}
+
     return {
         "error": error,
         "twin_sweep_note": _twin_sweep_note(repo),
         "agreed_count": len(agreed_items),
         "agreed_groups": _build_groups(
-            repo, agreed_items, agreed=True, doc_totals=doc_totals, pending_totals=pending_totals
+            repo,
+            agreed_items,
+            agreed=True,
+            doc_totals=doc_totals,
+            pending_totals=pending_totals,
+            image_cache=image_cache,
         ),
         "disagreement_count": len(disagreement_items),
         "disagreement_groups": _build_groups(
@@ -270,6 +286,7 @@ def _pending_context(repo: DataRepo, db: LabsDb, *, error: str | None = None) ->
             agreed=False,
             doc_totals=doc_totals,
             pending_totals=pending_totals,
+            image_cache=image_cache,
         ),
     }
 

@@ -572,3 +572,52 @@ def test_same_pass_same_value_rows_never_retro_pair(tmp_path: Path) -> None:
         assert rid is not None
         row = db.get_row(rid)
         assert row is not None and row.extraction_status is ExtractionStatus.PENDING
+
+
+def test_sweep_does_not_requery_resolved_rows_per_pending_row_in_one_document(
+    tmp_path: Path,
+) -> None:
+    """Perf regression guard: `find_candidate` used to call
+    `LabsDb.resolved_rows_for_document` fresh for every PENDING single_pass
+    row it checked - a document with many such rows (a real legacy-backlog
+    shape, per the module docstring's "1,153 of 1,159" finding in the
+    sibling `labs/reclassify.py` sweep) re-ran the identical query once per
+    row instead of once per document. `labs.sqlite` lives on EFS/NFS in
+    the deployed app, where each query costs milliseconds of round trip.
+
+    Every pending row here has a value that matches no resolved candidate
+    (each is distinct and none equal the one resolved row's value), so
+    `find_candidate` always scans to the end of the resolved set without
+    ever finding a match or reaching the LLM path."""
+    db = LabsDb(tmp_path / "labs.sqlite")
+    db.upsert_document(_doc())
+    db.insert_results([_row("Potassium", value=1.0, page=1, status=ExtractionStatus.AUTO)])
+    for i in range(15):
+        db.insert_results(
+            [
+                _row(
+                    f"Mystery Analyte {i}",
+                    value=100.0 + i,
+                    page=1,
+                    status=ExtractionStatus.PENDING,
+                    reasons=["single_pass"],
+                )
+            ]
+        )
+
+    selects: list[str] = []
+    db._conn.set_trace_callback(lambda stmt: selects.append(stmt))
+    try:
+        report = sweep_twins(db, _client(None))  # LLM must never be called
+    finally:
+        db._conn.set_trace_callback(None)
+
+    assert report.checked == 15
+    assert report.rejected == 0
+    resolved_selects = [s for s in selects if "source_doc = " in s and "extraction_status IN" in s]
+    # 15 PENDING rows sharing ONE document: a per-row implementation issues
+    # 15 of these. The cached implementation issues exactly one.
+    assert len(resolved_selects) == 1, (
+        f"expected 1 resolved_rows_for_document query (memoized per document), "
+        f"got {len(resolved_selects)}"
+    )
