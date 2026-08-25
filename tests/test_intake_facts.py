@@ -131,6 +131,56 @@ def test_update_fact_note_too_short_is_rejected_by_pydantic() -> None:
         UpdateFact(id="fact-1", note="short")
 
 
+# --- follow_up: docs/adr/0018-intake-clinical-progression-and-continuity.md ----------
+
+
+def test_add_fact_can_be_flagged_follow_up(tmp_path: Path) -> None:
+    store = IntakeFactsStore(tmp_path)
+    store.apply_ops([AddFact(fact=_new_fact(id="follow-me", follow_up=True))], _provenance())
+
+    fact = store.get("follow-me")
+    assert fact is not None
+    assert fact.follow_up is True
+
+
+def test_add_fact_defaults_follow_up_to_false(tmp_path: Path) -> None:
+    store = IntakeFactsStore(tmp_path)
+    store.apply_ops([AddFact(fact=_new_fact())], _provenance())
+
+    fact = store.get("fact-1")
+    assert fact is not None
+    assert fact.follow_up is False
+
+
+def test_update_fact_sets_and_clears_follow_up(tmp_path: Path) -> None:
+    store = IntakeFactsStore(tmp_path)
+    store.apply_ops([AddFact(fact=_new_fact())], _provenance())
+
+    store.apply_ops(
+        [UpdateFact(id="fact-1", follow_up=True, note="worth checking back on next visit")],
+        _provenance(),
+    )
+    assert store.get("fact-1").follow_up is True  # type: ignore[union-attr]
+
+    store.apply_ops(
+        [UpdateFact(id="fact-1", follow_up=False, note="revisited this on the next visit")],
+        _provenance(),
+    )
+    assert store.get("fact-1").follow_up is False  # type: ignore[union-attr]
+
+
+def test_update_fact_omitting_follow_up_leaves_it_unchanged(tmp_path: Path) -> None:
+    store = IntakeFactsStore(tmp_path)
+    store.apply_ops([AddFact(fact=_new_fact(follow_up=True))], _provenance())
+
+    store.apply_ops(
+        [UpdateFact(id="fact-1", fields={"reaction": "hives"}, note="added the reaction detail")],
+        _provenance(),
+    )
+
+    assert store.get("fact-1").follow_up is True  # type: ignore[union-attr]
+
+
 def test_retract_fact_marks_retracted_and_keeps_history(tmp_path: Path) -> None:
     store = IntakeFactsStore(tmp_path)
     store.apply_ops([AddFact(fact=_new_fact())], _provenance())

@@ -306,7 +306,7 @@ def test_onboard_legacy_wizard_flag_runs_the_wizard_loop_against_an_initialized_
 
     assert code == 0
     out = capsys.readouterr().out
-    assert "[1/10] Basics" in out
+    assert "[1/11] Basics" in out
     assert "resume anytime with `adoc onboard`" in out
 
 
@@ -339,7 +339,7 @@ def test_onboard_default_runs_the_conversational_engine_against_an_initialized_r
     assert "resume anytime with `adoc onboard`" in out
     # docs/adr/0012-initial-visit-conversation.md: no section display at all.
     assert "Basics" not in out
-    assert "[1/10]" not in out
+    assert "[1/11]" not in out
 
 
 def test_onboard_warns_loudly_when_identifiers_have_no_names(

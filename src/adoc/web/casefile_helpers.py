@@ -115,6 +115,17 @@ def last_chat_date(repo: DataRepo) -> date | None:
     single newest entry is needed, so `max_turns=1` regardless of
     `max_files`'s default (the newest entry always lives in the newest
     day-file)."""
+    at = last_chat_at(repo)
+    return at.date() if at is not None else None
+
+
+def last_chat_at(repo: DataRepo) -> datetime | None:
+    """Like `last_chat_date` but the full timestamp — post-intake continuity
+    (`docs/adr/0018-intake-clinical-progression-and-continuity.md`) needs an
+    hours-scale "how long has it been" gap, not just a date, to decide
+    whether a turn is starting a new visit
+    (`intake.agent.VISIT_GAP_THRESHOLD_HOURS`) and to render "it's been
+    about 3 hours"/"yesterday"/etc. `None` if no chat has happened yet."""
     entries = read_recent_chat(repo, max_turns=1)
     if not entries:
         return None
@@ -122,7 +133,7 @@ def last_chat_date(repo: DataRepo) -> date | None:
     if not timestamp:
         return None
     try:
-        return datetime.fromisoformat(timestamp).date()
+        return datetime.fromisoformat(timestamp)
     except ValueError:
         return None
 

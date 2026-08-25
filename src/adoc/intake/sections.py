@@ -1,8 +1,10 @@
 """Onboarding section schemas + the section registry.
 
-PLAN.md "Onboarding & end-user experience" lists 10 sections, each backed by
-a Pydantic schema. This module defines those schemas and `SECTIONS`, the
-ordered registry `wizard.py` drives the state machine from: each entry
+PLAN.md "Onboarding & end-user experience" lists 11 sections (10 plus
+`geography`, added by `docs/adr/0018-intake-clinical-progression-and-
+continuity.md`), each backed by a Pydantic schema. This module defines
+those schemas and `SECTIONS`, the ordered registry `wizard.py` drives the
+state machine from: each entry
 carries the section's `key` (stable id, also used as the intake-state.yaml
 key and the git-commit-message tag), a human `title`, the extraction
 `schema`, an `intro` prompt shown to the patient at the start of the
@@ -95,7 +97,32 @@ class FamilyHistorySection(BaseModel):
     relatives: list[Relative] = Field(default_factory=list)
 
 
-# --- 6. Medications ----------------------------------------------------------------------
+# --- 6. Geography & environmental exposure ---------------------------------------------
+
+# docs/adr/0018-intake-clinical-progression-and-continuity.md: added so travel/
+# regional exposure (e.g. tick-borne and other regional infectious risk) has a real
+# home in the case file instead of being folded into `BasicsSection.exposures`
+# (occupational-only) or dropped entirely.
+
+
+class ResidenceEntry(BaseModel):
+    place: str
+    date_approx: str | None = None
+    """Rough dates this residence covers ("2015-2020", "childhood") — same
+    free-form convention as `MedicalEvent.date_approx`."""
+    current: bool = False
+
+
+class GeographySection(BaseModel):
+    residences: list[ResidenceEntry] = Field(default_factory=list)
+    travel: list[str] = Field(default_factory=list)
+    exposures: list[str] = Field(default_factory=list)
+    """Environmental/occupational exposures tied to a place or trip (tick
+    habitat, well water, farm/agricultural work, a regional outbreak) —
+    distinct from `BasicsSection.exposures`, which stays occupational."""
+
+
+# --- 7. Medications ----------------------------------------------------------------------
 
 
 class Medication(BaseModel):
@@ -110,7 +137,7 @@ class MedicationsSection(BaseModel):
     medications: list[Medication] = Field(default_factory=list)
 
 
-# --- 7. Supplements ------------------------------------------------------------------------
+# --- 8. Supplements ------------------------------------------------------------------------
 
 
 class Supplement(BaseModel):
@@ -125,7 +152,7 @@ class SupplementsSection(BaseModel):
     supplements: list[Supplement] = Field(default_factory=list)
 
 
-# --- 8. Allergies & reactions ----------------------------------------------------------------
+# --- 9. Allergies & reactions ----------------------------------------------------------------
 
 
 class Allergy(BaseModel):
@@ -138,7 +165,7 @@ class AllergiesSection(BaseModel):
     allergies: list[Allergy] = Field(default_factory=list)
 
 
-# --- 9. Care team & insurance ------------------------------------------------------------------
+# --- 10. Care team & insurance ------------------------------------------------------------------
 
 
 class Provider(BaseModel):
@@ -152,7 +179,7 @@ class CareTeamSection(BaseModel):
     insurer: str | None = None
 
 
-# --- 10. Document drop -----------------------------------------------------------------------
+# --- 11. Document drop -----------------------------------------------------------------------
 
 
 class DocumentDropSection(BaseModel):
@@ -265,6 +292,27 @@ SECTIONS: list[SectionSpec] = [
             "conditions the patient mentioned for them, an approximate age at "
             "onset if given, and whether they are deceased (with age at death if "
             "given). Only include relatives the patient actually mentioned."
+        ),
+    ),
+    SectionSpec(
+        key="geography",
+        title="Geography & environmental exposure",
+        schema=GeographySection,
+        intro=(
+            "Where do you live now, and where else have you lived — roughly when? Any "
+            "travel worth mentioning, or things about where you've lived or worked that "
+            "could matter (well water, ticks/outdoor exposure, farm work, a regional "
+            "outbreak, that kind of thing)?"
+        ),
+        extraction_system_prompt=(
+            "You are the intake assistant for a personal medical case-file tool. Extract "
+            "the patient's residence history into `residences` (place, approximate dates, "
+            "and whether it's their CURRENT residence), any `travel` worth noting as a "
+            "list of short strings, and any environmental/occupational `exposures` tied "
+            "to a place or trip (well water, ticks/outdoor exposure, farm work, a "
+            "regional outbreak) as a list of short strings. Leave a list empty if the "
+            "patient did not mention anything for it — never guess or fabricate a place, "
+            "a date, or an exposure."
         ),
     ),
     SectionSpec(

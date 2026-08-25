@@ -18,9 +18,10 @@ from fastapi import APIRouter, Depends, Request
 from starlette.responses import RedirectResponse, Response
 
 from adoc.casefile.repo import DataRepo
-from adoc.intake.agent import intake_is_complete
+from adoc.intake.agent import build_continuity_info, intake_is_complete
 from adoc.intake.facts import IntakeFact, IntakeFactsStore
 from adoc.intake.sections import SECTIONS
+from adoc.web.casefile_helpers import last_chat_at
 from adoc.web.deps import get_repo
 from adoc.web.templating import templates
 
@@ -74,6 +75,14 @@ def onboard_review(request: Request, repo: DataRepo = Depends(get_repo)) -> Resp
         reverse=True,
     )
 
+    # Same three things a post-intake visit opens knowing
+    # (docs/adr/0018-intake-clinical-progression-and-continuity.md): last
+    # visit, current state, follow-ups — surfaced here too, structured
+    # rather than as a chat greeting, so the patient can see what the agent
+    # thinks is outstanding without waiting for a new visit to be told.
+    now = datetime.now(UTC)
+    continuity = build_continuity_info(repo, facts_store, last_visit_at=last_chat_at(repo), now=now)
+
     return templates.TemplateResponse(
         request,
         "onboard_review.html",
@@ -82,5 +91,6 @@ def onboard_review(request: Request, repo: DataRepo = Depends(get_repo)) -> Resp
             "baseline_incomplete": not intake_is_complete(repo),
             "recent_facts": recent_facts,
             "recent_window_days": RECENT_WINDOW_DAYS,
+            "continuity": continuity,
         },
     )

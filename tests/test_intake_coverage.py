@@ -102,6 +102,70 @@ def test_old_style_state_with_every_section_complete_and_no_cursor_migrates_to_i
     assert state.intake_complete is True
 
 
+def test_a_new_style_file_predating_the_geography_topic_treats_it_as_uncovered(
+    tmp_path: Path,
+) -> None:
+    """`docs/adr/0018-intake-clinical-progression-and-continuity.md` added the
+    `geography` topic after this coverage-state shape already existed. A
+    new-style file written before that (real `topics:` key, but no
+    `geography` entry in it, because the topic didn't exist yet) must load
+    without error and report `geography` as uncovered, exactly like any
+    other genuinely unstarted topic — never crash on the missing key."""
+    path = tmp_path / "intake-state.yaml"
+    yaml = YAML()
+    with path.open("w", encoding="utf-8") as fh:
+        yaml.dump(
+            {
+                "topics": {
+                    "basics": {"covered": True, "covered_at": "2026-01-01T00:00:00+00:00"},
+                    "family_history": {"covered": True, "covered_at": "2026-01-02T00:00:00+00:00"},
+                },
+                "intake_complete": False,
+            },
+            fh,
+        )
+
+    state = load_coverage_state(path)
+
+    assert state.topics["basics"].covered is True
+    assert "geography" not in state.topics
+    # The accessor pattern every caller actually uses (`_is_covered` in
+    # `intake.agent`) treats a missing key as uncovered, never an error:
+    assert state.topics.get("geography", TopicCoverage()).covered is False
+    assert state.intake_complete is False
+
+
+def test_an_old_style_file_predating_the_geography_topic_migrates_without_it_and_stays_uncovered(
+    tmp_path: Path,
+) -> None:
+    """Same guarantee for a pre-0012 legacy (`sections`/`cursor`) file that
+    also predates `geography`: migration must not choke on a key that
+    simply never appears in `sections`, and the migrated result must not
+    silently invent a covered `geography` entry."""
+    path = tmp_path / "intake-state.yaml"
+    yaml = YAML()
+    with path.open("w", encoding="utf-8") as fh:
+        yaml.dump(
+            {
+                "sections": {
+                    "basics": {
+                        "status": "complete",
+                        "completed_at": "2026-01-01T00:00:00+00:00",
+                    },
+                },
+                "cursor": "symptoms",
+            },
+            fh,
+        )
+
+    state = load_coverage_state(path)
+
+    assert state.topics["basics"].covered is True
+    assert "geography" not in state.topics
+    assert state.topics.get("geography", TopicCoverage()).covered is False
+    assert state.intake_complete is False
+
+
 def test_a_new_style_file_with_no_topics_key_at_all_is_not_mistaken_for_old_style(
     tmp_path: Path,
 ) -> None:

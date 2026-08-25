@@ -76,7 +76,7 @@ def test_immediate_eof_ends_session_cleanly_and_shows_first_section(tmp_path: Pa
     printed = _run(wizard, [])
 
     joined = "\n".join(printed)
-    assert "[1/10] Basics" in joined
+    assert "[1/11] Basics" in joined
     assert "resume anytime with `adoc onboard`" in joined
 
 
@@ -85,11 +85,11 @@ def test_skip_moves_cursor_forward_without_completing_the_section(tmp_path: Path
     printed = _run(wizard, ["skip"])
 
     joined = "\n".join(printed)
-    assert "[1/10] Basics" in joined
-    assert "[2/10] Current symptoms" in joined
+    assert "[1/11] Basics" in joined
+    assert "[2/11] Current symptoms" in joined
     assert wizard.current_status() == "pending"  # symptoms, not yet touched
     completed, total = wizard.progress()
-    assert (completed, total) == (0, 10)
+    assert (completed, total) == (0, 11)
 
 
 def test_back_returns_cursor_to_the_previous_section(tmp_path: Path) -> None:
@@ -98,7 +98,7 @@ def test_back_returns_cursor_to_the_previous_section(tmp_path: Path) -> None:
 
     joined = "\n".join(printed)
     # basics -> (skip) -> symptoms -> (back) -> basics again
-    assert joined.count("[1/10] Basics") == 2
+    assert joined.count("[1/11] Basics") == 2
 
 
 def test_submit_then_confirmation_phrase_commits_the_section(tmp_path: Path) -> None:
@@ -223,7 +223,7 @@ def test_conversational_session_immediate_eof_prints_the_opener(tmp_path: Path) 
     assert INTAKE_OPENER_MESSAGE in joined
     assert "resume anytime with `adoc onboard`" in joined
     # No section display of any kind.
-    assert "[1/10]" not in joined
+    assert "[1/11]" not in joined
     assert "Basics" not in joined
 
 

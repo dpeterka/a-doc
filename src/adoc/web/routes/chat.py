@@ -31,12 +31,21 @@ contracts. Skipped entirely on a red-flag/urgent, withheld, or error
 outcome (only a turn that actually reached the patient is worth capturing
 from); failures inside `run_visit_capture` itself are swallowed there, so
 this route never needs to handle them.
+
+**Post-intake continuity** (`docs/adr/0018-intake-clinical-progression-and-
+continuity.md`): the first successful informational/diagnostic reply of a
+new "visit" (the gap since the previous chat-transcript entry, captured
+BEFORE this turn's patient message is appended, exceeds `intake.agent.
+VISIT_GAP_THRESHOLD_HOURS`) is prefixed with a short, deterministic,
+code-composed continuity note (`intake.agent.render_continuity_note`) —
+same pattern as `red_flag_warning_prefix`: fixed text the model cannot
+suppress or soften, applied after the model has already spoken.
 """
 
 from __future__ import annotations
 
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from fastapi import APIRouter, Depends, Form, Request
@@ -47,17 +56,21 @@ from adoc.casefile.ledger import LedgerInvariantError
 from adoc.casefile.repo import LEDGER_RELPATH, DataRepo
 from adoc.intake.agent import (
     INTAKE_OPENER_MESSAGE,
+    VISIT_GAP_THRESHOLD_HOURS,
+    build_continuity_info,
     intake_is_complete,
     red_flag_warning_prefix,
+    render_continuity_note,
     run_intake_turn,
     run_visit_capture,
 )
+from adoc.intake.facts import IntakeFactsStore
 from adoc.labs.db import LabsDb
 from adoc.reason.client import LlmClient, LlmError, LlmResult
 from adoc.reason.dag import ContractViolation
 from adoc.reason.safety import RedFlagResult, red_flag_screen
 from adoc.reason.stages import PatientReply, route_turn, run_diagnostic_turn, run_informational_turn
-from adoc.web.casefile_helpers import append_chat_entry, read_recent_chat
+from adoc.web.casefile_helpers import append_chat_entry, last_chat_at, read_recent_chat
 from adoc.web.deps import get_client, get_db, get_repo
 from adoc.web.templating import templates
 
@@ -104,6 +117,24 @@ def _with_red_flag_warning(screen: RedFlagResult, reply: str) -> str:
     if not screen.flagged:
         return reply
     return red_flag_warning_prefix(screen.category) + reply
+
+
+def _continuity_note_for_new_visit(
+    repo: DataRepo, *, prior_chat_at: datetime | None, now: datetime
+) -> str | None:
+    """The post-intake continuity note (`docs/adr/0018-intake-clinical-
+    progression-and-continuity.md`) for the FIRST reply of a new visit, or
+    `None` when this turn isn't one: no prior chat on file yet, or the gap
+    since `prior_chat_at` (captured BEFORE this turn's patient message was
+    appended — see `chat_send`) is under `VISIT_GAP_THRESHOLD_HOURS`, so a
+    same-sitting back-and-forth is never mistaken for a new visit."""
+    if prior_chat_at is None:
+        return None
+    if now - prior_chat_at < timedelta(hours=VISIT_GAP_THRESHOLD_HOURS):
+        return None
+    facts_store = IntakeFactsStore(repo.root)
+    info = build_continuity_info(repo, facts_store, last_visit_at=prior_chat_at, now=now)
+    return render_continuity_note(info, now=now)
 
 
 def _wants_sse(request: Request) -> bool:
@@ -242,6 +273,10 @@ def chat_send(
 
     transcript_was_empty = not read_recent_chat(repo)
     intake_incomplete = not intake_is_complete(repo)
+    # Captured BEFORE this turn's patient message is appended below, so it
+    # reflects the PREVIOUS visit's last entry, not this one
+    # (docs/adr/0018-intake-clinical-progression-and-continuity.md).
+    prior_chat_at = last_chat_at(repo)
     if transcript_was_empty and intake_incomplete:
         append_chat_entry(
             repo,
@@ -260,6 +295,10 @@ def chat_send(
         if intake_incomplete
         else _handle_turn(stripped, client=client, repo=repo, db=db)
     )
+    if not intake_incomplete and turn["kind"] in ("informational", "diagnostic"):
+        continuity_note = _continuity_note_for_new_visit(repo, prior_chat_at=prior_chat_at, now=now)
+        if continuity_note:
+            turn["text"] = f"{continuity_note}\n\n{turn['text']}"
     append_chat_entry(
         repo,
         {
