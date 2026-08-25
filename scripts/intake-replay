@@ -30,7 +30,9 @@ Useful flags:
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
+import os
 import re
 import sys
 import time
@@ -90,13 +92,47 @@ class Session:
             return response.read().decode("utf-8", "replace")
 
     def login(self, username: str, password: str) -> None:
+        """A wrong password is worth failing loudly on: `/login` answers 401
+        with the login page rather than an empty body, so a harness that
+        ignored the status would sail on and report every turn as a failure.
+        The app also rate-limits failed sign-ins per username and IP, so
+        retrying a bad password in a loop locks the account out for minutes."""
         try:
             self._post("/login", {"username": username, "password": password}, timeout=30)
         except urllib.error.HTTPError as exc:
+            if exc.code == 401:
+                raise SystemExit(
+                    f"login failed: bad username or password for {username!r}.\n"
+                    "  List users:  ./scripts/user-list-local --dir <dir>\n"
+                    "  Add a user:  ./scripts/user-create-local <name> --dir <dir>\n"
+                    "  Note: repeated failures rate-limit this username for a few minutes."
+                ) from exc
+            if exc.code == 429:
+                raise SystemExit(
+                    "login failed: this username is temporarily locked out after too many "
+                    "failed sign-ins. Wait a few minutes and try again."
+                ) from exc
             raise SystemExit(f"login failed: HTTP {exc.code}") from exc
 
     def send(self, text: str) -> str:
         return self._post("/chat/send", {"text": text}, timeout=TURN_TIMEOUT_SECONDS)
+
+
+def resolve_password(*, use_stdin: bool) -> str:
+    """Env var, then explicit stdin, then an interactive prompt. Never a
+    default and never a file — a `.env` password beside the patient data
+    store is a worse trade than typing it once per run."""
+    from_env = os.environ.get("ADOC_REPLAY_PASSWORD")
+    if from_env:
+        return from_env
+    if use_stdin:
+        return sys.stdin.readline().rstrip("\n")
+    if not sys.stdin.isatty():
+        raise SystemExit(
+            "intake-replay: no password available. Set ADOC_REPLAY_PASSWORD, pass "
+            "--password-stdin, or run from an interactive terminal."
+        )
+    return getpass.getpass("a-doc password: ")
 
 
 def intake_is_complete(data_dir: Path) -> bool:
@@ -117,8 +153,19 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=9001)
-    parser.add_argument("--user", default="andrea")
-    parser.add_argument("--password", default="test")
+    # Credentials are never defaulted to a guess and never read from a file.
+    # `ADOC_REPLAY_PASSWORD` exists for CI/non-interactive use; interactively
+    # the prompt is the right answer, so the password stays out of shell
+    # history, out of the process table, and out of any dotfile sitting next
+    # to the patient data store.
+    parser.add_argument(
+        "--user", default=os.environ.get("ADOC_REPLAY_USER"), help="[env: ADOC_REPLAY_USER]"
+    )
+    parser.add_argument(
+        "--password-stdin",
+        action="store_true",
+        help="read the password from stdin instead of prompting",
+    )
     parser.add_argument(
         "--data-dir", type=Path, help="data repo, to read intake state after each turn"
     )
@@ -142,8 +189,17 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  {i:2d}. {message[:100]}{'...' if len(message) > 100 else ''}")
         return 0
 
+    username = args.user or input("a-doc username: ").strip()
+    if not username:
+        print("intake-replay: a username is required", file=sys.stderr)
+        return 2
+    password = resolve_password(use_stdin=args.password_stdin)
+    if not password:
+        print("intake-replay: a password is required", file=sys.stderr)
+        return 2
+
     session = Session(f"http://{args.host}:{args.port}")
-    session.login(args.user, args.password)
+    session.login(username, password)
 
     records: list[dict] = []
     completed_on: int | None = None
