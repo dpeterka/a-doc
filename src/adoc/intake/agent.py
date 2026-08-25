@@ -67,25 +67,67 @@ from adoc.reason.safety import red_flag_screen, treatment_gate
 
 logger = logging.getLogger(__name__)
 
-INTAKE_AGENT_PROMPT_VERSION = "3"
+INTAKE_AGENT_PROMPT_VERSION = "4"
 INTAKE_TRANSCRIPT_RELPATH = "case/intake-transcript.jsonl"
 
 DOC_DIGEST_MAX_LINES = 60
 TRANSCRIPT_CONTEXT_TURNS = 20
 
+# Defect fix (live blocker): a patient who pastes a long written history in
+# one message must never be truncated or refused, but the model needs an
+# explicit steer or it tries to process/ask about all of it at once. ~4000
+# characters is comfortably past an ordinary conversational turn (a few
+# paragraphs) while still well short of anything that risks the model's
+# context budget on its own -- a module constant so the threshold is easy
+# to retune from one place.
+LONG_MESSAGE_THRESHOLD_CHARS = 4000
+
+# Appended to the turn context (never to the patient's own text, which is
+# never truncated or refused) when a message crosses the threshold above --
+# tells the model, in its own bookkeeping context, to acknowledge the volume
+# warmly and steer to one thing at a time instead of trying to process
+# everything in a single reply (see `_INTAKE_AGENT_SYSTEM_PROMPT`'s "LONG
+# PASTES" section, which this note points at).
+_LONG_MESSAGE_NOTE = (
+    "\n\n## Note: this message is unusually long\n\n"
+    f"The patient's message above is over {LONG_MESSAGE_THRESHOLD_CHARS} characters -- "
+    "likely a pasted history or written summary. Follow the LONG PASTES guidance: "
+    "acknowledge warmly that you received a lot of detail, capture what you can "
+    "confidently pull out of it as fact ops, and steer `message` to ONE thing at a time. "
+    "Never refuse it and never ask her to shorten or resend it.\n"
+)
+
+# How many completions `run_intake_turn` may spend applying one turn's fact
+# ops: the first attempt plus one feedback-guided retry naming exactly which
+# ops `IntakeFactsStore.apply_ops` rejected and why -- mirrors
+# `reason.stages.composer_stage`'s gate-guided rewrite and the citation
+# checker's retry (PLAN.md Phase 2). Still-rejected ops after the retry are
+# simply dropped and logged; the turn still replies either way (see
+# `run_intake_turn`'s docstring -- one malformed op must never cost the
+# patient her whole turn).
+_OPS_RETRY_ATTEMPTS = 2
+
 _SPEC_BY_KEY: dict[str, SectionSpec] = {spec.key: spec for spec in SECTIONS}
 
 # The very first assistant message of a patient's initial visit — a
-# constant, never an LLM call, per the product redesign: greet, explain in
-# one sentence that this conversation builds the case file, then hand the
-# floor to the patient. `web.routes.chat` renders this into the page when
+# constant, never an LLM call, per the product redesign: greet, ask ONE
+# focused opening question so the conversation is driven rather than
+# inviting a wall of text, note that documents can stand in for retyping
+# everything, and give a clear steer to emergency care for anything urgent
+# happening right now. `web.routes.chat` renders this into the page when
 # the shared chat transcript is empty and intake is incomplete, and writes
 # it into that transcript on the first patient turn so history stays
 # coherent; `intake.cli`'s REPL prints the same constant at session start.
 INTAKE_OPENER_MESSAGE = (
     "Hi — I'm glad you're here. This first conversation is how we build your case "
     "file together, so anything you share becomes part of the record you and your "
-    "doctors can rely on. What's been going on? Start wherever you like."
+    "doctors can rely on. What's been bothering you the most lately, or what brings "
+    "you in?\n\n"
+    "You don't need to type everything at once -- if you've already got a written "
+    "history or records, you can add them as documents instead and we'll work from "
+    "those together.\n\n"
+    "And if something is happening right now and feels urgent, please seek emergency "
+    "care first rather than typing it here -- we can pick this back up once you're safe."
 )
 
 _WITHHELD_MESSAGE = (
@@ -93,6 +135,21 @@ _WITHHELD_MESSAGE = (
     "a-doc's built-in safety checks before it could reach you (the same deterministic "
     "guard that blocks treatment/dosing language everywhere in this app). Nothing is "
     "wrong with your case file. Please try rephrasing, and we'll pick this back up."
+)
+
+# Defect fix (live blocker): the red-flag screen's message
+# (`reason.safety.red_flag_screen`, never edited here — see that module's
+# docstring) reads, on its own, as a conversation-ending instruction. During
+# an INTAKE turn that strands a patient who was merely recounting past
+# history rather than describing a live emergency, with no obvious way to
+# continue. This note is appended ONLY in the intake path (never touches
+# `red_flag_screen` itself, its rules, its matching, or the zero-API-call
+# invariant — CLAUDE.md rule 2) to make the next step obvious either way.
+_INTAKE_URGENT_NEXT_STEP_NOTE = (
+    "\n\nIf what you just described is happening right now, please get care first "
+    "before continuing here. If you were describing something from your past, you're "
+    "welcome to keep going -- tell me about it one thing at a time whenever you're "
+    "ready, or add your written history as a document instead."
 )
 
 # Human phrasing for each internal topic key — used ONLY in the
@@ -225,6 +282,14 @@ restate in your `message` what you changed ("Got it -- updated your penicillin a
 to say hives, not a rash."). To remove something the patient says is wrong or no longer
 applies, use `retract_fact` with a `reason` -- never silently drop it (it stays in
 history, marked retracted).
+
+LONG PASTES:
+A patient sometimes pastes a very long written history in one message -- when that
+happens you will see a note marking it in the context below. Never refuse it and never
+ask her to shorten or resend it. Instead: acknowledge warmly that you got a lot of
+detail, quietly capture whatever you can confidently pull out of it as fact ops (still
+grounded ONLY in what she actually wrote), and steer your `message` to ONE thing at a
+time rather than trying to ask about or process everything in a single reply.
 
 FACT FIELDS CONVENTIONS:
 `fields` is a flat set of key/value pairs -- use plain keys matching what the case file
@@ -509,6 +574,22 @@ def _write_section_from_facts(
     return write_section(repo, section_key, section_data)
 
 
+def _build_ops_retry_feedback(rejected: list[str]) -> str:
+    """Feedback text for the ONE ops-retry `run_intake_turn` spends when
+    `IntakeFactsStore.apply_ops` rejects part of a turn's ops -- same shape
+    as `reason.citations.build_retry_feedback`: name what failed and why,
+    ask for a corrected re-emission of just those ops, same schema."""
+    lines = ["The following fact op(s) from your last response could not be applied:"]
+    lines.extend(f"- {reason}" for reason in rejected)
+    lines.append(
+        "Re-emit corrected versions of ONLY these ops in `ops` (fix the id/reference "
+        "problem named above, or drop the op if it no longer applies). Do not repeat any "
+        "other op -- it already applied successfully. `message`, `topics_covered`, and "
+        "`intake_complete` are ignored for this retry; only `ops` will be used."
+    )
+    return "\n".join(lines)
+
+
 # --------------------------------------------------------------------------
 # The turn entry point
 # --------------------------------------------------------------------------
@@ -519,11 +600,31 @@ def run_intake_turn(client: LlmClient, repo: DataRepo, db: LabsDb, text: str) ->
 
     Red-flag screening always runs first and short-circuits before any
     client call or persistence (mirroring `reason.stages`'s red-flag-first
-    ordering) — zero API calls, nothing written, on a flagged turn.
+    ordering) — zero API calls, nothing written, on a flagged turn. The
+    screen's own message/rules/matching are never touched here
+    (`reason.safety.red_flag_screen`); this only appends a deterministic
+    next-step note so an intake turn — where the patient is often recounting
+    PAST history rather than describing a live emergency — isn't a dead end
+    (`_INTAKE_URGENT_NEXT_STEP_NOTE`).
+
+    A malformed fact op must never cost the patient her whole turn (the live
+    incident this fixes: one op with an unrecognized `section` raised
+    `IntakeError`, and the WHOLE turn — reply included — was lost).
+    `IntakeFactsStore.apply_ops` itself is tolerant (applies every valid op,
+    collects the rest in `.rejected`); on top of that, this function spends
+    ONE feedback-guided retry — mirroring `reason.stages.composer_stage`'s
+    gate-guided rewrite and the citation checker's retry — naming exactly
+    which ops were rejected and why, so the model can re-emit corrected
+    versions. `message`/`topics_covered`/`intake_complete` always come from
+    the FIRST attempt: the retry is narrowly about fixing `ops`, never about
+    re-deciding what to say. Still-rejected ops after the retry (or a retry
+    call that itself fails) are simply dropped and logged; the turn still
+    replies normally either way.
     """
     screen = red_flag_screen(text)
     if screen.flagged:
-        return IntakeOutcome(kind="urgent", text=screen.message or "")
+        urgent_text = (screen.message or "") + _INTAKE_URGENT_NEXT_STEP_NOTE
+        return IntakeOutcome(kind="urgent", text=urgent_text)
 
     now = datetime.now(UTC)
     coverage = load_coverage_state(repo.root / INTAKE_STATE_RELPATH)
@@ -532,35 +633,67 @@ def run_intake_turn(client: LlmClient, repo: DataRepo, db: LabsDb, text: str) ->
 
     context = _build_turn_context(repo, db, coverage, facts_store)
     user_content = f"{context}\n\n## Patient message\n\n{text}\n"
+    # Never truncate or refuse a long paste -- just steer the model to
+    # handle it gracefully (product direction on the live blocker: "the
+    # agent should be able to indicate it got too much information or better
+    # drive the initial intake with questions").
+    if len(text) > LONG_MESSAGE_THRESHOLD_CHARS:
+        user_content += _LONG_MESSAGE_NOTE
 
-    try:
-        result = client.complete(
-            "intake_agent",
-            system=_INTAKE_AGENT_SYSTEM_PROMPT,
-            messages=[Message(role="user", content=user_content)],
-            schema=IntakeTurnResult,
+    messages: list[Message] = [Message(role="user", content=user_content)]
+    turn: IntakeTurnResult | None = None
+    last_parsed: IntakeTurnResult | None = None
+    applied = AppliedResult()
+    retry_feedback: str | None = None
+
+    for _attempt in range(_OPS_RETRY_ATTEMPTS):
+        if retry_feedback is not None:
+            assert last_parsed is not None
+            messages = [
+                *messages,
+                Message(role="assistant", content=last_parsed.model_dump_json()),
+                Message(role="user", content=retry_feedback),
+            ]
+        try:
+            result = client.complete(
+                "intake_agent",
+                system=_INTAKE_AGENT_SYSTEM_PROMPT,
+                messages=messages,
+                schema=IntakeTurnResult,
+            )
+        except LlmError as exc:
+            if turn is None:
+                return IntakeOutcome(kind="error", text=f"Sorry, I couldn't process that: {exc}")
+            logger.warning("intake turn: ops-retry call failed, keeping first attempt: %s", exc)
+            break
+
+        parsed = result.parsed
+        assert isinstance(parsed, IntakeTurnResult)
+        last_parsed = parsed
+        if turn is None:
+            turn = parsed
+
+        round_provenance = Provenance(
+            app_version=__version__,
+            prompt_template_version=INTAKE_AGENT_PROMPT_VERSION,
+            model_id=result.model_id,
+            dag_node="intake-agent",
+            timestamp=now,
         )
-    except LlmError as exc:
-        return IntakeOutcome(kind="error", text=f"Sorry, I couldn't process that: {exc}")
-
-    turn = result.parsed
-    assert isinstance(turn, IntakeTurnResult)
-
-    provenance = Provenance(
-        app_version=__version__,
-        prompt_template_version=INTAKE_AGENT_PROMPT_VERSION,
-        model_id=result.model_id,
-        dag_node="intake-agent",
-        timestamp=now,
-    )
-
-    try:
-        applied = facts_store.apply_ops(turn.ops, provenance)
-    except IntakeError as exc:
-        return IntakeOutcome(
-            kind="error",
-            text=f"Sorry, something in that update didn't apply cleanly: {exc}",
+        round_applied = facts_store.apply_ops(parsed.ops, round_provenance)
+        applied = AppliedResult(
+            added=[*applied.added, *round_applied.added],
+            updated=[*applied.updated, *round_applied.updated],
+            retracted=[*applied.retracted, *round_applied.retracted],
+            rejected=round_applied.rejected,
         )
+        if not applied.rejected:
+            break
+        retry_feedback = _build_ops_retry_feedback(applied.rejected)
+
+    assert turn is not None
+    for reason in applied.rejected:
+        logger.warning("intake turn: dropping fact op that failed to apply: %s", reason)
 
     touched_ids = [*applied.added, *applied.updated, *applied.retracted]
     touched_topics = {
@@ -618,8 +751,10 @@ def run_intake_turn(client: LlmClient, repo: DataRepo, db: LabsDb, text: str) ->
         corroboration_updates = corroborate_facts(facts_store.facts, db, repo)
         facts_store.apply_corroboration(corroboration_updates, at=now)
 
-    # Persist only on full success (IntakeError/LlmError above already
-    # returned before any of this — nothing is written for those turns).
+    # Persist (an LlmError above already returned before any of this —
+    # nothing is written for that turn; a rejected op never blocks the
+    # persist of everything else that DID apply — see this function's
+    # docstring).
     facts_store.save()
     save_coverage_state(repo.root / INTAKE_STATE_RELPATH, coverage)
     _append_transcript_turn(repo, text, outcome)
@@ -706,14 +841,17 @@ def run_visit_capture(client: LlmClient, repo: DataRepo, db: LabsDb, text: str) 
     provenance and no reply/coverage/wrap-up handling (there is nothing left
     to onboard).
 
-    Deliberately fails soft: an `LlmError` from the client call, or an
-    `IntakeError` applying the model's ops, is caught, logged, and reported
-    back via `CaptureResult.error` — it must NEVER raise and break the
-    calling chat turn, whose diagnostic/informational reply has already
-    succeeded by the time this runs (`web.routes.chat`). Persists (and
-    commits) only when at least one op actually changed the store — the
-    common case (a turn with nothing new to capture) touches disk not at
-    all.
+    Deliberately fails soft: an `LlmError` from the client call is caught,
+    logged, and reported back via `CaptureResult.error` — it must NEVER
+    raise and break the calling chat turn, whose diagnostic/informational
+    reply has already succeeded by the time this runs (`web.routes.chat`).
+    `apply_ops` itself is tolerant of a bad op (unknown/duplicate id — see
+    `intake.facts`), so a single malformed op never costs this pass its
+    other, valid ones; anything rejected is logged and otherwise ignored
+    (this pass is silent, so there is no reply to append it to). Persists
+    (and commits) only when at least one op actually changed the store —
+    the common case (a turn with nothing new to capture, or one whose only
+    ops were all rejected) touches disk not at all.
     """
     facts_store = IntakeFactsStore(repo.root)
     user_content = (
@@ -745,14 +883,18 @@ def run_visit_capture(client: LlmClient, repo: DataRepo, db: LabsDb, text: str) 
         timestamp=now,
     )
 
-    try:
-        applied = facts_store.apply_ops(turn.ops, provenance)
-    except IntakeError as exc:
-        logger.warning("visit-capture: ops failed to apply, skipping this turn's capture: %s", exc)
-        return CaptureResult(error=str(exc))
+    applied = facts_store.apply_ops(turn.ops, provenance)
+    for reason in applied.rejected:
+        logger.warning("visit-capture: dropping fact op that failed to apply: %s", reason)
+
+    touched_ids = [*applied.added, *applied.updated, *applied.retracted]
+    if not touched_ids:
+        # Nothing actually changed the store (every op was rejected, or --
+        # unreachable today since an empty `ops` list already returned
+        # above -- some other no-op case): touch disk not at all.
+        return CaptureResult(applied=applied)
 
     coverage = load_coverage_state(repo.root / INTAKE_STATE_RELPATH)
-    touched_ids = [*applied.added, *applied.updated, *applied.retracted]
     touched_topics = {
         fact.section for fact_id in touched_ids if (fact := facts_store.get(fact_id)) is not None
     }

@@ -22,6 +22,7 @@ from adoc.intake.agent import (
     INTAKE_AGENT_PROMPT_VERSION,
     INTAKE_OPENER_MESSAGE,
     INTAKE_TRANSCRIPT_RELPATH,
+    LONG_MESSAGE_THRESHOLD_CHARS,
     IntakeTurnResult,
     build_doc_digest,
     intake_is_complete,
@@ -124,6 +125,25 @@ def test_red_flag_turn_makes_zero_client_calls_and_returns_urgent(tmp_path: Path
     assert not (repo.root / INTAKE_FACTS_RELPATH).exists()
 
 
+def test_red_flag_turn_during_intake_adds_next_step_guidance_not_a_dead_end(
+    tmp_path: Path,
+) -> None:
+    """Defect fix (live blocker): the urgent message must not strand a
+    patient merely recounting history -- the intake path appends a next-step
+    note on top of the (untouched) `red_flag_screen` message, still with
+    zero client calls."""
+    repo = DataRepo.init_at(tmp_path / "data")
+    db = LabsDb(":memory:")
+    client = _exploding_client()
+
+    outcome = run_intake_turn(client, repo, db, "I'm having crushing chest pain and pressure")
+
+    assert outcome.kind == "urgent"
+    assert "911" in outcome.text or "emergency" in outcome.text.lower()  # unchanged screen message
+    assert "please get care first" in outcome.text.lower()
+    assert "one thing at a time" in outcome.text.lower()
+
+
 # --- ops applied and persisted; provenance stamped -------------------------------------
 
 
@@ -169,6 +189,38 @@ def test_ops_are_applied_and_persisted_with_stamped_provenance(tmp_path: Path) -
     assert transcript[1]["role"] == "assistant"
 
     assert intake_is_complete(repo) is False
+
+
+# --- long pastes: never truncated/refused, but flagged in context ---------------------
+
+
+def test_long_message_adds_a_context_note_without_truncating_the_patient_text(
+    tmp_path: Path,
+) -> None:
+    repo = DataRepo.init_at(tmp_path / "data")
+    db = LabsDb(":memory:")
+    client, transport = _make_client([_turn("That's a lot to take in -- let's go one at a time.")])
+
+    long_text = "I have a long history. " * 200
+    assert len(long_text) > LONG_MESSAGE_THRESHOLD_CHARS
+
+    run_intake_turn(client, repo, db, long_text)
+
+    sent_content = transport.calls[0].messages[-1].content
+    assert long_text in sent_content  # never truncated
+    assert "unusually long" in sent_content
+    assert "one thing at a time" in sent_content.lower()
+
+
+def test_short_message_gets_no_long_message_note(tmp_path: Path) -> None:
+    repo = DataRepo.init_at(tmp_path / "data")
+    db = LabsDb(":memory:")
+    client, transport = _make_client([_turn("Got it.")])
+
+    run_intake_turn(client, repo, db, "I'm 41.")
+
+    sent_content = transport.calls[0].messages[-1].content
+    assert "unusually long" not in sent_content
 
 
 # --- topics_covered: vetoed by each blocker rule, honored once clear -------------------
@@ -576,7 +628,12 @@ def test_llm_error_persists_nothing(tmp_path: Path) -> None:
     assert not (repo.root / INTAKE_TRANSCRIPT_RELPATH).exists()
 
 
-def test_duplicate_fact_id_op_error_persists_nothing(tmp_path: Path) -> None:
+def test_duplicate_fact_id_op_is_rejected_but_turn_still_replies_and_persists(
+    tmp_path: Path,
+) -> None:
+    """Defect fix (live blocker): a duplicate id is a tolerated rejection --
+    the second turn still replies normally (never `kind="error"`), and the
+    store is simply left as-is (nothing to duplicate)."""
     repo = DataRepo.init_at(tmp_path / "data")
     db = LabsDb(":memory:")
 
@@ -590,10 +647,13 @@ def test_duplicate_fact_id_op_error_persists_nothing(tmp_path: Path) -> None:
             "fields": {"age": 41},
         },
     }
-    client, _transport = _make_client(
+    # Turn 2's first attempt re-sends the duplicate id; the retry attempt
+    # (fed feedback naming the duplicate) simply drops it -- no ops at all.
+    client, transport = _make_client(
         [
             _turn("Noted.", [add_op]),
             _turn("Noted again.", [add_op]),
+            _turn("Noted again.", []),
         ]
     )
 
@@ -602,16 +662,58 @@ def test_duplicate_fact_id_op_error_persists_nothing(tmp_path: Path) -> None:
     before = (repo.root / INTAKE_FACTS_RELPATH).read_text(encoding="utf-8")
 
     second = run_intake_turn(client, repo, db, "I'm 41 again.")
-    assert second.kind == "error"
+    assert second.kind == "reply"
     after = (repo.root / INTAKE_FACTS_RELPATH).read_text(encoding="utf-8")
-    assert before == after  # nothing changed on the failed turn
+    assert before == after  # nothing changed -- the duplicate was rejected, not applied
+
+    # the retry actually fired, and named the duplicate in its feedback
+    assert len(transport.calls) == 3
+    retry_request = transport.calls[-1]
+    retry_feedback = retry_request.messages[-1].content
+    assert "basic-age" in retry_feedback
+    assert "duplicate fact id" in retry_feedback
+
+
+def test_invalid_op_rejected_after_retry_still_yields_a_normal_reply(tmp_path: Path) -> None:
+    """The retry gets exactly ONE chance; if the model still can't fix it,
+    the turn still replies normally -- the rejected op is just dropped and
+    logged (never a lost turn)."""
+    repo = DataRepo.init_at(tmp_path / "data")
+    db = LabsDb(":memory:")
+
+    bad_update = {
+        "op": "update_fact",
+        "id": "no-such-fact",
+        "note": "trying to update a fact that was never added",
+    }
+    client, transport = _make_client(
+        [
+            _turn("Got it.", [bad_update]),
+            _turn("Got it.", [bad_update]),  # retry still references the unknown id
+        ]
+    )
+
+    outcome = run_intake_turn(client, repo, db, "Something about an existing fact.")
+
+    assert outcome.kind == "reply"
+    assert len(transport.calls) == 2
+    store = IntakeFactsStore(repo.root)
+    assert store.active_facts() == []
 
 
 # --- the deterministic opener is a constant, not model output --------------------------
 
 
 def test_opener_message_is_a_plain_constant() -> None:
-    assert "What's been going on? Start wherever you like." in INTAKE_OPENER_MESSAGE
+    # Defect fix (live blocker): the opener now DRIVES with one focused
+    # question instead of inviting a wall of text, notes that documents can
+    # stand in for retyping everything, and gives a clear emergency-care
+    # steer -- see `INTAKE_OPENER_MESSAGE`'s definition.
+    assert "What's been bothering you the most lately, or what brings you in?" in (
+        INTAKE_OPENER_MESSAGE
+    )
+    assert "add them as documents instead" in INTAKE_OPENER_MESSAGE
+    assert "seek emergency care first" in INTAKE_OPENER_MESSAGE
 
 
 # --- doc digest ---------------------------------------------------------------------------

@@ -9,6 +9,22 @@ unit-tested code — CLAUDE.md's "deterministic logic ... never delegated to
 a model" applies to the gate every bit as much as it does to the ledger
 invariants in `casefile.ledger`.
 
+**Op-level tolerance (live intake blocker fix).** A malformed op must never
+cost the patient her whole turn: `apply_ops` applies every op that is valid
+given the store's current state and collects everything else — a duplicate
+`add_fact` id, an `update_fact`/`retract_fact` referencing an id that
+doesn't exist — into `AppliedResult.rejected` instead of raising. The
+closed-vocabulary fields (`kind`, `precision`, `attribution`,
+`clarification_status`, and now `section`, derived from `SECTIONS` so it
+cannot drift) are `Literal`s specifically so the *shape* of a bad op (an
+unrecognized topic key, e.g. the live incident where a model emitted
+`section="note"` — a valid `kind`, not a section) is rejected by structured-
+output validation before it ever reaches this module at all; the tolerance
+here is the second, defense-in-depth layer for whatever a closed
+vocabulary can't prevent (duplicate/unknown ids are inherently
+free-form). `intake.agent.run_intake_turn` is what spends the one
+feedback-guided retry this enables — see that function's docstring.
+
 Facts are never deleted, only retracted (`RetractFact`): `status` flips to
 `"retracted"` and a `FactRevision` is appended to `history`, exactly like
 `UpdateFact` appends one for every field it changes. This mirrors
@@ -49,6 +65,17 @@ INTAKE_FACTS_RELPATH = "case/intake-facts.yaml"
 MIN_UPDATE_NOTE_LENGTH = 10
 
 SECTION_KEYS: frozenset[str] = frozenset(spec.key for spec in SECTIONS)
+
+# Derived from `SECTIONS` (never hand-maintained) so the closed vocabulary
+# can't drift from the section registry it mirrors. This is what closes the
+# live incident's loophole: the model emitted `section="note"` — a valid
+# `kind`, not a section — and because `section` used to be a bare `str`,
+# that value sailed through structured-output validation and only blew up
+# deep in `apply_ops`, losing the whole turn (see module docstring).  A
+# `Literal` makes the provider's own structured-output validation reject
+# the mistake before it ever reaches this module.
+_SECTION_KEY_VALUES: tuple[str, ...] = tuple(spec.key for spec in SECTIONS)
+SectionKey = Literal[_SECTION_KEY_VALUES]  # type: ignore[valid-type]
 
 FactKind = Literal[
     "basic",
@@ -111,7 +138,7 @@ class IntakeFact(BaseModel):
     """
 
     id: str
-    section: str
+    section: SectionKey
     kind: FactKind
     statement: str
     fields: dict[str, FieldValue] = Field(default_factory=dict)
@@ -150,7 +177,7 @@ class NewFact(BaseModel):
     `status`/`history` are deliberately absent here."""
 
     id: str
-    section: str
+    section: SectionKey
     kind: FactKind
     statement: str
     fields: dict[str, FieldValue] = Field(default_factory=dict)
@@ -212,15 +239,24 @@ IntakeFactOp = Annotated[
 
 
 class AppliedResult(BaseModel):
-    """What `IntakeFactsStore.apply_ops` did, by fact id."""
+    """What `IntakeFactsStore.apply_ops` did, by fact id.
+
+    `rejected` is one human-readable reason per op that could not be
+    applied given the store's current state (duplicate `add_fact` id,
+    `update_fact`/`retract_fact` referencing an id that doesn't exist) —
+    those ops are simply skipped, never raised (see module docstring)."""
 
     added: list[str] = Field(default_factory=list)
     updated: list[str] = Field(default_factory=list)
     retracted: list[str] = Field(default_factory=list)
+    rejected: list[str] = Field(default_factory=list)
 
 
 class IntakeError(Exception):
-    """Raised for a fact-store operation that is invalid in its current state."""
+    """Raised for a fact-store operation that is invalid in a way `apply_ops`
+    itself cannot recover from (e.g. `intake.agent._spec_by_key` on an
+    internal registry lookup that should be impossible to miss). No longer
+    raised by `apply_ops` for a bad op — see `AppliedResult.rejected`."""
 
 
 # --- persistence --------------------------------------------------------------------
@@ -253,13 +289,15 @@ def save_intake_facts(path: Path, facts: Sequence[IntakeFact]) -> None:
 class IntakeFactsStore:
     """Loads/holds/saves `case/intake-facts.yaml` for one data repo.
 
-    `apply_ops` is plain deterministic code (CLAUDE.md code conventions):
-    it never calls a model, and every op is validated against the store's
-    current facts before anything is mutated — an invalid op anywhere in
-    the batch (unknown id, duplicate id on add, unknown section) raises
-    `IntakeError` and leaves the store's own `facts` untouched (the
-    mutation happens on a working copy, committed to `self._facts` only
-    once every op in the batch has succeeded).
+    `apply_ops` is plain deterministic code (CLAUDE.md code conventions): it
+    never calls a model, and every op is validated against the store's
+    current facts before it is applied. Unlike a ledger diff's all-or-
+    nothing invariant checking, a bad op here never costs the whole batch:
+    an op that is invalid given the store's current state (unknown id,
+    duplicate id on add) is skipped and named in `AppliedResult.rejected`;
+    every other, valid op in the same batch still applies normally (see
+    module docstring — this is what stops one malformed op from losing an
+    entire patient turn).
     """
 
     def __init__(self, repo_root: Path) -> None:
@@ -291,9 +329,18 @@ class IntakeFactsStore:
         for op in ops:
             if isinstance(op, AddFact):
                 if op.fact.id in by_id:
-                    raise IntakeError(f"duplicate fact id: {op.fact.id!r}")
-                if op.fact.section not in SECTION_KEYS:
-                    raise IntakeError(f"unknown intake section: {op.fact.section!r}")
+                    result.rejected.append(
+                        f"add_fact {op.fact.id!r}: duplicate fact id (already on file)"
+                    )
+                    continue
+                # `section` is a `Literal` (see module docstring) so this
+                # should be unreachable via a properly-validated op — kept
+                # as a defense-in-depth belt alongside that suspenders.
+                if op.fact.section not in SECTION_KEYS:  # pragma: no cover
+                    result.rejected.append(
+                        f"add_fact {op.fact.id!r}: unknown intake section {op.fact.section!r}"
+                    )
+                    continue
                 new_fact = IntakeFact(
                     id=op.fact.id,
                     section=op.fact.section,
@@ -315,7 +362,8 @@ class IntakeFactsStore:
 
             elif isinstance(op, UpdateFact):
                 if op.id not in by_id:
-                    raise IntakeError(f"unknown fact id: {op.id!r}")
+                    result.rejected.append(f"update_fact {op.id!r}: unknown fact id")
+                    continue
                 index = by_id[op.id]
                 current = working[index]
                 revision = FactRevision(
@@ -344,7 +392,8 @@ class IntakeFactsStore:
 
             elif isinstance(op, RetractFact):
                 if op.id not in by_id:
-                    raise IntakeError(f"unknown fact id: {op.id!r}")
+                    result.rejected.append(f"retract_fact {op.id!r}: unknown fact id")
+                    continue
                 index = by_id[op.id]
                 current = working[index]
                 revision = FactRevision(

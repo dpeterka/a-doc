@@ -11,7 +11,6 @@ import pytest
 
 from adoc.intake.facts import (
     AddFact,
-    IntakeError,
     IntakeFact,
     IntakeFactsStore,
     NewFact,
@@ -62,22 +61,34 @@ def test_add_fact_persists_and_shows_up_active(tmp_path: Path) -> None:
     assert active[0].history == []
 
 
-def test_add_fact_with_duplicate_id_raises_and_leaves_store_untouched(tmp_path: Path) -> None:
+def test_add_fact_with_duplicate_id_is_rejected_not_raised_and_leaves_store_untouched(
+    tmp_path: Path,
+) -> None:
+    """Defect fix (live blocker): a bad op must never cost the whole batch --
+    `apply_ops` collects it in `.rejected` and keeps going, it never raises."""
     store = IntakeFactsStore(tmp_path)
     store.apply_ops([AddFact(fact=_new_fact())], _provenance())
 
-    with pytest.raises(IntakeError):
-        store.apply_ops([AddFact(fact=_new_fact())], _provenance())
+    result = store.apply_ops([AddFact(fact=_new_fact())], _provenance())
 
+    assert result.added == []
+    assert len(result.rejected) == 1
+    assert "duplicate fact id" in result.rejected[0]
     assert len(store.active_facts()) == 1  # unchanged
 
 
-def test_add_fact_with_unknown_section_raises(tmp_path: Path) -> None:
-    store = IntakeFactsStore(tmp_path)
-    bad = _new_fact(id="fact-x", section="not-a-real-section")
+def test_new_fact_section_is_a_literal_rejected_at_model_validation_time() -> None:
+    """Defect fix (live blocker): the live incident was a model emitting
+    `section="note"` -- a valid `kind`, not a section -- which used to sail
+    through as a bare `str` and only blow up deep inside `apply_ops`,
+    losing the whole turn. `section` is now a `Literal` derived from
+    `SECTIONS`, so the provider's own structured-output validation rejects
+    the mistake before it ever reaches this module."""
+    with pytest.raises(Exception):  # noqa: B017 - pydantic ValidationError
+        _new_fact(id="fact-x", section="note")
 
-    with pytest.raises(IntakeError):
-        store.apply_ops([AddFact(fact=bad)], _provenance())
+    with pytest.raises(Exception):  # noqa: B017 - pydantic ValidationError
+        _new_fact(id="fact-x", section="not-a-real-section")
 
 
 def test_update_fact_merges_fields_and_appends_history(tmp_path: Path) -> None:
@@ -103,13 +114,16 @@ def test_update_fact_merges_fields_and_appends_history(tmp_path: Path) -> None:
     assert fact.history[0].prior_statement == "Patient reports a penicillin allergy."
 
 
-def test_update_fact_unknown_id_raises(tmp_path: Path) -> None:
+def test_update_fact_unknown_id_is_rejected_not_raised(tmp_path: Path) -> None:
     store = IntakeFactsStore(tmp_path)
-    with pytest.raises(IntakeError):
-        store.apply_ops(
-            [UpdateFact(id="does-not-exist", note="this should fail because id is unknown")],
-            _provenance(),
-        )
+    result = store.apply_ops(
+        [UpdateFact(id="does-not-exist", note="this should be rejected, id is unknown")],
+        _provenance(),
+    )
+
+    assert result.updated == []
+    assert len(result.rejected) == 1
+    assert "unknown fact id" in result.rejected[0]
 
 
 def test_update_fact_note_too_short_is_rejected_by_pydantic() -> None:
@@ -132,10 +146,13 @@ def test_retract_fact_marks_retracted_and_keeps_history(tmp_path: Path) -> None:
     assert "retracted" in fact.history[0].change
 
 
-def test_retract_fact_unknown_id_raises(tmp_path: Path) -> None:
+def test_retract_fact_unknown_id_is_rejected_not_raised(tmp_path: Path) -> None:
     store = IntakeFactsStore(tmp_path)
-    with pytest.raises(IntakeError):
-        store.apply_ops([RetractFact(id="nope", reason="n/a")], _provenance())
+    result = store.apply_ops([RetractFact(id="nope", reason="n/a")], _provenance())
+
+    assert result.retracted == []
+    assert len(result.rejected) == 1
+    assert "unknown fact id" in result.rejected[0]
 
 
 # --- persistence round-trip -----------------------------------------------------------
