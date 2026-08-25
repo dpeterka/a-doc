@@ -36,10 +36,15 @@ Contracts:
 
 `apply_review_diff` merges the accepted-divergence ops and the full
 challenge-sweep's `RecordChallenge` ops into ONE `LedgerDiff`, applied in a
-single `apply_and_save` call — recording a challenge for every currently
-active hypothesis in the same diff is what keeps `ledger.apply_diff`'s
-staleness invariant (c) satisfied regardless of how stale any hypothesis
-was going into the review; that is the entire point of a weekly full sweep.
+single `DataRepo.apply_ledger_diff` call (not the lock-free `casefile.
+ledger.apply_and_save` primitive it wraps — this DAG runs from the weekly
+scheduled task, which shares the same EFS-mounted data repo with the web
+task's diagnostic turns, so it is exactly as exposed to the concurrent-
+write durability defect `apply_ledger_diff` fixes; see that method's
+docstring) — recording a challenge for every currently active hypothesis
+in the same diff is what keeps `ledger.apply_diff`'s staleness invariant
+(c) satisfied regardless of how stale any hypothesis was going into the
+review; that is the entire point of a weekly full sweep.
 """
 
 from __future__ import annotations
@@ -55,7 +60,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 from adoc import __version__
-from adoc.casefile.ledger import ACTIVE_STATUSES, apply_and_save, load_ledger
+from adoc.casefile.ledger import ACTIVE_STATUSES, load_ledger
 from adoc.casefile.repo import HISTORY_RELPATH, LEDGER_RELPATH, DataRepo
 from adoc.casefile.schema import (
     AddHypothesis,
@@ -989,7 +994,7 @@ def build_review_dag(
             current_ledger, divergence_set, adjudication, sweep, today=clock().date()
         )
         history_path = repo.root / HISTORY_RELPATH
-        new_ledger = apply_and_save(ledger_path, history_path, diff)
+        new_ledger = repo.apply_ledger_diff(ledger_path, history_path, diff)
         results["apply_review_diff"] = new_ledger
         return new_ledger
 

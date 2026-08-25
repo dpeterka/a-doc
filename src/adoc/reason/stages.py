@@ -27,7 +27,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from adoc import __version__
-from adoc.casefile.ledger import apply_and_save, load_ledger
+from adoc.casefile.ledger import load_ledger
 from adoc.casefile.repo import HISTORY_RELPATH, DataRepo
 from adoc.casefile.schema import (
     AddEvidence,
@@ -373,9 +373,18 @@ def apply_stage(
     provenance: Provenance,
 ) -> Ledger:
     """Code node: merge the Challenger's `additional_ops` into `diff`, then
-    apply via `casefile.ledger.apply_and_save` — the ledger invariants
-    (can't-miss non-empty, patient-origin promotion gating, staleness,
-    confirmed-by-doctor bar, version bump) enforce the rest."""
+    apply via `DataRepo.apply_ledger_diff` — NOT the lock-free
+    `casefile.ledger.apply_and_save` primitive it wraps. `apply_ledger_diff`
+    holds `repo._lock` across load -> apply -> save -> append-history ->
+    commit in one critical section (CONFIRMED durability defect: two
+    overlapping diagnostic turns — `chat_send` is a sync route Starlette
+    thread-pools — used to be able to both validate against the same stale
+    ledger snapshot and have one silently clobber the other's applied diff,
+    with no commit ever made for a diagnostic turn until the weekly review
+    swept it up, see `casefile.repo.DataRepo.apply_ledger_diff`'s
+    docstring). The ledger invariants (can't-miss non-empty, patient-origin
+    promotion gating, staleness, confirmed-by-doctor bar, version bump)
+    enforce the rest, evaluated fresh inside that critical section."""
     combined_ops = list(diff.ops) + list(verdict.additional_ops)
     rationale = diff.rationale
     if verdict.verdict_notes.strip():
@@ -383,7 +392,7 @@ def apply_stage(
 
     merged_diff = LedgerDiff(provenance=provenance, rationale=rationale, ops=combined_ops)
     history_path = repo.root / HISTORY_RELPATH
-    return apply_and_save(ledger_path, history_path, merged_diff)
+    return repo.apply_ledger_diff(ledger_path, history_path, merged_diff)
 
 
 def _render_ledger_for_prompt(ledger: Ledger) -> str:

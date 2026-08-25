@@ -96,14 +96,12 @@ from __future__ import annotations
 import logging
 import shutil
 import tempfile
-import time
 import zipfile
 from collections.abc import Callable
 from datetime import UTC, date, datetime
 from pathlib import Path, PurePosixPath
 from typing import Literal
 
-from git.exc import GitCommandError
 from pydantic import BaseModel, Field
 
 from adoc.casefile.encounters import (
@@ -253,65 +251,14 @@ def _commit_message(*, label: str, doc_date: date | None, rows_auto: int, rows_p
     return f"ingest: {label} {date_part} ({rows_auto} rows, {rows_pending} queued)"
 
 
-# CONFIRMED bug fix (code review item 4): retry-with-backoff for
-# cross-process git index/ref-lock contention on commit.
-_COMMIT_RETRY_ATTEMPTS = 4
-_COMMIT_RETRY_BASE_DELAY_SECONDS = 0.25
-
-
-def _commit_with_retry(
-    repo: DataRepo,
-    message: str,
-    *,
-    paths: list[str],
-    sleep: Callable[[float], None] = time.sleep,
-) -> str:
-    """`repo.commit(message, paths=paths)`, retrying with exponential
-    backoff on cross-process git index/ref-lock contention.
-
-    `DataRepo._lock` (a `threading.RLock`, `casefile.repo`) already
-    serializes `commit()` calls from multiple THREADS within one process -
-    the fix for the earlier `sqlite3.InterfaceError`-shaped bug in that
-    module. But this pipeline is *also* driven from its own separate OS
-    PROCESS (the scheduled ingest task, PLAN.md), sharing the same
-    EFS-mounted data repo with the web task and other scheduled jobs. An
-    in-process lock cannot serialize across processes: two OS processes
-    committing to the same `.git` at the same moment can collide on git's
-    own index/ref lock files - GitPython surfaces that as `OSError`
-    ("Lock at ... could not be obtained", from `IndexFile.write()`'s
-    internal `LockedFD`) or `GitCommandError` (if a future call path ever
-    shells out via `repo.git.add`). Previously there was no retry at all
-    here, so a single unlucky cross-process collision raised straight out
-    of `_ingest_one` - which, pre-fix, also aborted every remaining file in
-    the batch (see `ingest_inbox`'s per-file try/except, added alongside
-    this).
-
-    This retry lives at the pipeline's own commit call sites rather than
-    inside `DataRepo.commit()` itself: `casefile/repo.py` is owned by a
-    different workstream for this change, and a shared retry belongs
-    there for every caller of `commit()`, not just ingest - noted in the
-    task report rather than added here.
-    """
-    delay = _COMMIT_RETRY_BASE_DELAY_SECONDS
-    last_exc: OSError | GitCommandError | None = None
-    for attempt in range(1, _COMMIT_RETRY_ATTEMPTS + 1):
-        try:
-            return repo.commit(message, paths=paths)
-        except (OSError, GitCommandError) as exc:
-            last_exc = exc
-            if attempt == _COMMIT_RETRY_ATTEMPTS:
-                break
-            logger.warning(
-                "git commit lock contention (attempt %d/%d), retrying in %.2fs: %s",
-                attempt,
-                _COMMIT_RETRY_ATTEMPTS,
-                delay,
-                exc,
-            )
-            sleep(delay)
-            delay *= 2
-    assert last_exc is not None  # the loop only exits via `break` after setting it
-    raise last_exc
+# CONFIRMED bug fix (code review item 4), consolidated (ledger-durability
+# task): retry-with-backoff for cross-process git index/ref-lock
+# contention on commit now lives in `casefile.repo.DataRepo.commit()`
+# itself, so every caller benefits, not just this pipeline's commit call
+# sites — `repo.commit(...)` below already retries. See that method's
+# docstring for the cross-process rationale (this pipeline's scheduled
+# ingest task shares the EFS-mounted data repo with the web task and other
+# scheduled jobs, same as before).
 
 
 def _commit_paths_with_doc_text(base: list[str], repo: DataRepo) -> list[str]:
@@ -410,8 +357,8 @@ def _ingest_lab_report(
     message = _commit_message(
         label=facility, doc_date=doc_date, rows_auto=rows_auto, rows_pending=rows_pending
     )
-    commit_sha = _commit_with_retry(
-        repo, message, paths=_commit_paths_with_doc_text(["sources", "labs-export.jsonl"], repo)
+    commit_sha = repo.commit(
+        message, paths=_commit_paths_with_doc_text(["sources", "labs-export.jsonl"], repo)
     )
 
     return FileOutcome(
@@ -472,8 +419,8 @@ def _ingest_non_lab(
         _store_text_best_effort(repo, db, sha256, doc_text)
 
     message = _commit_message(label=path.name, doc_date=doc_date, rows_auto=0, rows_pending=0)
-    commit_sha = _commit_with_retry(
-        repo, message, paths=_commit_paths_with_doc_text(["sources", "case/encounters"], repo)
+    commit_sha = repo.commit(
+        message, paths=_commit_paths_with_doc_text(["sources", "case/encounters"], repo)
     )
 
     return FileOutcome(
@@ -698,8 +645,8 @@ def _ingest_genomic(
     )
     regenerate_inventory(repo.root, db)
 
-    commit_sha = _commit_with_retry(
-        repo, f"ingest: genomic data file {path.name}", paths=[GENOMICS_INVENTORY_RELPATH]
+    commit_sha = repo.commit(
+        f"ingest: genomic data file {path.name}", paths=[GENOMICS_INVENTORY_RELPATH]
     )
     return FileOutcome(
         path=str(path),
