@@ -367,3 +367,103 @@ that back.
 catch the next one. A live-comparison mode for `adoc eval --candidate`
 (currently Phase 3 scope) is what makes rule 4 enforceable rather than
 aspirational.
+
+## Revised again (2026-08-25, fix/number-check-pairing) — the checker's third revision
+
+### What happened
+
+A real diagnostic turn against a full case file failed `composer_number_
+check` with 24 mismatches. Reading the captured log closely showed every
+one was the same shape: the Composer was quoting REAL, correctly-attributed
+values, and the checker was pairing them with the wrong analyte —
+
+```
+62.9 near 'fsh'  (stored fsh: [..., 63.9, ...])   <- 62.9 is LH's real value
+91.4 near 'lh'   (stored lh:  [..., 91.4? no])    <- 91.4 is FSH's real value
+22.0 near 'alt'  (stored alt: [10.0, 14.0, ...])  <- 22.0 is AST's real value
+15.0 near 'ast'  (stored ast: [16.0, 18.0, ...])  <- 15.0 is ALT's real value
+1.8  near 'crp'  (stored crp: [10.0])             <- 1.8 is hs-CRP's value
+```
+
+This is by this point the THIRD real diagnostic turn `check_composer_
+numbers` has failed in production, and it has never once caught a genuine
+fabrication — recorded here honestly, per this ADR's own standard for
+tracking a safety-relevant guard's real-world hit rate rather than only its
+test-suite score.
+
+### Why: two distinct bugs in HOW a number was matched to an analyte
+
+**1. Checked against every mention in the clause, not the one that governs
+it.** The prior two passes fixed WHICH numbers count as candidate values
+(`_quoted_number_is_value_evidence`); neither touched WHICH analyte a
+qualifying number is compared against. The old code found every known
+analyte label present anywhere in a clause, then nested-looped every
+qualifying number against every one of them. "FSH was 91.4 and LH was
+62.9" has two mentions and two numbers in one clause — 91.4 was correctly
+matched against `fsh` (passing) AND incorrectly matched against `lh`
+(failing, since 91.4 isn't LH's value), and the reverse for 62.9. Both
+numbers were right; the pairing manufactured two mismatches out of nothing.
+
+**2. Substring collision between a longer and a shorter label.** "hs-CRP"
+matched the literal substring "crp" — a hyphen is not a `\w` character, so
+`\bcrp\b` matches inside "hs-crp" — and 1.8 (hs-CRP's real value) was
+checked against plain CRP's stored values (10.0), a completely different
+assay with its own reference range.
+
+### Decision — structural pairing, longest-match, fail safe on ambiguity
+
+`reason/verify.py` gains `_mention_pattern` (one alternation regex over
+every known analyte label for this patient, LONGEST-label-first at every
+start position, mirroring the longest-alias-first precedence
+`labs.validate.canonicalize`/`_SCORE_SUFFIX_TO_CANONICAL` already applies —
+so "hs-crp" always wins over "crp" at the same text position) and
+`_resolve_governing_mention`: each qualifying number is checked against the
+ONE mention that structurally governs it — the nearest mention immediately
+before it (`ALT 15`, `ALT was 15`, `ALT of 15 U/L`, tied by the existing
+copula/unit evidence, now scoped to just the text between that mention and
+the number so an unrelated earlier mention's copula word can never leak
+in), or the nearest mention immediately after it (`15 U/L ALT`, tied by a
+unit directly attached to the number belonging to that trailing mention).
+Because both candidates are always the NEAREST mention on their side, a
+number can never bind to a mention on the far side of another mention in
+between — there is no "other" mention within reach to skip past.
+
+**Fails safe on ambiguity, explicitly, per this checker's asymmetry.**
+`check_composer_numbers` runs as a POSTCONDITION on the Composer stage —
+after `apply_stage` has already committed the ledger (`build_diagnostic_
+dag`'s node order: Ledger-Maintainer -> Challenger -> apply -> Composer).
+A false positive here does not just block one claim; it discards an
+already-correct, already-grounded reply that the citation checker and
+`verify_claims` have already independently verified. A missed check, by
+contrast, costs nothing beyond what those two earlier, independent checks
+already cover. So when a number's evidence ties it to BOTH a different
+preceding and a different following mention, `_resolve_governing_mention`
+returns no governing mention at all rather than guessing — this asymmetry
+is stated directly in the code comment above `check_composer_numbers`, per
+this ADR's now-established practice of writing the reasoning down where a
+future edit might otherwise "tighten" it back.
+
+### Consequences (third revision)
+
+- `evals/suites/hallucination.py`'s `composer_number_legitimate_phrasing_
+  pass_rate` metric (pinned at 1.0) gains the multi-analyte pairing cases
+  built directly from the production evidence: FSH/LH, ALT/AST, and a
+  femoral-neck-T-score/lumbar-spine-BMD sentence, each with every number
+  correctly quoted next to its own analyte, plus an hs-CRP-vs-CRP longest-
+  match case. `_COMPOSER_NUMBER_FABRICATED_SENTENCES` gains the matching
+  "still caught under correct pairing" cases — a wrong LH value alongside
+  a correct FSH value, and an hs-CRP value that happens to equal plain
+  CRP's real number — proving the fix does not trade false positives for
+  false negatives.
+- `tests/test_verify.py` pins the structural-pairing rule directly,
+  including the ambiguous-pairing fail-safe case (a number tied by evidence
+  to two different, disagreeing mentions must not be flagged).
+- This guard's real-world record after three revisions: three production
+  turns failed, zero genuine fabrications ever caught. The design is now
+  conservative by construction (longest-match mention-spotting, single-
+  governing-mention pairing, fail-safe-on-ambiguity) specifically because
+  every failure to date has been a false positive, never a miss — the same
+  proportionality principle the entailment verifier's "strip, don't reject"
+  revision above already established for a different check. Loosening any
+  of the three fail-safe properties above to make an unrelated change pass
+  is exactly the kind of change CLAUDE.md rule 2 forbids doing silently.

@@ -972,3 +972,111 @@ def test_composer_numbers_still_catches_a_year_range_value_when_a_unit_is_attach
     check = check_composer_numbers("Your B12 was 2024 pg/mL, dramatically high.", db)
     assert not check.passed
     assert check.mismatches[0].quoted_number == 2024.0
+
+
+# --- check_composer_numbers: structural pairing (ADR 0016 revised, third pass) ----------------
+#
+# A real production run failed with 24 mismatches that were entirely a
+# mis-pairing bug: the old code checked every number in a clause against
+# EVERY analyte name mentioned in that clause, not just the one it actually
+# refers to. These regression cases are built directly from the captured
+# production evidence (see `_resolve_governing_mention`'s docstring in
+# `reason.verify` for the pairing rule that fixes this).
+
+
+def test_composer_numbers_pairs_two_analytes_each_quoted_correctly(db: LabsDb) -> None:
+    """The exact production failure: 91.4 is FSH's real value and 62.9 is
+    LH's real value (each correctly quoted next to its own analyte) but the
+    old code also cross-checked 91.4 against LH and 62.9 against FSH,
+    manufacturing two false mismatches. Correct pairing must pass."""
+    _seed_lab_row(db, name="FSH", value=91.4)
+    _seed_lab_row(db, name="LH", value=62.9)
+    check = check_composer_numbers("Your FSH was 91.4 and your LH was 62.9.", db)
+    assert check.passed
+
+
+def test_composer_numbers_pairs_alt_ast_each_quoted_correctly(db: LabsDb) -> None:
+    """Same shape as the FSH/LH case, from the same production run: ALT 15
+    and AST 22 are each the correct value for their own analyte."""
+    _seed_lab_row(db, name="ALT", value=15.0, ucum_unit="U/L")
+    _seed_lab_row(db, name="AST", value=22.0, ucum_unit="U/L")
+    check = check_composer_numbers("Your ALT was 15 U/L and your AST was 22 U/L.", db)
+    assert check.passed
+
+
+def test_composer_numbers_pairs_femoral_neck_tscore_and_lumbar_spine_bmd(db: LabsDb) -> None:
+    """Same shape again: a femoral neck T-score and a lumbar spine BMD, on
+    completely different numeric scales, each correctly quoted."""
+    _seed_lab_row(db, name="Femoral Neck T-score", value=-1.1)
+    _seed_lab_row(db, name="Lumbar Spine BMD", value=1.098)
+    check = check_composer_numbers(
+        "Your femoral neck T-score was -1.1, and your lumbar spine BMD was 1.098.", db
+    )
+    assert check.passed
+
+
+def test_composer_numbers_hs_crp_not_judged_against_plain_crp(db: LabsDb) -> None:
+    """ "hs-CRP" must resolve as its own longest-match mention, not as plain
+    "CRP" via the substring "crp" (a hyphen is not a word character, so
+    `\\bcrp\\b` matches inside "hs-crp"). hs-CRP's own real value (1.8)
+    correctly quoted must pass, even though it is a different number from
+    plain CRP's real value (8.5, seeded on the same patient)."""
+    _seed_lab_row(db, name="CRP", value=8.5, ucum_unit="mg/L")
+    _seed_lab_row(db, name="hs-CRP", value=1.8, ucum_unit="mg/L")
+    check = check_composer_numbers("Your hs-CRP was 1.8 mg/L, mildly elevated.", db)
+    assert check.passed
+
+
+def test_composer_numbers_hs_crp_mismatch_is_not_masked_by_plain_crp(db: LabsDb) -> None:
+    """The genuine catch under correct pairing: a fabricated hs-CRP value
+    that happens to EQUAL plain CRP's real stored value (8.5) must still be
+    flagged as wrong for hs-CRP — proving the number was actually paired
+    with hs-CRP's own stored values (1.8), not silently passed because it
+    happened to match a DIFFERENT analyte's number."""
+    _seed_lab_row(db, name="CRP", value=8.5, ucum_unit="mg/L")
+    _seed_lab_row(db, name="hs-CRP", value=1.8, ucum_unit="mg/L")
+    check = check_composer_numbers("Your hs-CRP was 8.5 mg/L, notably elevated.", db)
+    assert not check.passed
+    assert check.mismatches[0].analyte_label == "hs-crp"
+    assert check.mismatches[0].quoted_number == 8.5
+    assert check.mismatches[0].stored_values == [1.8]
+
+
+def test_composer_numbers_still_catches_fabrication_without_cross_contamination(
+    db: LabsDb,
+) -> None:
+    """A genuinely fabricated value under correct pairing must still fail —
+    and only the analyte it is actually attributed to, leaving the
+    correctly-quoted neighbor untouched."""
+    _seed_lab_row(db, name="FSH", value=91.4)
+    _seed_lab_row(db, name="LH", value=62.9)
+    check = check_composer_numbers("Your FSH was 91.4 and your LH was 999.0.", db)
+    assert not check.passed
+    assert len(check.mismatches) == 1
+    assert check.mismatches[0].analyte_label == "lh"
+    assert check.mismatches[0].quoted_number == 999.0
+
+
+def test_composer_numbers_governs_via_a_trailing_unit_before_the_mention(db: LabsDb) -> None:
+    """The "immediately following" pairing direction: a number directly
+    followed by a unit that itself is directly followed by the analyte
+    mention (`15 U/L ALT`) is governed by that trailing mention."""
+    _seed_lab_row(db, name="ALT", value=15.0, ucum_unit="U/L")
+    check = check_composer_numbers("Recorded today: 15 U/L ALT.", db)
+    assert check.passed
+
+
+def test_composer_numbers_ambiguous_pairing_is_not_flagged(db: LabsDb) -> None:
+    """Fail-safe on ambiguity: a number tied by evidence to BOTH a
+    different preceding mention (copula "of") and a different following
+    mention (a unit shared with the following analyte) is genuinely
+    unclear and must not be flagged — even though naively picking the
+    preceding mention here would have looked like a pass (15 matches
+    ALT's stored value) and picking the following mention would have
+    looked like a fabrication (15 does not match AST's stored value).
+    Per this module's asymmetry (a missed check costs nothing; a false
+    positive discards an already-committed reply), neither guess is made."""
+    _seed_lab_row(db, name="ALT", value=15.0, ucum_unit="U/L")
+    _seed_lab_row(db, name="AST", value=999.0, ucum_unit="U/L")
+    check = check_composer_numbers("ALT of 15 U/L AST.", db)
+    assert check.passed
