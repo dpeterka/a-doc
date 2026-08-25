@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.2] - 2026-08-25
+
+### Fixed
+- Concurrent requests could crash the labs page and, worse, return torn data. `LabsDb` shared one SQLite connection across FastAPI's sync-route threadpool on the (false) assumption that this app never serves two requests at once; a browser issuing parallel requests produced `sqlite3.InterfaceError: bad parameter or other API misuse` in production, and — with the fix removed to check — also a torn row surfacing as a `None` primary key inside a validated model. All 43 connection-touching methods now hold a re-entrant lock spanning execute through fetch.
+- The same shared-singleton-across-threads shape applied to `DataRepo`'s git writes. `commit()` is a read-modify-write over `.git/index` and `HEAD`, and every intake turn commits, so a concurrent caller could collide on git's index lock or silently lose a commit — that is, lose patient-reported facts. `commit()` and `tag()` are now serialized.
+- Both regression tests were verified to fail with their lock removed (SQLite: `InterfaceError` and a torn-row validation error; git: a half-written `COMMIT_EDITMSG`), so they genuinely exercise the race rather than passing either way.
+
 ## [0.7.1] - 2026-08-25
 
 ### Changed
