@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-08-25
+
+A code review of the whole codebase produced these; each fix has a test verified to fail without it.
+
+### Fixed
+- **Direct identifiers were being sent to external model providers.** The web app built its LLM client with no scrubber and the client's default was a no-op, so every chat and intake turn transmitted unscrubbed text to Anthropic, OpenAI, and Featherless. Separately, the identifiers file the scrubber reads for name/DOB/address was never scaffolded, so even the CLI path only ever applied shape-based SSN/phone/email/MRN patterns. The real scrubber is now the default (a no-op must be explicit), `adoc init` scaffolds `case/identifiers.yaml`, `adoc identifiers show|add|remove` manages it, and a missing or empty file produces a loud warning instead of silent degradation (ADR 0017). Page images sent for vision extraction remain unscrubbable and are documented as an accepted limitation.
+- **Two paths let model text reach the patient without passing the treatment/dosing gate.** Informational chat replies were never gated at all — deprecating `guarded_turn` in 0.7.1 had silently orphaned the only gated entry point — and the ledger page and weekly review reports rendered evidence claims, challenger notes, and review markdown raw. The gate now lives inside the function every informational caller uses, and both surfaces redact only the offending passage rather than blanking the page.
+- **The Phase 2 guards blocked so aggressively that a real diagnostic turn could not complete** (measured: 29 of 41 claims rejected, still 14 after the retry). `not_entailed` now means factual conflict with the source rather than "adds clinical interpretation", and a failing claim is stripped from the diff instead of destroying the turn — stronger grounding, since unverified evidence never reaches the ledger. The composer's number check no longer reads "elevated across 3 separate panels" as a lab value. The eval suite gained the missing false-positive direction: it previously only tested that fabrications are caught, never that legitimate claims pass (ADR 0016, revised).
+- **A shared YAML parser on the auth path was crashing requests and returning silently wrong results** (31–173 failures per 320 concurrent calls) — the third instance of the shared-mutable-state-across-threads bug class, and the true cause of a test that had been dismissed as flaky, now deterministic. The login rate limiter carried the same false single-threading assumption and could under-count concurrent failed attempts.
+- **Zip ingestion could lose a document silently**: a failed member left the archive marked successful, so inbox hygiene deleted it with no failure record anywhere. An unexpected exception also abandoned every remaining file in an ingest batch.
+- LLM-decided twin rejections now carry model id, prompt version, and timestamp, as the provenance rule requires.
+
 ## [0.8.0] - 2026-08-25
 
 ### Added
