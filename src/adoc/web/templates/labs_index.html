@@ -4,25 +4,35 @@
   <h1>Labs</h1>
   <p class="muted">Your recurring lab results over time. Tap an analyte for the full trend.</p>
 
-  {% if analytes %}
-    <ul class="labs-list">
-      {% for item in analytes %}
-        <li class="labs-list-row">
-          <a href="/labs/{{ item.url_name }}" class="labs-list-link">
-            <span class="labs-name">
-              {{ item.name }}
-              {% if item.specimen != "unknown" %}<span class="chip chip-specimen">{{ item.specimen }}</span>{% endif %}
-            </span>
-            <span class="labs-sparkline">{{ item.sparkline_svg | safe }}</span>
-            <span class="labs-latest">
-              {{ item.latest.value if item.latest.value is not none else item.latest.value_text }}
-              {% if item.latest.ucum_unit %}{{ item.latest.ucum_unit }}{% endif %}
-              {% if item.latest.flag %}<span class="chip chip-flag">{{ item.latest.flag.value }}</span>{% endif %}
-            </span>
-          </a>
-        </li>
-      {% endfor %}
-    </ul>
+  {% if groups %}
+    {#
+      Grouped by curated clinical panel (lab-taxonomy layer): curated
+      panels in a fixed clinical order, "Other" (analytes with no curated
+      panel) always last - see `labs.panels.panel_sort_key`.
+    #}
+    {% for group in groups %}
+      <section class="labs-panel-group">
+        <h2 class="labs-panel-title">{{ group.panel }}</h2>
+        <ul class="labs-list">
+          {% for item in group.analytes %}
+            <li class="labs-list-row">
+              <a href="/labs/{{ item.url_name }}" class="labs-list-link">
+                <span class="labs-name">
+                  {{ item.name }}
+                  {% if item.specimen != "unknown" %}<span class="chip chip-specimen">{{ item.specimen }}</span>{% endif %}
+                </span>
+                <span class="labs-sparkline">{{ item.sparkline_svg | safe }}</span>
+                <span class="labs-latest">
+                  {{ item.latest.value if item.latest.value is not none else item.latest.value_text }}
+                  {% if item.latest.ucum_unit %}{{ item.latest.ucum_unit }}{% endif %}
+                  {% if item.latest.flag %}<span class="chip chip-flag">{{ item.latest.flag.value }}</span>{% endif %}
+                </span>
+              </a>
+            </li>
+          {% endfor %}
+        </ul>
+      </section>
+    {% endfor %}
   {% else %}
     <p>No labs recorded yet. <a href="/upload">Add a document</a> to get started.</p>
   {% endif %}

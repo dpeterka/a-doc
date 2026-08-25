@@ -13,6 +13,7 @@ from adoc.labs.models import DocumentStatus, ExtractionStatus, LabDocument, LabF
 from adoc.labs.validate import (
     ANALYTE_SPECS,
     IssueCode,
+    canonical_rename_target,
     canonicalize,
     trend_outlier,
     validate_row,
@@ -394,6 +395,162 @@ def test_trend_outlier_unknown_specimen_row_compares_against_unknown_priors_only
     assert issue.code is IssueCode.TREND_OUTLIER
 
 
+# ----------------------------------------------------------------
+# lab-taxonomy layer: empty `allowed_units` means "no unit whitelist"
+# ----------------------------------------------------------------
+
+
+def test_empty_allowed_units_never_flags_unknown_unit() -> None:
+    """A curation-only spec (`allowed_units=()`, no curated unit knowledge)
+    must never manufacture a new UNKNOWN_UNIT issue - this is the
+    critical semantics the lab-taxonomy layer's many panel-only additions
+    depend on to avoid re-queuing thousands of already-accepted rows."""
+    spec = ANALYTE_SPECS["Chloride"]
+    assert spec.allowed_units == ()
+    for unit in (None, "mmol/L", "some bogus unit", "%"):
+        row = _lab(name="Chloride", value=100.0, ucum_unit=unit, ref_low=None, ref_high=None)
+        issues = validate_row(row)
+        assert not any(i.code is IssueCode.UNKNOWN_UNIT for i in issues), unit
+
+
+def test_empty_allowed_units_still_enforced_for_score_kind() -> None:
+    """`kind="score"`'s empty-`allowed_units` semantics are unchanged: a
+    score is unitless BY NATURE, so any actually-printed unit is still
+    flagged (unlike the new numeric-kind "no whitelist" meaning above)."""
+    row = _lab(name="T-score", value=-1.0, ucum_unit="mg/dL", ref_low=None, ref_high=None)
+    issues = validate_row(row)
+    assert any(i.code is IssueCode.UNKNOWN_UNIT for i in issues)
+
+
+def test_nonempty_allowed_units_still_enforced() -> None:
+    """A curated whitelist (existing specs, unchanged) still rejects an
+    unrecognized unit - only an EMPTY whitelist means "don't check"."""
+    row = _lab(name="potassium", ucum_unit="not-a-real-unit")
+    issues = validate_row(row)
+    assert any(i.code is IssueCode.UNKNOWN_UNIT for i in issues)
+
+
+# ----------------------------------------------------------------
+# lab-taxonomy layer: explicit spelling-variant merges
+# ----------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "raw",
+    ["% SATURATION", "TSAT", "transferrin saturation", "IRON SATURATION"],
+)
+def test_transferrin_saturation_variants_merge_onto_tsat(raw: str) -> None:
+    assert canonicalize(raw) == "TSAT"
+
+
+@pytest.mark.parametrize("raw", ["ACTH,PLASMA", "ACTH, Plasma", "ACTH"])
+def test_acth_variants_merge(raw: str) -> None:
+    assert canonicalize(raw) == "ACTH"
+
+
+@pytest.mark.parametrize(
+    "raw", ["ALKALINE PHOSPHATASE", "Alkaline Phosphatase", "Alkaline Phosphatase, S"]
+)
+def test_alkaline_phosphatase_variants_merge(raw: str) -> None:
+    assert canonicalize(raw) == "Alkaline Phosphatase"
+
+
+@pytest.mark.parametrize("raw", ["BILIRUBIN", "BILIRUBIN, TOTAL", "Bilirubin, Total"])
+def test_bilirubin_total_variants_merge(raw: str) -> None:
+    assert canonicalize(raw) == "Bilirubin, Total"
+
+
+@pytest.mark.parametrize("raw", ["C-PEPTIDE, LC/MS/MS", "C-Peptide, Serum", "C-Peptide"])
+def test_c_peptide_variants_merge(raw: str) -> None:
+    assert canonicalize(raw) == "C-Peptide"
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "ANTI-MULLERIAN HORMONE",
+        "ANTI-MULLERIAN HORMONE (AMH), FEMALE",
+        "Anti-Mullerian Hormone (AMH)",
+    ],
+)
+def test_amh_variants_merge(raw: str) -> None:
+    assert canonicalize(raw) == "AMH"
+
+
+@pytest.mark.parametrize(
+    "raw", ["ANA Direct", "ANA SCREEN, IFA", "ANA SCREEN, IMMUNOASSAY", "ANACHOICE SCREEN"]
+)
+def test_ana_screen_variants_merge_and_stay_separate_from_ana_titer(raw: str) -> None:
+    assert canonicalize(raw) == "ANA Screen"
+    assert canonicalize(raw) != "ANA titer"
+
+
+@pytest.mark.parametrize(
+    "raw", ["Babesia microti IgG", "BABESIA MICROTI AB (IGG)", "BABESIA MICROTI AB (IGG), SCREEN"]
+)
+def test_babesia_microti_igg_labcorp_vs_quest_spellings_merge(raw: str) -> None:
+    assert canonicalize(raw) == "Babesia microti Antibody IgG"
+
+
+@pytest.mark.parametrize("raw", ["CRP", "C-Reactive Protein", "C-Reactive Protein, Quant"])
+def test_crp_variants_merge(raw: str) -> None:
+    assert canonicalize(raw) == "CRP"
+
+
+def test_hs_crp_is_not_merged_into_crp() -> None:
+    """hs-CRP is a distinct, more-sensitive assay - never merged with
+    ordinary CRP even though the names look similar."""
+    assert canonicalize("HS CRP") == "hs-CRP"
+    assert canonicalize("HS CRP") != "CRP"
+
+
+# ----------------------------------------------------------------
+# lab-taxonomy layer: generic specimen/method suffix-strip rule
+# ----------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("Chloride, Serum", "Chloride"),
+        ("Alkaline Phosphatase, S", "Alkaline Phosphatase"),
+        ("Globulin, Serum", "Globulin"),
+        ("17-OH-PROGESTERONE,LCMSMS", "17-Hydroxyprogesterone"),
+    ],
+)
+def test_suffix_strip_rule_resolves_specimen_and_method_suffixes(raw: str, expected: str) -> None:
+    assert canonicalize(raw) == expected
+
+
+def test_suffix_strip_rule_does_not_collapse_a_clinically_distinct_specimen() -> None:
+    """RBC magnesium is a different assay from serum magnesium - the
+    suffix-strip rule must never merge them (this is why "RBC" isn't in
+    the curated suffix list)."""
+    assert canonicalize("Magnesium, RBC") == "Magnesium, RBC"
+    assert canonicalize("Magnesium, Plasma") == "Magnesium"
+    assert canonicalize("Magnesium, RBC") != canonicalize("Magnesium, Plasma")
+
+
+# ----------------------------------------------------------------
+# lab-taxonomy layer: panel/derived_from metadata
+# ----------------------------------------------------------------
+
+
+def test_panel_field_is_set_for_curated_panel_members() -> None:
+    assert ANALYTE_SPECS["WBC"].panel == "CBC"
+    assert ANALYTE_SPECS["TSH"].panel == "Thyroid"
+    assert ANALYTE_SPECS["TSAT"].panel == "Iron Studies"
+
+
+def test_panel_field_defaults_to_none_for_unpanelled_analytes() -> None:
+    assert ANALYTE_SPECS["Tryptase"].panel is None
+
+
+def test_derived_from_recorded_for_tsat_and_ag_ratio() -> None:
+    assert set(ANALYTE_SPECS["TSAT"].derived_from) == {"Iron", "TIBC"}
+    assert set(ANALYTE_SPECS["A/G Ratio"].derived_from) == {"albumin", "Globulin"}
+
+
 def test_labcorp_long_form_unit_spellings_are_accepted() -> None:
     """LabCorp prints 'Million/uL'/'Thousand/uL' (real-corpus finding); these
     are the same units as M/uL / K/uL and must not queue. Comparison is
@@ -407,3 +564,103 @@ def test_labcorp_long_form_unit_spellings_are_accepted() -> None:
         row = _lab(name=name, ucum_unit=unit, value=value)
         issues = validate_row(row)
         assert not any(i.code == IssueCode.UNKNOWN_UNIT for i in issues), (name, unit)
+
+
+# ----------------------------------------------------------------
+# lab-taxonomy layer: specimen-distinct analytes must never share a
+# canonical (feature/taxonomy-distinctions spec-table sweep - same shape
+# as "Magnesium, RBC" above, found for Copper/Selenium/urine creatinine).
+# ----------------------------------------------------------------
+
+
+def test_copper_blood_and_serum_plasma_are_distinct_canonicals() -> None:
+    assert canonicalize("Copper, Blood") == "Copper, Blood"
+    assert canonicalize("Copper, Serum or Plasma") == "Copper, Serum or Plasma"
+    assert canonicalize("Copper, Blood") != canonicalize("Copper, Serum or Plasma")
+
+
+def test_selenium_blood_and_serum_plasma_are_distinct_canonicals() -> None:
+    assert canonicalize("Selenium, Blood") == "Selenium, Blood"
+    assert canonicalize("Selenium, Serum/Plasma") == "Selenium, Serum/Plasma"
+    assert canonicalize("Selenium, Blood") != canonicalize("Selenium, Serum/Plasma")
+
+
+def test_urine_creatinine_is_distinct_from_serum_creatinine() -> None:
+    assert canonicalize("Creatinine, Random Urine") == "Creatinine, Urine"
+    assert canonicalize("creatinine") == "creatinine"
+    assert canonicalize("Creatinine, Random Urine") != canonicalize("creatinine")
+
+
+# ----------------------------------------------------------------
+# canonical_rename_target (feature/taxonomy-distinctions): the strict,
+# exact-alias-only counterpart to `canonicalize` that
+# `labs.recanonicalize` uses to decide whether a stored row's `name` may
+# be physically overwritten. See `validate`'s module docstring ("Matching
+# vs. renaming").
+# ----------------------------------------------------------------
+
+
+@pytest.mark.parametrize("raw", ["ACTH,PLASMA", "ACTH, Plasma", "ACTH"])
+def test_canonical_rename_target_still_merges_exact_aliases(raw: str) -> None:
+    assert canonical_rename_target(raw, raw) == "ACTH"
+
+
+def test_canonical_rename_target_ignores_the_generic_suffix_strip_rule() -> None:
+    """ "Alkaline Phosphatase, S" only resolves via the suffix-strip retry
+    (`canonicalize` still merges it) - `canonical_rename_target` must
+    never rename it, since that retry is a heuristic resemblance, not a
+    human-reviewed exact alias."""
+    raw = "Alkaline Phosphatase, S"
+    assert canonicalize(raw) == "Alkaline Phosphatase"
+    assert canonical_rename_target(raw, raw) is None
+
+
+def test_canonical_rename_target_ignores_the_score_suffix_rule() -> None:
+    """A site-prefixed DEXA score name only resolves via the score-suffix
+    rule (`canonicalize` still merges it for panel/read purposes) -
+    `canonical_rename_target` must never rename it."""
+    raw = "LEFT HIP femoral neck T-Score"
+    assert canonicalize(raw) == "T-score"
+    assert canonical_rename_target(raw, raw) is None
+
+
+@pytest.mark.parametrize(
+    "raw",
+    ["LEFT HIP femoral neck Z-Score", "LEFT HIP Total Z-Score"],
+)
+def test_canonical_rename_target_preserves_site_prefixed_z_scores(raw: str) -> None:
+    """Real collision family: both site-prefixed Z-scores used to rename
+    onto one shared "Z-score" canonical via the score-suffix rule - stored
+    names must now be preserved (no rename target at all)."""
+    assert canonical_rename_target(raw, raw) is None
+
+
+def test_canonical_rename_target_gives_left_and_right_hip_bmd_distinct_targets() -> None:
+    """Real collision family: both sides used to rename onto one shared
+    "Total Hip BMD" canonical via a shared alias list - each side now has
+    its own spec and its own distinct rename target."""
+    left = canonical_rename_target("LEFT HIP Total BMD", "LEFT HIP Total BMD")
+    right = canonical_rename_target("RIGHT HIP Total BMD", "RIGHT HIP Total BMD")
+    assert left == "Left Hip Total BMD"
+    assert right == "Right Hip Total BMD"
+    assert left != right
+
+
+def test_canonical_rename_target_gives_manganese_specimens_distinct_targets() -> None:
+    """Real collision family: plasma/RBC manganese used to rename onto one
+    shared "Manganese" canonical via a shared alias list."""
+    plasma = canonical_rename_target("Manganese, Plasma", "Manganese, Plasma")
+    rbc = canonical_rename_target("Manganese, RBC", "Manganese, RBC")
+    assert plasma == "Manganese, Plasma"
+    assert rbc == "Manganese, RBC"
+    assert plasma != rbc
+
+
+def test_canonical_rename_target_gives_egfr_stratifications_distinct_targets() -> None:
+    """Real collision family: the two race-stratified eGFR variants used to
+    rename onto one shared "eGFR" canonical via a shared alias list."""
+    black = canonical_rename_target("eGFR If Africn Am", "eGFR If Africn Am")
+    non_black = canonical_rename_target("eGFR If NonAfricn Am", "eGFR If NonAfricn Am")
+    assert black == "eGFR (African American)"
+    assert non_black == "eGFR (Non-African American)"
+    assert black != non_black

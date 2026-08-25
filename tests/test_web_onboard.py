@@ -1,5 +1,11 @@
-"""Onboarding surface tests: the web wizard drives `IntakeWizard` end to
-end — submit produces a playback, confirm advances the section state.
+"""Onboarding surface tests (`docs/adr/0012-initial-visit-conversation.md`):
+onboarding is no longer its own chat surface — `/onboard` and
+`/onboard/send` are redirects to the one real surface, `/chat` (see
+`tests/test_web_chat.py` for the actual conversation-routing tests).
+`/onboard/review` survives as "Intake record": a read-only page listing
+every active fact grouped by internal topic (fine for a record, unlike a
+stepper), still with attribution/precision badges and a "Correct this"
+affordance that now points back at `/chat`.
 """
 
 from __future__ import annotations
@@ -10,86 +16,260 @@ from typing import Any
 from fastapi.testclient import TestClient
 from web_support import build_app, login
 
+from adoc.intake.agent import IntakeTurnResult
 from adoc.reason.client import TransportRequest, TransportResponse
 
 
-def _basics_transport(calls: list[TransportRequest]):
+def _intake_transport(queue: list[dict[str, Any]]):
+    remaining = list(queue)
+
     def transport(request: TransportRequest) -> TransportResponse:
-        calls.append(request)
-        assert request.schema is not None
-        if request.schema.__name__ == "BasicsSection":
-            tool_input: dict[str, Any] = {
-                "age": 40,
-                "sex_at_birth": "female",
-                "height_cm": None,
-                "weight_kg": None,
-                "occupation": None,
-                "exposures": [],
-            }
-        else:  # pragma: no cover - defensive
-            raise AssertionError(f"unexpected schema: {request.schema.__name__}")
-        return TransportResponse(text="", tool_input=tool_input, input_tokens=5, output_tokens=5)
+        assert request.schema is IntakeTurnResult
+        if not remaining:
+            raise AssertionError("no scripted intake_agent response left")
+        return TransportResponse(
+            text="", tool_input=remaining.pop(0), input_tokens=5, output_tokens=5
+        )
 
     return transport
 
 
-def test_onboard_page_shows_progress_and_first_section(tmp_path: Path) -> None:
-    app, _repo, _db, _calls = build_app(tmp_path)
-    client = TestClient(app)
-    login(client)
-
-    response = client.get("/onboard")
-
-    assert response.status_code == 200
-    assert "[1/10] Basics" in response.text
-    assert "0 of 10" in response.text
-
-
-def test_submit_then_confirm_advances_the_section(tmp_path: Path) -> None:
-    calls: list[TransportRequest] = []
-    app, repo, _db, _ = build_app(tmp_path, primary_transport=_basics_transport(calls))
-    client = TestClient(app)
-    login(client)
-
-    submit_response = client.post("/onboard/submit", data={"text": "I'm 40 and female."})
-    assert submit_response.status_code == 200
-    assert "age: 40" in submit_response.text
-    assert "Confirm" in submit_response.text
-    assert len(calls) == 1
-
-    confirm_response = client.post("/onboard/confirm")
-    assert confirm_response.status_code == 200
-    assert "1 of 10" in confirm_response.text
-    assert "[2/10] Current symptoms" in confirm_response.text
-
-    # The section write + intake-state update is a real git commit.
-    assert "Age: 40" in repo.read("case/case-summary.md")
-
-
-def test_submit_with_blank_text_shows_an_error_without_calling_the_llm(
-    tmp_path: Path,
-) -> None:
+def test_onboard_get_redirects_permanently_to_chat(tmp_path: Path) -> None:
     app, _repo, _db, calls = build_app(tmp_path)
     client = TestClient(app)
     login(client)
 
-    response = client.post("/onboard/submit", data={"text": "   "})
+    response = client.get("/onboard", follow_redirects=False)
 
-    assert response.status_code == 200
-    assert "Please write something" in response.text
+    assert response.status_code == 301
+    assert response.headers["location"] == "/chat"
     assert calls == []
 
 
-def test_reopen_a_section_moves_the_cursor(tmp_path: Path) -> None:
-    calls: list[TransportRequest] = []
-    app, _repo, _db, _ = build_app(tmp_path, primary_transport=_basics_transport(calls))
+def test_onboard_send_post_redirects_to_chat(tmp_path: Path) -> None:
+    app, _repo, _db, calls = build_app(tmp_path)
     client = TestClient(app)
     login(client)
 
-    client.post("/onboard/submit", data={"text": "I'm 40 and female."})
-    client.post("/onboard/confirm")
+    response = client.post("/onboard/send", data={"text": "anything"}, follow_redirects=False)
 
-    response = client.get("/onboard/section/basics")
+    assert response.status_code == 303
+    assert response.headers["location"] == "/chat"
+    assert calls == []
+
+
+def test_review_page_renders_active_fact_badges_and_retracted_facts_collapsed(
+    tmp_path: Path,
+) -> None:
+    intake_transport = _intake_transport(
+        [
+            {
+                "message": "Noted.",
+                "ops": [
+                    {
+                        "op": "add_fact",
+                        "fact": {
+                            "id": "cancer-theory",
+                            "section": "prior_diagnoses",
+                            "kind": "diagnosis",
+                            "statement": "Patient believes they have cancer.",
+                            "attribution": "patient_assumption",
+                            "fields": {"reasoning": "unexplained weight loss"},
+                        },
+                    },
+                    {
+                        "op": "add_fact",
+                        "fact": {
+                            "id": "old-theory",
+                            "section": "prior_diagnoses",
+                            "kind": "diagnosis",
+                            "statement": "An old, since-withdrawn theory.",
+                            "attribution": "patient_assumption",
+                            "fields": {"reasoning": "n/a"},
+                        },
+                    },
+                ],
+                "topics_covered": [],
+                "intake_complete": False,
+            },
+            {
+                "message": "Got it, removed.",
+                "ops": [
+                    {
+                        "op": "retract_fact",
+                        "id": "old-theory",
+                        "reason": "patient said this no longer applies",
+                    }
+                ],
+                "topics_covered": [],
+                "intake_complete": False,
+            },
+        ]
+    )
+    app, _repo, _db, _ = build_app(tmp_path, intake_agent_transport=intake_transport)
+    client = TestClient(app)
+    login(client)
+
+    client.post("/chat/send", data={"text": "I think I have cancer, unexplained weight loss."})
+    client.post("/chat/send", data={"text": "Actually forget the old theory."})
+
+    response = client.get("/onboard/review")
 
     assert response.status_code == 200
-    assert "[1/10] Basics" in response.text
+    body = response.text
+    assert "Intake record" in body
+    assert "Patient believes they have cancer." in body
+    assert "Patient&#39;s own suspicion" in body or "Patient's own suspicion" in body
+    assert "Correct this" in body
+    assert "1 retracted" in body
+
+
+def test_review_page_never_shows_a_section_list_or_progress(tmp_path: Path) -> None:
+    app, _repo, _db, _calls = build_app(tmp_path)
+    client = TestClient(app)
+    login(client)
+
+    response = client.get("/onboard/review")
+
+    assert response.status_code == 200
+    assert "of 10" not in response.text
+    assert "<progress" not in response.text
+
+
+def test_review_page_correct_this_prefills_the_chat_page(tmp_path: Path) -> None:
+    app, _repo, _db, _calls = build_app(tmp_path)
+    client = TestClient(app)
+    login(client)
+
+    response = client.get("/onboard/review")
+
+    assert response.status_code == 200
+    assert '"/chat?prefill="' in response.text
+
+
+def test_review_page_omits_since_last_visit_strip_when_nothing_recent(tmp_path: Path) -> None:
+    app, _repo, _db, _calls = build_app(tmp_path)
+    client = TestClient(app)
+    login(client)
+
+    response = client.get("/onboard/review")
+
+    assert response.status_code == 200
+    assert "Since last visit" not in response.text
+
+
+def test_review_page_shows_since_last_visit_strip_for_recently_reported_facts(
+    tmp_path: Path,
+) -> None:
+    """`docs/adr/0013-fact-corroboration.md`: every fact gets a `reported_on`
+    stamp, and a fact reported within the last 14 days shows up in the
+    "Since last visit" strip."""
+    intake_transport = _intake_transport(
+        [
+            {
+                "message": "Noted.",
+                "ops": [
+                    {
+                        "op": "add_fact",
+                        "fact": {
+                            "id": "recent-symptom",
+                            "section": "symptoms",
+                            "kind": "symptom",
+                            "statement": "New joint pain reported this visit.",
+                        },
+                    }
+                ],
+                "topics_covered": [],
+                "intake_complete": False,
+            }
+        ]
+    )
+    app, _repo, _db, _calls = build_app(tmp_path, intake_agent_transport=intake_transport)
+    client = TestClient(app)
+    login(client)
+
+    client.post("/chat/send", data={"text": "New joint pain."})
+
+    response = client.get("/onboard/review")
+
+    assert response.status_code == 200
+    assert "Since last visit" in response.text
+    assert "New joint pain reported this visit." in response.text
+
+
+def test_review_page_shows_corroboration_badges_and_sorts_contradicted_first(
+    tmp_path: Path,
+) -> None:
+    """A diagnosis with a future `fields.year` is auto-contradicted by
+    `run_intake_turn`'s own corroboration sweep (`intake.corroborate`); an
+    ordinary one with no matching documentation stays unverified. The
+    contradicted fact must sort before its topic-mate."""
+    intake_transport = _intake_transport(
+        [
+            {
+                "message": "Noted.",
+                "ops": [
+                    {
+                        "op": "add_fact",
+                        "fact": {
+                            "id": "first-added",
+                            "section": "prior_diagnoses",
+                            "kind": "diagnosis",
+                            "statement": "Diagnosed with hypothyroidism.",
+                            "attribution": "doctor_diagnosed",
+                            "fields": {"year": 2015, "by_whom": "Dr. Ray"},
+                        },
+                    },
+                    {
+                        "op": "add_fact",
+                        "fact": {
+                            "id": "future-dx",
+                            "section": "prior_diagnoses",
+                            "kind": "diagnosis",
+                            "statement": "Diagnosed with lupus in 2099.",
+                            "attribution": "doctor_diagnosed",
+                            "fields": {"year": 2099, "by_whom": "Dr. Lee"},
+                        },
+                    },
+                ],
+                "topics_covered": [],
+                "intake_complete": False,
+            }
+        ]
+    )
+    app, _repo, _db, _calls = build_app(tmp_path, intake_agent_transport=intake_transport)
+    client = TestClient(app)
+    login(client)
+
+    client.post("/chat/send", data={"text": "Two diagnoses to record."})
+
+    response = client.get("/onboard/review")
+
+    assert response.status_code == 200
+    body = response.text
+    assert "Contradicted" in body
+    assert "Unverified" in body
+    # Both facts were reported today, so they also both appear (in insertion
+    # order) in the unsorted "Since last visit" strip above the topic
+    # sections -- `rindex` finds each statement's LAST occurrence, i.e. its
+    # position within the (corroboration-sorted) "prior_diagnoses" section.
+    assert body.rindex("Diagnosed with lupus in 2099.") < body.rindex(
+        "Diagnosed with hypothyroidism."
+    )
+
+
+def test_onboard_review_stays_reachable_and_shows_amend_banner_after_completion(
+    tmp_path: Path,
+) -> None:
+    from web_support import mark_intake_complete
+
+    app, repo, _db, _ = build_app(tmp_path)
+    mark_intake_complete(repo)
+
+    client = TestClient(app)
+    login(client)
+
+    response = client.get("/onboard/review")
+
+    assert response.status_code == 200
+    assert "Initial visit complete" in response.text

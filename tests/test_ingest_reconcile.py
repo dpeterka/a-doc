@@ -834,3 +834,28 @@ def test_multi_tier_conditional_ranges_compare_numerically(
     from adoc.ingest.reconcile import ref_ranges_equivalent
 
     assert ref_ranges_equivalent(ref_a, ref_b) is equivalent
+
+
+def test_stored_name_requires_exact_alias_not_permissive_match(tmp_path: Path) -> None:
+    """Only an exact alias may NAME a persisted row (`_stored_name`,
+    feature/taxonomy-distinctions): a site-prefixed DEXA score matches the
+    "Z-score" spec via the score-suffix rule (read-time grouping/
+    validation), but persisting it under bare "Z-score" would discard the
+    site - so `canonical_name` must be None (store the raw name verbatim)."""
+    score = _result(
+        name_raw="LEFT HIP Total Z-Score", value=-1.2, unit_raw=None, ref_range_raw=None
+    )
+    rows = reconcile(_doc([score]), _doc([score]), _empty_db(tmp_path))
+    assert len(rows) == 1
+    assert rows[0].canonical_name is None
+    assert rows[0].name_raw == "LEFT HIP Total Z-Score"
+
+
+def test_stored_name_requires_exact_alias_in_single_pass_path(tmp_path: Path) -> None:
+    score = _result(
+        name_raw="LEFT HIP femoral neck T-Score", value=-0.8, unit_raw=None, ref_range_raw=None
+    )
+    rows = reconcile(_doc([score]), _doc([]), _empty_db(tmp_path))
+    assert len(rows) == 1
+    assert rows[0].canonical_name is None
+    assert rows[0].name_raw == "LEFT HIP femoral neck T-Score"

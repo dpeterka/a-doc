@@ -1050,12 +1050,16 @@ def test_resolve_pass_converging_on_existing_row_rejects_as_duplicate(tmp_path: 
             status=DocumentStatus.COMPLETE,
         )
     )
-    # the already-existing row the resolution will converge onto
+    # the already-existing row the resolution will converge onto - stored
+    # under its canonical name (lab-taxonomy layer: "E. CHAFFEENSIS AB IGG"
+    # now canonicalizes to "Ehrlichia chaffeensis Antibody IgG", same as a
+    # real ingestion would store it) so the convergence below is on the
+    # canonical key, not the raw string.
     db.insert_results(
         [
             LabResult(
                 date=date(2024, 7, 18),
-                name="E. CHAFFEENSIS AB IGG",
+                name="Ehrlichia chaffeensis Antibody IgG",
                 name_raw="E. CHAFFEENSIS AB IGG",
                 value_text="<1:64",
                 source_doc=doc_sha,

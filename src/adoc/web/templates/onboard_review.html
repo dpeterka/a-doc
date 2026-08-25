@@ -1,0 +1,104 @@
+{% extends "base.html" %}
+{% block title %}Intake record — a-doc{% endblock %}
+{% block content %}
+  <h1>Intake record</h1>
+  <p class="muted">
+    Every fact captured so far in your conversations, grouped here for review only — the
+    conversation itself never steps through these groups one at a time. Nothing here is ever
+    silently deleted — a correction is recorded as a revision, and removing something marks it
+    retracted rather than erasing it.
+  </p>
+  <p><a href="/chat">&larr; Back to chat</a></p>
+
+  {% if not baseline_incomplete %}
+    <p class="banner">Initial visit complete — you can still correct or add details here.</p>
+  {% endif %}
+
+  {% if recent_facts %}
+    <section class="review-section since-last-visit">
+      <h2>Since last visit</h2>
+      <p class="muted">Reported in the last {{ recent_window_days }} days.</p>
+      {% for fact in recent_facts %}
+        <div class="fact-card">
+          <p>{{ fact.statement }}</p>
+          <p class="muted">reported {{ fact.reported_on }}</p>
+        </div>
+      {% endfor %}
+    </section>
+  {% endif %}
+
+  {% for key, section in sections.items() %}
+    <section class="review-section">
+      <h2>{{ section.title }}</h2>
+
+      {% if not section.active and not section.retracted %}
+        <p class="muted">Nothing recorded yet.</p>
+      {% endif %}
+
+      {% for fact in section.active %}
+        <div class="fact-card">
+          <p>{{ fact.statement }}</p>
+          <p class="muted">
+            {% if fact.date_approx %}{{ fact.date_approx }} &middot;{% endif %}
+            <span class="badge badge-attribution-{{ fact.attribution }}">
+              {%- if fact.attribution == "doctor_diagnosed" -%}
+                Doctor-diagnosed
+              {%- elif fact.attribution == "patient_assumption" -%}
+                Patient's own suspicion
+              {%- else -%}
+                Patient-reported
+              {%- endif -%}
+            </span>
+            <span class="badge badge-precision-{{ fact.precision }}">
+              {%- if fact.precision == "exact" -%}
+                exact timing
+              {%- elif fact.precision == "approx" -%}
+                approximate timing
+              {%- elif fact.precision == "unknown_after_probe" -%}
+                timing unknown — asked
+              {%- else -%}
+                timing not yet asked
+              {%- endif -%}
+            </span>
+            {% if fact.clarification_status == "needs_probe" %}
+              <span class="badge badge-needs-probe">needs follow-up</span>
+            {% endif %}
+            <span class="badge badge-corroboration-{{ fact.corroboration }}">
+              {%- if fact.corroboration == "corroborated" -%}
+                Corroborated &#10003;{% if fact.corroboration_source %} ({{ fact.corroboration_source }}){% endif %}
+              {%- elif fact.corroboration == "contradicted" -%}
+                Contradicted &#9888;{% if fact.corroboration_note %} — {{ fact.corroboration_note }}{% endif %}
+              {%- else -%}
+                Unverified
+              {%- endif -%}
+            </span>
+            {% if fact.reported_on %}
+              <span class="muted">reported {{ fact.reported_on }}</span>
+            {% endif %}
+          </p>
+          <button type="button" class="link-button correct-this-fact"
+            data-statement="{{ fact.statement }}">Correct this</button>
+        </div>
+      {% endfor %}
+
+      {% if section.retracted %}
+        <details class="retracted-facts">
+          <summary>{{ section.retracted|length }} retracted</summary>
+          {% for fact in section.retracted %}
+            <p class="retracted"><s>{{ fact.statement }}</s></p>
+          {% endfor %}
+        </details>
+      {% endif %}
+    </section>
+  {% endfor %}
+
+  <script>
+    document.querySelectorAll(".correct-this-fact").forEach(function (button) {
+      button.addEventListener("click", function () {
+        var statement = button.getAttribute("data-statement");
+        var prefill = "About '" + statement + "': ";
+        window.location.href = "/chat?prefill=" + encodeURIComponent(prefill);
+      });
+    });
+  </script>
+{% endblock %}

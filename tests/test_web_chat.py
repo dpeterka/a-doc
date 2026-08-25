@@ -1,5 +1,12 @@
 """Chat surface tests: the red-flag screen runs before any model call, and
 a diagnostic turn renders the three-tier differential.
+
+`docs/adr/0012-initial-visit-conversation.md` merged onboarding into this
+same surface: while intake is incomplete every turn routes through
+`intake.agent.run_intake_turn` instead of the diagnostic pipeline, so the
+diagnostic-focused tests below seed `mark_intake_complete(repo)` first —
+they are about what happens once the initial visit is done, not about
+onboarding itself (that gets its own tests further down).
 """
 
 from __future__ import annotations
@@ -7,10 +14,19 @@ from __future__ import annotations
 from pathlib import Path
 
 from fastapi.testclient import TestClient
-from web_support import build_app, login, make_challenger_transport, make_primary_transport
+from web_support import (
+    build_app,
+    exploding_transport,
+    login,
+    make_challenger_transport,
+    make_primary_transport,
+    mark_intake_complete,
+)
 
 from adoc.casefile.ledger import load_ledger
 from adoc.casefile.repo import LEDGER_RELPATH
+from adoc.intake.agent import INTAKE_OPENER_MESSAGE, IntakeTurnResult, VisitCaptureResult
+from adoc.reason.client import TransportRequest, TransportResponse
 
 _SLE_MOST_LIKELY_OP = {
     "op": "add_hypothesis",
@@ -78,9 +94,10 @@ def test_diagnostic_turn_renders_the_three_tiers(tmp_path: Path) -> None:
         additional_ops=[],
         calls=calls,
     )
-    app, _repo, _db, _calls = build_app(
+    app, repo, _db, _calls = build_app(
         tmp_path, primary_transport=primary, challenger_transport=challenger
     )
+    mark_intake_complete(repo)
     client = TestClient(app)
     login(client)
 
@@ -133,6 +150,7 @@ def test_dosing_laden_composer_output_is_withheld_but_ledger_is_still_updated(
     app, repo, _db, _calls = build_app(
         tmp_path, primary_transport=primary, challenger_transport=challenger
     )
+    mark_intake_complete(repo)
     client = TestClient(app)
     login(client)
 
@@ -175,9 +193,10 @@ def test_ledger_invariant_violation_is_withheld_not_a_bare_500(tmp_path: Path) -
     calls: list = []
     primary = make_primary_transport([_ACTIVE_NO_CANT_MISS_OP], {}, calls)
     challenger = make_challenger_transport(counter_arguments=[], additional_ops=[], calls=calls)
-    app, _repo, _db, _calls = build_app(
+    app, repo, _db, _calls = build_app(
         tmp_path, primary_transport=primary, challenger_transport=challenger
     )
+    mark_intake_complete(repo)
     client = TestClient(app)
     login(client)
 
@@ -201,3 +220,316 @@ def test_chat_page_renders_without_error_when_transcript_is_empty(tmp_path: Path
     response = client.get("/chat")
 
     assert response.status_code == 200
+
+
+# --- one surface: onboarding merged into /chat (docs/adr/0012) -------------------------
+
+
+def _intake_transport(queue: list[dict]):
+    remaining = list(queue)
+
+    def transport(request: TransportRequest) -> TransportResponse:
+        assert request.schema is IntakeTurnResult
+        if not remaining:
+            raise AssertionError("no scripted intake_agent response left")
+        return TransportResponse(
+            text="", tool_input=remaining.pop(0), input_tokens=5, output_tokens=5
+        )
+
+    return transport
+
+
+def test_fresh_chat_page_shows_the_deterministic_opener(tmp_path: Path) -> None:
+    app, _repo, _db, calls = build_app(tmp_path)
+    client = TestClient(app)
+    login(client)
+
+    response = client.get("/chat")
+
+    assert response.status_code == 200
+    # (Jinja HTML-escapes apostrophes, so check a clause that has none.)
+    assert "This first conversation is how we build your case file together" in response.text
+    assert calls == []  # a constant, never an LLM call
+
+
+def test_chat_page_has_no_opener_once_intake_is_complete(tmp_path: Path) -> None:
+    app, repo, _db, _calls = build_app(tmp_path)
+    mark_intake_complete(repo)
+    client = TestClient(app)
+    login(client)
+
+    response = client.get("/chat")
+
+    assert response.status_code == 200
+    assert INTAKE_OPENER_MESSAGE not in response.text
+
+
+def test_no_progress_bar_or_section_list_while_intake_incomplete(tmp_path: Path) -> None:
+    """Owner feedback: sections must never be visible UI, not even a
+    progress percentage."""
+    app, _repo, _db, _calls = build_app(tmp_path)
+    client = TestClient(app)
+    login(client)
+
+    response = client.get("/chat")
+
+    assert response.status_code == 200
+    assert "Basics" not in response.text
+    assert "of 10" not in response.text
+
+
+def test_first_turn_while_intake_incomplete_routes_through_intake_agent(tmp_path: Path) -> None:
+    intake_transport = _intake_transport(
+        [
+            {
+                "message": "Got it — 41, female. What's your occupation?",
+                "ops": [
+                    {
+                        "op": "add_fact",
+                        "fact": {
+                            "id": "basic-1",
+                            "section": "basics",
+                            "kind": "basic",
+                            "statement": "Patient is 41, female.",
+                            "fields": {"age": 41, "sex_at_birth": "female"},
+                        },
+                    }
+                ],
+                "topics_covered": [],
+                "intake_complete": False,
+            }
+        ]
+    )
+    app, repo, _db, calls = build_app(tmp_path, intake_agent_transport=intake_transport)
+    client = TestClient(app)
+    login(client)
+
+    response = client.post("/chat/send", data={"text": "I'm 41 and female."})
+
+    assert response.status_code == 200
+    assert "your occupation" in response.text
+    # `calls` only accumulates primary/challenger transport invocations
+    # (see web_support.build_fake_client) -- an empty list here confirms
+    # the diagnostic pipeline was never touched for this turn.
+    assert calls == []
+
+    from adoc.intake.facts import IntakeFactsStore
+    from adoc.web.casefile_helpers import read_recent_chat
+
+    store = IntakeFactsStore(repo.root)
+    assert len(store.active_facts()) == 1
+
+    transcript = read_recent_chat(repo)
+    # opener (assistant) -> patient -> assistant reply: one continuous
+    # conversation, the opener written on the first patient turn.
+    assert [entry["role"] for entry in transcript] == ["assistant", "patient", "assistant"]
+    assert transcript[0]["text"] == INTAKE_OPENER_MESSAGE
+
+
+def test_diagnostic_turns_unlock_only_once_wrap_up_is_accepted(tmp_path: Path) -> None:
+    """Once the deterministic wrap-up gate accepts `intake_complete` on one
+    turn, the VERY NEXT turn routes through the diagnostic pipeline instead
+    of `run_intake_turn` — same `/chat/send` route, no separate surface,
+    and every topic must already be covered with no active blockers for
+    the accept to happen at all (`intake.agent.run_intake_turn`'s own unit
+    tests cover the veto path in detail)."""
+    from adoc.intake.coverage import CoverageState, TopicCoverage, save_coverage_state
+    from adoc.intake.wizard import INTAKE_STATE_RELPATH
+
+    intake_transport = _intake_transport(
+        [
+            {
+                "message": "Thank you — I think I have a good picture. Feel free to send over "
+                "any records, or ask me anything.",
+                "ops": [],
+                "topics_covered": [],
+                "intake_complete": True,
+            }
+        ]
+    )
+    calls: list = []
+    primary = make_primary_transport([_PE_CANT_MISS_OP], _PATIENT_REPLY, calls, route="diagnostic")
+    challenger = make_challenger_transport(counter_arguments=[], additional_ops=[], calls=calls)
+    app, repo, _db, _calls = build_app(
+        tmp_path,
+        intake_agent_transport=intake_transport,
+        primary_transport=primary,
+        challenger_transport=challenger,
+    )
+    # Every topic already covered (no active facts anywhere means no
+    # blockers), so this turn's `intake_complete=True` proposal is
+    # actually accepted rather than vetoed.
+    from adoc.intake.sections import SECTIONS
+
+    save_coverage_state(
+        repo.root / INTAKE_STATE_RELPATH,
+        CoverageState(topics={spec.key: TopicCoverage(covered=True) for spec in SECTIONS}),
+    )
+    repo.commit("chore: seed all-topics-covered state for test")
+    client = TestClient(app)
+    login(client)
+
+    wrap_up = client.post("/chat/send", data={"text": "I think that's everything."})
+    assert wrap_up.status_code == 200
+    assert "good picture" in wrap_up.text
+
+    response = client.post(
+        "/chat/send",
+        data={"text": "My joints have been aching for weeks and I'm constantly exhausted."},
+    )
+
+    assert response.status_code == 200
+    assert "Most Likely" in response.text
+
+
+def test_onboard_get_redirects_to_chat(tmp_path: Path) -> None:
+    app, _repo, _db, _calls = build_app(tmp_path)
+    client = TestClient(app)
+    login(client)
+
+    response = client.get("/onboard", follow_redirects=False)
+
+    assert response.status_code == 301
+    assert response.headers["location"] == "/chat"
+
+
+def test_onboard_send_post_redirects_to_chat(tmp_path: Path) -> None:
+    app, _repo, _db, _calls = build_app(tmp_path)
+    client = TestClient(app)
+    login(client)
+
+    response = client.post("/onboard/send", data={"text": "anything"}, follow_redirects=False)
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/chat"
+
+
+# --- interval history: post-intake visit capture (docs/adr/0013) -----------------------
+
+
+def _visit_capture_transport(ops: list, calls: list):
+    def transport(request: TransportRequest) -> TransportResponse:
+        calls.append(request)
+        assert request.schema is VisitCaptureResult
+        return TransportResponse(text="", tool_input={"ops": ops}, input_tokens=5, output_tokens=5)
+
+    return transport
+
+
+def test_successful_diagnostic_turn_triggers_visit_capture(tmp_path: Path) -> None:
+    capture_calls: list = []
+    capture_transport = _visit_capture_transport(
+        [
+            {
+                "op": "add_fact",
+                "fact": {
+                    "id": "new-symptom",
+                    "section": "symptoms",
+                    "kind": "symptom",
+                    "statement": "New knee swelling mentioned in this visit.",
+                },
+            }
+        ],
+        capture_calls,
+    )
+    calls: list = []
+    primary = make_primary_transport([_PE_CANT_MISS_OP], _PATIENT_REPLY, calls)
+    challenger = make_challenger_transport(counter_arguments=[], additional_ops=[], calls=calls)
+    app, repo, _db, _calls = build_app(
+        tmp_path,
+        primary_transport=primary,
+        challenger_transport=challenger,
+        visit_capture_transport=capture_transport,
+    )
+    mark_intake_complete(repo)
+    client = TestClient(app)
+    login(client)
+
+    response = client.post(
+        "/chat/send",
+        data={"text": "My joints have been aching for weeks and I'm constantly exhausted."},
+    )
+
+    assert response.status_code == 200
+    assert len(capture_calls) == 1
+
+    from adoc.intake.facts import IntakeFactsStore
+
+    store = IntakeFactsStore(repo.root)
+    fact = store.get("new-symptom")
+    assert fact is not None
+    assert fact.provenance.dag_node == "visit-capture"
+
+
+def test_red_flag_turn_never_triggers_visit_capture(tmp_path: Path) -> None:
+    capture_calls: list = []
+    app, repo, _db, _calls = build_app(
+        tmp_path, visit_capture_transport=exploding_transport(capture_calls)
+    )
+    mark_intake_complete(repo)
+    client = TestClient(app)
+    login(client)
+
+    response = client.post(
+        "/chat/send", data={"text": "I have crushing chest pain radiating to my left arm"}
+    )
+
+    assert response.status_code == 200
+    assert capture_calls == []
+
+
+def test_withheld_turn_never_triggers_visit_capture(tmp_path: Path) -> None:
+    capture_calls: list = []
+    bad_reply = {
+        "tiers_rendered": (
+            "Most Likely: a lupus-like presentation. You should take 20 mg prednisone daily."
+        ),
+        "tests_to_request": [],
+        "framing_ack": True,
+    }
+    calls: list = []
+    primary = make_primary_transport([_PE_CANT_MISS_OP], bad_reply, calls)
+    challenger = make_challenger_transport(counter_arguments=[], additional_ops=[], calls=calls)
+    app, repo, _db, _calls = build_app(
+        tmp_path,
+        primary_transport=primary,
+        challenger_transport=challenger,
+        visit_capture_transport=exploding_transport(capture_calls),
+    )
+    mark_intake_complete(repo)
+    client = TestClient(app)
+    login(client)
+
+    response = client.post(
+        "/chat/send",
+        data={"text": "My joints have been aching for weeks and I'm constantly exhausted."},
+    )
+
+    assert response.status_code == 200
+    assert capture_calls == []
+
+
+def test_error_turn_never_triggers_visit_capture(tmp_path: Path) -> None:
+    capture_calls: list = []
+
+    def broken_route_transport(request: TransportRequest) -> TransportResponse:
+        assert request.schema is not None
+        if request.schema.__name__ == "TurnRoute":
+            return TransportResponse(
+                text="not structured", tool_input=None, input_tokens=1, output_tokens=1
+            )
+        raise AssertionError("must never reach past a failed route_turn call")
+
+    app, repo, _db, _calls = build_app(
+        tmp_path,
+        primary_transport=broken_route_transport,
+        visit_capture_transport=exploding_transport(capture_calls),
+    )
+    mark_intake_complete(repo)
+    client = TestClient(app)
+    login(client)
+
+    response = client.post("/chat/send", data={"text": "My joints have been aching for weeks."})
+
+    assert response.status_code == 200
+    assert capture_calls == []

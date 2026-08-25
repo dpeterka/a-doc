@@ -49,9 +49,12 @@ from adoc.evals.runner import known_suites, run_suite
 from adoc.ingest.archive import PageRenderer, pdftoppm_renderer
 from adoc.ingest.pipeline import IngestReport, ingest_directory, ingest_inbox
 from adoc.ingest.vision import VisionClient
-from adoc.intake.cli import run_onboarding_session
+from adoc.intake.cli import run_conversational_onboarding_session, run_onboarding_session
+from adoc.intake.corroborate import corroborate_facts
+from adoc.intake.facts import INTAKE_FACTS_RELPATH, IntakeFactsStore
 from adoc.intake.wizard import IntakeWizard
 from adoc.labs.db import LabsDb
+from adoc.labs.recanonicalize import recanonicalize_rows
 from adoc.labs.reclassify import reclassify_pending
 from adoc.labs.specimen import infer_unknown_specimens
 from adoc.labs.twins import sweep_twins, write_sweep_summary
@@ -151,7 +154,12 @@ def _cmd_user_remove(args: argparse.Namespace) -> int:
     return 1
 
 
-def _cmd_onboard(_args: argparse.Namespace) -> int:
+def _cmd_onboard(args: argparse.Namespace) -> int:
+    """Default: the conversational onboarding engine (docs/adr/0011). Pass
+    `--legacy-wizard` to run the original state-machine wizard loop instead
+    (`IntakeWizard` + `run_onboarding_session` — unchanged, still the CLI's
+    escape hatch and still what `test_intake_wizard.py`/`test_intake_cli.py`
+    exercise directly)."""
     try:
         settings = Settings()
     except Exception as exc:  # noqa: BLE001 - surface any config error to the user
@@ -169,10 +177,17 @@ def _cmd_onboard(_args: argparse.Namespace) -> int:
         print(f"onboard: configuration error: {exc}", file=sys.stderr)
         return 1
 
-    wizard = IntakeWizard(repo, client, dropbox_folder=settings.dropbox_folder)
     # `input`/`print` are looked up here (not bound as a default parameter
     # value at import time) so tests can monkeypatch `builtins.input`.
-    return run_onboarding_session(wizard, input_fn=input, print_fn=print)
+    if args.legacy_wizard:
+        wizard = IntakeWizard(repo, client, dropbox_folder=settings.dropbox_folder)
+        return run_onboarding_session(wizard, input_fn=input, print_fn=print)
+
+    db_path = settings.data_dir / "labs.sqlite"
+    with LabsDb(db_path, journal_mode=settings.sqlite_journal_mode) as db:
+        return run_conversational_onboarding_session(
+            client, repo, db, input_fn=input, print_fn=print
+        )
 
 
 def _build_llm_client(settings: Settings) -> LlmClient:
@@ -532,6 +547,128 @@ def _cmd_labs_reclassify(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_labs_recanonicalize(args: argparse.Namespace) -> int:
+    """Deterministic maintenance pass (`labs/recanonicalize.py`; NO LLM
+    calls): re-run `labs.validate.canonicalize` against every non-rejected
+    row's current spec table (`ANALYTE_SPECS` has grown well past what
+    existed when many rows were first ingested) and update `name` wherever
+    it now resolves differently - renaming outright, merging an exact-
+    reading duplicate, or queuing a differing-reading collision for human
+    review. `--dry-run` computes and reports the same counts without
+    mutating anything - no renames, no rejects, no export, no commit.
+    """
+    try:
+        settings = Settings()
+    except Exception as exc:  # noqa: BLE001 - surface any config error to the user
+        print(f"labs-recanonicalize: configuration error: {exc}", file=sys.stderr)
+        return 1
+
+    repo = DataRepo(settings.data_dir)
+    if not repo.is_initialized:
+        print(
+            f"labs-recanonicalize: data repo not initialized at {settings.data_dir} "
+            "- run `adoc init` first",
+            file=sys.stderr,
+        )
+        return 1
+
+    db_path = settings.data_dir / "labs.sqlite"
+    with LabsDb(db_path, journal_mode=settings.sqlite_journal_mode) as db:
+        report = recanonicalize_rows(db, dry_run=args.dry_run)
+
+        if args.dry_run:
+            print(f"labs-recanonicalize: dry-run - checked {report.checked} row(s)")
+            print(
+                f"labs-recanonicalize: dry-run - would rename {report.renamed}, "
+                f"merge {report.merged_duplicates} duplicate(s), "
+                f"queue {report.conflicts_queued} conflict(s), "
+                f"leave {report.untouched} untouched, "
+                f"block {report.blocked_by_tombstone} on rejected-row key(s)"
+            )
+            return 0
+
+        changed = report.renamed + report.merged_duplicates + report.conflicts_queued
+        if changed:
+            db.export_jsonl(repo.root / "labs-export.jsonl")
+            repo.commit(
+                f"labs: recanonicalized {changed} row(s) "
+                f"(renamed={report.renamed}, merged={report.merged_duplicates}, "
+                f"conflicts_queued={report.conflicts_queued})",
+                paths=["labs-export.jsonl"],
+            )
+
+    print(f"labs-recanonicalize: checked {report.checked} row(s)")
+    print(f"labs-recanonicalize: renamed {report.renamed}")
+    print(f"labs-recanonicalize: merged {report.merged_duplicates} duplicate(s)")
+    print(f"labs-recanonicalize: queued {report.conflicts_queued} conflict(s)")
+    print(f"labs-recanonicalize: left {report.untouched} untouched")
+    if report.blocked_by_tombstone:
+        print(
+            f"labs-recanonicalize: {report.blocked_by_tombstone} rename(s) blocked - "
+            "target key held by a rejected row (stored name kept)"
+        )
+    return 0
+
+
+def _cmd_intake_corroborate(args: argparse.Namespace) -> int:
+    """Deterministic maintenance pass (`intake/corroborate.py`; NO LLM
+    calls): sweep every active `IntakeFact` and recompute its
+    `corroboration` state against currently-ingested documents/labs/
+    encounters (`docs/adr/0013-fact-corroboration.md`) — the same sweep
+    `intake.agent.run_intake_turn`/`run_visit_capture` already run
+    automatically after a turn that adds or changes facts, exposed here so
+    corroboration can also be refreshed on demand (e.g. after a backfill
+    added a batch of historical documents, mirroring the `labs-*`
+    maintenance command pattern). `--dry-run` computes and reports the same
+    counts without mutating anything - no store mutation, no export, no
+    commit.
+    """
+    try:
+        settings = Settings()
+    except Exception as exc:  # noqa: BLE001 - surface any config error to the user
+        print(f"intake-corroborate: configuration error: {exc}", file=sys.stderr)
+        return 1
+
+    repo = DataRepo(settings.data_dir)
+    if not repo.is_initialized:
+        print(
+            f"intake-corroborate: data repo not initialized at {settings.data_dir} "
+            "- run `adoc init` first",
+            file=sys.stderr,
+        )
+        return 1
+
+    db_path = settings.data_dir / "labs.sqlite"
+    with LabsDb(db_path, journal_mode=settings.sqlite_journal_mode) as db:
+        store = IntakeFactsStore(repo.root)
+        updates = corroborate_facts(store.facts, db, repo)
+        counts: dict[str, int] = {}
+        for update in updates:
+            counts[update.corroboration] = counts.get(update.corroboration, 0) + 1
+
+        if args.dry_run:
+            print(f"intake-corroborate: dry-run - checked {len(store.facts)} fact(s)")
+            print(f"intake-corroborate: dry-run - would update {len(updates)} fact(s)")
+            for state, count in sorted(counts.items()):
+                print(f"  - {state}: {count}")
+            return 0
+
+        touched = store.apply_corroboration(updates, at=datetime.now(UTC))
+        if touched:
+            store.save()
+            breakdown = ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
+            repo.commit(
+                f"intake: recorded corroboration updates for {len(touched)} fact(s) ({breakdown})",
+                paths=[INTAKE_FACTS_RELPATH],
+            )
+
+    print(f"intake-corroborate: checked {len(store.facts)} fact(s)")
+    print(f"intake-corroborate: updated {len(touched)} fact(s)")
+    for state, count in sorted(counts.items()):
+        print(f"  - {state}: {count}")
+    return 0
+
+
 def _cmd_review(_args: argparse.Namespace) -> int:
     try:
         settings = Settings()
@@ -657,9 +794,17 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("init", help="validate configuration and models.yaml").set_defaults(
         func=_cmd_init
     )
-    subparsers.add_parser("onboard", help="run the onboarding intake wizard").set_defaults(
-        func=_cmd_onboard
+    onboard_parser = subparsers.add_parser(
+        "onboard", help="run the conversational onboarding intake session"
     )
+    onboard_parser.add_argument(
+        "--legacy-wizard",
+        action="store_true",
+        default=False,
+        help="run the original form-style section-by-section wizard instead of the "
+        "conversational engine",
+    )
+    onboard_parser.set_defaults(func=_cmd_onboard)
     ingest_parser = subparsers.add_parser("ingest", help="run the document ingestion pipeline")
     ingest_parser.add_argument(
         "--reason",
@@ -707,6 +852,33 @@ def build_parser() -> argparse.ArgumentParser:
         help="report what the sweep would do without mutating anything",
     )
     labs_reclassify_parser.set_defaults(func=_cmd_labs_reclassify)
+    labs_recanonicalize_parser = subparsers.add_parser(
+        "labs-recanonicalize",
+        help=(
+            "re-run canonical_rename_target() against every non-rejected row's current spec "
+            "table, renaming/merging/queuing rows whose EXACT-alias canonical name has "
+            "changed (no LLM calls)"
+        ),
+    )
+    labs_recanonicalize_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="report what the sweep would do without mutating anything",
+    )
+    labs_recanonicalize_parser.set_defaults(func=_cmd_labs_recanonicalize)
+    intake_corroborate_parser = subparsers.add_parser(
+        "intake-corroborate",
+        help=(
+            "sweep active intake facts and recompute their corroboration state against "
+            "currently-ingested documents/labs/encounters (no LLM calls)"
+        ),
+    )
+    intake_corroborate_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="report what the sweep would do without mutating anything",
+    )
+    intake_corroborate_parser.set_defaults(func=_cmd_intake_corroborate)
     subparsers.add_parser(
         "backup",
         help="git-bundle the data repo and upload it (+ sources/, labs-export.jsonl) to S3",

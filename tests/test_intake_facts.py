@@ -1,0 +1,276 @@
+"""Tests for adoc.intake.facts: the intake fact store and its deterministic
+completion gates — the core safety mechanism of conversational onboarding
+(docs/adr/0011-conversational-agentic-onboarding.md)."""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime
+from pathlib import Path
+
+import pytest
+
+from adoc.intake.facts import (
+    AddFact,
+    IntakeError,
+    IntakeFact,
+    IntakeFactsStore,
+    NewFact,
+    RetractFact,
+    UpdateFact,
+    load_intake_facts,
+    save_intake_facts,
+    section_completion_blockers,
+)
+
+
+def _provenance(model_id: str = "fake-model") -> object:
+    from adoc.casefile.schema import Provenance
+
+    return Provenance(
+        app_version="0.0.0-test",
+        prompt_template_version="1",
+        model_id=model_id,
+        dag_node="intake-agent",
+        timestamp=datetime.now(UTC),
+    )
+
+
+def _new_fact(**overrides: object) -> NewFact:
+    data: dict[str, object] = {
+        "id": "fact-1",
+        "section": "allergies",
+        "kind": "allergy",
+        "statement": "Patient reports a penicillin allergy.",
+        "fields": {"allergen": "penicillin"},
+    }
+    data.update(overrides)
+    return NewFact.model_validate(data)
+
+
+# --- op application: add / update / retract -----------------------------------------
+
+
+def test_add_fact_persists_and_shows_up_active(tmp_path: Path) -> None:
+    store = IntakeFactsStore(tmp_path)
+    result = store.apply_ops([AddFact(fact=_new_fact())], _provenance())
+
+    assert result.added == ["fact-1"]
+    active = store.active_facts()
+    assert len(active) == 1
+    assert active[0].statement == "Patient reports a penicillin allergy."
+    assert active[0].status == "active"
+    assert active[0].history == []
+
+
+def test_add_fact_with_duplicate_id_raises_and_leaves_store_untouched(tmp_path: Path) -> None:
+    store = IntakeFactsStore(tmp_path)
+    store.apply_ops([AddFact(fact=_new_fact())], _provenance())
+
+    with pytest.raises(IntakeError):
+        store.apply_ops([AddFact(fact=_new_fact())], _provenance())
+
+    assert len(store.active_facts()) == 1  # unchanged
+
+
+def test_add_fact_with_unknown_section_raises(tmp_path: Path) -> None:
+    store = IntakeFactsStore(tmp_path)
+    bad = _new_fact(id="fact-x", section="not-a-real-section")
+
+    with pytest.raises(IntakeError):
+        store.apply_ops([AddFact(fact=bad)], _provenance())
+
+
+def test_update_fact_merges_fields_and_appends_history(tmp_path: Path) -> None:
+    store = IntakeFactsStore(tmp_path)
+    store.apply_ops([AddFact(fact=_new_fact(fields={"allergen": "penicillin"}))], _provenance())
+
+    store.apply_ops(
+        [
+            UpdateFact(
+                id="fact-1",
+                fields={"reaction": "hives"},
+                note="patient clarified the reaction after a follow-up question",
+            )
+        ],
+        _provenance(),
+    )
+
+    fact = store.get("fact-1")
+    assert fact is not None
+    assert fact.fields == {"allergen": "penicillin", "reaction": "hives"}
+    assert len(fact.history) == 1
+    assert "follow-up" in fact.history[0].change
+    assert fact.history[0].prior_statement == "Patient reports a penicillin allergy."
+
+
+def test_update_fact_unknown_id_raises(tmp_path: Path) -> None:
+    store = IntakeFactsStore(tmp_path)
+    with pytest.raises(IntakeError):
+        store.apply_ops(
+            [UpdateFact(id="does-not-exist", note="this should fail because id is unknown")],
+            _provenance(),
+        )
+
+
+def test_update_fact_note_too_short_is_rejected_by_pydantic() -> None:
+    with pytest.raises(Exception):  # noqa: B017 - pydantic ValidationError
+        UpdateFact(id="fact-1", note="short")
+
+
+def test_retract_fact_marks_retracted_and_keeps_history(tmp_path: Path) -> None:
+    store = IntakeFactsStore(tmp_path)
+    store.apply_ops([AddFact(fact=_new_fact())], _provenance())
+
+    store.apply_ops(
+        [RetractFact(id="fact-1", reason="patient says this was a duplicate entry")], _provenance()
+    )
+
+    assert store.active_facts() == []
+    fact = store.get("fact-1")
+    assert fact is not None
+    assert fact.status == "retracted"
+    assert "retracted" in fact.history[0].change
+
+
+def test_retract_fact_unknown_id_raises(tmp_path: Path) -> None:
+    store = IntakeFactsStore(tmp_path)
+    with pytest.raises(IntakeError):
+        store.apply_ops([RetractFact(id="nope", reason="n/a")], _provenance())
+
+
+# --- persistence round-trip -----------------------------------------------------------
+
+
+def test_save_and_load_round_trips(tmp_path: Path) -> None:
+    store = IntakeFactsStore(tmp_path)
+    store.apply_ops([AddFact(fact=_new_fact())], _provenance())
+    store.save()
+
+    path = tmp_path / "case" / "intake-facts.yaml"
+    loaded = load_intake_facts(path)
+    assert len(loaded) == 1
+    assert loaded[0].id == "fact-1"
+
+    reloaded_store = IntakeFactsStore(tmp_path)
+    assert len(reloaded_store.facts) == 1
+
+
+def test_save_intake_facts_empty_list(tmp_path: Path) -> None:
+    path = tmp_path / "intake-facts.yaml"
+    save_intake_facts(path, [])
+    assert load_intake_facts(path) == []
+
+
+def test_load_intake_facts_missing_file_returns_empty(tmp_path: Path) -> None:
+    assert load_intake_facts(tmp_path / "does-not-exist.yaml") == []
+
+
+# --- completion gates: the owner's named examples --------------------------------------
+
+
+def _fact(**overrides: object) -> IntakeFact:
+    data: dict[str, object] = {
+        "id": "f1",
+        "section": "family_history",
+        "kind": "relative",
+        "statement": "placeholder",
+        "provenance": _provenance(),
+    }
+    data.update(overrides)
+    return IntakeFact.model_validate(data)
+
+
+def test_vague_family_allergy_needs_probe_blocks_and_clears() -> None:
+    """ "My dad has allergies" -> needs_probe blocks; once resolved, clears."""
+    vague = _fact(
+        section="family_history",
+        kind="relative",
+        statement="Patient's dad has allergies.",
+        clarification_status="needs_probe",
+    )
+    blockers = section_completion_blockers([vague], "family_history")
+    assert len(blockers) == 1
+    assert "needs a follow-up" in blockers[0] or "follow-up" in blockers[0]
+
+    resolved = vague.model_copy(update={"clarification_status": "resolved"})
+    assert section_completion_blockers([resolved], "family_history") == []
+
+
+def test_doctor_diagnosed_without_by_whom_or_year_blocks() -> None:
+    """ "I have cancer" recorded as doctor_diagnosed with neither by_whom nor
+    year blocks; either one present clears it."""
+    fact = _fact(
+        section="prior_diagnoses",
+        kind="diagnosis",
+        statement="Patient says they have cancer.",
+        attribution="doctor_diagnosed",
+        fields={},
+        precision="unknown_after_probe",  # isolate rule (b) from rule (d)
+    )
+    blockers = section_completion_blockers([fact], "prior_diagnoses")
+    assert len(blockers) == 1
+    assert "diagnosed-by unclear" in blockers[0]
+
+    with_year = fact.model_copy(update={"fields": {"year": 2020}})
+    assert section_completion_blockers([with_year], "prior_diagnoses") == []
+
+    with_by_whom = fact.model_copy(update={"fields": {"by_whom": "Dr. Lee"}})
+    assert section_completion_blockers([with_by_whom], "prior_diagnoses") == []
+
+
+def test_patient_assumption_without_reasoning_blocks_and_clears() -> None:
+    fact = _fact(
+        section="prior_diagnoses",
+        kind="diagnosis",
+        statement="Patient suspects they have lupus.",
+        attribution="patient_assumption",
+        fields={},
+        precision="unknown_after_probe",
+    )
+    blockers = section_completion_blockers([fact], "prior_diagnoses")
+    assert any("reasoning" in b for b in blockers)
+
+    resolved = fact.model_copy(update={"fields": {"reasoning": "joint pain and fatigue"}})
+    assert section_completion_blockers([resolved], "prior_diagnoses") == []
+
+
+def test_event_with_precision_unasked_blocks_and_unknown_after_probe_passes() -> None:
+    unasked = _fact(
+        section="events",
+        kind="event",
+        statement="ER visit for chest pain.",
+        precision="unasked",
+    )
+    blockers = section_completion_blockers([unasked], "events")
+    assert any("timing never asked" in b for b in blockers)
+
+    asked_but_unknown = unasked.model_copy(update={"precision": "unknown_after_probe"})
+    assert section_completion_blockers([asked_but_unknown], "events") == []
+
+    exact = unasked.model_copy(update={"precision": "exact", "date_approx": "2019-03-02"})
+    assert section_completion_blockers([exact], "events") == []
+
+
+def test_retracted_facts_never_block() -> None:
+    fact = _fact(
+        section="events",
+        kind="event",
+        statement="Old event.",
+        precision="unasked",
+        status="retracted",
+    )
+    assert section_completion_blockers([fact], "events") == []
+
+
+def test_facts_in_other_sections_never_block() -> None:
+    fact = _fact(
+        section="events",
+        kind="event",
+        statement="ER visit.",
+        precision="unasked",
+    )
+    assert section_completion_blockers([fact], "allergies") == []
+
+
+def test_no_facts_means_no_blockers() -> None:
+    assert section_completion_blockers([], "events") == []

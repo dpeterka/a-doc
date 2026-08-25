@@ -469,6 +469,16 @@ def _write_document_drop(repo: DataRepo, data: DocumentDropSection) -> list[str]
     return []
 
 
+def write_section(repo: DataRepo, key: str, data: BaseModel) -> list[str]:
+    """Public entry point for `_write_section` — the conversational intake
+    engine (`intake/agent.py`, via `intake/convert.py`) writes a section's
+    case-file artifact(s) through this same function, so the per-section
+    writers below stay the single source of truth for output regardless of
+    which front end (the state-machine wizard or the fact-based agent)
+    produced the section's data."""
+    return _write_section(repo, key, data)
+
+
 def _write_section(repo: DataRepo, key: str, data: BaseModel) -> list[str]:
     if key == "basics":
         assert isinstance(data, BasicsSection)

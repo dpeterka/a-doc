@@ -20,6 +20,7 @@ from adoc.casefile.repo import DataRepo
 from adoc.config import ModelBinding, Settings
 from adoc.ingest.archive import PageRenderer
 from adoc.ingest.vision import VisionClient
+from adoc.intake.coverage import INTAKE_STATE_RELPATH, CoverageState, save_coverage_state
 from adoc.labs.db import LabsDb
 from adoc.reason.client import (
     AnthropicProvider,
@@ -111,19 +112,71 @@ def make_challenger_transport(
     return transport
 
 
-def build_fake_client(primary_transport: Transport, challenger_transport: Transport) -> LlmClient:
+def default_visit_capture_transport(request: TransportRequest) -> TransportResponse:
+    """Default `VisitCaptureResult` transport: empty ops, so a test that
+    doesn't care about interval-history capture (most chat tests) never has
+    to script one — every post-intake successful turn now also triggers
+    `intake.agent.run_visit_capture` (`docs/adr/0013-fact-corroboration.md`),
+    and this keeps that pass a silent no-op by default."""
+    return TransportResponse(text="", tool_input={"ops": []}, input_tokens=1, output_tokens=1)
+
+
+def build_fake_client(
+    primary_transport: Transport,
+    challenger_transport: Transport,
+    *,
+    intake_agent_transport: Transport | None = None,
+    visit_capture_transport: Transport | None = None,
+) -> LlmClient:
     """`primary_reasoner`/`classifier` -> anthropic; `challenger` -> openai —
-    same role/provider layout as `tests/test_stages.py`."""
+    same role/provider layout as `tests/test_stages.py`. `intake_agent`
+    also binds to the anthropic provider, defaulting to `primary_transport`
+    so any test not exercising onboarding never has to think about it;
+    `visit_capture_transport` defaults to `default_visit_capture_transport`
+    (empty ops) so a test not exercising interval-history capture never has
+    to think about it either."""
     bindings: dict[str, list[ModelBinding]] = {
         "primary_reasoner": [ModelBinding(provider="anthropic", model="fake-primary")],
         "challenger": [ModelBinding(provider="openai", model="fake-challenger")],
         "classifier": [ModelBinding(provider="anthropic", model="fake-primary")],
+        "intake_agent": [ModelBinding(provider="anthropic", model="fake-intake-agent")],
     }
     providers = {
-        "anthropic": AnthropicProvider(api_key=None, transport=primary_transport),
+        "anthropic": AnthropicProvider(
+            api_key=None,
+            transport=_dispatching_anthropic_transport(
+                primary_transport,
+                intake_agent_transport or primary_transport,
+                visit_capture_transport or default_visit_capture_transport,
+            ),
+        ),
         "openai": OpenAIProvider(api_key=None, transport=challenger_transport),
     }
     return LlmClient(bindings, providers)
+
+
+def _dispatching_anthropic_transport(
+    primary_transport: Transport,
+    intake_agent_transport: Transport,
+    visit_capture_transport: Transport,
+) -> Transport:
+    """`primary_reasoner`/`classifier`, `intake_agent`, and the interval-
+    history visit-capture pass all share the anthropic provider slot in this
+    test double; dispatch by schema name (`IntakeTurnResult`/
+    `VisitCaptureResult`) so onboarding/capture tests can inject their own
+    transport independently of whatever `primary_transport` a given test
+    already set up for chat/ledger schemas."""
+
+    def transport(request: TransportRequest) -> TransportResponse:
+        if request.schema is not None:
+            name = request.schema.__name__
+            if name == "IntakeTurnResult":
+                return intake_agent_transport(request)
+            if name == "VisitCaptureResult":
+                return visit_capture_transport(request)
+        return primary_transport(request)
+
+    return transport
 
 
 def build_app(
@@ -135,6 +188,8 @@ def build_app(
     max_upload_mb: int | None = None,
     primary_transport: Transport | None = None,
     challenger_transport: Transport | None = None,
+    intake_agent_transport: Transport | None = None,
+    visit_capture_transport: Transport | None = None,
     vision: VisionClient | None = None,
     renderer: PageRenderer | None = None,
 ) -> tuple[FastAPI, DataRepo, LabsDb, list[TransportRequest]]:
@@ -146,7 +201,12 @@ def build_app(
     calls: list[TransportRequest] = []
     primary = primary_transport or exploding_transport(calls)
     challenger = challenger_transport or exploding_transport(calls)
-    client = build_fake_client(primary, challenger)
+    client = build_fake_client(
+        primary,
+        challenger,
+        intake_agent_transport=intake_agent_transport,
+        visit_capture_transport=visit_capture_transport,
+    )
 
     data_dir = tmp_path / "data"
     repo = DataRepo.init_at(data_dir)
@@ -162,6 +222,19 @@ def build_app(
 
     app = create_app(settings, repo=repo, db=db, client=client, vision=vision, renderer=renderer)
     return app, repo, db, calls
+
+
+def mark_intake_complete(repo: DataRepo) -> None:
+    """Test helper: seed `case/intake-state.yaml` as already-complete
+    (`docs/adr/0012-initial-visit-conversation.md`) so a test can exercise
+    the diagnostic/informational chat pipeline directly, without also
+    scripting an `intake_agent` transport through a full initial-visit
+    conversation first. Real completion only ever happens through
+    `intake.agent.run_intake_turn`'s deterministic wrap-up gate — this
+    helper exists only because most chat tests are about what happens
+    *after* onboarding, not onboarding itself."""
+    save_coverage_state(repo.root / INTAKE_STATE_RELPATH, CoverageState(intake_complete=True))
+    repo.commit("chore: seed intake-complete state for test")
 
 
 def login(

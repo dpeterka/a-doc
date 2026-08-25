@@ -104,7 +104,7 @@ def test_source_ref_grammar_accepts_valid_refs(ref: str) -> None:
 @pytest.mark.parametrize(
     "ref",
     [
-        "labs:ANA:2026-05-02",  # uppercase not allowed in slug
+        "labs:ana ana:2026-05-02",  # whitespace in slug still invalid
         "labs:ana:05-02-2026",  # wrong date format
         "labs:ana",  # missing date
         "doc:smith-report.pdf",  # missing #p<int>
@@ -668,3 +668,18 @@ def test_patient_origin_cannot_be_added_directly_at_most_likely() -> None:
     )
     with pytest.raises(LedgerInvariantError, match="challenged before promotion"):
         apply_diff(ledger, diff)
+
+
+@pytest.mark.parametrize(
+    "ref",
+    [
+        "labs:%-saturation:2025-05-06",  # live challenger failure
+        "labs:b.-miyamotoi-ab-(igg):2024-08-09",
+        "labs:a/g-ratio:2024-01-01",
+        "labs:transferrin-saturation:2025-05-06",
+    ],
+)
+def test_source_ref_slug_accepts_real_analyte_punctuation(ref: str) -> None:
+    from adoc.casefile.schema import validate_source_ref
+
+    assert validate_source_ref(ref) == ref

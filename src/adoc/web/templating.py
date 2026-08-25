@@ -11,7 +11,10 @@ from datetime import date, datetime
 from pathlib import Path
 
 from fastapi.templating import Jinja2Templates
+from starlette.requests import Request
 
+from adoc.casefile.repo import DataRepo
+from adoc.intake.facts import INTAKE_FACTS_RELPATH
 from adoc.web.markdown_lite import render_markdown_lite
 
 TEMPLATES_DIR = Path(__file__).parent / "templates"
@@ -63,8 +66,20 @@ def friendly_date(value: date | datetime) -> str:
     return value.strftime("%B %d, %Y")
 
 
+def has_intake_facts(request: Request) -> bool:
+    """Whether `case/intake-facts.yaml` exists for this request's data
+    repo — gates `base.html`'s "Intake record" nav link (visible once any
+    fact has been captured, never before). A plain file-existence check
+    (never parses the file) so it's cheap enough to call from every page's
+    nav, not just onboarding-adjacent ones; `request.app.state.repo` is the
+    same seam every route's `get_repo` dependency reads from."""
+    repo: DataRepo = request.app.state.repo
+    return bool((repo.root / INTAKE_FACTS_RELPATH).exists())
+
+
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 templates.env.globals["disclaimer_text"] = DISCLAIMER_TEXT
+templates.env.globals["has_intake_facts"] = has_intake_facts
 templates.env.filters["markdown_lite"] = render_markdown_lite
 templates.env.filters["tier_label"] = tier_label
 templates.env.filters["status_label"] = status_label

@@ -382,6 +382,72 @@ def test_labs_index_renders_a_dot_for_a_single_reading_analyte(tmp_path: Path) -
     assert "<circle" in response.text
 
 
+def test_labs_index_groups_analytes_under_panel_headings_in_curated_order(
+    tmp_path: Path,
+) -> None:
+    """CBC comes before Comprehensive Metabolic Panel in `PANEL_ORDER`, and
+    an analyte with no curated panel ("Other") always sorts last -
+    deterministic, not incidental to insertion order."""
+    app, _repo, db, _calls = build_app(tmp_path)
+    db.upsert_document(
+        LabDocument(sha256=SHA, filename="doc.pdf", doc_type="lab_report", page_count=1)
+    )
+    db.insert_results(
+        [
+            LabResult(
+                date=date(2026, 5, 1),
+                name="an unmapped one-off marker",
+                name_raw="an unmapped one-off marker",
+                value=1.0,
+                source_doc=SHA,
+                raw_json=json.dumps({}),
+            ),
+            LabResult(
+                date=date(2026, 5, 1),
+                name="sodium",
+                name_raw="Sodium",
+                value=140.0,
+                ucum_unit="mmol/L",
+                source_doc=SHA,
+                raw_json=json.dumps({}),
+            ),
+            LabResult(
+                date=date(2026, 5, 1),
+                name="WBC",
+                name_raw="WBC",
+                value=6.0,
+                ucum_unit="K/uL",
+                source_doc=SHA,
+                raw_json=json.dumps({}),
+            ),
+        ]
+    )
+    client = TestClient(app)
+    login(client)
+
+    response = client.get("/labs")
+
+    assert response.status_code == 200
+    text = response.text
+    cbc_pos = text.index(">CBC<")
+    cmp_pos = text.index(">Comprehensive Metabolic Panel<")
+    other_pos = text.index(">Other<")
+    assert cbc_pos < cmp_pos < other_pos
+
+
+def test_labs_detail_shows_the_panel_and_derived_from_note(tmp_path: Path) -> None:
+    app, _repo, db, _calls = build_app(tmp_path)
+    _seed_single_reading(db, name="TSAT", value=25.0, ucum_unit="%")
+    client = TestClient(app)
+    login(client)
+
+    response = client.get(f"/labs/{encode_analyte_id('TSAT')}")
+
+    assert response.status_code == 200
+    assert "Iron Studies" in response.text
+    assert "calculated from Iron and TIBC" in response.text
+
+
 def test_labs_detail_handles_a_single_reading_analyte_gracefully(tmp_path: Path) -> None:
     app, _repo, db, _calls = build_app(tmp_path)
     _seed_single_reading(db, name="solo-marker", value=42.0, ucum_unit="mg/dL")
