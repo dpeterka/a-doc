@@ -82,6 +82,7 @@ FactKind = Literal[
     "diagnosis",
     "patient_theory",
     "relative",
+    "location",
     "medication",
     "supplement",
     "allergy",
@@ -89,6 +90,12 @@ FactKind = Literal[
     "insurance",
     "note",
 ]
+"""`"location"` (added for the `geography` topic, `docs/adr/0018-intake-
+clinical-progression-and-continuity.md`) covers a residence, a trip, or an
+environmental/occupational exposure — disambiguated by
+`fields["category"]` (`"residence"` (default) | `"travel"` | `"exposure"`),
+the same "coarse kind, `fields` carries the nuance" convention
+`diagnosis`/`attribution` already uses."""
 
 Precision = Literal["exact", "approx", "unknown_after_probe", "unasked"]
 Attribution = Literal["doctor_diagnosed", "patient_reported", "patient_assumption"]
@@ -160,6 +167,16 @@ class IntakeFact(BaseModel):
     (intake or a later visit) — stamped by `IntakeFactsStore.apply_ops` from
     the applying `Provenance.timestamp`, never by the model. `None` only for
     facts written before this field existed (backward compat)."""
+    follow_up: bool = False
+    """Explicitly flagged by the `intake_agent` (via `AddFact`/`UpdateFact`,
+    never inferred) as something to revisit on a later visit — the real
+    mechanism `docs/adr/0018-intake-clinical-progression-and-continuity.md`'s
+    post-intake continuity note is built from
+    (`intake.agent.build_continuity_note`), not a guess derived from
+    corroboration or clarification status. The model clears it (another
+    `update_fact` with `follow_up=False`) once it has actually revisited the
+    topic with the patient. Defaults to `False` for facts written before
+    this field existed."""
     provenance: Provenance
     history: list[FactRevision] = Field(default_factory=list)
 
@@ -183,6 +200,7 @@ class NewFact(BaseModel):
     precision: Precision = "unasked"
     attribution: Attribution = "patient_reported"
     clarification_status: ClarificationStatus = "resolved"
+    follow_up: bool = False
 
     @field_validator("id")
     @classmethod
@@ -207,6 +225,7 @@ class UpdateFact(BaseModel):
     precision: Precision | None = None
     attribution: Attribution | None = None
     clarification_status: ClarificationStatus | None = None
+    follow_up: bool | None = None
     note: str
     """Why this update is being made — min `MIN_UPDATE_NOTE_LENGTH` chars
     after stripping whitespace, same substantive-note floor as
@@ -349,6 +368,7 @@ class IntakeFactsStore:
                     precision=op.fact.precision,
                     attribution=op.fact.attribution,
                     clarification_status=op.fact.clarification_status,
+                    follow_up=op.fact.follow_up,
                     status="active",
                     reported_on=provenance.timestamp.date(),
                     provenance=provenance,
@@ -382,6 +402,8 @@ class IntakeFactsStore:
                     data["attribution"] = op.attribution
                 if op.clarification_status is not None:
                     data["clarification_status"] = op.clarification_status
+                if op.follow_up is not None:
+                    data["follow_up"] = op.follow_up
                 data["reported_on"] = provenance.timestamp.date()
                 data["provenance"] = provenance
                 data["history"] = [*current.history, revision]

@@ -161,6 +161,54 @@ def test_llm_error_is_swallowed_and_reported_as_capture_error(tmp_path: Path) ->
     assert not (repo.root / INTAKE_FACTS_RELPATH).exists()
 
 
+def test_follow_up_marked_in_one_visit_appears_in_the_next_visits_context(tmp_path: Path) -> None:
+    """docs/adr/0018-intake-clinical-progression-and-continuity.md: proves
+    the follow-up mechanism actually carries forward -- a fact flagged
+    `follow_up=true` on one visit's silent capture pass shows up in the
+    context BUILT FOR the very next visit's capture pass, so the model
+    genuinely has it available to check back on."""
+    repo = DataRepo.init_at(tmp_path / "data")
+    db = LabsDb(":memory:")
+    client = _make_client(
+        [
+            {
+                "op": "add_fact",
+                "fact": {
+                    "id": "rash-followup",
+                    "section": "symptoms",
+                    "kind": "symptom",
+                    "statement": "Rash spreading on her arm.",
+                    "follow_up": True,
+                },
+            }
+        ]
+    )
+
+    first_visit = run_visit_capture(client, repo, db, "I noticed a rash spreading on my arm.")
+    assert first_visit.applied.added == ["rash-followup"]
+    store = IntakeFactsStore(repo.root)
+    assert store.get("rash-followup").follow_up is True  # type: ignore[union-attr]
+
+    calls: list[TransportRequest] = []
+
+    def transport(request: TransportRequest) -> TransportResponse:
+        calls.append(request)
+        return TransportResponse(text="", tool_input={"ops": []}, input_tokens=5, output_tokens=5)
+
+    provider = AnthropicProvider(api_key=None, transport=transport)
+    second_visit_client = LlmClient(
+        {"intake_agent": [ModelBinding(provider="anthropic", model="claude-opus-5")]},
+        {"anthropic": provider},
+    )
+
+    run_visit_capture(second_visit_client, repo, db, "Just checking in, nothing new today.")
+
+    assert len(calls) == 1
+    sent_content = calls[0].messages[-1].content
+    assert "Follow-ups flagged on a prior visit" in sent_content
+    assert "Rash spreading on her arm." in sent_content
+
+
 def test_duplicate_fact_id_op_is_rejected_not_an_error_and_persists_nothing(
     tmp_path: Path,
 ) -> None:

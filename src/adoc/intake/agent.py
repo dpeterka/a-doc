@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal
 
@@ -55,6 +55,7 @@ from adoc.intake.facts import (
     SECTION_KEYS,
     AppliedResult,
     IntakeError,
+    IntakeFact,
     IntakeFactOp,
     IntakeFactsStore,
     section_completion_blockers,
@@ -67,7 +68,7 @@ from adoc.reason.safety import red_flag_screen, treatment_gate
 
 logger = logging.getLogger(__name__)
 
-INTAKE_AGENT_PROMPT_VERSION = "5"
+INTAKE_AGENT_PROMPT_VERSION = "6"
 INTAKE_TRANSCRIPT_RELPATH = "case/intake-transcript.jsonl"
 
 DOC_DIGEST_MAX_LINES = 60
@@ -119,21 +120,28 @@ _OPS_RETRY_ATTEMPTS = 2
 _SPEC_BY_KEY: dict[str, SectionSpec] = {spec.key: spec for spec in SECTIONS}
 
 # The very first assistant message of a patient's initial visit — a
-# constant, never an LLM call, per the product redesign: greet, ask ONE
-# focused opening question so the conversation is driven rather than
-# inviting a wall of text, note that documents can stand in for retyping
-# everything, and give a clear steer to emergency care for anything urgent
-# happening right now. `web.routes.chat` renders this into the page when
-# the shared chat transcript is empty and intake is incomplete, and writes
-# it into that transcript on the first patient turn so history stays
+# constant, never an LLM call, per the product redesign
+# (docs/adr/0018-intake-clinical-progression-and-continuity.md, refining
+# 0012): greet, then ask ONE short, concrete opening question — the same
+# first thing a clinician actually asks a new patient (age, sex at birth) —
+# so the conversation is driven, incremental, and never invites a
+# wall-of-text answer the way an open "what brings you in?" did. Deliberately
+# NOT "what's been bothering you" — that belongs at the END of the intended
+# arc (see `_INTAKE_AGENT_SYSTEM_PROMPT`'s "INTENDED ARC"), once individual
+# stats, family history, geography, and a review of the existing record are
+# already in hand; asking it first is exactly what produced the wall-of-text
+# failure this rewrite fixes. `web.routes.chat` renders this into the page
+# when the shared chat transcript is empty and intake is incomplete, and
+# writes it into that transcript on the first patient turn so history stays
 # coherent; `intake.cli`'s REPL prints the same constant at session start.
 INTAKE_OPENER_MESSAGE = (
     "Hi — I'm glad you're here. This first conversation is how we build your case "
     "file together, so anything you share becomes part of the record you and your "
-    "doctors can rely on. What's been bothering you the most lately, or what brings "
-    "you in?\n\n"
-    "You don't need to type everything at once -- your existing records and documents "
-    "are already on file, so we can work from those together as we go."
+    "doctors can rely on. Let's start simple: how old are you, and what was your sex "
+    "at birth?\n\n"
+    "We'll take it a step at a time -- you don't need to cover everything today, and "
+    "your existing records and documents are already on file, so we can work from "
+    "those together as we go."
 )
 
 _WITHHELD_MESSAGE = (
@@ -186,6 +194,7 @@ _TOPIC_PHRASES: dict[str, str] = {
     "events": "the major medical events in your history",
     "prior_diagnoses": "any diagnoses or suspicions you or a doctor have raised",
     "family_history": "your family's health history",
+    "geography": "where you live and have lived, plus any travel or exposures",
     "medications": "the medications you're taking",
     "supplements": "any supplements you take",
     "allergies": "your allergies or reactions",
@@ -193,18 +202,131 @@ _TOPIC_PHRASES: dict[str, str] = {
     "document_drop": "getting your existing records on file",
 }
 
+# --------------------------------------------------------------------------
+# The intended clinical arc (docs/adr/0018-intake-clinical-progression-and-
+# continuity.md) — GUIDANCE only, derived from the same coverage map
+# `intake.coverage.CoverageState` already tracks. This is deliberately NOT a
+# state machine: `run_intake_turn` never refuses or reorders anything a
+# patient volunteers, and a topic later in this list can be covered before
+# one earlier in it (existing behavior, unchanged). All this drives is which
+# ONE topic the "Suggested next step" context hint below points the model
+# toward once the current thread winds down — the same thing an experienced
+# clinician's own mental checklist does, silently.
+#
+# Order mirrors the owner's stated arc: individual stats -> family history ->
+# geography -> review the existing record (events/prior diagnoses/documents,
+# where the document digest + excerpts genuinely pay off) -> what's recent
+# (current symptoms/state) LAST, not first — the inversion that fixes the
+# old wall-of-text-inviting opener. medications/supplements/allergies/
+# care_team are folded in between record-review and "what's recent" since
+# they are typically short, factual asks with no strong ordering
+# requirement of their own.
+_ARC_STEERING_ORDER: tuple[str, ...] = (
+    "basics",
+    "family_history",
+    "geography",
+    "events",
+    "prior_diagnoses",
+    "document_drop",
+    "medications",
+    "supplements",
+    "allergies",
+    "care_team",
+    "symptoms",
+)
+
+# Extra, stage-specific guidance folded into the "Suggested next step" hint
+# for topics that need more than just their `_TOPIC_PHRASES` phrase — the
+# record-review cluster (walk the digest/excerpts with her rather than
+# re-asking) and the final "what's recent" stage.
+_ARC_STAGE_NOTE: dict[str, str] = {
+    "events": (
+        "This is the record-review stage: walk her through what the documents/encounters "
+        "list above already shows (a hospitalization, an ER visit, a procedure) and ask her "
+        "to confirm or correct it, citing what you're referencing (\"your records show a "
+        "hospitalization in early 2024 and an ER visit before that -- can we go through "
+        'those?") -- rather than asking her to retype her whole history from scratch.'
+    ),
+    "prior_diagnoses": (
+        "Still the record-review stage: check any prior diagnoses she raises against what is "
+        "already on file (the documents/encounters above, or the excerpts below) before "
+        "treating it as new."
+    ),
+    "document_drop": (
+        "Still the record-review stage: once you've walked the existing record with her, ask "
+        "whether there's anything else worth adding to what's already on file."
+    ),
+    "symptoms": (
+        "This is the 'what's recent' stage, deliberately last -- now is the time to ask what's "
+        "been going on lately and what, if anything, has changed."
+    ),
+}
+
+
+def _next_arc_topic(coverage: CoverageState) -> str | None:
+    """The first not-yet-covered topic in `_ARC_STEERING_ORDER` — the ONE
+    thing the "Suggested next step" hint points the model toward. `None`
+    once every topic in the arc is covered (nothing left to steer toward)."""
+    for key in _ARC_STEERING_ORDER:
+        if key in SECTION_KEYS and not _is_covered(coverage, key):
+            return key
+    return None
+
+
+def _render_arc_guidance(coverage: CoverageState) -> str:
+    """Internal-only guidance text (never shown to the patient, never a
+    rule the model must obey) naming the one topic to gently steer toward
+    once the patient's own current thread winds down. See
+    `_ARC_STEERING_ORDER`'s docstring — a patient volunteering something
+    else first is always captured immediately regardless of this hint."""
+    next_key = _next_arc_topic(coverage)
+    if next_key is None:
+        return "(every topic in the intended arc has been explored -- steer toward wrapping up.)"
+    phrase = _TOPIC_PHRASES.get(next_key, next_key)
+    note = _ARC_STAGE_NOTE.get(next_key)
+    hint = f"Once the current thread winds down, gently steer toward {phrase}."
+    return f"{hint} {note}" if note else hint
+
+
 _INTAKE_AGENT_SYSTEM_PROMPT = f"""[intake-agent-v{INTAKE_AGENT_PROMPT_VERSION}]
 You are conducting a patient's first visit for a-doc, a single-patient longitudinal
 medical case-file tool -- the way an experienced clinician runs an initial intake
-conversation, not a form. There is no fixed order to get through and no checklist to
-show the patient. Follow the patient's own narrative: let them start wherever they
-want, follow what they bring up, and only when a thread has genuinely wound down do
-you gently steer toward something you haven't heard about yet, with a natural bridge
-("you mentioned your knee surgery -- that reminds me, has anything like that run in
-your family?" / "before we move on, can I ask about any medications you're taking?").
-Never mention "sections," "topics," "categories," a checklist, a percentage, or how
-much is "left to cover" -- the patient should experience one continuous conversation,
-never a form with a progress bar.
+conversation, not a form. There is no checklist to show the patient and no rigid state
+machine underneath you -- but a real clinician also does not ask a brand-new patient
+"what's been bothering you?" as the very first question; they build up incrementally,
+one or two facts at a time, starting from who the patient is before asking what's
+wrong. Follow the patient's own narrative first and always: let them start wherever
+they want, capture whatever they bring up immediately regardless of "the right time,"
+and only when a thread has genuinely wound down do you gently steer -- using the
+INTENDED ARC below and the "Suggested next step" hint in your context -- toward
+something you haven't heard about yet, with a natural bridge ("you mentioned your knee
+surgery -- that reminds me, has anything like that run in your family?" / "before we
+move on, can I ask about any medications you're taking?"). Never mention "sections,"
+"topics," "categories," a checklist, a percentage, "the arc," or how much is "left to
+cover" -- the patient should experience one continuous conversation, never a form with
+a progress bar.
+
+INTENDED ARC (soft guidance, never a gate -- a patient volunteering something out of
+order is always captured right away, never deferred or refused):
+1. Individual stats -- age and sex at birth first (short, warm, one or two facts at a
+   time), then height/weight and occupation as the conversation flows there naturally.
+2. Family history -- parents, siblings, grandparents; what runs in the family.
+3. Geography -- where she lives now and has lived before, travel of note, and any
+   environmental/occupational exposure tied to a place or trip.
+4. Review the existing record WITH her -- once the above is in hand, walk through what
+   is already on file (the documents/encounters digest and any matched excerpts in your
+   context below) rather than asking her to retype her history: "your records show a
+   hospitalization in early 2024 and an ER visit before that -- can we go through
+   those?" Cite what you're referencing. This is also where prior diagnoses and
+   remaining document drop naturally live.
+5. What's recent -- only now do you ask what's been going on lately and what has
+   changed, the way a clinician circles back to "so what brings you in today" only
+   after already knowing who the patient is.
+Medications, supplements, allergies, and care team fit in wherever they come up
+naturally, typically around stage 4-5. In an ordinary turn, build the record up
+incrementally -- respond to and ask about the one or two facts actually in front of you
+rather than front-loading a long list of questions (LONG PASTES below covers the
+different case of a patient volunteering a lot of detail in one message).
 
 This case file quietly organizes what you capture under a fixed set of internal
 bookkeeping topics (never named to the patient): basics, symptoms, events,
@@ -326,15 +448,30 @@ detail, quietly capture whatever you can confidently pull out of it as fact ops 
 grounded ONLY in what she actually wrote), and steer your `message` to ONE thing at a
 time rather than trying to ask about or process everything in a single reply.
 
+FOLLOW-UPS (for a later visit):
+When something is worth explicitly checking back on next time -- a symptom you'd like
+an update on, something left open that isn't quite ready to resolve now -- set
+`follow_up=true` on that fact (via `add_fact` or `update_fact`). This is the ONLY
+mechanism that carries something forward to a future visit's opening context, so use it
+deliberately: real follow-up items only, not everything you hear. Once a later visit's
+conversation genuinely revisits it, clear the flag with `update_fact(follow_up=false)`
+and a note. Never mention "follow-up flags" or this mechanism by name to the patient --
+just raise it naturally when the moment comes ("last time you mentioned the rash was
+spreading -- how has that been?").
+
 FACT FIELDS CONVENTIONS:
 `fields` is a flat set of key/value pairs -- use plain keys matching what the case file
 expects for that internal topic (symptoms: onset/frequency/triggers/severity;
 diagnoses: by_whom/year/reasoning/status; relatives: relation/conditions/age_at_onset/
-deceased/age_at_death; medications & supplements: name/dose/frequency/still_taking/
-notes; allergies: allergen/reaction/severity; providers: name/specialty/org; care team:
-insurer). Where a field is naturally a list (e.g. a relative's conditions), write it as
-one comma-separated string. Every `id` you invent must be a short, stable, lowercase
-slug with no spaces or colons (e.g. `father-allergy`, `2019-er-chest-pain`) -- reuse the
+deceased/age_at_death; locations (geography topic): place/date_approx/current/
+category, where `category` is `"residence"` (default -- omit it for an ordinary
+residence), `"travel"`, or `"exposure"` (an environmental/occupational exposure tied to
+a place or trip -- tick/outdoor exposure, well water, farm work, a regional outbreak);
+medications & supplements: name/dose/frequency/still_taking/notes; allergies:
+allergen/reaction/severity; providers: name/specialty/org; care team: insurer). Where a
+field is naturally a list (e.g. a relative's conditions), write it as one
+comma-separated string. Every `id` you invent must be a short, stable, lowercase slug
+with no spaces or colons (e.g. `father-allergy`, `2019-er-chest-pain`) -- reuse the
 exact same id every time you touch the same fact again.
 
 Respond only with the structured result (message, ops, topics_covered, intake_complete)
@@ -608,6 +745,9 @@ def _build_turn_context(
         "## Topic coverage so far (internal bookkeeping only — never mention topics, "
         "sections, or checklists to the patient)\n\n"
         f"{_render_coverage_map(coverage)}\n\n"
+        "## Suggested next step (internal guidance only -- the patient's own thread always "
+        "comes first; this only shapes where you steer once it winds down)\n\n"
+        f"{_render_arc_guidance(coverage)}\n\n"
         "## What's currently blocking an uncovered topic (internal only)\n\n"
         f"{_render_gate_status(facts_store, coverage)}\n\n"
         f"## Active facts on file\n\n{_render_active_facts(facts_store)}\n\n"
@@ -843,11 +983,147 @@ def run_intake_turn(client: LlmClient, repo: DataRepo, db: LabsDb, text: str) ->
 
 
 # --------------------------------------------------------------------------
+# Post-intake continuity: last visit, current state, follow-ups
+# (docs/adr/0018-intake-clinical-progression-and-continuity.md)
+# --------------------------------------------------------------------------
+
+OPEN_QUESTIONS_RELPATH = "case/questions-open.md"
+
+# How far back "recently changed" reaches for continuity purposes -- mirrors
+# `web.routes.onboard.RECENT_WINDOW_DAYS` (the Intake record page's "Since
+# last visit" strip), kept as its own constant here so this module never
+# needs to import from `web` (layering: web depends on intake, not the
+# reverse).
+RECENT_FACT_WINDOW_DAYS = 14
+
+# A returning chat session counts as the start of a NEW "visit" once this
+# much time has passed since the previous transcript entry -- short enough
+# that a same-sitting back-and-forth is never mistaken for a new visit, long
+# enough that a same-day-but-later check-in still counts as one. Consumed by
+# `web.routes.chat` (which owns the chat transcript, and therefore "when did
+# we last talk"), not by anything in this module.
+VISIT_GAP_THRESHOLD_HOURS = 4
+
+
+def active_follow_ups(facts_store: IntakeFactsStore) -> list[IntakeFact]:
+    """Active facts explicitly flagged `follow_up=True` (`IntakeFact.
+    follow_up` — set only by the model, via `add_fact`/`update_fact`, never
+    inferred). Order matches the store's own (insertion) order, so callers
+    that want "the most relevant one" consistently get the same fact for a
+    given store state — this is what a returning visit's greeting and the
+    Intake record page both read from."""
+    return [f for f in facts_store.active_facts() if f.follow_up]
+
+
+class ContinuityInfo(BaseModel):
+    """What a post-intake visit should open already knowing
+    (docs/adr/0018): when the patient last talked to a-doc, what was
+    explicitly flagged to revisit, and what else is still open. Computed
+    fresh from durable state on every call — nothing here is itself
+    persisted. `last_visit_at` is supplied by the caller (`web.routes.chat`
+    owns the chat transcript this module never reads) rather than computed
+    here."""
+
+    last_visit_at: datetime | None = None
+    follow_ups: list[IntakeFact] = Field(default_factory=list)
+    unresolved_facts: list[IntakeFact] = Field(default_factory=list)
+    recent_facts: list[IntakeFact] = Field(default_factory=list)
+    open_questions: str | None = None
+
+
+def _read_open_questions(repo: DataRepo) -> str | None:
+    path = repo.root / OPEN_QUESTIONS_RELPATH
+    if not path.exists():
+        return None
+    text = repo.read(OPEN_QUESTIONS_RELPATH).strip()
+    return text or None
+
+
+def build_continuity_info(
+    repo: DataRepo,
+    facts_store: IntakeFactsStore,
+    *,
+    last_visit_at: datetime | None,
+    now: datetime,
+) -> ContinuityInfo:
+    """Assemble `ContinuityInfo` from durable state: active facts flagged
+    `follow_up`, active facts still `clarification_status="needs_probe"`,
+    facts `reported_on` within `RECENT_FACT_WINDOW_DAYS` of `now`, and
+    `case/questions-open.md` if non-empty. `last_visit_at` is passed through
+    unchanged — the caller (which owns the chat transcript) decides what
+    counts as "last visit"."""
+    active = facts_store.active_facts()
+    unresolved = [f for f in active if f.clarification_status == "needs_probe"]
+    cutoff = now.date() - timedelta(days=RECENT_FACT_WINDOW_DAYS)
+    recent = sorted(
+        (f for f in active if f.reported_on is not None and f.reported_on >= cutoff),
+        key=lambda f: f.reported_on,  # type: ignore[arg-type, return-value]
+        reverse=True,
+    )
+    return ContinuityInfo(
+        last_visit_at=last_visit_at,
+        follow_ups=active_follow_ups(facts_store),
+        unresolved_facts=unresolved,
+        recent_facts=recent,
+        open_questions=_read_open_questions(repo),
+    )
+
+
+def _opening_line(delta: timedelta) -> str:
+    """A short, conversational opening sentence naming a time gap -- never a
+    raw duration or an exact timestamp (this must read like a person talks,
+    not a log line). Full sentences, not just a duration fragment, so the
+    grammar stays natural for very recent gaps ("We talked earlier today.")
+    as well as longer ones ("It's been about 3 weeks since we last
+    talked.")."""
+    days = delta.days
+    if days <= 0:
+        hours = int(delta.total_seconds() // 3600)
+        return "We talked earlier today." if hours <= 1 else f"We talked about {hours} hours ago."
+    if days == 1:
+        return "We talked yesterday."
+    if days < 14:
+        return f"It's been about {days} days since we last talked."
+    if days < 60:
+        weeks = max(days // 7, 1)
+        return f"It's been about {weeks} week{'s' if weeks != 1 else ''} since we last talked."
+    months = max(days // 30, 1)
+    return f"It's been about {months} month{'s' if months != 1 else ''} since we last talked."
+
+
+def render_continuity_note(info: ContinuityInfo, *, now: datetime) -> str | None:
+    """A short, conversational note for the first reply of a new post-intake
+    visit -- code-composed (not model-authored), the same pattern
+    `red_flag_warning_prefix` already uses, so it is deterministic and
+    testable and `web.routes.chat` can prepend it exactly like the red-flag
+    warning. Returns `None` when there is nothing worth saying (no prior
+    visit on file yet) — never a status dump: at most one line naming how
+    long it's been, plus at most one more line naming the single most
+    relevant open item (a follow-up first, then an unresolved fact, then a
+    generic nudge toward open questions on file)."""
+    if info.last_visit_at is None:
+        return None
+    lines = [_opening_line(now - info.last_visit_at)]
+    if info.follow_ups:
+        subject = info.follow_ups[0].statement.rstrip(".")
+        lines.append(f"Last time I made a note to check back on: {subject} -- how has that been?")
+    elif info.unresolved_facts:
+        subject = info.unresolved_facts[0].statement.rstrip(".")
+        lines.append(f"One thing we hadn't fully pinned down yet: {subject}.")
+    elif info.open_questions:
+        lines.append(
+            "There's also an open question or two on file from before, whenever you want to "
+            "pick that back up."
+        )
+    return " ".join(lines)
+
+
+# --------------------------------------------------------------------------
 # Interval history: silent post-intake visit capture
 # (docs/adr/0013-fact-corroboration.md, "visits grow the record")
 # --------------------------------------------------------------------------
 
-VISIT_CAPTURE_PROMPT_VERSION = "1"
+VISIT_CAPTURE_PROMPT_VERSION = "2"
 
 _VISIT_CAPTURE_SYSTEM_PROMPT = f"""[visit-capture-v{VISIT_CAPTURE_PROMPT_VERSION}]
 You are a silent background process for a-doc, a single-patient longitudinal medical case-file
@@ -856,7 +1132,8 @@ complete, and a separate diagnostic assistant is handling (or has already handle
 conversationally. Your only job is to notice whether this one message contains genuinely NEW or
 CHANGED patient-reported information worth adding to the permanent case file: a new or worsening
 symptom, a new medical event, a medication or supplement change, a new diagnosis or suspicion
-reported from an outside doctor, a new allergy, a new family-history detail, and so on.
+reported from an outside doctor, a new allergy, a new family-history or geography detail, and so
+on.
 
 You never reply to the patient -- there is no `message` field in your output, and nothing you
 produce is ever shown to them. Emitting NO ops at all is the correct, expected result for MOST
@@ -867,11 +1144,18 @@ under-capturing. When in doubt, emit nothing.
 
 When you do emit ops, use the exact same `add_fact`/`update_fact`/`retract_fact` shapes, internal
 topic keys, `kind` values, and `fields` conventions the initial-visit engine uses (basics,
-symptoms, events, prior_diagnoses, family_history, medications, supplements, allergies,
-care_team, document_drop). Check the active facts already on file below before adding anything --
-if this message updates something already recorded, emit `update_fact` (never a duplicate
-`add_fact`) with a substantive note. Never diagnose, never give treatment or dosing advice, and
-never invent or embellish a detail the patient did not actually state.
+symptoms, events, prior_diagnoses, family_history, geography, medications, supplements,
+allergies, care_team, document_drop). Check the active facts already on file below before adding
+anything -- if this message updates something already recorded, emit `update_fact` (never a
+duplicate `add_fact`) with a substantive note. Never diagnose, never give treatment or dosing
+advice, and never invent or embellish a detail the patient did not actually state.
+
+FOLLOW-UPS FLAGGED ON A PRIOR VISIT: the context below lists any facts a previous visit flagged
+`follow_up=true` as worth checking back on. If this message genuinely addresses one (the patient
+gives an update on it), emit `update_fact` for it with the new information AND `follow_up=false`
+to clear the flag. You may also set `follow_up=true` on a new or updated fact yourself when
+something in THIS message is worth explicitly checking back on next time -- use it deliberately,
+not for everything you hear.
 
 Respond only with the structured result (`ops`) -- never free text, never anything addressed to
 the patient.
@@ -893,9 +1177,19 @@ class CaptureResult(BaseModel):
     error: str | None = None
 
 
+def _render_follow_ups(facts_store: IntakeFactsStore) -> str:
+    follow_ups = active_follow_ups(facts_store)
+    if not follow_ups:
+        return "(none flagged)"
+    return "\n".join(f"- id: {fact.id} -- {fact.statement!r}" for fact in follow_ups)
+
+
 def _build_capture_context(db: LabsDb, repo: DataRepo, facts_store: IntakeFactsStore) -> str:
     return (
         f"## Active facts on file\n\n{_render_active_facts(facts_store)}\n\n"
+        "## Follow-ups flagged on a prior visit (system-tracked; clear one with "
+        "update_fact(follow_up=false) once genuinely revisited)\n\n"
+        f"{_render_follow_ups(facts_store)}\n\n"
         f"## Documents & encounters already on file\n\n{build_doc_digest(db, repo)}\n"
     )
 

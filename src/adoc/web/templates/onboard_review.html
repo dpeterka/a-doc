@@ -14,6 +14,39 @@
     <p class="banner">Initial visit complete — you can still correct or add details here.</p>
   {% endif %}
 
+  {% if continuity and (continuity.last_visit_at or continuity.follow_ups or continuity.unresolved_facts or continuity.open_questions) %}
+    <section class="review-section continuity">
+      <h2>Where things stand</h2>
+      {% if continuity.last_visit_at %}
+        <p class="muted">Last spoke: {{ continuity.last_visit_at.strftime('%Y-%m-%d') }}</p>
+      {% endif %}
+
+      {% if continuity.follow_ups %}
+        <h3>Follow-ups</h3>
+        <p class="muted">Flagged to check back on at your next visit.</p>
+        {% for fact in continuity.follow_ups %}
+          <div class="fact-card">
+            <p>{{ fact.statement }}</p>
+          </div>
+        {% endfor %}
+      {% endif %}
+
+      {% if continuity.unresolved_facts %}
+        <h3>Still open</h3>
+        {% for fact in continuity.unresolved_facts %}
+          <div class="fact-card">
+            <p>{{ fact.statement }}</p>
+          </div>
+        {% endfor %}
+      {% endif %}
+
+      {% if continuity.open_questions %}
+        <h3>Open questions on file</h3>
+        <p class="muted">{{ continuity.open_questions }}</p>
+      {% endif %}
+    </section>
+  {% endif %}
+
   {% if recent_facts %}
     <section class="review-section since-last-visit">
       <h2>Since last visit</h2>

@@ -12,7 +12,7 @@ onboarding itself (that gets its own tests further down).
 from __future__ import annotations
 
 import json
-from datetime import date
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -27,11 +27,13 @@ from web_support import (
 )
 
 from adoc.casefile.ledger import load_ledger
-from adoc.casefile.repo import LEDGER_RELPATH
+from adoc.casefile.repo import LEDGER_RELPATH, DataRepo
+from adoc.casefile.schema import Provenance
 from adoc.intake.agent import INTAKE_OPENER_MESSAGE, IntakeTurnResult, VisitCaptureResult
 from adoc.labs.db import LabsDb
 from adoc.labs.models import LabDocument, LabResult
 from adoc.reason.client import TransportRequest, TransportResponse
+from adoc.web.casefile_helpers import chat_log_path
 
 _ANA_SOURCE_DOC_SHA = "c" * 64
 
@@ -163,6 +165,94 @@ def test_diagnostic_turn_renders_the_three_tiers(tmp_path: Path) -> None:
     assert "Expanded" in body
     assert "Can" in body and "Miss" in body
     assert "Complement C3/C4 panel" in body
+
+
+def _seed_old_chat_entry(repo: DataRepo, *, days_ago: int) -> datetime:
+    """Write a chat-transcript entry directly, dated `days_ago` in the past
+    -- simulates "the last time we talked" for post-intake continuity
+    (`docs/adr/0018-intake-clinical-progression-and-continuity.md`) without
+    needing a real prior HTTP round trip."""
+    when = datetime.now(UTC) - timedelta(days=days_ago)
+    path = chat_log_path(repo, when.date())
+    path.parent.mkdir(parents=True, exist_ok=True)
+    entry = {
+        "timestamp": when.isoformat(),
+        "role": "assistant",
+        "kind": "informational",
+        "text": "(a prior visit's reply)",
+    }
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(entry) + "\n")
+    return when
+
+
+def test_new_visit_greeting_carries_a_continuity_note(tmp_path: Path) -> None:
+    """docs/adr/0018: the first reply of a new visit (gap since the last
+    chat entry past the visit-gap threshold) opens with a short,
+    deterministic continuity note -- here, naming the flagged follow-up."""
+    from adoc.intake.coverage import INTAKE_STATE_RELPATH, CoverageState, save_coverage_state
+    from adoc.intake.facts import AddFact, IntakeFactsStore, NewFact
+
+    calls: list = []
+    informational = make_informational_transport("Thanks for the update.", calls)
+    app, repo, _db, _calls = build_app(tmp_path, primary_transport=informational)
+    save_coverage_state(repo.root / INTAKE_STATE_RELPATH, CoverageState(intake_complete=True))
+    repo.commit("chore: seed intake-complete state for test")
+
+    store = IntakeFactsStore(repo.root)
+    store.apply_ops(
+        [
+            AddFact(
+                fact=NewFact(
+                    id="rash-followup",
+                    section="symptoms",
+                    kind="symptom",
+                    statement="Rash spreading on her forearm.",
+                    follow_up=True,
+                )
+            )
+        ],
+        Provenance(
+            app_version="0.0.0-test",
+            prompt_template_version="1",
+            model_id="fake",
+            dag_node="intake-agent",
+            timestamp=datetime.now(UTC),
+        ),
+    )
+    store.save()
+    repo.commit("chore: seed a flagged follow-up for test")
+
+    _seed_old_chat_entry(repo, days_ago=21)
+    client = TestClient(app)
+    login(client)
+
+    response = client.post("/chat/send", data={"text": "Hi, checking in again."})
+
+    assert response.status_code == 200
+    body_lower = response.text.lower()
+    # Jinja autoescapes apostrophes ("it&#39;s been...") -- assert on the
+    # apostrophe-free tail of the sentence instead.
+    assert "since we last talked" in body_lower
+    assert "rash spreading on her forearm" in body_lower
+    assert "thanks for the update" in body_lower  # the real reply still followed
+
+
+def test_same_sitting_reply_carries_no_continuity_note(tmp_path: Path) -> None:
+    """A second turn moments after the first must NOT be mistaken for a new
+    visit -- the gap is under `VISIT_GAP_THRESHOLD_HOURS`."""
+    calls: list = []
+    informational = make_informational_transport("Got it.", calls)
+    app, repo, _db, _calls = build_app(tmp_path, primary_transport=informational)
+    mark_intake_complete(repo)
+    _seed_old_chat_entry(repo, days_ago=0)  # a few hours ago at most in wall-clock terms
+    client = TestClient(app)
+    login(client)
+
+    response = client.post("/chat/send", data={"text": "Following up on that."})
+
+    assert response.status_code == 200
+    assert "since we last talked" not in response.text.lower()
 
 
 def test_blank_message_shows_an_error_without_calling_the_llm(tmp_path: Path) -> None:

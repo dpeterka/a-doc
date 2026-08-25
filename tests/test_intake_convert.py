@@ -15,6 +15,7 @@ from adoc.intake.sections import (
     CareTeamSection,
     EventsSection,
     FamilyHistorySection,
+    GeographySection,
     MedicationsSection,
     PriorDiagnosesSection,
     SupplementsSection,
@@ -127,6 +128,46 @@ def test_family_history_conversion_splits_comma_separated_conditions() -> None:
     assert section.relatives[0].relation == "mother"
     assert section.relatives[0].conditions == ["Hashimoto's", "vitiligo"]
     assert section.relatives[0].age_at_onset == 35
+
+
+def test_geography_conversion_splits_residences_travel_and_exposures() -> None:
+    residence = _fact(
+        section="geography",
+        kind="location",
+        statement="Lives in rural Connecticut.",
+        date_approx="2015-2020",
+        fields={"place": "rural Connecticut"},
+    )
+    current_residence = _fact(
+        id="f2",
+        section="geography",
+        kind="location",
+        statement="Currently lives in Boston.",
+        fields={"place": "Boston, MA", "current": True},
+    )
+    travel = _fact(
+        id="f3",
+        section="geography",
+        kind="location",
+        statement="Annual camping trips in upstate New York.",
+        fields={"category": "travel"},
+    )
+    exposure = _fact(
+        id="f4",
+        section="geography",
+        kind="location",
+        statement="Frequent tick exposure while hiking.",
+        fields={"category": "exposure", "description": "frequent tick exposure while hiking"},
+    )
+    data = facts_to_section_data([residence, current_residence, travel, exposure], "geography")
+    section = GeographySection.model_validate(data)
+
+    assert len(section.residences) == 2
+    assert section.residences[0].place == "rural Connecticut"
+    assert section.residences[0].date_approx == "2015-2020"
+    assert section.residences[1].current is True
+    assert section.travel == ["Annual camping trips in upstate New York."]
+    assert section.exposures == ["frequent tick exposure while hiking"]
 
 
 def test_medications_and_supplements_conversion() -> None:
