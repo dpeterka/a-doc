@@ -78,11 +78,17 @@ def test_init_creates_data_repo_and_is_idempotent(
     assert first_code == 0
     assert f"initialized data repo at {data_dir}" in first_out
     assert (data_dir / "case" / "differential-ledger.yaml").exists()
+    # PII-scrubbing scaffold (docs/adr/0017): `init` also creates an empty
+    # identifiers template so a fresh install is never left un-scaffolded.
+    identifiers_path = data_dir / "case" / "identifiers.yaml"
+    assert identifiers_path.exists()
+    assert "scaffolded identifier scrub template" in first_out
 
     second_code = main(["init"])
     second_out = capsys.readouterr().out
     assert second_code == 0
     assert f"already initialized at {data_dir}" in second_out
+    assert "identifiers file already present" in second_out
 
 
 def test_init_fails_without_data_dir(
@@ -123,11 +129,17 @@ def test_ingest_scans_the_inbox_and_prints_a_report(
     code = main(["ingest"])
 
     assert code == 0
-    out = capsys.readouterr().out
-    assert "visit.pdf" in out
-    assert "ingested" in out
+    captured = capsys.readouterr()
+    assert "visit.pdf" in captured.out
+    assert "ingested" in captured.out
     encounters = list((repo.root / "case" / "encounters").glob("*.md"))
     assert len(encounters) == 1
+    # docs/adr/0017: `_build_llm_client` (the real, non-monkeypatched path
+    # here - only vision/renderer are faked) warns loudly on stderr because
+    # this test seeds the repo via `DataRepo.init_at` directly, bypassing
+    # `adoc init`'s identifiers.yaml scaffold.
+    assert "identifiers.yaml" in captured.err
+    assert "does not exist" in captured.err
 
 
 def test_backfill_ingests_a_given_directory(
@@ -328,6 +340,32 @@ def test_onboard_default_runs_the_conversational_engine_against_an_initialized_r
     # docs/adr/0012-initial-visit-conversation.md: no section display at all.
     assert "Basics" not in out
     assert "[1/10]" not in out
+
+
+def test_onboard_warns_loudly_when_identifiers_have_no_names(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """docs/adr/0017: `onboard` builds its `LlmClient` via
+    `LlmClient.from_settings(settings)` with no `scrubber=` argument - the
+    exact call shape that used to mean silent no-op scrubbing. It must now
+    print the loud warning whenever the scaffolded (still-empty)
+    identifiers file has no names configured."""
+    data_dir = tmp_path / "a-doc-data"
+    monkeypatch.setenv("ADOC_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("ADOC_MODELS_FILE", str(REPO_ROOT / "models.yaml"))
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    assert main(["init"]) == 0
+    capsys.readouterr()
+
+    monkeypatch.setattr("builtins.input", lambda *_a, **_kw: (_ for _ in ()).throw(EOFError))
+
+    code = main(["onboard"])
+
+    assert code == 0
+    err = capsys.readouterr().err
+    assert "no 'names' entries" in err
 
 
 def _empty_review_fake_client() -> LlmClient:
@@ -1163,6 +1201,108 @@ def test_user_add_fails_without_data_dir(
 
     assert code == 1
     assert "configuration error" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------
+# identifiers show|add|remove (docs/adr/0017-default-scrubber-and-identifiers-file.md)
+# --------------------------------------------------------------------------
+
+
+def test_identifiers_show_reports_no_file_before_init(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("ADOC_DATA_DIR", str(tmp_path / "a-doc-data"))
+
+    code = main(["identifiers", "show"])
+
+    assert code == 0
+    assert "no identifiers file at" in capsys.readouterr().out
+
+
+def test_identifiers_show_warns_on_the_scaffolded_empty_template(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    data_dir = tmp_path / "a-doc-data"
+    monkeypatch.setenv("ADOC_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("ADOC_MODELS_FILE", str(REPO_ROOT / "models.yaml"))
+    assert main(["init"]) == 0
+    capsys.readouterr()
+
+    code = main(["identifiers", "show"])
+
+    assert code == 0
+    err = capsys.readouterr().err
+    assert "no 'names' entries" in err
+
+
+def test_identifiers_add_and_show_round_trip(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    data_dir = tmp_path / "a-doc-data"
+    monkeypatch.setenv("ADOC_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("ADOC_MODELS_FILE", str(REPO_ROOT / "models.yaml"))
+    assert main(["init"]) == 0
+    capsys.readouterr()
+
+    assert main(["identifiers", "add", "name", "Jane Q. Public"]) == 0
+    assert main(["identifiers", "add", "dob", "1980-05-12"]) == 0
+    capsys.readouterr()
+
+    code = main(["identifiers", "show"])
+
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "Jane Q. Public" in out
+    assert "1980-05-12" in out
+    # No more loud warning once a name is configured.
+    assert capsys.readouterr().err == ""
+
+
+def test_identifiers_add_rejects_an_unknown_field(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("ADOC_DATA_DIR", str(tmp_path / "a-doc-data"))
+
+    # argparse's `choices` rejects this before the command ever runs.
+    with pytest.raises(SystemExit) as excinfo:
+        main(["identifiers", "add", "ssn", "123-45-6789"])
+    assert excinfo.value.code == 2
+
+
+def test_identifiers_remove_reports_no_match(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    data_dir = tmp_path / "a-doc-data"
+    monkeypatch.setenv("ADOC_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("ADOC_MODELS_FILE", str(REPO_ROOT / "models.yaml"))
+    assert main(["init"]) == 0
+    capsys.readouterr()
+
+    code = main(["identifiers", "remove", "name", "Nobody"])
+
+    assert code == 1
+    assert "no matching" in capsys.readouterr().err
+
+
+def test_identifiers_add_then_remove_round_trip(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    data_dir = tmp_path / "a-doc-data"
+    monkeypatch.setenv("ADOC_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("ADOC_MODELS_FILE", str(REPO_ROOT / "models.yaml"))
+    assert main(["init"]) == 0
+    assert main(["identifiers", "add", "name", "Jane Q. Public"]) == 0
+    capsys.readouterr()
+
+    code = main(["identifiers", "remove", "name", "Jane Q. Public"])
+
+    assert code == 0
+    assert "removed name" in capsys.readouterr().out
+
+    from adoc.privacy import PatientIdentifiers
+
+    identifiers = PatientIdentifiers.load(data_dir / "case" / "identifiers.yaml")
+    assert identifiers.names == []
 
 
 def test_backup_fails_without_data_dir(

@@ -104,3 +104,135 @@ apply_and_save` ever executes.
   weakening `most_likely_requires_resolved_evidence`/`entailment_check_*`
   to make an unrelated change pass, is exactly the kind of change CLAUDE.md
   rule 2 forbids doing silently — same bar as the red-team suite.
+
+## Revised (2026-08-25, fix/entailment-proportionate)
+
+### What happened
+
+v0.8.0 shipped this ADR's entailment verifier to production. On the first
+real diagnostic turn against a full case file (121 documents, ~2000 lab
+rows), `run_diagnostic_turn` died with `ContractViolation
+node=ledger_maintainer contract=entailment_check_ledger_maintainer` after
+464 seconds. `logs/entailment-checks.jsonl` showed:
+
+- first attempt: **entailed 8, not_entailed 29, insufficient_source 4**
+- after the one retry: **entailed 23, not_entailed 14, insufficient_source 4**
+
+Every failing ref was a `labs:` ref. The contract fired, the whole turn was
+lost, and the patient got the generic "withheld" message instead of a
+reply that was, substantively, well-grounded.
+
+### Why: the bar was wrong, not the mechanism
+
+A `labs:` source text is a deterministic rendering of one row — value,
+unit, reference range, flag. An evidence claim's job is to say *why that
+value matters* ("ESR elevated, consistent with an inflammatory process").
+The original prompt's closing instruction — "if a source text is ambiguous
+or only partially supports the claim, judge `not_entailed`... do not
+resolve ambiguity in the claim's favor" — made every claim that added
+clinical framing beyond the bare number fail, because a bare lab row
+"only partially supports" any framing by construction. The verifier was
+correctly following its instructions; the instructions asked it to reject
+normal, well-grounded clinical reasoning, not hallucination. A gate that
+blocks ~35% of claims after a retry and kills the turn on that basis is
+not protecting the patient — it is denying her a reply.
+
+The all-or-nothing consequence compounded this: even a diff that was 85%
+correct (23/27 entailed after retry) lost 100% of its content, because
+`entailment_check_ledger_maintainer` treated any single `not_entailed`
+claim as disqualifying for the whole diff.
+
+### Decision — two changes, both required
+
+**1. Sharpen `not_entailed` (prompt v2, `entailment_verifier.md`).**
+`not_entailed` is now reserved for an actual *factual conflict* with the
+source — this is the one thing this stage can catch that the deterministic
+citation checker cannot:
+- a value, unit, direction, or date that misstates the source (says
+  "elevated" when the row is in range and unflagged; quotes 12.3 when the
+  row says 1.23; cites a row from a different date);
+- a finding the source does not contain at all (an invented result, an
+  invented test, an invented encounter detail);
+- a claim describing a different row than the one actually cited.
+
+Explicitly NOT `not_entailed`: a claim whose factual core matches the
+source and then adds clinical interpretation, significance, or a
+mechanism — that judgment is the Ledger-Maintainer's to make and the
+Challenger's to attack, not this stage's to re-litigate. The "resolve
+ambiguity against the claim" instruction is deleted; the prompt now says
+explicitly that accurate-value-plus-accurate-inference is `entailed`.
+
+**2. Strip, don't reject (`reason/verify.py`, `reason/stages.py`).** A
+`not_entailed` claim surviving the one retry no longer fails the whole
+diff. Instead:
+- `strip_not_entailed_ops` removes just that evidence item from the diff's
+  (or verdict's) ops; `insufficient_source` items are always kept
+  (unresolvable is not the same as wrong — same principle this ADR already
+  applied to the citation checker's `unverifiable`). The turn proceeds on
+  the remaining, verified evidence.
+- Every stripped claim is logged to `logs/entailment-stripped.jsonl`
+  (ref, hypothesis id, judgment — no claim prose at a level that could leak
+  into anything but this data-repo-local audit file, same handling
+  `log_verification_report` already gave `not_entailed` claims) so
+  over-stripping is measurable going forward, distinct from the raw
+  per-attempt counts in `entailment-checks.jsonl`.
+- **The threshold for a hard failure is "all", not "any":**
+  `VerificationReport.all_not_entailed` — every claim the check examined
+  judged `not_entailed`, with nothing surviving, not even an
+  `insufficient_source` claim. That is the one outcome still worth
+  stopping the run for: it means the pipeline itself produced garbage
+  (every single claim wrong), not that one claim was imprecise. This is
+  evaluated on the Ledger-Maintainer's own diff (`entailment_check_
+  ledger_maintainer`'s exact scope, 1:1 with what `ledger_maintainer_
+  stage` itself checked) — the Challenger's `additional_ops` is a smaller,
+  auxiliary contribution with no 1:1 postcondition of its own (the closest
+  equivalent, `entailment_check_apply`, checks it MERGED with the diff), so
+  `challenger_stage` strips its `not_entailed` claims unconditionally
+  rather than ever leaving a small, isolated `additional_ops` set
+  "100% failing" and unstripped — that would create a real gap where the
+  merged-ops check at `apply` no longer sees it as "all failing" either,
+  and a Challenger-introduced misrepresentation would sail through
+  unstripped.
+- **This makes grounding stronger, not weaker.** Under the old design, a
+  `not_entailed` claim's practical effect was to fail the whole turn open
+  — the patient got nothing, and the same (still-flawed) diff could be
+  regenerated and resubmitted with no guarantee the offending claim
+  wouldn't recur. Under strip-don't-reject, unverified evidence never
+  reaches the ledger at all, in a turn that otherwise succeeds — a strictly
+  better outcome for both correctness and availability.
+- **The abstention contract is unweakened and remains the backstop.**
+  `most_likely_requires_resolved_evidence_contract` runs on the same
+  merged, post-strip ops: if stripping leaves a `most-likely` hypothesis
+  with no resolved `evidence_for` at all, that PRECONDITION on `apply`
+  still fires before anything is written to disk — proven directly by
+  `tests/test_stages.py::test_stripping_composes_with_abstention_contract`.
+
+### Consequences (revised)
+
+- `evals/suites/hallucination.py` gains a dedicated
+  `interpretation_claims_entailed_rate` metric (pinned at 1.0) over fixture
+  pairs prefixed `interpretation-` — a well-grounded value plus ordinary
+  clinical interpretation must be judged `entailed`; this is the exact
+  false-positive shape that took down the production turn. The existing
+  planted-fact and fabricated-citation probes are unaffected and still pin
+  at 1.0: a planted fabricated value is a factual conflict, still caught,
+  and (being the diff's only evidence claim in those fixtures) still hits
+  the `all_not_entailed` hard-failure path, not the strip path.
+- A code review of this same change surfaced an identical over-block shape
+  in the Composer's separate, fully deterministic `check_composer_numbers`
+  check (`reason/verify.py`) — a count/frequency/duration sharing a clause
+  with an analyte name ("elevated across 3 separate panels") was being
+  flagged as if it were that analyte's value. Fixed in the same branch with
+  the same proportionality principle: `_quoted_number_looks_like_a_value`
+  requires that a number NOT be immediately followed by a recognized
+  count/frequency/duration word before it is compared against stored
+  values at all; a fabricated value (with or without an adjacent unit)
+  is still caught exactly as before. This is a distinct, purely
+  deterministic check with its own DAG contract (`composer_number_check`)
+  and its own reject-the-whole-reply-and-rewrite-once behavior, unaffected
+  by the entailment strip mechanism above; it gets its own eval metric,
+  `composer_number_legitimate_phrasing_pass_rate`, pinned at 1.0.
+- Changing the entailment threshold from "any `not_entailed` fails" to
+  "all `not_entailed` fails", or removing the strip step, is exactly the
+  kind of change CLAUDE.md rule 2 forbids doing silently going forward —
+  same bar this ADR already set for the cross-family binding.

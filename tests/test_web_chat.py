@@ -21,6 +21,7 @@ from web_support import (
     exploding_transport,
     login,
     make_challenger_transport,
+    make_informational_transport,
     make_primary_transport,
     mark_intake_complete,
 )
@@ -219,6 +220,33 @@ def test_dosing_laden_composer_output_is_withheld_but_ledger_is_still_updated(
 
     ledger_after = load_ledger(repo.root / LEDGER_RELPATH)
     assert ledger_after.version > ledger_before.version
+
+
+def test_informational_dosing_reply_is_withheld_not_shown(tmp_path: Path) -> None:
+    """Violation 1 regression: `reason.tools.informational_llm_result`
+    used to return raw model text with no `treatment_gate` call at all,
+    and this route rendered it straight to the patient — the only gated
+    sibling (`tools.answer_informational`) was called from no production
+    code. This posts real dosing language through the actual informational
+    route (classifier routes to "informational", the informational LLM
+    call answers with dosing language) and asserts the patient never sees
+    it, end to end."""
+    calls: list = []
+    dosing_text = "You should take 20 mg prednisone daily for the inflammation."
+    informational = make_informational_transport(dosing_text, calls)
+    app, repo, _db, _calls = build_app(tmp_path, primary_transport=informational)
+    mark_intake_complete(repo)
+    client = TestClient(app)
+    login(client)
+
+    response = client.post(
+        "/chat/send",
+        data={"text": "What should I take for my joint inflammation?"},
+    )
+
+    assert response.status_code == 200
+    assert "20 mg prednisone" not in response.text
+    assert "withholding" in response.text.lower()
 
 
 _ACTIVE_NO_CANT_MISS_OP = {

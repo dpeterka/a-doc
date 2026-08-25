@@ -4,7 +4,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from adoc.privacy import PatientIdentifiers, Scrubber
+from adoc.privacy import (
+    PatientIdentifiers,
+    Scrubber,
+    add_identifier,
+    remove_identifier,
+    scaffold_identifiers_file,
+)
 
 
 def _identifiers(**kwargs: object) -> PatientIdentifiers:
@@ -137,3 +143,203 @@ def test_longer_identifier_is_preferred_over_a_shorter_substring_identifier() ->
     # pattern gets a chance to match, so there is exactly one replacement.
     assert count == 1
     assert text == "[NAME] called."
+
+
+def test_clinical_text_survives_scrubbing_intact_lab_value_analyte_and_diagnosis() -> None:
+    """The important guard: over-scrubbing would silently degrade every
+    diagnosis, so a lab value, an analyte name, and a diagnosis must never
+    be altered by a scrubber that also has real patient identifiers loaded
+    (not just the empty-identifiers case `test_clinical_values_are_never_
+    scrubbed` already covers)."""
+    scrubber = Scrubber(
+        _identifiers(
+            names=["Jane Q. Public", "Jane Public", "Janie"],
+            dob="1980-05-12",
+            address_fragments=["123 Main St"],
+            phone=["217-555-0134"],
+            email=["jane.public@example.com"],
+            mrn=["A123456"],
+        )
+    )
+    clinical_text = (
+        "Assessment: findings are consistent with systemic lupus erythematosus. "
+        "CRP 8.5 mg/L (ref 0.0-3.0). ANA titer 1:640 homogeneous pattern. "
+        "Sodium 140 mmol/L. BP 120/80. Alkaline phosphatase 98 U/L. Temp 98.6F. "
+        "Continue home monitoring; follow up in 6 weeks."
+    )
+
+    text, count = scrubber.scrub(clinical_text)
+
+    assert count == 0
+    assert text == clinical_text
+
+
+# --------------------------------------------------------------------------
+# Scrubber.coverage_warning — the loud-failure surface
+# --------------------------------------------------------------------------
+
+
+def test_coverage_warning_is_none_for_an_explicit_noop() -> None:
+    assert Scrubber.noop().coverage_warning is None
+
+
+def test_coverage_warning_is_none_for_a_scrubber_built_without_a_source_file() -> None:
+    # Constructed directly from in-memory identifiers (e.g. tests, or a
+    # future caller with no file involved) - no file to warn about.
+    scrubber = Scrubber(_identifiers())
+    assert scrubber.coverage_warning is None
+
+
+def test_coverage_warning_names_the_missing_file(tmp_path: Path) -> None:
+    missing = tmp_path / "case" / "identifiers.yaml"
+
+    scrubber = Scrubber.from_file(missing)
+
+    warning = scrubber.coverage_warning
+    assert warning is not None
+    assert str(missing) in warning
+    assert "does not exist" in warning
+
+
+def test_coverage_warning_fires_when_the_file_exists_but_has_no_names(tmp_path: Path) -> None:
+    path = tmp_path / "identifiers.yaml"
+    path.write_text("dob: '1980-05-12'\n", encoding="utf-8")
+
+    scrubber = Scrubber.from_file(path)
+
+    warning = scrubber.coverage_warning
+    assert warning is not None
+    assert str(path) in warning
+    assert "no 'names' entries" in warning
+
+
+def test_coverage_warning_is_none_once_a_name_is_configured(tmp_path: Path) -> None:
+    path = tmp_path / "identifiers.yaml"
+    path.write_text("names: ['Jane Doe']\n", encoding="utf-8")
+
+    scrubber = Scrubber.from_file(path)
+
+    assert scrubber.coverage_warning is None
+
+
+# --------------------------------------------------------------------------
+# case/identifiers.yaml scaffolding + CLI-facing add/remove helpers
+# --------------------------------------------------------------------------
+
+
+def test_scaffold_identifiers_file_creates_a_commented_template(tmp_path: Path) -> None:
+    path = tmp_path / "case" / "identifiers.yaml"
+
+    created = scaffold_identifiers_file(path)
+
+    assert created is True
+    assert path.exists()
+    content = path.read_text(encoding="utf-8")
+    # Every field add_identifier/remove_identifier support is documented.
+    assert "names:" in content
+    assert "dob:" in content
+    assert "mrn:" in content
+    assert "address_fragments:" in content
+    assert "phone:" in content
+    assert "email:" in content
+    assert "adoc identifiers add" in content
+    # Loading the freshly-scaffolded template back gives empty (safe)
+    # identifiers, not a parse error.
+    assert PatientIdentifiers.load(path) == PatientIdentifiers.empty()
+
+
+def test_scaffold_identifiers_file_never_overwrites_an_existing_file(tmp_path: Path) -> None:
+    path = tmp_path / "identifiers.yaml"
+    path.write_text("names: ['Real Patient Name']\n", encoding="utf-8")
+
+    created = scaffold_identifiers_file(path)
+
+    assert created is False
+    assert "Real Patient Name" in path.read_text(encoding="utf-8")
+
+
+def test_add_identifier_appends_to_a_list_field_and_is_idempotent(tmp_path: Path) -> None:
+    path = tmp_path / "identifiers.yaml"
+
+    add_identifier(path, "name", "Jane Q. Public")
+    add_identifier(path, "name", "Janie")
+    add_identifier(path, "name", "Jane Q. Public")  # duplicate: no-op
+
+    identifiers = PatientIdentifiers.load(path)
+    assert identifiers.names == ["Jane Q. Public", "Janie"]
+
+
+def test_add_identifier_dob_replaces_any_existing_value(tmp_path: Path) -> None:
+    path = tmp_path / "identifiers.yaml"
+
+    add_identifier(path, "dob", "1980-05-12")
+    add_identifier(path, "dob", "1980-05-13")
+
+    assert PatientIdentifiers.load(path).dob == "1980-05-13"
+
+
+def test_add_identifier_maps_address_field_to_address_fragments(tmp_path: Path) -> None:
+    path = tmp_path / "identifiers.yaml"
+
+    add_identifier(path, "address", "123 Main St")
+
+    assert PatientIdentifiers.load(path).address_fragments == ["123 Main St"]
+
+
+def test_add_identifier_rejects_an_unknown_field(tmp_path: Path) -> None:
+    path = tmp_path / "identifiers.yaml"
+
+    try:
+        add_identifier(path, "ssn", "123-45-6789")
+        raised = False
+    except ValueError:
+        raised = True
+    assert raised
+
+
+def test_remove_identifier_removes_a_matching_value_and_reports_it(tmp_path: Path) -> None:
+    path = tmp_path / "identifiers.yaml"
+    add_identifier(path, "name", "Jane Q. Public")
+
+    identifiers, removed = remove_identifier(path, "name", "Jane Q. Public")
+
+    assert removed is True
+    assert identifiers.names == []
+    assert PatientIdentifiers.load(path).names == []
+
+
+def test_remove_identifier_reports_false_for_a_non_matching_value(tmp_path: Path) -> None:
+    path = tmp_path / "identifiers.yaml"
+    add_identifier(path, "name", "Jane Q. Public")
+
+    _identifiers, removed = remove_identifier(path, "name", "Someone Else")
+
+    assert removed is False
+    assert PatientIdentifiers.load(path).names == ["Jane Q. Public"]
+
+
+def test_remove_identifier_dob_clears_regardless_of_value(tmp_path: Path) -> None:
+    path = tmp_path / "identifiers.yaml"
+    add_identifier(path, "dob", "1980-05-12")
+
+    identifiers, removed = remove_identifier(path, "dob", None)
+
+    assert removed is True
+    assert identifiers.dob is None
+
+
+def test_add_then_remove_round_trip_changes_scrubbing_behavior(tmp_path: Path) -> None:
+    """End-to-end: a name added via `add_identifier` is scrubbed by a fresh
+    `Scrubber.from_file`; once removed, it is not."""
+    path = tmp_path / "identifiers.yaml"
+    add_identifier(path, "name", "Jane Q. Public")
+
+    scrubbed_text, count = Scrubber.from_file(path).scrub("Jane Q. Public reports fatigue.")
+    assert count == 1
+    assert scrubbed_text == "[NAME] reports fatigue."
+
+    remove_identifier(path, "name", "Jane Q. Public")
+
+    unscrubbed_text, count2 = Scrubber.from_file(path).scrub("Jane Q. Public reports fatigue.")
+    assert count2 == 0
+    assert unscrubbed_text == "Jane Q. Public reports fatigue."
