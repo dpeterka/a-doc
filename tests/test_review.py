@@ -18,13 +18,21 @@ from adoc.casefile.repo import HISTORY_RELPATH, LEDGER_RELPATH, DataRepo
 from adoc.casefile.schema import AddHypothesis, Hypothesis, Ledger, LedgerDiff, Provenance
 from adoc.config import ModelBinding
 from adoc.labs.db import LabsDb
-from adoc.reason.client import AnthropicProvider, LlmClient, TransportRequest, TransportResponse
+from adoc.labs.models import LabDocument, LabResult
+from adoc.reason.client import (
+    AnthropicProvider,
+    LlmClient,
+    OpenAIProvider,
+    TransportRequest,
+    TransportResponse,
+)
 from adoc.reason.context import build_context
 from adoc.reason.dag import ContractViolation
 from adoc.reason.dag import run as dag_run
 from adoc.reason.review import (
     AdjudicationResult,
     ChallengeSweepResult,
+    DeferredVerificationSweepResult,
     Divergence,
     DivergenceDecisionPayload,
     DivergenceSet,
@@ -41,7 +49,9 @@ from adoc.reason.review import (
     render_review_markdown,
     run_weekly_review,
     scan_staleness,
+    sweep_deferred_entailment_claims,
 )
+from adoc.reason.verify import DEFERRED_CLAIMS_RELPATH, Claim, queue_deferred_claims
 
 SLE_ID = "sle-01"
 PE_ID = "pe-01"
@@ -241,6 +251,102 @@ def report_ledger_hypotheses(repo: DataRepo) -> list[Hypothesis]:
     from adoc.casefile.ledger import load_ledger
 
     return load_ledger(repo.root / LEDGER_RELPATH).hypotheses
+
+
+# --- deferred entailment sweep (latency: "diagnostic-turn-latency") ----------------------------
+
+
+def test_deferred_claim_is_picked_up_and_verified_by_the_weekly_review(
+    repo: DataRepo, db: LabsDb
+) -> None:
+    """Acceptance: a claim a diagnostic turn DEFERRED (queued via
+    `reason.verify.queue_deferred_claims` because it supported an
+    `expanded`/`cant-miss` hypothesis rather than `most-likely` - PLAN.md
+    latency "diagnostic-turn-latency") is never silently dropped. The next
+    weekly review pops the ENTIRE queue, verifies every claim through the
+    same `verify_claims` a diagnostic turn uses, empties the queue, and
+    surfaces the result in the committed review report."""
+    _seed_ledger(repo)
+    sha = "9" * 64
+    db.upsert_document(
+        LabDocument(sha256=sha, filename="crp.pdf", doc_type="lab-result", page_count=1)
+    )
+    db.insert_results(
+        [
+            LabResult(
+                date=date(2026, 5, 2),
+                name="CRP",
+                name_raw="CRP",
+                value=8.5,
+                source_doc=sha,
+                raw_json=json.dumps({"name_raw": "CRP"}),
+            )
+        ]
+    )
+    deferred_claim = Claim(
+        hypothesis_id=PE_ID,
+        for_or_against="for",
+        claim="CRP was sky-high, indicating severe inflammation",
+        source="labs:crp:2026-05-02",
+    )
+    queue_deferred_claims(repo, [deferred_claim], dag_node="ledger_maintainer")
+    deferred_path = repo.root / DEFERRED_CLAIMS_RELPATH
+    assert json.loads(deferred_path.read_text(encoding="utf-8"))  # queued, not empty yet
+
+    calls: list[TransportRequest] = []
+
+    def entailment_transport(request: TransportRequest) -> TransportResponse:
+        _preamble, _blank, payload_text = request.messages[-1].content.partition("\n\n")
+        pairs = json.loads(payload_text)
+        judgments = [
+            {
+                "claim_index": p["claim_index"],
+                "judgment": "not_entailed",
+                "rationale": "the stored row is 8.5, not sky-high",
+            }
+            for p in pairs
+        ]
+        return TransportResponse(
+            text="", tool_input={"judgments": judgments}, input_tokens=5, output_tokens=5
+        )
+
+    bindings: dict[str, list[ModelBinding]] = {
+        "blind_panel": _blind_panel_bindings(),
+        "challenger": [ModelBinding(provider="anthropic", model="fake-challenger")],
+        "test_chooser": [ModelBinding(provider="anthropic", model="fake-test-chooser")],
+        "entailment_verifier": [ModelBinding(provider="featherless", model="fake-verifier")],
+    }
+    providers = {
+        "anthropic": AnthropicProvider(api_key=None, transport=_happy_path_transport(calls)),
+        "featherless": OpenAIProvider(api_key=None, transport=entailment_transport),
+    }
+    client = LlmClient(bindings, providers)
+
+    report = run_weekly_review(repo, db, client, clock=_fixed_clock)
+
+    # Picked up exactly once - the queue is empty again.
+    assert json.loads(deferred_path.read_text(encoding="utf-8")) == []
+
+    assert report.deferred_verification.checked == 1
+    assert len(report.deferred_verification.not_entailed) == 1
+    finding = report.deferred_verification.not_entailed[0]
+    assert finding.hypothesis_id == PE_ID
+    assert finding.claim == "CRP was sky-high, indicating severe inflammation"
+
+    markdown = (repo.root / report.markdown_path).read_text(encoding="utf-8")
+    assert "Deferred evidence checks" in markdown
+    assert "CRP was sky-high" in markdown
+
+    # Nothing left to check the second time - never re-verified, never
+    # re-charged a model call, and the ledger evidence itself is untouched
+    # (this codebase's schema has no evidence-removal op; the finding is
+    # surfaced for a human to act on, not auto-stripped from an already-
+    # applied diff).
+    second_sweep = sweep_deferred_entailment_claims(client, repo, db)
+    assert second_sweep == DeferredVerificationSweepResult()
+
+    pe = next(h for h in report_ledger_hypotheses(repo) if h.id == PE_ID)
+    assert pe.evidence_for == []  # never applied to the ledger in the first place
 
 
 # --- negative test: blind-panel blindness contract ---------------------------------------------
@@ -744,6 +850,7 @@ def test_render_review_markdown_redacts_dosing_language() -> None:
             items=[TestChooserItem(text="Start taking 500 mg metformin twice daily")]
         ),
         staleness=StalenessReport(),
+        deferred_verification=DeferredVerificationSweepResult(),
         metrics=OpsMetrics(),
         ledger_before=empty_ledger,
         ledger_after=empty_ledger,

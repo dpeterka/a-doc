@@ -1240,49 +1240,9 @@ def test_ingest_inbox_continues_the_batch_after_an_unexpected_exception(
     assert "boom" in lines[0]
 
 
-def test_commit_with_retry_retries_on_lock_contention_then_succeeds() -> None:
-    """`_commit_with_retry` retries a transient cross-process git
-    index/ref-lock collision (`OSError`) with backoff rather than raising
-    immediately."""
-    from adoc.ingest.pipeline import _commit_with_retry
-
-    calls: list[str] = []
-    sleeps: list[float] = []
-
-    class _FlakyRepo:
-        def commit(self, message: str, paths: list[str] | None = None) -> str:
-            calls.append(message)
-            if len(calls) < 3:
-                raise OSError("Lock at '.git/index.lock' could not be obtained")
-            return "deadbeef"
-
-    sha = _commit_with_retry(
-        _FlakyRepo(),  # type: ignore[arg-type]
-        "test commit",
-        paths=["x"],
-        sleep=sleeps.append,
-    )
-
-    assert sha == "deadbeef"
-    assert len(calls) == 3
-    # slept between attempt 1->2 and 2->3, never after the final success.
-    assert len(sleeps) == 2
-
-
-def test_commit_with_retry_raises_after_exhausting_attempts() -> None:
-    """Once every retry attempt is exhausted, the original exception
-    propagates (routing the file to `work/failed/` via `ingest_inbox`'s
-    own per-file try/except, not silently swallowed here)."""
-    from adoc.ingest.pipeline import _commit_with_retry
-
-    class _AlwaysLockedRepo:
-        def commit(self, message: str, paths: list[str] | None = None) -> str:
-            raise OSError("Lock at '.git/index.lock' could not be obtained")
-
-    with pytest.raises(OSError, match="Lock at"):
-        _commit_with_retry(
-            _AlwaysLockedRepo(),  # type: ignore[arg-type]
-            "test commit",
-            paths=["x"],
-            sleep=lambda _seconds: None,
-        )
+# Commit lock-contention retry moved from this module's `_commit_with_retry`
+# into `casefile.repo.DataRepo.commit()` itself (ledger-durability task) so
+# every caller benefits, not just this pipeline's commit call sites — see
+# `test_casefile_repo.py`'s `test_commit_retries_on_lock_contention_then_
+# succeeds`/`test_commit_raises_after_exhausting_retry_attempts` for the
+# retry behavior tests, now exercised directly against `DataRepo.commit`.

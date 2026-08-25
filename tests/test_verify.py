@@ -41,6 +41,8 @@ from adoc.reason.verify import (
     Claim,
     ClaimVerification,
     DefaultSourceTextResolver,
+    DeferredClaim,
+    EntailmentCache,
     VerificationReport,
     build_composer_number_retry_feedback,
     build_entailment_retry_feedback,
@@ -48,6 +50,8 @@ from adoc.reason.verify import (
     claims_from_ops,
     log_stripped_claims,
     log_verification_report,
+    pop_deferred_claims,
+    queue_deferred_claims,
     strip_not_entailed_ops,
     verify_claims,
 )
@@ -404,6 +408,192 @@ def test_verify_claims_propagates_hypothesis_id_for_insufficient_source(
     assert report.checks[0].hypothesis_id == "h-02"
 
 
+# --- EntailmentCache (latency: "diagnostic-turn-latency") ------------------------------------
+
+
+def test_entailment_cache_key_depends_on_both_claim_and_source_text() -> None:
+    key_a = EntailmentCache.key("claim text", "source text")
+    key_b = EntailmentCache.key("claim text", "DIFFERENT source text")
+    key_c = EntailmentCache.key("DIFFERENT claim text", "source text")
+    assert len({key_a, key_b, key_c}) == 3
+
+
+def test_entailment_cache_round_trips_through_disk(tmp_path: Path) -> None:
+    cache = EntailmentCache(tmp_path / "entailment-cache.json")
+    assert cache.load() == {}
+
+    key = EntailmentCache.key("claim", "source")
+    cache.save({key: {"judgment": "entailed", "rationale": "matches"}})
+
+    reloaded = EntailmentCache(tmp_path / "entailment-cache.json")
+    assert reloaded.load() == {key: {"judgment": "entailed", "rationale": "matches"}}
+
+
+def test_verify_claims_cache_hit_skips_the_model_call(db: LabsDb, repo: DataRepo) -> None:
+    """The genuine latency win: a claim whose `(claim, resolved source
+    text)` pair is already in the cache is scored WITHOUT ever calling the
+    model - a second `verify_claims` call over the exact same claim (e.g.
+    the DAG contract's independent re-check, moments after the stage
+    function's own call) is a cache hit, not a second completion."""
+    _seed_lab_row(db, name="CRP", value=8.5)
+    cache = EntailmentCache(repo.root / "work" / "entailment-cache.json")
+    claim = Claim(
+        hypothesis_id="h-01",
+        for_or_against="for",
+        claim="CRP elevated",
+        source="labs:crp:2026-05-02",
+    )
+
+    first_client = _build_verifier_client({})  # 0 -> defaults to "entailed"
+    first_report = verify_claims(first_client, [claim], db=db, repo=repo, cache=cache)
+    assert first_report.checks[0].judgment == "entailed"
+
+    def exploding(_request: TransportRequest) -> TransportResponse:
+        raise AssertionError("must not be called: this exact (claim, source_text) is cached")
+
+    bindings: dict[str, list[ModelBinding]] = {
+        "entailment_verifier": [ModelBinding(provider="featherless", model="fake-verifier")]
+    }
+    second_client = LlmClient(
+        bindings, {"featherless": OpenAIProvider(api_key=None, transport=exploding)}
+    )
+
+    second_report = verify_claims(second_client, [claim], db=db, repo=repo, cache=cache)
+
+    assert second_report.checks[0].judgment == "entailed"
+    assert second_report.checks[0].rationale == first_report.checks[0].rationale
+
+
+def test_verify_claims_cache_miss_on_changed_source_text(db: LabsDb, repo: DataRepo) -> None:
+    """A changed source text (e.g. a corrected lab value) hashes to a
+    DIFFERENT key and misses the cache naturally - no explicit
+    invalidation needed. Uses a fake resolver whose text changes between
+    calls (rather than mutating a stored row, which goes through
+    `LabsDb.insert_results`'s re-extraction-conflict handling - a
+    different concern from what this test is pinning: the CACHE's own
+    key-by-resolved-text behavior)."""
+    cache = EntailmentCache(repo.root / "work" / "entailment-cache.json")
+    claim = Claim(
+        hypothesis_id="h-01",
+        for_or_against="for",
+        claim="CRP elevated",
+        source="labs:crp:2026-05-02",
+    )
+
+    class _MutableResolver:
+        def __init__(self, text: str) -> None:
+            self.text = text
+
+        def resolve(self, _source: str) -> str | None:
+            return self.text
+
+    resolver = _MutableResolver("CRP on 2026-05-02: 8.5")
+    first_client = _build_verifier_client({})
+    verify_claims(first_client, [claim], db=db, repo=repo, resolver=resolver, cache=cache)
+
+    # The resolved source text changes (e.g. a corrected value) - the old
+    # cache entry, keyed on the OLD text, must not be reused.
+    resolver.text = "CRP on 2026-05-02: 99.0"
+    second_client = _build_verifier_client({0: "not_entailed"})
+    second_report = verify_claims(
+        second_client, [claim], db=db, repo=repo, resolver=resolver, cache=cache
+    )
+
+    assert second_report.checks[0].judgment == "not_entailed"
+
+
+def test_verify_claims_does_not_cache_a_missing_judgment(db: LabsDb, repo: DataRepo) -> None:
+    """A claim scored `not_entailed` only because the model omitted a
+    judgment for it (fail-closed, not a real verdict) must NOT be cached -
+    caching it could wrongly pin a transient response glitch forever."""
+    _seed_lab_row(db, name="CRP", value=8.5)
+    cache = EntailmentCache(repo.root / "work" / "entailment-cache.json")
+    claim = Claim(
+        hypothesis_id="h-01",
+        for_or_against="for",
+        claim="CRP elevated",
+        source="labs:crp:2026-05-02",
+    )
+
+    def missing_judgment_transport(_request: TransportRequest) -> TransportResponse:
+        return TransportResponse(
+            text="", tool_input={"judgments": []}, input_tokens=5, output_tokens=5
+        )
+
+    bindings: dict[str, list[ModelBinding]] = {
+        "entailment_verifier": [ModelBinding(provider="featherless", model="fake-verifier")]
+    }
+    first_client = LlmClient(
+        bindings,
+        {"featherless": OpenAIProvider(api_key=None, transport=missing_judgment_transport)},
+    )
+    first_report = verify_claims(first_client, [claim], db=db, repo=repo, cache=cache)
+    assert first_report.checks[0].judgment == "not_entailed"
+    assert cache.load() == {}  # nothing cached - not a real verdict
+
+    second_client = _build_verifier_client({})  # would default to entailed if actually called
+    second_report = verify_claims(second_client, [claim], db=db, repo=repo, cache=cache)
+    assert second_report.checks[0].judgment == "entailed"
+
+
+# --- Deferred verification queue (latency: "diagnostic-turn-latency") -------------------------
+
+
+def test_queue_deferred_claims_empty_list_is_a_no_op(repo: DataRepo) -> None:
+    queue_deferred_claims(repo, [], dag_node="ledger_maintainer")
+    assert pop_deferred_claims(repo) == []
+
+
+def test_queue_and_pop_deferred_claims_round_trips(repo: DataRepo) -> None:
+    claim = Claim(
+        hypothesis_id="pe-01",
+        for_or_against="for",
+        claim="D-dimer elevated",
+        source="labs:d-dimer:2026-05-02",
+    )
+    queue_deferred_claims(repo, [claim], dag_node="challenger")
+
+    popped = pop_deferred_claims(repo)
+
+    assert len(popped) == 1
+    assert isinstance(popped[0], DeferredClaim)
+    assert popped[0].hypothesis_id == "pe-01"
+    assert popped[0].claim == "D-dimer elevated"
+    assert popped[0].source == "labs:d-dimer:2026-05-02"
+    assert popped[0].dag_node == "challenger"
+
+
+def test_pop_deferred_claims_clears_the_queue(repo: DataRepo) -> None:
+    claim = Claim(
+        hypothesis_id="pe-01",
+        for_or_against="for",
+        claim="D-dimer elevated",
+        source="labs:d-dimer:2026-05-02",
+    )
+    queue_deferred_claims(repo, [claim], dag_node="challenger")
+
+    first_pop = pop_deferred_claims(repo)
+    second_pop = pop_deferred_claims(repo)
+
+    assert len(first_pop) == 1
+    assert second_pop == []
+
+
+def test_queue_deferred_claims_accumulates_across_calls(repo: DataRepo) -> None:
+    claim_a = Claim(
+        hypothesis_id="a", for_or_against="for", claim="claim a", source="labs:a:2026-05-02"
+    )
+    claim_b = Claim(
+        hypothesis_id="b", for_or_against="for", claim="claim b", source="labs:b:2026-05-02"
+    )
+
+    queue_deferred_claims(repo, [claim_a], dag_node="ledger_maintainer")
+    queue_deferred_claims(repo, [claim_b], dag_node="challenger")
+
+    popped = pop_deferred_claims(repo)
+    assert {c.claim for c in popped} == {"claim a", "claim b"}
+
+
 # --- VerificationReport.all_not_entailed (ADR 0016 revised) -------------------------------------
 
 
@@ -713,3 +903,72 @@ def test_composer_numbers_a_real_value_and_a_count_in_the_same_reply(db: LabsDb)
         "Your CRP was 8.5 mg/L, checked on 3 separate occasions this year.", db
     )
     assert check.passed
+
+
+# --- check_composer_numbers: positive-evidence design (ADR 0016 revised, second pass) ---------
+#
+# A live diagnostic run was lost when the first-pass exclusion-list design
+# flagged BOTH "40" (a percent CHANGE) and "2024" (a YEAR) in "Ferritin
+# dropped by 40% since 2024" as claimed Ferritin values. These cases pin
+# the inverted, positive-evidence design that fixes it.
+
+
+def test_composer_numbers_ignores_a_percent_change_and_a_bare_year(db: LabsDb) -> None:
+    """The exact production regression: neither the percent CHANGE nor the
+    YEAR is the analyte's value, and neither carries positive evidence
+    (no unit, no copula tying it to Ferritin)."""
+    _seed_lab_row(db, name="Ferritin", value=150.0, ucum_unit="ng/mL")
+    check = check_composer_numbers("Ferritin dropped by 40% since 2024.", db)
+    assert check.passed
+
+
+def test_composer_numbers_checks_a_percent_unit_analyte_and_catches_fabrication(
+    db: LabsDb,
+) -> None:
+    """A `%`-suffixed number is NOT unconditionally excluded — when the
+    analyte's own recorded unit genuinely is '%' (e.g. an iron saturation
+    or a differential count), a %-suffixed number is still checked, and a
+    fabricated one is still caught, decided from stored data rather than a
+    hardcoded analyte name."""
+    _seed_lab_row(db, name="Iron Saturation", value=25.0, ucum_unit="%")
+    check = check_composer_numbers("Your Iron Saturation was 40%, notably elevated.", db)
+    assert not check.passed
+    assert check.mismatches[0].quoted_number == 40.0
+    assert check.mismatches[0].stored_values == [25.0]
+
+
+def test_composer_numbers_percent_unit_analyte_correct_value_passes(db: LabsDb) -> None:
+    _seed_lab_row(db, name="Iron Saturation", value=25.0, ucum_unit="%")
+    check = check_composer_numbers("Your Iron Saturation was 25%, within range.", db)
+    assert check.passed
+
+
+def test_composer_numbers_ignores_a_duration_even_after_the_copula_at(db: LabsDb) -> None:
+    """ "at" is a copula word ("at 22" is the canonical positive-evidence
+    example), but "at 6 weeks" must still be excluded by the trailing
+    duration-word veto — a copula alone does not override it."""
+    _seed_lab_row(db, name="Ferritin", value=150.0, ucum_unit="ng/mL")
+    check = check_composer_numbers("Your Ferritin was drawn at 6 weeks.", db)
+    assert check.passed
+
+
+def test_composer_numbers_ignores_a_year_after_a_copula_with_no_unit(db: LabsDb) -> None:
+    """Common English date phrasing can borrow a copula word ("...reading
+    was 2024") with no unit attached — the year veto guards exactly this
+    copula-only case."""
+    _seed_lab_row(db, name="Ferritin", value=150.0, ucum_unit="ng/mL")
+    check = check_composer_numbers("Your Ferritin reading was 2024 this visit.", db)
+    assert check.passed
+
+
+def test_composer_numbers_still_catches_a_year_range_value_when_a_unit_is_attached(
+    db: LabsDb,
+) -> None:
+    """The year veto only guards copula-only evidence: a number directly
+    followed by this analyte's own unit is unambiguous regardless of
+    magnitude, so a fabricated 4-digit-looking value with a real unit is
+    still caught."""
+    _seed_lab_row(db, name="B12", value=500.0, ucum_unit="pg/mL")
+    check = check_composer_numbers("Your B12 was 2024 pg/mL, dramatically high.", db)
+    assert not check.passed
+    assert check.mismatches[0].quoted_number == 2024.0

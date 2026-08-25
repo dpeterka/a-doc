@@ -41,15 +41,44 @@ itself produced garbage, not merely an imprecise claim, so
 `reason.stages.entailment_check_contract` still raises a
 `ContractViolation` in that one case. See the ADR for the measured
 over-block rate this fixes and why the threshold is "all", not "any".
+
+Latency (2026-08-25, "diagnostic-turn-latency"): a real, full-case-file
+diagnostic turn measured 930s (66% of total model time) in the
+`entailment_verifier` role alone, from a reasoning model (DeepSeek R1)
+burning ~13k output tokens per call on a comparatively easy judgment, times
+up to 4 calls/turn (a same-generation retry that is now redundant under
+"strip, don't reject" — a `not_entailed` claim is stripped either way, so
+paying for a second completion to maybe rescue one evidence item is not
+worth ~300s). Two changes address this without weakening what
+`not_entailed` catches:
+- `reason.stages` no longer retries the model on an entailment failure —
+  `verify_claims` is called exactly once per stage call ("verify once;
+  strip what fails").
+- `EntailmentCache` (below) caches a verdict by a hash of `(claim,
+  resolved source text)`, mirroring `reason.citations.EutilsPmidVerifier`'s
+  on-disk cache pattern (`work/`-scoped, gitignored, rebuildable). Unlike
+  the PMID cache's TTL for `not_found`, a judgment for an EXACT (claim,
+  source text) pair is cached forever once made — the pair is bytewise
+  identical, so the judgment can never go stale for THAT pair; a changed
+  claim or a changed source text (e.g. a corrected lab value) simply
+  hashes to a different key and misses, invalidating naturally. This also
+  means the DAG's independent postcondition/precondition re-checks
+  (`reason.stages.entailment_check_contract`, run moments after the stage
+  call on the same or a merged claim set) are cache hits, not a second
+  round of model calls — they remain genuine independent re-checks (same
+  code path, same judging logic), they are just free when the exact pair
+  was already judged this run.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from collections.abc import Sequence
 from datetime import UTC, date, datetime
-from typing import Literal, Protocol
+from pathlib import Path
+from typing import Any, Literal, Protocol
 
 from pydantic import BaseModel, Field
 
@@ -71,6 +100,60 @@ VERIFICATION_LOG_RELPATH = "logs/entailment-checks.jsonl"
 # decided by source-text resolution, before the model is ever called, never
 # by the model's own judgment (it never sees a pair it has no text for).
 _ModelEntailmentJudgment = Literal["entailed", "not_entailed"]
+
+
+# --------------------------------------------------------------------------
+# Entailment verdict cache (latency: "diagnostic-turn-latency" — see module
+# docstring for the measured problem this addresses)
+# --------------------------------------------------------------------------
+
+ENTAILMENT_CACHE_RELPATH = "work/entailment-cache.json"
+
+
+class EntailmentCache:
+    """On-disk cache of `(claim, source_text) -> judgment`, mirroring
+    `reason.citations.EutilsPmidVerifier`'s on-disk cache pattern
+    (`work/`-scoped, so it is gitignored and rebuildable — losing this file
+    only means re-paying for calls that were previously free, never a
+    correctness change).
+
+    Keyed on a hash of the claim text plus the RESOLVED source text (not
+    just the source ref), so a changed source — a corrected lab value, an
+    edited encounter file — invalidates naturally: same ref, different
+    resolved text, different key, a clean miss. No TTL: unlike the PMID
+    cache's `not_found` (which can flip true if NCBI indexes a PMID later),
+    an entailment judgment for a byte-identical `(claim, source_text)` pair
+    cannot become stale — the pair itself never changes underneath it.
+
+    Loads/saves the whole file per call, matching `EutilsPmidVerifier`'s
+    own simplicity; callers that need to check many claims in one pass
+    (`verify_claims`) load once and save once, not once per claim, to avoid
+    N redundant JSON round-trips.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+
+    @staticmethod
+    def key(claim: str, source_text: str) -> str:
+        digest = hashlib.sha256()
+        digest.update(claim.encode("utf-8"))
+        digest.update(b"\x1f")
+        digest.update(source_text.encode("utf-8"))
+        return digest.hexdigest()
+
+    def load(self) -> dict[str, dict[str, str]]:
+        if not self.path.exists():
+            return {}
+        try:
+            data: Any = json.loads(self.path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def save(self, entries: dict[str, dict[str, str]]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(json.dumps(entries, sort_keys=True), encoding="utf-8")
 
 
 # --------------------------------------------------------------------------
@@ -351,24 +434,38 @@ def verify_claims(
     db: LabsDb,
     repo: DataRepo,
     resolver: SourceTextResolver | None = None,
+    cache: EntailmentCache | None = None,
 ) -> VerificationReport:
     """Judge every claim in `claims`, role `entailment_verifier`.
 
     Source text is resolved first, per claim, via `resolver` (default
     `DefaultSourceTextResolver(db, repo)`). A claim whose source text cannot
     be resolved is `insufficient_source` and is never sent to the model at
-    all. Claims WITH resolved text are sent to the model in a single call
-    (one completion per `verify_claims` invocation, not one per claim) so a
-    turn carrying several evidence claims costs one verifier call, not N.
+    all.
+
+    When `cache` is given, a claim whose `(claim, resolved source text)`
+    pair was already judged (by ANY prior call sharing this cache, this run
+    or a previous one) is scored from the cache and never sent to the model
+    either — see `EntailmentCache`. Only claims that are neither
+    `insufficient_source` NOR a cache hit are sent to the model, in a
+    single call (one completion per `verify_claims` invocation, not one per
+    claim) so a turn carrying several evidence claims costs at most one
+    verifier call, not N.
 
     If the model's response omits a judgment for a claim it was sent (a
     schema-valid but incomplete response), that claim is scored
     `not_entailed` — fail closed: a claim the verifier did not actually
-    judge can never be assumed to have passed."""
+    judge can never be assumed to have passed. A judgment scored this way
+    (no real verdict from the model) is deliberately NOT written to the
+    cache — it is a response-shape artifact, not a genuine judgment about
+    the pair, and caching it could wrongly pin a transient glitch forever.
+    """
     checks: list[ClaimVerification] = []
     resolved_resolver = resolver or DefaultSourceTextResolver(db, repo)
+    cache_entries = cache.load() if cache is not None else {}
+    cache_dirty = False
 
-    pairs: list[tuple[int, Claim, str]] = []
+    pairs: list[tuple[int, Claim, str, str | None]] = []
     for claim in claims:
         source_text = resolved_resolver.resolve(claim.source)
         if source_text is None:
@@ -382,7 +479,25 @@ def verify_claims(
                 )
             )
             continue
-        pairs.append((len(pairs), claim, source_text))
+
+        cache_key = EntailmentCache.key(claim.claim, source_text) if cache is not None else None
+        cached_entry = cache_entries.get(cache_key) if cache_key is not None else None
+        if cached_entry is not None and cached_entry.get("judgment") in (
+            "entailed",
+            "not_entailed",
+        ):
+            checks.append(
+                ClaimVerification(
+                    source=claim.source,
+                    claim=claim.claim,
+                    judgment=cached_entry["judgment"],
+                    rationale=cached_entry.get("rationale", ""),
+                    hypothesis_id=claim.hypothesis_id,
+                )
+            )
+            continue
+
+        pairs.append((len(pairs), claim, source_text, cache_key))
 
     if not pairs:
         return VerificationReport(checks=checks)
@@ -395,7 +510,7 @@ def verify_claims(
             "source_ref": claim.source,
             "source_text": source_text,
         }
-        for idx, claim, source_text in pairs
+        for idx, claim, source_text, _cache_key in pairs
     ]
     user_content = (
         "Judge entailment for each claim/source pair below. Return one judgment per "
@@ -411,7 +526,7 @@ def verify_claims(
     assert isinstance(parsed, _EntailmentPayload)
     judgment_by_index = {j.claim_index: j for j in parsed.judgments}
 
-    for idx, claim, _source_text in pairs:
+    for idx, claim, _source_text, cache_key in pairs:
         judged = judgment_by_index.get(idx)
         if judged is None:
             checks.append(
@@ -424,6 +539,12 @@ def verify_claims(
                 )
             )
         else:
+            if cache_key is not None:
+                cache_entries[cache_key] = {
+                    "judgment": judged.judgment,
+                    "rationale": judged.rationale,
+                }
+                cache_dirty = True
             checks.append(
                 ClaimVerification(
                     source=claim.source,
@@ -433,6 +554,8 @@ def verify_claims(
                     hypothesis_id=claim.hypothesis_id,
                 )
             )
+    if cache is not None and cache_dirty:
+        cache.save(cache_entries)
     return VerificationReport(checks=checks)
 
 
@@ -467,6 +590,99 @@ def log_verification_report(repo: DataRepo, report: VerificationReport, *, dag_n
     }
     with path.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(record) + "\n")
+
+
+# --------------------------------------------------------------------------
+# Deferred verification queue (latency: "diagnostic-turn-latency",
+# 2026-08-25) — claims on `expanded`/`cant-miss` hypotheses are not
+# verified synchronously in a diagnostic turn (only `most-likely` evidence
+# drives this turn's patient-facing reply within the latency budget); this
+# is where they wait until the weekly review sweeps them
+# (`reason.review.sweep_deferred_entailment_claims`), so nothing is
+# silently skipped forever.
+# --------------------------------------------------------------------------
+
+DEFERRED_CLAIMS_RELPATH = "work/entailment-deferred.json"
+
+
+class DeferredClaim(BaseModel):
+    """One evidence claim whose entailment check was deferred out of a
+    diagnostic turn's synchronous path — enough identity to rebuild a
+    `Claim` and re-resolve its source text later."""
+
+    hypothesis_id: str
+    for_or_against: Literal["for", "against"]
+    claim: str
+    source: str
+    dag_node: str
+    deferred_at: datetime
+
+
+def _load_deferred_claims(path: Path) -> list[DeferredClaim]:
+    if not path.exists():
+        return []
+    try:
+        raw: Any = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return []
+    if not isinstance(raw, list):
+        return []
+    items: list[DeferredClaim] = []
+    for entry in raw:
+        try:
+            items.append(DeferredClaim.model_validate(entry))
+        except Exception:  # noqa: BLE001 - a malformed entry is dropped, never crashes the sweep
+            continue
+    return items
+
+
+def _save_deferred_claims(path: Path, items: Sequence[DeferredClaim]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps([item.model_dump(mode="json") for item in items], sort_keys=True),
+        encoding="utf-8",
+    )
+
+
+def queue_deferred_claims(
+    repo: DataRepo, claims: Sequence[Claim], *, dag_node: str, at: datetime | None = None
+) -> None:
+    """Append `claims` to the deferred-verification queue
+    (`work/entailment-deferred.json`, gitignored — losing this file loses
+    the deferral, not the underlying evidence, which stays exactly as
+    entailed/unverified as it always was; the weekly review simply has
+    nothing to sweep that run). A no-op when `claims` is empty."""
+    if not claims:
+        return
+    path = repo.root / DEFERRED_CLAIMS_RELPATH
+    existing = _load_deferred_claims(path)
+    deferred_at = at or datetime.now(UTC)
+    existing.extend(
+        DeferredClaim(
+            hypothesis_id=c.hypothesis_id,
+            for_or_against=c.for_or_against,
+            claim=c.claim,
+            source=c.source,
+            dag_node=dag_node,
+            deferred_at=deferred_at,
+        )
+        for c in claims
+    )
+    _save_deferred_claims(path, existing)
+
+
+def pop_deferred_claims(repo: DataRepo) -> list[DeferredClaim]:
+    """Read and CLEAR the deferred-verification queue in one step — the
+    weekly review sweep calls this exactly once per run so each deferred
+    claim is picked up exactly once (barring a review that fails before
+    committing, which is no worse than a diagnostic turn's own claims: the
+    underlying evidence is unchanged either way, only WHEN it gets
+    verified is affected)."""
+    path = repo.root / DEFERRED_CLAIMS_RELPATH
+    items = _load_deferred_claims(path)
+    if items:
+        _save_deferred_claims(path, [])
+    return items
 
 
 # --------------------------------------------------------------------------
@@ -673,44 +889,147 @@ def _analyte_value_index(db: LabsDb) -> dict[str, set[float]]:
     return index
 
 
-def _known_unit_tokens(db: LabsDb) -> set[str]:
-    """Every distinct `ucum_unit` actually recorded in `labs.sqlite`,
-    lowercased — the unit vocabulary `_quoted_number_looks_like_a_value`
-    treats as direct positive evidence a quoted number is a lab value
-    ("8.5 mg/L" is a value because "mg/L" is a unit this patient's own data
-    actually uses)."""
-    units: set[str] = set()
+def _analyte_unit_index(db: LabsDb) -> dict[str, set[str]]:
+    """Every distinct `ucum_unit` recorded for each analyte label (both
+    `name` and `name_raw`, lowercased) — PER-ANALYTE, unlike a single global
+    unit vocabulary. This is what lets `_quoted_number_is_value_evidence`
+    decide the "is this analyte itself a percent-unit analyte?" question
+    (`% SATURATION`, a differential count, ...) from this patient's own
+    stored data rather than a hardcoded analyte-name list."""
+    index: dict[str, set[str]] = {}
     for row in db.all_non_rejected_rows():
-        if row.ucum_unit:
-            units.add(row.ucum_unit.strip().lower())
-    return units
+        if not row.ucum_unit:
+            continue
+        for label in {row.name, row.name_raw}:
+            key = label.strip().lower()
+            if not key:
+                continue
+            index.setdefault(key, set()).add(row.ucum_unit.strip().lower())
+    return index
 
 
-def _quoted_number_looks_like_a_value(tail: str, unit_tokens: set[str]) -> bool:
+# Positive-evidence design (2026-08-25, second pass). The first pass
+# (above: `_COUNT_CONTEXT_WORDS`/`_COUNT_CONTEXT_FILLER_WORDS`) defaulted
+# every number sitting near a known analyte name to "is a value" and tried
+# to enumerate what to exclude (a count, a frequency, a duration). That
+# design kept losing: a live diagnostic run was lost when "Ferritin dropped
+# by 40% since 2024" flagged BOTH "40" (a percent CHANGE, not a value) and
+# "2024" (a YEAR, not a value) as claimed Ferritin readings — ordinary
+# clinical prose is full of numbers near an analyte name that are not its
+# value (percentages, years, dates, durations, counts, ratios), and
+# enumerating every such shape is an unbounded, always-losing game.
+#
+# Inverted here: a number counts as a candidate VALUE only when something
+# in the text actually TIES it to the analyte —
+#   - it is immediately followed by a unit THIS analyte is actually
+#     recorded under (per-analyte, via `_analyte_unit_index` — never a
+#     unit that merely exists somewhere else in the patient's data), or
+#   - it is immediately preceded (skipping a short filler word such as
+#     "back"/"in"/"up"/"down"/"out") by a copula/preposition that ties a
+#     number to a measurement ("was 15 ng/mL", "at 22", "reading of 8.5").
+# A number with neither kind of positive evidence is left unflagged by
+# construction — no exclusion list required.
+#
+# Even a number WITH positive evidence is still vetoed when:
+#   - it is immediately followed by "%" and this analyte's own recorded
+#     unit is not itself "%" — a percentage attached to an analyte whose
+#     real unit is something else (ng/mL, mg/dL, ...) is a percent CHANGE
+#     or a percentage OF something, not the analyte's value. When the
+#     analyte genuinely IS a percent-unit analyte ("% SATURATION", a
+#     differential count), a %-suffixed number is checked exactly like any
+#     other value — decided from `_analyte_unit_index`, never a hardcoded
+#     analyte name;
+#   - it is a bare 4-digit integer in a plausible calendar-year range
+#     ("since 2024" is a date, not a measurement) AND its only positive
+#     evidence was a copula, not a unit — a unit directly attached (e.g.
+#     "B12 was 2024 pg/mL") is unambiguous regardless of magnitude, so the
+#     year veto only guards the copula-only case, where common English date
+#     phrasing ("...was 2024") can otherwise borrow a copula word. Accepted,
+#     documented tradeoff: a genuine unit-less 4-digit reading that happens
+#     to fall in this numeric range is a rare false negative traded off
+#     against the much more common false positive this fixes;
+#   - it is immediately followed (skipping a short qualifier) by an
+#     explicit count/frequency/duration word from `_COUNT_CONTEXT_WORDS`
+#     ("at 6 weeks" is a duration, not a value, even though "at" is a
+#     copula) — kept from the first pass.
+_VALUE_COPULA_WORDS = {
+    "was",
+    "is",
+    "were",
+    "are",
+    "at",
+    "of",
+    "reading",
+    "read",
+    "measured",
+    "resulted",
+    "reached",
+    "recorded",
+    "value",
+    "came",
+}
+_COPULA_SKIPPABLE_FILLERS = {"back", "in", "up", "down", "out"}
+_HEAD_WORD_RE = re.compile(r"[A-Za-z]+")
+
+_YEAR_MIN = 1900
+_YEAR_MAX = 2099
+
+
+def _has_preceding_copula(head: str) -> bool:
+    """True iff the closest real word before the number (skipping a short
+    filler word like "back"/"in"/"up"/"down"/"out") is a copula/preposition
+    from `_VALUE_COPULA_WORDS`. Only the CLOSEST non-filler word counts —
+    "CRP was elevated on 2 occasions" must not fire just because "was"
+    appears earlier in the clause; the word immediately governing "2" is
+    "on", which is neither a filler nor a copula, so this returns `False`
+    there (the count-word veto is a second, independent guard for exactly
+    that shape, not the only one)."""
+    words = [w.lower() for w in _HEAD_WORD_RE.findall(head)]
+    for word in reversed(words[-4:]):
+        if word in _COPULA_SKIPPABLE_FILLERS:
+            continue
+        return word in _VALUE_COPULA_WORDS
+    return False
+
+
+def _looks_like_bare_year(number_text: str) -> bool:
+    """True iff `number_text` is a plain integer (no decimal point) whose
+    value falls in a plausible calendar-year range — "since 2024" is a
+    date, not a measurement. Only consulted for copula-only evidence (see
+    the module-level design comment above)."""
+    if "." in number_text:
+        return False
+    try:
+        value = int(number_text)
+    except ValueError:
+        return False
+    return _YEAR_MIN <= value <= _YEAR_MAX
+
+
+def _quoted_number_is_value_evidence(
+    number_text: str, head: str, tail: str, analyte_units: set[str]
+) -> bool:
     """Positive-evidence check for whether a quoted number sitting near a
-    known analyte name is plausibly THAT analyte's value, rather than an
-    unrelated count/frequency/duration — the false-positive over-block a
-    code review caught alongside the entailment-verifier one (ADR 0016
-    revised, 2026-08-25): "Your CRP has been elevated across 3 separate
-    panels" quotes "3", which sits in the same clause as "CRP", but "3" is
-    a COUNT OF PANELS, not a CRP value.
+    known analyte name is plausibly THAT analyte's value (see the
+    module-level design comment above for the full rationale). `head`/
+    `tail` are the (date/titer/range-stripped) clause text immediately
+    before/after the quoted number; `analyte_units` are the units THIS
+    analyte is actually recorded under."""
+    stripped_tail = tail.lstrip()
+    lowered_tail = stripped_tail.lower()
+    lowered_units = {u.lower() for u in analyte_units if u}
 
-    `tail` is the text immediately following the quoted number in its
-    (date/titer/range-stripped) clause. Deliberately NOT an exhaustive
-    non-value blacklist: a number immediately followed by one of this
-    patient's own recorded units ("8.5 mg/L") is a value by direct positive
-    evidence, and — because the genuine catch this check exists for (a
-    fabricated value with no unit at all, e.g. "12.0, notably elevated")
-    must never regress — a number with no recognizable count/frequency/
-    duration word immediately after it is ALSO still treated as a value
-    candidate by default. Only a number directly followed (skipping a
-    short qualifier like "separate" or "additional") by an explicit count/
-    frequency/duration word from `_COUNT_CONTEXT_WORDS` is excluded."""
-    stripped = tail.lstrip()
-    lowered = stripped.lower()
-    if any(unit and lowered.startswith(unit) for unit in unit_tokens):
-        return True
-    for word in _VALUE_TOKEN_RE.findall(stripped)[:2]:
+    has_unit_evidence = any(lowered_tail.startswith(unit) for unit in lowered_units)
+    has_copula_evidence = _has_preceding_copula(head)
+    if not (has_unit_evidence or has_copula_evidence):
+        return False
+
+    if lowered_tail.startswith("%") and "%" not in lowered_units:
+        return False
+    if not has_unit_evidence and _looks_like_bare_year(number_text):
+        return False
+
+    for word in _VALUE_TOKEN_RE.findall(stripped_tail)[:2]:
         word_l = word.lower()
         if word_l in _COUNT_CONTEXT_FILLER_WORDS:
             continue
@@ -755,17 +1074,21 @@ def check_composer_numbers(text: str, db: LabsDb) -> ComposerNumberCheck:
     quoted result value (mirrors `reason.citations._extract_quoted_numbers`
     exactly, including reusing its `_RANGE_RE`).
 
-    ADR 0016 revised (2026-08-25): sharing a clause with an analyte name is
-    NOT enough on its own — a number is also checked against
-    `_quoted_number_looks_like_a_value` so a COUNT sitting in the same
-    clause ("elevated across 3 separate panels") is never mistaken for that
-    analyte's value. A number that clears both gates and still fails to
-    match any stored value for the analyte it sits next to is exactly the
-    fabrication this check exists to catch."""
+    ADR 0016 revised (2026-08-25, second pass): sharing a clause with an
+    analyte name is NOT enough on its own — a number is also required to
+    carry POSITIVE evidence it is that analyte's value (a directly-attached
+    unit, or a copula/preposition tying it to the analyte), via
+    `_quoted_number_is_value_evidence` (see that function's module-level
+    design comment for the full rationale and the false positives it
+    fixes: a percent CHANGE and a bare YEAR both wrongly flagged as a
+    claimed analyte value under the first-pass exclusion-list design). A
+    number that clears that gate and still fails to match any stored value
+    for the analyte it sits next to is exactly the fabrication this check
+    exists to catch."""
     index = _analyte_value_index(db)
     if not index:
         return ComposerNumberCheck()
-    unit_tokens = _known_unit_tokens(db)
+    unit_index = _analyte_unit_index(db)
 
     mismatches: list[ComposerNumberMismatch] = []
     for clause in _split_clauses(text):
@@ -785,9 +1108,13 @@ def check_composer_numbers(text: str, db: LabsDb) -> ComposerNumberCheck:
 
         for label in matched_labels:
             stored = index[label]
+            analyte_units = unit_index.get(label, set())
             for number_match in number_matches:
+                head = cleaned[: number_match.start()]
                 tail = cleaned[number_match.end() :]
-                if not _quoted_number_looks_like_a_value(tail, unit_tokens):
+                if not _quoted_number_is_value_evidence(
+                    number_match.group(), head, tail, analyte_units
+                ):
                     continue
                 number = float(number_match.group())
                 if not any(abs(number - v) <= 1e-9 for v in stored):
@@ -825,7 +1152,11 @@ __all__ = [
     "ClaimVerification",
     "ComposerNumberCheck",
     "ComposerNumberMismatch",
+    "DEFERRED_CLAIMS_RELPATH",
     "DefaultSourceTextResolver",
+    "DeferredClaim",
+    "ENTAILMENT_CACHE_RELPATH",
+    "EntailmentCache",
     "EntailmentJudgment",
     "SourceTextResolver",
     "VerificationReport",
@@ -835,6 +1166,8 @@ __all__ = [
     "claims_from_ops",
     "log_stripped_claims",
     "log_verification_report",
+    "pop_deferred_claims",
+    "queue_deferred_claims",
     "strip_not_entailed_ops",
     "verify_claims",
 ]

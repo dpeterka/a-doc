@@ -236,3 +236,134 @@ diff. Instead:
   "all `not_entailed` fails", or removing the strip step, is exactly the
   kind of change CLAUDE.md rule 2 forbids doing silently going forward —
   same bar this ADR already set for the cross-family binding.
+
+## Revised (2026-08-25, perf/diagnostic-turn-latency)
+
+### What happened
+
+A real diagnostic turn against a full case file (121 documents, ~2000 lab
+rows) measured **1410s (23.5 min)** of total model time, **$1.52**.
+`entailment_verifier` (DeepSeek R1-0528) alone accounted for **930s (66%)**
+across up to 4 calls/turn: a same-generation retry inside
+`ledger_maintainer_stage`/`challenger_stage` (redundant now — under
+"strip, don't reject" a still-`not_entailed` claim after a retry is
+stripped exactly the same as one caught on the first try, so the retry
+only ever spent a second ~minutes-long completion to maybe rescue one
+evidence item) plus two independent DAG-contract re-checks
+(`entailment_check_ledger_maintainer`, `entailment_check_apply`) that
+re-verified the SAME claims a moment later via a fresh model call. Net
+protective effect of the 930s on that run: one claim stripped.
+
+### Decision — three changes, latency only, no weakening of what `not_entailed` catches
+
+1. **Drop the entailment retry.** `verify_claims` is called exactly once
+   per `ledger_maintainer_stage`/`challenger_stage` invocation now — no
+   feedback-and-retry loop for an entailment failure (the citation-checker
+   retry is untouched: cheap, deterministic, and still worth a second
+   try).
+2. **Cache verdicts by `(claim, resolved source text)` hash**
+   (`reason.verify.EntailmentCache`, mirroring `reason.citations.
+   EutilsPmidVerifier`'s on-disk cache pattern, `work/`-scoped). Shared
+   across one `build_diagnostic_dag` call, so the two DAG-contract
+   re-checks above are cache hits, not a second model call, for every
+   claim the stage already judged this same turn — and across turns, since
+   an unchanged claim/source pair recurs. No TTL: a judgment for a
+   byte-identical pair cannot go stale; a changed source hashes to a
+   different key and misses naturally.
+3. **Verify only `most-likely`-tier evidence synchronously; defer the
+   rest.** `reason.stages._partition_claims_by_tier`/`_most_likely_ops`
+   split a diff's claims by the tier of the hypothesis each one supports
+   (after the diff is applied): `most-likely` evidence — the tier that
+   actually drives this turn's patient-facing reply — is verified now;
+   `expanded`/`cant-miss` evidence is queued
+   (`reason.verify.queue_deferred_claims`, `work/entailment-deferred.json`)
+   instead of checked in-turn. The weekly review's new
+   `deferred_entailment_sweep` DAG node
+   (`reason.review.sweep_deferred_entailment_claims`) pops the ENTIRE
+   queue every run and verifies every claim through the same
+   `verify_claims` a diagnostic turn uses — nothing deferred waits more
+   than one review cycle. A `not_entailed` finding on a deferred claim is
+   surfaced in the committed review report, never used to mutate the
+   ledger: this schema has no evidence-removal op by design (history is
+   never deleted), so a deferred `not_entailed` finding is a signal for a
+   human to act on (e.g. a follow-up `record_challenge`), the same shape
+   `scan_staleness` already uses to surface drift without rewriting
+   history.
+
+Combined, a clean diagnostic turn's `entailment_verifier` call count drops
+from up to 4 to 1 (`tests/test_stages.py::
+test_clean_diagnostic_turn_makes_the_expected_model_call_count` pins the
+full per-role call count as a latency regression guard); a claim's fate on
+`not_entailed`/`all_not_entailed`/`insufficient_source` is decided by the
+exact same logic as before this revision — only WHEN and HOW OFTEN a claim
+is checked changed, never the verdict logic itself.
+
+### Considered and NOT shipped: rebinding `entailment_verifier` off DeepSeek R1
+
+DeepSeek R1 is a reasoning model that spends the large majority of its
+~13k output tokens/call on hidden chain-of-thought for what is, for most
+claims, an easy factual-match judgment — the fast-model rebinding CLAUDE.md
+rule 4 anticipates for exactly this shape of role. A same-family (third
+family, Featherless-hosted, distinct from `primary_reasoner`/Anthropic and
+`challenger`/OpenAI — preserving this ADR's cross-family placement without
+reopening it) non-reasoning candidate such as `deepseek-ai/DeepSeek-V3` is
+the recommended follow-up, at zero incremental cost (Featherless's flat
+rate already covers the blind panel).
+
+This was NOT shipped in `perf/diagnostic-turn-latency`, per CLAUDE.md rule
+4's requirement for an `adoc eval` incumbent-vs-candidate comparison:
+running `adoc eval --suite hallucination --candidate
+featherless:deepseek-ai/DeepSeek-V3` produces a report, but
+`evals/runner.py`'s own module docstring is explicit that no suite
+(`extraction`/`redteam`/`hallucination`) makes a real model call today —
+`--candidate` only changes the label recorded on the `SuiteResult`, so
+incumbent and candidate score byte-identically (confirmed: every metric's
+delta was `+0`). Live incumbent-vs-candidate comparison is Phase 3 scope
+(PLAN.md: "`adoc eval --candidate` produces an incumbent-vs-candidate
+comparison report from a single command" is listed under Phase 3
+acceptance, not Phase 2), and this sandboxed development environment additionally
+had no provider credentials to make a real call even if the harness
+supported one. Shipping the rebinding without genuine evidence it clears
+`entailment_precision`/`entailment_recall`/
+`interpretation_claims_entailed_rate` is exactly the silent-model-change
+rule 4 forbids — the responsible call is to leave `models.yaml` unchanged
+and land the retry/cache/deferral optimizations (which need no model
+change) now, with the rebinding as a follow-up once a human can run a live
+comparison against real credentials.
+
+## Revised again (2026-08-25) — binding changed to DeepSeek V3, with live evidence
+
+The `perf/diagnostic-turn-latency` work correctly REFUSED to rebind this
+role, because the hallucination eval suite is fully offline and scripted:
+every candidate scored byte-identically, which is not evidence. CLAUDE.md
+rule 4 wants a real comparison, so one was run — the same 20 labelled
+pairs from `tests/fixtures/entailment/pairs.json`, sent to each candidate
+for real:
+
+| model | latency (20 pairs) | agreement with labels | judgment split |
+|---|---|---|---|
+| deepseek-ai/DeepSeek-R1-0528 (incumbent) | 78s | 17/20 (85%) | 10 entailed / 10 not_entailed |
+| deepseek-ai/DeepSeek-V3-0324 | 20s | 19/20 (95%) | 12 / 8 |
+| gpt-5.2 | 10s | 19/20 (95%) | 12 / 8 |
+
+Two conclusions, one of them uncomfortable:
+
+1. The reasoning model was **both slower and less accurate**. Choosing R1
+   assumed this was a hard judgment; it is a short factual comparison, and
+   the extra deliberation bought nothing.
+2. R1 skewed toward `not_entailed` (10 vs 8 for both candidates). The
+   over-blocking incident earlier this date was therefore not purely a
+   prompt problem, as the first revision assumed — the model contributed,
+   and the prompt fix alone would have left a bias in place.
+
+**V3 chosen over the marginally faster gpt-5.2** to preserve three
+distinct families: Anthropic proposes, OpenAI challenges, DeepSeek
+verifies. Putting the challenger and the verifier on one family would let
+a shared blind spot clear both gates, which is the exact property ADR 0005
+exists to protect. Ten seconds inside a multi-minute turn does not buy
+that back.
+
+**Follow-up:** the offline suite could not have caught this, and cannot
+catch the next one. A live-comparison mode for `adoc eval --candidate`
+(currently Phase 3 scope) is what makes rule 4 enforceable rather than
+aspirational.

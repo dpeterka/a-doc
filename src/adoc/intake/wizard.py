@@ -63,6 +63,7 @@ from adoc.intake.sections import (
     DocumentDropSection,
     EventsSection,
     FamilyHistorySection,
+    GeographySection,
     MedicationsSection,
     PriorDiagnosesSection,
     SectionSpec,
@@ -75,6 +76,7 @@ INTAKE_STATE_RELPATH = "case/intake-state.yaml"
 CASE_SUMMARY_RELPATH = "case/case-summary.md"
 MEDICATIONS_RELPATH = "case/medications.md"
 FAMILY_HISTORY_RELPATH = "case/family-history.md"
+GEOGRAPHY_RELPATH = "case/geography.md"
 CARE_TEAM_RELPATH = "case/care-team.md"
 PATIENT_THEORIES_RELPATH = "case/patient-theories.md"
 ENCOUNTERS_RELDIR = "case/encounters"
@@ -409,6 +411,35 @@ def _write_family_history(repo: DataRepo, data: FamilyHistorySection) -> list[st
     return [FAMILY_HISTORY_RELPATH]
 
 
+def _write_geography(repo: DataRepo, data: GeographySection) -> list[str]:
+    """Own whole-file writer (like `_write_family_history`/`_write_care_team`)
+    rather than a `case-summary.md` block — a residence history plus travel
+    plus exposures is the same kind of multi-list structured content those
+    sibling topics already get a dedicated file for, and it keeps
+    `case-summary.md` from growing an ever-longer list of prior addresses."""
+    lines = ["# Geography & Environmental Exposure", "", "## Residences", ""]
+    if not data.residences:
+        lines.append("_Not yet recorded._")
+    else:
+        for residence in data.residences:
+            when = f" ({residence.date_approx})" if residence.date_approx else ""
+            current = " — current" if residence.current else ""
+            lines.append(f"- {residence.place}{when}{current}")
+    lines += ["", "## Travel of note", ""]
+    if data.travel:
+        lines += [f"- {t}" for t in data.travel]
+    else:
+        lines.append("_None recorded._")
+    lines += ["", "## Environmental & occupational exposures", ""]
+    if data.exposures:
+        lines += [f"- {e}" for e in data.exposures]
+    else:
+        lines.append("_None recorded._")
+    content = "\n".join(lines) + "\n"
+    repo.write(GEOGRAPHY_RELPATH, content)
+    return [GEOGRAPHY_RELPATH]
+
+
 def _write_medications(repo: DataRepo, data: MedicationsSection) -> list[str]:
     if not data.medications:
         body = "_None recorded._"
@@ -495,6 +526,9 @@ def _write_section(repo: DataRepo, key: str, data: BaseModel) -> list[str]:
     if key == "family_history":
         assert isinstance(data, FamilyHistorySection)
         return _write_family_history(repo, data)
+    if key == "geography":
+        assert isinstance(data, GeographySection)
+        return _write_geography(repo, data)
     if key == "medications":
         assert isinstance(data, MedicationsSection)
         return _write_medications(repo, data)

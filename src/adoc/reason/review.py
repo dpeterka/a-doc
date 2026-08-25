@@ -36,10 +36,15 @@ Contracts:
 
 `apply_review_diff` merges the accepted-divergence ops and the full
 challenge-sweep's `RecordChallenge` ops into ONE `LedgerDiff`, applied in a
-single `apply_and_save` call — recording a challenge for every currently
-active hypothesis in the same diff is what keeps `ledger.apply_diff`'s
-staleness invariant (c) satisfied regardless of how stale any hypothesis
-was going into the review; that is the entire point of a weekly full sweep.
+single `DataRepo.apply_ledger_diff` call (not the lock-free `casefile.
+ledger.apply_and_save` primitive it wraps — this DAG runs from the weekly
+scheduled task, which shares the same EFS-mounted data repo with the web
+task's diagnostic turns, so it is exactly as exposed to the concurrent-
+write durability defect `apply_ledger_diff` fixes; see that method's
+docstring) — recording a challenge for every currently active hypothesis
+in the same diff is what keeps `ledger.apply_diff`'s staleness invariant
+(c) satisfied regardless of how stale any hypothesis was going into the
+review; that is the entire point of a weekly full sweep.
 """
 
 from __future__ import annotations
@@ -55,7 +60,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 from adoc import __version__
-from adoc.casefile.ledger import ACTIVE_STATUSES, apply_and_save, load_ledger
+from adoc.casefile.ledger import ACTIVE_STATUSES, load_ledger
 from adoc.casefile.repo import HISTORY_RELPATH, LEDGER_RELPATH, DataRepo
 from adoc.casefile.schema import (
     AddHypothesis,
@@ -85,6 +90,16 @@ from adoc.reason.dag import (
 )
 from adoc.reason.prompts import load_prompt
 from adoc.reason.tools import redact_gated_text
+from adoc.reason.verify import (
+    ENTAILMENT_CACHE_RELPATH,
+    Claim,
+    DefaultSourceTextResolver,
+    EntailmentCache,
+    SourceTextResolver,
+    log_verification_report,
+    pop_deferred_claims,
+    verify_claims,
+)
 
 # --------------------------------------------------------------------------
 # Stage-IO models
@@ -218,6 +233,30 @@ class StalenessReport(BaseModel):
     stale: list[StaleArtifact] = Field(default_factory=list)
 
 
+class DeferredVerificationFinding(BaseModel):
+    """One deferred claim the sweep judged `not_entailed` — surfaced in the
+    review report rather than silently dropped or (impossible, by schema
+    design — see `sweep_deferred_entailment_claims`'s docstring)
+    automatically stripped from an already-applied ledger."""
+
+    hypothesis_id: str
+    claim: str
+    source: str
+    rationale: str
+
+
+class DeferredVerificationSweepResult(BaseModel):
+    """Result of sweeping `reason.verify`'s deferred-entailment queue
+    (PLAN.md latency "diagnostic-turn-latency": claims on `expanded`/
+    `cant-miss` hypotheses are deferred out of a diagnostic turn's
+    synchronous path; this is the batch venue that picks them up)."""
+
+    checked: int = 0
+    entailed: int = 0
+    insufficient_source: int = 0
+    not_entailed: list[DeferredVerificationFinding] = Field(default_factory=list)
+
+
 class RoleCost(BaseModel):
     role: str
     calls: int
@@ -250,6 +289,9 @@ class ReviewReport(BaseModel):
     divergences: DivergenceSet
     adjudication: AdjudicationResult
     staleness: StalenessReport
+    deferred_verification: DeferredVerificationSweepResult = Field(
+        default_factory=DeferredVerificationSweepResult
+    )
     metrics: OpsMetrics
 
 
@@ -544,6 +586,70 @@ def scan_staleness(history_path: Path, ledger: Ledger, *, horizon: int = 2) -> S
     return StalenessReport(stale=stale)
 
 
+def sweep_deferred_entailment_claims(
+    client: LlmClient,
+    repo: DataRepo,
+    db: LabsDb,
+    *,
+    resolver: SourceTextResolver | None = None,
+    cache: EntailmentCache | None = None,
+) -> DeferredVerificationSweepResult:
+    """The weekly-review venue that picks up claims a diagnostic turn
+    DEFERRED (PLAN.md latency "diagnostic-turn-latency": only claims
+    supporting a `most-likely` hypothesis are verified synchronously in a
+    diagnostic turn; claims on `expanded`/`cant-miss` hypotheses are queued
+    via `reason.verify.queue_deferred_claims` instead). This is what makes
+    that deferral safe rather than a silent drop: every weekly review pops
+    the ENTIRE queue (`reason.verify.pop_deferred_claims` — empty again
+    once this returns) and judges every claim through the exact same
+    `verify_claims` a diagnostic turn uses, so nothing deferred waits more
+    than one review cycle to actually be checked.
+
+    Deliberately does NOT mutate the ledger: this codebase's schema has no
+    evidence-removal op by design (`casefile.schema`'s module docstring:
+    "history is never deleted, only status changes"), and by the time a
+    deferred claim is swept, its evidence may already be sitting in an
+    applied, committed ledger diff. A `not_entailed` finding is surfaced in
+    the review report instead (`render_review_markdown`'s "Deferred
+    evidence checks" section) — the same shape `scan_staleness` already
+    uses to make drift visible without silently rewriting history — so a
+    human sees it and can act (e.g. a follow-up `record_challenge`), rather
+    than it vanishing into a log file nobody reads.
+
+    Returns an empty `DeferredVerificationSweepResult` (no model call at
+    all) when the queue is empty, which is the common case."""
+    deferred = pop_deferred_claims(repo)
+    if not deferred:
+        return DeferredVerificationSweepResult()
+
+    claims = [
+        Claim(
+            hypothesis_id=d.hypothesis_id,
+            for_or_against=d.for_or_against,
+            claim=d.claim,
+            source=d.source,
+        )
+        for d in deferred
+    ]
+    report = verify_claims(client, claims, db=db, repo=repo, resolver=resolver, cache=cache)
+    log_verification_report(repo, report, dag_node="weekly_review_deferred_sweep")
+
+    return DeferredVerificationSweepResult(
+        checked=len(report.checks),
+        entailed=len([c for c in report.checks if c.judgment == "entailed"]),
+        insufficient_source=len(report.insufficient_source),
+        not_entailed=[
+            DeferredVerificationFinding(
+                hypothesis_id=c.hypothesis_id,
+                claim=c.claim,
+                source=c.source,
+                rationale=c.rationale,
+            )
+            for c in report.not_entailed
+        ],
+    )
+
+
 def parse_audit_costs(audit_log_path: Path) -> list[RoleCost]:
     """Aggregate `reason.client.LlmClient`'s audit JSONL by role (PLAN.md
     "Ops metrics logged continuously"). No LLM call — pure parsing.
@@ -651,6 +757,7 @@ def render_review_markdown(
     challenge_sweep: ChallengeSweepResult,
     test_chooser: TestChooserResult,
     staleness: StalenessReport,
+    deferred_verification: DeferredVerificationSweepResult,
     metrics: OpsMetrics,
     ledger_before: Ledger,
     ledger_after: Ledger,
@@ -708,6 +815,25 @@ def render_review_markdown(
             )
         lines.append("")
 
+    if deferred_verification.checked:
+        lines.append("## Deferred evidence checks")
+        lines.append("")
+        lines.append(
+            f"{deferred_verification.checked} evidence claim(s) held on `expanded`/`cant-miss` "
+            "leads (not needed for this week's headline picture, so checking them was put off "
+            "until this review) were checked against their sources this week."
+        )
+        if deferred_verification.not_entailed:
+            lines.append("")
+            lines.append("Some did not hold up and are flagged for a closer look:")
+            for deferred_finding in deferred_verification.not_entailed:
+                deferred_claim = redact_gated_text(deferred_finding.claim)
+                deferred_rationale = redact_gated_text(deferred_finding.rationale)
+                lines.append(
+                    f"- ({deferred_finding.hypothesis_id}) {deferred_claim!r}: {deferred_rationale}"
+                )
+        lines.append("")
+
     lines.append("## What to ask your doctor")
     lines.append("")
     if test_chooser.items:
@@ -746,6 +872,10 @@ def render_review_markdown(
             f"${role_cost.cost_estimate:.2f}"
         )
     lines.append(f"- Divergences considered: {len(divergence_set.divergences)}")
+    lines.append(
+        f"- Deferred evidence claims checked this review: {deferred_verification.checked} "
+        f"({len(deferred_verification.not_entailed)} not entailed)"
+    )
     lines.append("")
 
     return "\n".join(lines) + "\n"
@@ -860,6 +990,8 @@ def build_review_dag(
     *,
     clock: Callable[[], datetime],
     sink: dict[str, BaseModel] | None = None,
+    resolver: SourceTextResolver | None = None,
+    entailment_cache: EntailmentCache | None = None,
 ) -> Dag:
     """Assemble the weekly-review DAG (PLAN.md loop (c)) — see the module
     docstring for topology and contracts.
@@ -867,16 +999,27 @@ def build_review_dag(
     Expected `run()` initial context: `{"initial": Marker(),
     "blind_context_pack": ContextPack}` (built with `include_ledger=False`).
     Deliberately does NOT expect a `"ledger"` key — the current ledger is
-    loaded by the `current_ledger` node, *after* every blind panel node has
-    already run, so `forbid_context_key("ledger")` has nothing to catch in
-    a correct run (see the negative test in `tests/test_review.py` for the
-    incorrect case).
+    loaded by the `current_ledger` node, *after* every blind panel member
+    has already run, so `forbid_context_key("ledger")` has nothing to catch
+    in a correct run (see the negative test in `tests/test_review.py` for
+    the incorrect case).
+
+    `resolver`/`entailment_cache` are passed through to
+    `sweep_deferred_entailment_claims` (the `deferred_entailment_sweep`
+    node, PLAN.md latency "diagnostic-turn-latency") exactly like
+    `reason.stages.build_diagnostic_dag`'s own parameters of the same name
+    — defaulting to a real `DefaultSourceTextResolver`/`EntailmentCache`
+    (cached at `<repo>/work/entailment-cache.json`, SHARED with any
+    diagnostic turn that ran earlier and cached the same `(claim,
+    source_text)` pair) when omitted; tests should always inject fakes.
     """
     results: dict[str, BaseModel] = sink if sink is not None else {}
     num_panel = len(client._bindings.get("blind_panel", []))  # noqa: SLF001
     if num_panel < 1:
         raise ValueError("role 'blind_panel' must have at least one model binding")
     panel_node_names = [f"blind_panel_{i}" for i in range(num_panel)]
+    resolved_resolver = resolver or DefaultSourceTextResolver(db, repo)
+    resolved_cache = entailment_cache or EntailmentCache(repo.root / ENTAILMENT_CACHE_RELPATH)
 
     def _trend_scan_fn(_ctx: Ctx) -> BaseModel:
         result = deterministic_trend_scan(db)
@@ -989,7 +1132,7 @@ def build_review_dag(
             current_ledger, divergence_set, adjudication, sweep, today=clock().date()
         )
         history_path = repo.root / HISTORY_RELPATH
-        new_ledger = apply_and_save(ledger_path, history_path, diff)
+        new_ledger = repo.apply_ledger_diff(ledger_path, history_path, diff)
         results["apply_review_diff"] = new_ledger
         return new_ledger
 
@@ -1018,6 +1161,13 @@ def build_review_dag(
         report = scan_staleness(repo.root / HISTORY_RELPATH, ledger)
         results["staleness_scan"] = report
         return report
+
+    def _deferred_entailment_sweep_fn(_ctx: Ctx) -> BaseModel:
+        result = sweep_deferred_entailment_claims(
+            client, repo, db, resolver=resolved_resolver, cache=resolved_cache
+        )
+        results["deferred_entailment_sweep"] = result
+        return result
 
     def _ops_metrics_fn(ctx: Ctx) -> BaseModel:
         ledger = ctx["apply_review_diff"]
@@ -1060,6 +1210,8 @@ def build_review_dag(
         assert isinstance(test_chooser, TestChooserResult)
         staleness = ctx["staleness_scan"]
         assert isinstance(staleness, StalenessReport)
+        deferred_verification = ctx["deferred_entailment_sweep"]
+        assert isinstance(deferred_verification, DeferredVerificationSweepResult)
         metrics = ctx["ops_metrics"]
         assert isinstance(metrics, OpsMetrics)
         trend_scan = ctx["trend_scan"]
@@ -1073,6 +1225,7 @@ def build_review_dag(
             challenge_sweep=sweep,
             test_chooser=test_chooser,
             staleness=staleness,
+            deferred_verification=deferred_verification,
             metrics=metrics,
             ledger_before=ledger_before,
             ledger_after=ledger_after,
@@ -1098,6 +1251,7 @@ def build_review_dag(
             divergences=divergence_set,
             adjudication=adjudication,
             staleness=staleness,
+            deferred_verification=deferred_verification,
             metrics=metrics,
         )
         results["render_report"] = report
@@ -1198,11 +1352,20 @@ def build_review_dag(
     )
     nodes.append(
         Node(
+            name="deferred_entailment_sweep",
+            fn=_deferred_entailment_sweep_fn,
+            input_model=StalenessReport,
+            output_model=DeferredVerificationSweepResult,
+            depends_on="staleness_scan",
+        )
+    )
+    nodes.append(
+        Node(
             name="ops_metrics",
             fn=_ops_metrics_fn,
-            input_model=StalenessReport,
+            input_model=DeferredVerificationSweepResult,
             output_model=OpsMetrics,
-            depends_on="staleness_scan",
+            depends_on="deferred_entailment_sweep",
         )
     )
     nodes.append(
@@ -1244,17 +1407,32 @@ def run_weekly_review(
     client: LlmClient,
     *,
     clock: Callable[[], datetime] | None = None,
+    resolver: SourceTextResolver | None = None,
+    entailment_cache: EntailmentCache | None = None,
 ) -> ReviewReport:
     """Run the weekly deep review end to end (PLAN.md "Session loops (c)")
     and return the committed, tagged `ReviewReport`. See the module
     docstring for the DAG topology and contracts.
+
+    `resolver`/`entailment_cache` are forwarded to `build_review_dag`'s
+    `deferred_entailment_sweep` node (PLAN.md latency
+    "diagnostic-turn-latency") — tests should inject fakes explicitly.
     """
     clock = clock if clock is not None else _utcnow
     ledger_path = repo.root / LEDGER_RELPATH
     blind_context_pack = build_context(repo, db, include_ledger=False)
 
     sink: dict[str, BaseModel] = {}
-    dag = build_review_dag(client, repo, db, ledger_path, clock=clock, sink=sink)
+    dag = build_review_dag(
+        client,
+        repo,
+        db,
+        ledger_path,
+        clock=clock,
+        sink=sink,
+        resolver=resolver,
+        entailment_cache=entailment_cache,
+    )
     run(
         dag,
         {
@@ -1272,6 +1450,8 @@ __all__ = [
     "AdjudicationResult",
     "BlindDifferential",
     "ChallengeSweepResult",
+    "DeferredVerificationFinding",
+    "DeferredVerificationSweepResult",
     "Divergence",
     "DivergenceSet",
     "OpsMetrics",
@@ -1291,4 +1471,5 @@ __all__ = [
     "render_review_markdown",
     "run_weekly_review",
     "scan_staleness",
+    "sweep_deferred_entailment_claims",
 ]

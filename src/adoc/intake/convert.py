@@ -30,6 +30,7 @@ _SUPPORTED_SECTIONS = frozenset(
         "events",
         "prior_diagnoses",
         "family_history",
+        "geography",
         "medications",
         "supplements",
         "allergies",
@@ -126,6 +127,37 @@ def _relative_data(fact: IntakeFact) -> dict[str, Any]:
     }
 
 
+def _residence_data(fact: IntakeFact) -> dict[str, Any]:
+    return {
+        "place": fact.fields.get("place") or fact.statement,
+        "date_approx": fact.date_approx or fact.fields.get("date_approx"),
+        "current": bool(fact.fields.get("current", False)),
+    }
+
+
+def _geography_data(facts: Sequence[IntakeFact]) -> dict[str, Any]:
+    """`location`-kind facts, split by `fields["category"]`
+    (`"residence"` (default) | `"travel"` | `"exposure"`) into the three
+    `GeographySection` lists."""
+    location_facts = [f for f in facts if f.kind == "location"]
+    residences = [
+        _residence_data(f)
+        for f in location_facts
+        if f.fields.get("category", "residence") == "residence"
+    ]
+    travel = [
+        str(f.fields.get("place") or f.statement)
+        for f in location_facts
+        if f.fields.get("category") == "travel"
+    ]
+    exposures = [
+        str(f.fields.get("description") or f.statement)
+        for f in location_facts
+        if f.fields.get("category") == "exposure"
+    ]
+    return {"residences": residences, "travel": travel, "exposures": exposures}
+
+
 def _medication_like_data(fact: IntakeFact) -> dict[str, Any]:
     return {
         "name": fact.fields.get("name") or fact.statement,
@@ -182,6 +214,8 @@ def facts_to_section_data(facts: Sequence[IntakeFact], section_key: str) -> dict
         return {"diagnoses": diagnoses, "patient_suspected": patient_suspected}
     if section_key == "family_history":
         return {"relatives": [_relative_data(f) for f in active if f.kind == "relative"]}
+    if section_key == "geography":
+        return _geography_data(active)
     if section_key == "medications":
         return {"medications": [_medication_like_data(f) for f in active if f.kind == "medication"]}
     if section_key == "supplements":
