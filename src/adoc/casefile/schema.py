@@ -44,12 +44,24 @@ _DATE_RE = r"\d{4}-\d{2}-\d{2}"
 # non-colon, non-whitespace characters; the slug's SEMANTIC resolution
 # against the labs table is Phase 2's citation checker, not this regex.
 _SLUG_RE = r"[^\s:]+"
-_FILENAME_RE = r"[^\s#]+"
+# Spaces are legal: real ingested filenames look like "Comprehensive
+# Clinical Context and Longitudinal Health History.docx". Excluding
+# whitespace made every such document uncitable — a real run died on
+# exactly that name. `#` stays excluded because it delimits the optional
+# `#p<int>` page suffix, and newlines because a ref is one line.
+_FILENAME_RE = r"[^#\n]+"
 
 SOURCE_REF_PATTERN = re.compile(
     rf"^(?:"
     rf"labs:{_SLUG_RE}:{_DATE_RE}"
-    rf"|doc:{_FILENAME_RE}#p\d+"
+    # `#p<int>` is OPTIONAL. Requiring it assumed every document is
+    # paginated, which was true when the only citable documents were
+    # scanned PDFs. The document-text corpus (ADR 0015) made `.docx` and
+    # plain-text records citable too, and they have no pages — a real run
+    # died rejecting `doc:Comprehensive Clinical Context and Longitudinal
+    # Health History.docx`. A page-less ref means "this document"; the
+    # resolver and the citation checker both already handle that form.
+    rf"|doc:{_FILENAME_RE}(?:#p\d+)?"
     rf"|encounter:{_FILENAME_RE}"
     rf"|pmid:\d+"
     rf"|patient-report:{_DATE_RE}"
