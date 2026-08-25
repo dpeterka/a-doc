@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
@@ -105,6 +106,72 @@ def read_recent_chat(repo: DataRepo, *, max_files: int = 3, max_turns: int = 100
                 if line:
                     entries.append(json.loads(line))
     return entries[-max_turns:]
+
+
+def last_chat_date(repo: DataRepo) -> date | None:
+    """The date of the most recent chat-transcript entry (patient or
+    assistant turn, whichever landed last), for the home dashboard's "last
+    conversation" line — `None` if no chat has happened yet. Only the
+    single newest entry is needed, so `max_turns=1` regardless of
+    `max_files`'s default (the newest entry always lives in the newest
+    day-file)."""
+    entries = read_recent_chat(repo, max_turns=1)
+    if not entries:
+        return None
+    timestamp = entries[-1].get("timestamp")
+    if not timestamp:
+        return None
+    try:
+        return datetime.fromisoformat(timestamp).date()
+    except ValueError:
+        return None
+
+
+# --- "what's already on file" strip (home dashboard, empty-state fix) --------------------
+
+
+@dataclass(frozen=True)
+class OnFileSummary:
+    """Server-computed "what's already on file" counts for the home
+    dashboard. Owner-observed feedback: a fresh install with documents and
+    labs already ingested (a seeded/restored deployment, or a local repo
+    that ran a backfill) but no diagnostic conversation yet must not render
+    as if nothing exists — this is what lets the home page say so.
+    `doc_count == 0` is the signal the template uses to show an "add
+    documents" pointer instead of the strip."""
+
+    doc_count: int
+    lab_row_count: int
+    analyte_count: int
+    date_span: tuple[date, date] | None
+    encounter_count: int
+
+
+def on_file_summary(repo: DataRepo, db: LabsDb) -> OnFileSummary:
+    """Compute `OnFileSummary` from the labs DB + data repo — read-only
+    queries only, no schema changes, safe to call on every home-page
+    request."""
+    doc_count = len(db.documents_overview())
+
+    rows = db.all_non_rejected_rows()
+    lab_row_count = len(rows)
+    analyte_count = len({row.name for row in rows})
+    date_span = (min(row.date for row in rows), max(row.date for row in rows)) if rows else None
+
+    encounters_dir = repo.root / "case" / "encounters"
+    encounter_count = (
+        sum(1 for p in encounters_dir.iterdir() if p.suffix == ".md")
+        if encounters_dir.is_dir()
+        else 0
+    )
+
+    return OnFileSummary(
+        doc_count=doc_count,
+        lab_row_count=lab_row_count,
+        analyte_count=analyte_count,
+        date_span=date_span,
+        encounter_count=encounter_count,
+    )
 
 
 # --- page images (confirm queue, ledger doc: refs) ---------------------------------------

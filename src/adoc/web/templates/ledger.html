@@ -2,12 +2,12 @@
 {% block title %}Full picture — a-doc{% endblock %}
 {% block content %}
   <h1>The full picture</h1>
-  <p class="muted">
-    Every lead a-doc has considered, version {{ ledger.version }}, last updated
-    {{ ledger.updated.date().isoformat() }}. This is the complete, unfiltered record — read-only.
-  </p>
 
   {% if ledger.hypotheses %}
+    <p class="muted">
+      Every lead a-doc has considered, version {{ ledger.version }}, last updated
+      {{ ledger.updated.date().isoformat() }}. This is the complete, unfiltered record — read-only.
+    </p>
     {% for h in ledger.hypotheses %}
       <article class="card hypothesis-full">
         <h2>{{ h.name }}</h2>
@@ -63,6 +63,11 @@
       </article>
     {% endfor %}
   {% else %}
-    <p>Nothing recorded yet.</p>
+    <p class="muted">
+      Leads appear here once you've had a diagnostic conversation with a-doc — every
+      hypothesis it considers, including the ones it later rules out, so this becomes the
+      complete, unfiltered record once there's anything to record.
+    </p>
+    <p><a href="/chat">Start a conversation &rarr;</a></p>
   {% endif %}
 {% endblock %}
