@@ -9,6 +9,7 @@ import pytest
 from pydantic import ValidationError
 
 from adoc.casefile.encounters import (
+    SLUG_MAX_CHARS,
     Encounter,
     EncounterFrontmatter,
     encounter_filename,
@@ -165,3 +166,42 @@ def test_write_encounter_creates_missing_directory(tmp_path: Path) -> None:
     path = write_encounter(encounters_dir, encounter, "first-visit")
 
     assert path.exists()
+
+
+def test_slugify_bounds_a_paragraph_length_title(tmp_path: Path) -> None:
+    """Slugs come from model-written titles, which are unbounded. A live intake
+    turn produced a paragraph-long event title and the write failed with
+    `OSError: [Errno 36] File name too long`, so the encounter was lost."""
+    long_title = (
+        "Patient made two separate ER trips in March 2025 with nausea and weakness "
+        "she attributes both to her thyroid levels thyroid stopping functioning "
+        "during these hormonal coma events she remained conscious but could not "
+        "function she was placed on an IV and monitored until she recovered"
+    )
+    slug = slugify(long_title)
+    assert len(slug) <= SLUG_MAX_CHARS
+    assert slug.startswith("patient-made-two-separate-er-trips")
+
+    frontmatter = EncounterFrontmatter(date=date(2025, 1, 1), type="patient-report")
+    assert len(encounter_filename(frontmatter, long_title).encode("utf-8")) < 255
+
+    written = write_encounter(
+        tmp_path / "encounters", Encounter(frontmatter=frontmatter), long_title
+    )
+    assert written.exists()
+
+
+def test_slugify_keeps_long_titles_distinct_when_they_share_a_prefix() -> None:
+    """Generated titles for related events share long prefixes, so naive
+    truncation would silently overwrite one encounter with another."""
+    base = "Patient made two separate ER trips in March 2025 with nausea and weakness and "
+    a = slugify(base + "was admitted overnight for observation")
+    b = slugify(base + "was discharged the same evening after fluids")
+    assert a != b
+    assert len(a) <= SLUG_MAX_CHARS
+    assert len(b) <= SLUG_MAX_CHARS
+
+
+def test_slugify_is_unchanged_for_ordinary_titles() -> None:
+    assert slugify("ER visit for chest pain") == "er-visit-for-chest-pain"
+    assert slugify("   ") == "encounter"

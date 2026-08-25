@@ -8,6 +8,7 @@ this same door as doctor notes, tagged `type: patient-report`.
 
 from __future__ import annotations
 
+import hashlib
 import io
 import re
 from datetime import date
@@ -48,13 +49,37 @@ class Encounter(BaseModel):
     unchanged."""
 
 
+# A slug is built from model-written text (an event title), which is
+# unbounded — a live intake turn produced a paragraph-long title and the
+# resulting path blew past the filesystem limit with
+# `OSError: [Errno 36] File name too long`. Most filesystems cap a single
+# NAME at 255 bytes; 80 leaves ample room for the date prefix, the `.md`
+# suffix, the disambiguating hash below, and any longer path around it.
+SLUG_MAX_CHARS = 80
+
+
 def slugify(text: str) -> str:
-    """Turn free text into a filename-safe slug (lowercase, hyphen-separated)."""
+    """Turn free text into a filename-safe slug (lowercase, hyphen-separated).
+
+    Bounded at `SLUG_MAX_CHARS`. When truncation happens the slug is cut at
+    a word boundary and a short hash of the FULL text is appended, so two
+    long titles sharing a prefix — very likely, since these are generated
+    descriptions of related events — cannot collapse onto one filename and
+    silently overwrite each other.
+    """
     slug = text.strip().lower()
     slug = slug.replace(" ", "-")
     slug = _SLUG_INVALID.sub("", slug)
     slug = _SLUG_DASHES.sub("-", slug).strip("-")
-    return slug or "encounter"
+    if not slug:
+        return "encounter"
+    if len(slug) <= SLUG_MAX_CHARS:
+        return slug
+
+    digest = hashlib.sha256(text.strip().encode("utf-8")).hexdigest()[:8]
+    keep = SLUG_MAX_CHARS - len(digest) - 1
+    head = slug[:keep].rsplit("-", 1)[0] or slug[:keep]
+    return f"{head}-{digest}"
 
 
 def encounter_filename(frontmatter: EncounterFrontmatter, slug: str) -> str:
