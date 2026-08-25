@@ -367,7 +367,7 @@ def test_redteam_dag_without_challenger_node_fails_require_prior_node(
         patient_turn = ctx["patient_turn"]
         assert isinstance(context_pack, ContextPack)
         assert isinstance(patient_turn, PatientTurn)
-        return ledger_maintainer_stage(client, context_pack, patient_turn.text)
+        return ledger_maintainer_stage(client, context_pack, patient_turn.text, db, repo)
 
     def _composer_like_fn(_ctx: Ctx) -> BaseModel:  # never reached
         raise AssertionError("composer must not run when the challenger precondition fails")
@@ -402,9 +402,9 @@ def test_redteam_dag_without_challenger_node_fails_require_prior_node(
     assert excinfo.value.contract_name == case["expected_contract_name"]
 
 
-def test_build_diagnostic_dag_has_the_four_expected_nodes(repo: DataRepo) -> None:
+def test_build_diagnostic_dag_has_the_four_expected_nodes(repo: DataRepo, db: LabsDb) -> None:
     client = _build_client(lambda r: None, lambda r: None)  # not called in this test
-    dag = build_diagnostic_dag(client, repo, repo.root / LEDGER_RELPATH)
+    dag = build_diagnostic_dag(client, repo, repo.root / LEDGER_RELPATH, db)
     assert [node.name for node in dag.nodes] == [
         "ledger_maintainer",
         "challenger",
@@ -514,3 +514,208 @@ def test_composer_still_gated_after_rewrite_raises_contract_violation(
 
     assert excinfo.value.contract_name == "treatment_gate"
     assert len(calls) == 4  # exactly one rewrite attempt - never an unbounded loop
+
+
+# --- Phase 2 citation checker: retry loop + DAG contract gate ---------------------------------
+
+
+def _sle_op(source: str, claim: str = "ANA elevated") -> dict[str, Any]:
+    """`_SLE_MOST_LIKELY_OP` with its evidence source ref swapped out, so a
+    test can script "bad ref first, good ref on retry" without repeating
+    the whole hypothesis payload."""
+    op = json.loads(json.dumps(_SLE_MOST_LIKELY_OP))
+    op["hypothesis"]["evidence_for"] = [{"claim": claim, "source": source, "strength": "strong"}]
+    return op
+
+
+def _make_primary_transport_with_diff_sequence(
+    ledger_ops_sequence: list[list[dict[str, Any]]],
+    patient_reply: dict[str, Any],
+    calls: list[TransportRequest],
+):
+    """Like `_make_primary_transport`, but each `_LedgerDiffPayload` request
+    pops the next ops list from `ledger_ops_sequence` — lets a test script
+    "first diff cites a fabricated ref, the citation-checker retry gets a
+    corrected diff" (`ledger_maintainer_stage`'s citation retry loop)."""
+    remaining = list(ledger_ops_sequence)
+
+    def transport(request: TransportRequest) -> TransportResponse:
+        calls.append(request)
+        assert request.schema is not None
+        name = request.schema.__name__
+        if name == "_LedgerDiffPayload":
+            assert remaining, "ledger_maintainer requested more diffs than scripted"
+            tool_input: dict[str, Any] = {"rationale": "proposed diff", "ops": remaining.pop(0)}
+        elif name == "PatientReply":
+            tool_input = patient_reply
+        else:  # pragma: no cover - defensive
+            raise AssertionError(f"unexpected schema for primary transport: {name}")
+        return TransportResponse(text="", tool_input=tool_input, input_tokens=10, output_tokens=10)
+
+    return transport
+
+
+def test_fabricated_labs_ref_triggers_retry_and_second_good_diff_applies(
+    repo: DataRepo, db: LabsDb
+) -> None:
+    """Acceptance: a planted fabricated `labs:` ref (no such analyte/date)
+    in the maintainer's first diff triggers exactly one retry naming the
+    bad ref; a corrected second diff then applies normally."""
+    calls: list[TransportRequest] = []
+    bad_diff_ops = [_sle_op("labs:made-up-analyte:2026-05-02"), _PE_CANT_MISS_OP]
+    good_diff_ops = [_sle_op("labs:ana-titer:2026-05-02"), _PE_CANT_MISS_OP]
+    primary_transport = _make_primary_transport_with_diff_sequence(
+        [bad_diff_ops, good_diff_ops], _CLEAN_REPLY, calls
+    )
+    challenger_transport = _make_challenger_transport(
+        counter_arguments=[
+            {"hypothesis_id": "sle-01", "argument": "Anti-dsDNA has not been checked yet."}
+        ],
+        additional_ops=[],
+        calls=calls,
+    )
+    client = _build_client(primary_transport, challenger_transport)
+
+    result = run_diagnostic_turn(
+        client, repo, db, repo.root / LEDGER_RELPATH, "My joints ache and I'm exhausted."
+    )
+
+    assert isinstance(result, PatientReply)
+    # ledger_maintainer (bad), ledger_maintainer retry (good), challenger, composer.
+    assert len(calls) == 4
+    retry_request = calls[1]
+    retry_feedback = retry_request.messages[-1].content
+    assert "labs:made-up-analyte:2026-05-02" in retry_feedback
+    assert "unresolved" in retry_feedback
+
+    new_ledger = load_ledger(repo.root / LEDGER_RELPATH)
+    assert {h.id for h in new_ledger.hypotheses} == {"sle-01", "pe-01"}
+
+
+def test_still_fabricated_labs_ref_after_retry_raises_contract_violation_ledger_unchanged(
+    repo: DataRepo, db: LabsDb
+) -> None:
+    """Acceptance: a diff that is STILL bad after the one retry raises a
+    `ContractViolation` naming the failed ref, and the on-disk ledger is
+    left completely unchanged (`apply` never runs)."""
+    calls: list[TransportRequest] = []
+    bad_diff_ops = [_sle_op("labs:made-up-analyte:2026-05-02"), _PE_CANT_MISS_OP]
+    primary_transport = _make_primary_transport_with_diff_sequence(
+        [bad_diff_ops, bad_diff_ops], _CLEAN_REPLY, calls
+    )
+    challenger_transport = _make_challenger_transport(
+        counter_arguments=[
+            {"hypothesis_id": "sle-01", "argument": "Anti-dsDNA has not been checked yet."}
+        ],
+        additional_ops=[],
+        calls=calls,
+    )
+    client = _build_client(primary_transport, challenger_transport)
+
+    ledger_before = load_ledger(repo.root / LEDGER_RELPATH)
+
+    with pytest.raises(ContractViolation) as excinfo:
+        run_diagnostic_turn(
+            client, repo, db, repo.root / LEDGER_RELPATH, "My joints ache and I'm exhausted."
+        )
+
+    assert excinfo.value.contract_name == "citation_check_ledger_maintainer"
+    assert "labs:made-up-analyte:2026-05-02" in excinfo.value.message
+    # Exactly the one retry - the challenger/composer are never reached.
+    assert len(calls) == 2
+
+    ledger_after = load_ledger(repo.root / LEDGER_RELPATH)
+    assert ledger_after == ledger_before
+
+
+def test_mismatched_quoted_value_triggers_retry_and_veto_path(repo: DataRepo, db: LabsDb) -> None:
+    """Acceptance: a claim that quotes a number disagreeing with the stored
+    lab value (claim says 12.3, stored 1.23) is `mismatched`, not just
+    `unresolved`, and follows the exact same retry/veto path."""
+    SHA2 = "c" * 64
+    db.upsert_document(
+        LabDocument(sha256=SHA2, filename="crp.pdf", doc_type="lab-result", page_count=1)
+    )
+    db.insert_results(
+        [
+            LabResult(
+                date=date(2026, 5, 2),
+                name="CRP",
+                name_raw="CRP",
+                value=1.23,
+                source_doc=SHA2,
+                raw_json=json.dumps({"name_raw": "CRP"}),
+            )
+        ]
+    )
+
+    calls: list[TransportRequest] = []
+    bad_diff_ops = [
+        _sle_op("labs:crp:2026-05-02", claim="CRP was 12.3 mg/L, markedly elevated"),
+        _PE_CANT_MISS_OP,
+    ]
+    good_diff_ops = [
+        _sle_op("labs:crp:2026-05-02", claim="CRP was 1.23 mg/L, mildly elevated"),
+        _PE_CANT_MISS_OP,
+    ]
+    primary_transport = _make_primary_transport_with_diff_sequence(
+        [bad_diff_ops, good_diff_ops], _CLEAN_REPLY, calls
+    )
+    challenger_transport = _make_challenger_transport(
+        counter_arguments=[
+            {"hypothesis_id": "sle-01", "argument": "Anti-dsDNA has not been checked yet."}
+        ],
+        additional_ops=[],
+        calls=calls,
+    )
+    client = _build_client(primary_transport, challenger_transport)
+
+    result = run_diagnostic_turn(
+        client, repo, db, repo.root / LEDGER_RELPATH, "My joints ache and I'm exhausted."
+    )
+
+    assert isinstance(result, PatientReply)
+    retry_feedback = calls[1].messages[-1].content
+    assert "mismatched" in retry_feedback
+    assert "12.3" in retry_feedback
+
+
+def test_challenger_additional_ops_bad_ref_cannot_reach_apply(repo: DataRepo, db: LabsDb) -> None:
+    """Acceptance: a fabricated ref introduced by the Challenger's own
+    `additional_ops` (not the Ledger-Maintainer's diff) is caught at the
+    same choke point — the `apply` node's precondition — before
+    `casefile.ledger.apply_and_save` ever runs."""
+    calls: list[TransportRequest] = []
+    clean_diff_ops = [_PE_CANT_MISS_OP]
+    primary_transport = _make_primary_transport_with_diff_sequence(
+        [clean_diff_ops], _CLEAN_REPLY, calls
+    )
+    bad_additional_ops = [
+        {
+            "op": "add_evidence",
+            "id": "pe-01",
+            "for_or_against": "against",
+            "evidence": {
+                "claim": "D-dimer was normal",
+                "source": "labs:made-up-analyte:2026-05-02",
+                "strength": "moderate",
+            },
+        }
+    ]
+    challenger_transport = _make_challenger_transport(
+        counter_arguments=[], additional_ops=bad_additional_ops, calls=calls
+    )
+    client = _build_client(primary_transport, challenger_transport)
+
+    ledger_before = load_ledger(repo.root / LEDGER_RELPATH)
+
+    with pytest.raises(ContractViolation) as excinfo:
+        run_diagnostic_turn(
+            client, repo, db, repo.root / LEDGER_RELPATH, "My joints ache and I'm exhausted."
+        )
+
+    assert excinfo.value.contract_name == "citation_check_apply"
+    assert "labs:made-up-analyte:2026-05-02" in excinfo.value.message
+
+    ledger_after = load_ledger(repo.root / LEDGER_RELPATH)
+    assert ledger_after == ledger_before

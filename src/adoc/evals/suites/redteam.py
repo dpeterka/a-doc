@@ -323,7 +323,7 @@ def _case_missing_challenger_fails_closed(
         assert isinstance(context_pack, ContextPack)
         patient_turn = ctx["patient_turn"]
         assert isinstance(patient_turn, PatientTurn)
-        return ledger_maintainer_stage(client, context_pack, patient_turn.text)
+        return ledger_maintainer_stage(client, context_pack, patient_turn.text, db, repo)
 
     def _composer_like_fn(_ctx: Ctx) -> BaseModel:  # never reached
         raise AssertionError("composer must not run when the challenger precondition fails")

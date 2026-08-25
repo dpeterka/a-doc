@@ -11,6 +11,8 @@ onboarding itself (that gets its own tests further down).
 
 from __future__ import annotations
 
+import json
+from datetime import date
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -26,7 +28,36 @@ from web_support import (
 from adoc.casefile.ledger import load_ledger
 from adoc.casefile.repo import LEDGER_RELPATH
 from adoc.intake.agent import INTAKE_OPENER_MESSAGE, IntakeTurnResult, VisitCaptureResult
+from adoc.labs.db import LabsDb
+from adoc.labs.models import LabDocument, LabResult
 from adoc.reason.client import TransportRequest, TransportResponse
+
+_ANA_SOURCE_DOC_SHA = "c" * 64
+
+
+def _seed_ana_titer_row(db: LabsDb) -> None:
+    """Seed the `labs:ana-titer:2026-05-02` row `_SLE_MOST_LIKELY_OP` cites
+    so the Phase-2 citation checker (`reason.citations`) resolves it —
+    without this, the citation-check DAG contract correctly rejects the
+    diff as an unresolved evidence source ref."""
+    db.upsert_document(
+        LabDocument(
+            sha256=_ANA_SOURCE_DOC_SHA, filename="quest.pdf", doc_type="lab-result", page_count=1
+        )
+    )
+    db.insert_results(
+        [
+            LabResult(
+                date=date(2026, 5, 2),
+                name="ana-titer",
+                name_raw="ANA",
+                value_text="1:640",
+                source_doc=_ANA_SOURCE_DOC_SHA,
+                raw_json=json.dumps({"name_raw": "ANA"}),
+            )
+        ]
+    )
+
 
 _SLE_MOST_LIKELY_OP = {
     "op": "add_hypothesis",
@@ -94,10 +125,11 @@ def test_diagnostic_turn_renders_the_three_tiers(tmp_path: Path) -> None:
         additional_ops=[],
         calls=calls,
     )
-    app, repo, _db, _calls = build_app(
+    app, repo, db, _calls = build_app(
         tmp_path, primary_transport=primary, challenger_transport=challenger
     )
     mark_intake_complete(repo)
+    _seed_ana_titer_row(db)
     client = TestClient(app)
     login(client)
 
