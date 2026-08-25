@@ -321,9 +321,19 @@ def _check_doc_ref(source: str, claim: str, db: LabsDb) -> CitationCheck:
     rest = source[len("doc:") :]
     filename, sep, page_str = rest.rpartition("#p")
     if not sep:
-        return CitationCheck(
-            source=source, outcome="unresolved", reason="malformed doc ref", claim=claim
-        )
+        # Page-less ref: "this document", valid since the document-text
+        # corpus made unpaginated records (.docx, .txt) citable. Resolve
+        # the document itself; there is no page to bounds-check.
+        filename = rest
+        doc = next((d for d in db.list_documents() if d.filename == filename), None)
+        if doc is None:
+            return CitationCheck(
+                source=source,
+                outcome="unresolved",
+                reason=f"no ingested document named {filename!r}",
+                claim=claim,
+            )
+        return CitationCheck(source=source, outcome="resolved", reason="", claim=claim)
     try:
         page = int(page_str)
     except ValueError:
