@@ -442,8 +442,8 @@ def _cmd_labs_infer_specimen(_args: argparse.Namespace) -> int:
 
 
 def _cmd_labs_dedupe_twins(args: argparse.Namespace) -> int:
-    """Queue-ergonomics slice item 4: sweep legacy single-pass PENDING rows
-    for a duplicate ("twin") already-resolved row in the same document and
+    """Sweep legacy single-pass PENDING rows for a duplicate ("twin")
+    already-resolved row in the same document and
     auto-reject the duplicate half (`labs/twins.py`'s `sweep_twins`).
     `--dry-run` computes and reports the same thing without mutating
     anything - no rejects, no export, no commit, no summary write.

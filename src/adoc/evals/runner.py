@@ -1,26 +1,23 @@
 """Self-evaluation benchmark harness (PLAN.md "Model strategy & self-evaluation").
 
 `run_suite` dispatches by name to one of `evals/suites/*.py`'s `run()`
-function. Every suite is offline and deterministic in this slice
+function. Every currently-registered suite is offline and deterministic
 (`extraction` replays fixtures through `ingest.reconcile` with no model
 call at all; `redteam` drives `reason.safety`/`reason.stages` against a
-scripted FAKE client, per PLAN.md's own red-team-suite design — see
-`suites/redteam.py`; `hallucination`, PLAN.md Phase 2's acceptance gate,
-drives the citation checker, entailment verifier, and abstention contract
-the same way, plus a pure-code fabricated-citation-detection check — see
-`suites/hallucination.py`) — CI (`eval.yml`) runs all three with no
-network and no data repo.
+scripted FAKE client — see `suites/redteam.py`; `hallucination`, PLAN.md
+Phase 2's acceptance gate, drives the citation checker, entailment
+verifier, and abstention contract the same way, plus a pure-code
+fabricated-citation-detection check — see `suites/hallucination.py`) — CI
+(`eval.yml`) runs all three with no network and no data repo.
 
 `client_factory` and `candidate` are accepted by every suite for a
 uniform dispatch signature and for the incumbent-vs-candidate comparison
 report (`report.py`) to have something to label columns with. No current
 suite makes a real model call, so `--candidate provider:model` does not
 change any suite's pass/fail outcome today — it changes the label recorded
-on the `SuiteResult` (and would change behavior for a future suite that
-actually calls the client `client_factory` builds, e.g. a phase-3
-differential-recall suite). This is a deliberate, documented scope choice,
-not an oversight: PLAN.md's rare-302/retrospective suites (which *would*
-need a real model) are explicitly out of scope for this slice.
+on the `SuiteResult`. Phase 3's rare-disease-cohort and retrospective
+suites (PLAN.md) are the ones that will actually call the client
+`client_factory` builds and make `--candidate` change outcomes.
 """
 
 from __future__ import annotations

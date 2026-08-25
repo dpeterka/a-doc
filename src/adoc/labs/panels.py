@@ -20,8 +20,8 @@ from adoc.labs.validate import ANALYTE_SPECS, AnalyteSpec, canonicalize
 
 OTHER_PANEL = "Other"
 
-# Curated clinical display order (item 5 of the lab-taxonomy plan). Anything
-# with `panel=None`, or a panel string not listed here, is grouped under
+# Curated clinical display order. Anything with `panel=None`, or a panel
+# string not listed here, is grouped under
 # `OTHER_PANEL`, which always sorts last regardless of where it would fall
 # alphabetically - see `panel_sort_key`.
 PANEL_ORDER: tuple[str, ...] = (

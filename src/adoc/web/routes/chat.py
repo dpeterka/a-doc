@@ -65,7 +65,7 @@ router = APIRouter(prefix="/chat")
 
 logger = logging.getLogger(__name__)
 
-# S5 remediation: a `ContractViolation` (e.g. the Composer's output failing
+# A `ContractViolation` (e.g. the Composer's output failing
 # `safety.treatment_gate`) can only ever fire AFTER the diagnostic DAG's
 # `apply` node has already committed a ledger diff (Ledger-Maintainer ->
 # Challenger -> apply -> Composer, CLAUDE.md rule 3) — so by the time this
@@ -132,9 +132,9 @@ def _handle_turn(text: str, *, client: LlmClient, repo: DataRepo, db: LabsDb) ->
     `tests_to_request` (diagnostic only).
 
     `ContractViolation` and `LedgerInvariantError` are caught alongside
-    `LlmError` around every DAG-running call (S5 remediation): both are
-    expected, safety-driven outcomes of the diagnostic DAG (CLAUDE.md rules
-    2/3/5) — never a reason to let a bare 500/traceback reach the patient.
+    `LlmError` around every DAG-running call: both are expected,
+    safety-driven outcomes of the diagnostic DAG (CLAUDE.md rules 2/3/5) —
+    never a reason to let a bare 500/traceback reach the patient.
     """
     # Warn, don't block (ADR 0014): the screen still runs first, before any
     # model call, and its match is surfaced verbatim by code at the end of

@@ -83,13 +83,12 @@ TRANSCRIPT_CONTEXT_TURNS = 20
 DOC_EXCERPT_LIMIT = 4
 DOC_EXCERPT_MAX_CHARS = 2000
 
-# Defect fix (live blocker): a patient who pastes a long written history in
-# one message must never be truncated or refused, but the model needs an
-# explicit steer or it tries to process/ask about all of it at once. ~4000
-# characters is comfortably past an ordinary conversational turn (a few
-# paragraphs) while still well short of anything that risks the model's
-# context budget on its own -- a module constant so the threshold is easy
-# to retune from one place.
+# A patient who pastes a long written history in one message must never be
+# truncated or refused, but the model needs an explicit steer or it tries to
+# process/ask about all of it at once. ~4000 characters is comfortably past
+# an ordinary conversational turn (a few paragraphs) while still well short
+# of anything that risks the model's context budget on its own -- a module
+# constant so the threshold is easy to retune from one place.
 LONG_MESSAGE_THRESHOLD_CHARS = 4000
 
 # Appended to the turn context (never to the patient's own text, which is
@@ -144,8 +143,7 @@ _WITHHELD_MESSAGE = (
     "wrong with your case file. Please try rephrasing, and we'll pick this back up."
 )
 
-# Red-flag handling is WARN-NOT-BLOCK (ADR 0014, explicit product-owner
-# decision for this single-patient tool). `reason.safety.red_flag_screen`
+# Red-flag handling is WARN-NOT-BLOCK (ADR 0014). `reason.safety.red_flag_screen`
 # still runs first on every turn, deterministically, before any model call,
 # and its rules/terms/matching are untouched. What changed is the RESPONSE:
 # a match no longer replaces the turn. The warning below is prepended to the
@@ -704,9 +702,8 @@ def run_intake_turn(client: LlmClient, repo: DataRepo, db: LabsDb, text: str) ->
     context = _build_turn_context(repo, db, coverage, facts_store, text)
     user_content = f"{context}\n\n## Patient message\n\n{text}\n"
     # Never truncate or refuse a long paste -- just steer the model to
-    # handle it gracefully (product direction on the live blocker: "the
-    # agent should be able to indicate it got too much information or better
-    # drive the initial intake with questions").
+    # handle it gracefully (acknowledge the volume, extract what it can,
+    # ask about one thing at a time).
     if len(text) > LONG_MESSAGE_THRESHOLD_CHARS:
         user_content += _LONG_MESSAGE_NOTE
 
