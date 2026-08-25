@@ -33,6 +33,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import secrets
+import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -163,22 +164,41 @@ class _UserStoreCache:
     nothing has changed. Never serves stale data across a real edit: a
     write from `adoc user add/remove` rewrites the file, which bumps its
     mtime and forces a reload on the next lookup.
+
+    `is_authenticated` runs on every request and is driven from FastAPI's
+    sync-route thread pool, so `self._cache` (a plain dict) is genuinely
+    read and written from multiple threads at once - `self._lock` (a
+    `threading.Lock`, non-reentrant is fine: no method here calls another)
+    guards every read/write of it so a stat-then-read/then-write cache
+    fill can never race another thread's fill of the same entry. This is
+    a narrower race than `web.users`'s shared-`YAML()` bug (that one could
+    corrupt ruamel's parser state and raise `DuplicateKeyError`; this one
+    would "only" mean redundant reloads or a torn cache entry), but the
+    fix is the same shape: hold a lock around the shared mutable state.
+    The `users_module.load_fingerprints(path)` call itself is deliberately
+    OUTSIDE the lock - it does its own file I/O and YAML parsing (each
+    call gets its own `YAML()` instance, see `web.users._new_yaml`), so
+    there's no need to serialize that part, only the cache dict itself.
     """
 
     def __init__(self) -> None:
         self._cache: dict[Path, tuple[float, dict[str, str]]] = {}
+        self._lock = threading.Lock()
 
     def fingerprints(self, path: Path) -> dict[str, str]:
         try:
             mtime = path.stat().st_mtime
         except FileNotFoundError:
-            self._cache.pop(path, None)
+            with self._lock:
+                self._cache.pop(path, None)
             return {}
-        cached = self._cache.get(path)
-        if cached is not None and cached[0] == mtime:
-            return cached[1]
+        with self._lock:
+            cached = self._cache.get(path)
+            if cached is not None and cached[0] == mtime:
+                return cached[1]
         fingerprints = users_module.load_fingerprints(path)
-        self._cache[path] = (mtime, fingerprints)
+        with self._lock:
+            self._cache[path] = (mtime, fingerprints)
         return fingerprints
 
 
@@ -290,9 +310,23 @@ class LoginRateLimiter:
     counter, which is an accepted tradeoff for a single-patient app with
     no multi-instance deployment (documented in README).
 
-    Not thread-safe against true concurrent access, but uvicorn's default
-    single-worker/async-event-loop model never calls this from two threads
-    at once here.
+    Thread-safe against true concurrent access via `self._lock` (a plain
+    `threading.Lock` — no method here calls another, so no reentrancy is
+    needed). A previous version of this docstring claimed "uvicorn's
+    default single-worker/async-event-loop model never calls this from two
+    threads at once" — that was FALSE: `web.routes.auth`'s `login_submit`
+    is a sync `def` route, so Starlette runs it in its sync-route thread
+    pool, not on the event loop directly, and concurrent login attempts
+    (a credential-stuffing burst is exactly the scenario this class exists
+    to defend against) really do call `is_locked`/`record_failure` from
+    multiple threads at once. An unlocked check-then-act read-modify-write
+    over `_username_failures`/`_ip_failures` can under-count concurrent
+    failures — e.g. two threads both read the same pre-append list before
+    either appends, so one failure is silently lost from the count —
+    weakening the only brute-force control on a public login surface with
+    no WAF, no VPN, and no TOTP (ADR 0007). The lockout policy itself
+    (limits, window) is unchanged; only the counting is now correct under
+    concurrency.
     """
 
     def __init__(
@@ -309,6 +343,7 @@ class LoginRateLimiter:
         self._clock = clock
         self._username_failures: dict[str, list[float]] = {}
         self._ip_failures: dict[str, list[float]] = {}
+        self._lock = threading.Lock()
 
     def _now(self) -> float:
         return self._clock()
@@ -318,18 +353,23 @@ class LoginRateLimiter:
         return [t for t in failures if t > cutoff]
 
     def is_locked(self, *, username: str, ip: str) -> bool:
-        now = self._now()
-        username_failures = self._prune(self._username_failures.get(username, []), now)
-        ip_failures = self._prune(self._ip_failures.get(ip, []), now)
-        self._username_failures[username] = username_failures
-        self._ip_failures[ip] = ip_failures
-        return len(username_failures) >= self._username_limit or len(ip_failures) >= self._ip_limit
+        with self._lock:
+            now = self._now()
+            username_failures = self._prune(self._username_failures.get(username, []), now)
+            ip_failures = self._prune(self._ip_failures.get(ip, []), now)
+            self._username_failures[username] = username_failures
+            self._ip_failures[ip] = ip_failures
+            return (
+                len(username_failures) >= self._username_limit or len(ip_failures) >= self._ip_limit
+            )
 
     def record_failure(self, *, username: str, ip: str) -> None:
-        now = self._now()
-        self._username_failures.setdefault(username, []).append(now)
-        self._ip_failures.setdefault(ip, []).append(now)
+        with self._lock:
+            now = self._now()
+            self._username_failures.setdefault(username, []).append(now)
+            self._ip_failures.setdefault(ip, []).append(now)
 
     def clear(self, *, username: str, ip: str) -> None:
-        self._username_failures.pop(username, None)
-        self._ip_failures.pop(ip, None)
+        with self._lock:
+            self._username_failures.pop(username, None)
+            self._ip_failures.pop(ip, None)

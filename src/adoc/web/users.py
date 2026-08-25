@@ -55,15 +55,41 @@ _SALT_BYTES = 16
 _DUMMY_SALT = bytes(_SALT_BYTES)
 _DUMMY_HASH = hashlib.scrypt(b"", salt=_DUMMY_SALT, n=_SCRYPT_N, r=_SCRYPT_R, p=_SCRYPT_P)
 
-_yaml = YAML(typ="safe")
-_yaml.default_flow_style = False
+
+def _new_yaml() -> YAML:
+    """A fresh `YAML(typ="safe")` instance for one load/dump call.
+
+    A single module-level `YAML()` used to be shared here - the only
+    module-level `YAML` instance in the codebase (every other of the 13
+    other construction sites builds one per call). ruamel's `YAML` objects
+    are NOT thread-safe. This sits on the hot auth path
+    (`web.security.SessionAuthMiddleware` -> `is_authenticated` ->
+    `load_fingerprints` -> `_load` -> `_yaml.load(fh)`), which FastAPI
+    serves from a sync-route thread pool, so concurrent requests really do
+    call `.load()` on the same shared parser from two threads at once. That
+    produced intermittent `ruamel.yaml.constructor.DuplicateKeyError`s on
+    perfectly valid, non-duplicate YAML (confirmed by running 8 threads x
+    40 loads against a static file - see
+    `tests/test_web_users_concurrency.py`) - i.e. intermittent 500s on any
+    authenticated page, worst right after container start or `adoc user
+    add` (a fresh/rewritten file with no warm cache yet, so more
+    concurrent callers land on an actual parse). Constructing a new,
+    unshared `YAML()` per call removes the shared mutable state entirely
+    instead of trying to lock around it - this module has no long-lived
+    instance to hang a lock on. (`web.security._UserStoreCache`'s
+    cache-fill has its own lock for the analogous race on ITS shared
+    dict.)
+    """
+    yaml = YAML(typ="safe")
+    yaml.default_flow_style = False
+    return yaml
 
 
 def _load(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
     with path.open("r", encoding="utf-8") as fh:
-        data = _yaml.load(fh)
+        data = _new_yaml().load(fh)
     if not data:
         return []
     users: list[dict[str, Any]] = data.get("users", [])
@@ -73,7 +99,7 @@ def _load(path: Path) -> list[dict[str, Any]]:
 def _save(path: Path, users: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as fh:
-        _yaml.dump({"users": users}, fh)
+        _new_yaml().dump({"users": users}, fh)
 
 
 def _scrypt(password: str, salt: bytes) -> bytes:
