@@ -5,20 +5,22 @@ function. Every suite is offline and deterministic in this slice
 (`extraction` replays fixtures through `ingest.reconcile` with no model
 call at all; `redteam` drives `reason.safety`/`reason.stages` against a
 scripted FAKE client, per PLAN.md's own red-team-suite design — see
-`suites/redteam.py`) — CI (`eval.yml`) runs both with no network and no
-data repo.
+`suites/redteam.py`; `hallucination`, PLAN.md Phase 2's acceptance gate,
+drives the citation checker, entailment verifier, and abstention contract
+the same way, plus a pure-code fabricated-citation-detection check — see
+`suites/hallucination.py`) — CI (`eval.yml`) runs all three with no
+network and no data repo.
 
 `client_factory` and `candidate` are accepted by every suite for a
 uniform dispatch signature and for the incumbent-vs-candidate comparison
-report (`report.py`) to have something to label columns with. Neither
-current suite makes a real model call, so `--candidate provider:model`
-does not change either suite's pass/fail outcome today — it changes the
-label recorded on the `SuiteResult` (and would change behavior for a
-future suite that actually calls the client `client_factory` builds, e.g.
-a phase-3 differential-recall suite). This is a deliberate, documented
-scope choice, not an oversight: PLAN.md's rare-302/retrospective suites
-(which *would* need a real model) are explicitly out of scope for this
-slice.
+report (`report.py`) to have something to label columns with. No current
+suite makes a real model call, so `--candidate provider:model` does not
+change any suite's pass/fail outcome today — it changes the label recorded
+on the `SuiteResult` (and would change behavior for a future suite that
+actually calls the client `client_factory` builds, e.g. a phase-3
+differential-recall suite). This is a deliberate, documented scope choice,
+not an oversight: PLAN.md's rare-302/retrospective suites (which *would*
+need a real model) are explicitly out of scope for this slice.
 """
 
 from __future__ import annotations
@@ -87,9 +89,9 @@ def _suites() -> dict[str, Suite]:
     # Imported lazily (not at module level) so importing `evals.runner`
     # never requires the suites' own dependencies to already be wired up,
     # and to keep this module import-cycle-safe against `evals.suites.*`.
-    from adoc.evals.suites import extraction, redteam
+    from adoc.evals.suites import extraction, hallucination, redteam
 
-    return {"extraction": extraction, "redteam": redteam}
+    return {"extraction": extraction, "hallucination": hallucination, "redteam": redteam}
 
 
 def known_suites() -> list[str]:
@@ -99,8 +101,9 @@ def known_suites() -> list[str]:
 def run_suite(
     name: str, *, client_factory: ClientFactory, candidate: str | None = None
 ) -> SuiteResult:
-    """Run one named suite (`"extraction"` or `"redteam"`) and return its
-    `SuiteResult`. Raises `ValueError` for an unknown suite name."""
+    """Run one named suite (`"extraction"`, `"redteam"`, or
+    `"hallucination"`) and return its `SuiteResult`. Raises `ValueError`
+    for an unknown suite name."""
     suites = _suites()
     suite = suites.get(name)
     if suite is None:

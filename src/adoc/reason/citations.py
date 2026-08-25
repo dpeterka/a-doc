@@ -441,6 +441,23 @@ def _iter_evidence(ops: Sequence[LedgerOp]) -> Iterator[Evidence]:
             yield op.evidence
 
 
+def check_evidence_citations(
+    evidence: Sequence[Evidence],
+    db: LabsDb,
+    repo: DataRepo,
+    *,
+    pmid_verifier: PmidVerifier | None = None,
+) -> CitationReport:
+    """Resolve every `Evidence.source` ref in `evidence` directly (no
+    `LedgerOp` wrapping needed) — the primitive `check_ops_citations`
+    delegates to, and also usable standalone by a caller that already has a
+    plain `list[Evidence]` in hand (e.g. `reason.stages`'s Phase-2
+    abstention contract, which inspects one applied `Hypothesis.evidence_for`
+    at a time, not a `LedgerOp` sequence)."""
+    checks = [_check_source(item.source, item.claim, db, repo, pmid_verifier) for item in evidence]
+    return CitationReport(checks=checks)
+
+
 def check_ops_citations(
     ops: Sequence[LedgerOp],
     db: LabsDb,
@@ -452,11 +469,9 @@ def check_ops_citations(
     `AddHypothesis.hypothesis.evidence_for`/`evidence_against` and
     `AddEvidence.evidence`) — the primitive `check_diff_citations` and the
     Challenger's `additional_ops` check (`reason.stages`) both call."""
-    checks = [
-        _check_source(evidence.source, evidence.claim, db, repo, pmid_verifier)
-        for evidence in _iter_evidence(ops)
-    ]
-    return CitationReport(checks=checks)
+    return check_evidence_citations(
+        list(_iter_evidence(ops)), db, repo, pmid_verifier=pmid_verifier
+    )
 
 
 def check_diff_citations(

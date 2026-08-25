@@ -32,6 +32,7 @@ from typing import Any, Protocol
 from git import Repo
 
 from adoc.casefile.repo import DataRepo
+from adoc.ingest.doctext import rebuild_document_text_from_files
 from adoc.labs.db import LabsDb
 
 BUNDLE_KEY = "latest/a-doc-data.bundle"
@@ -189,6 +190,14 @@ class RestoreReport:
     sources_restored: int
     lab_rows_rebuilt: int
     warnings: list[str]
+    doc_text_rebuilt: int = 0
+    """How many documents' `document_text`/`document_text_fts` rows were
+    repopulated from the cloned `doc-text/*.txt` files
+    (docs/adr/0015-document-text-corpus.md). `doc-text/` is committed (never
+    gitignored, unlike `sources/genomics/`), so the bundle clone already
+    restores it in full — this only rebuilds the derived sqlite side, and
+    only runs alongside a successful `labs.sqlite` rebuild (it needs the
+    `documents` table already populated first)."""
 
 
 def _object_exists(s3: S3Client, bucket: str, key: str) -> bool:
@@ -375,10 +384,17 @@ def restore_from_bucket(
             (staging_dir / relpath).mkdir(parents=True, exist_ok=True)
 
         lab_rows_rebuilt = 0
+        doc_text_rebuilt = 0
         if jsonl_path is not None:
             with LabsDb(staging_dir / "labs.sqlite", journal_mode=sqlite_journal_mode) as db:
                 db.rebuild_from_jsonl(jsonl_path)
                 lab_rows_rebuilt = _count_lab_rows(jsonl_path)
+                # doc-text/ (docs/adr/0015) is committed, so the bundle clone
+                # already restored its files in full - this only rebuilds the
+                # derived sqlite side (document_text/document_text_fts), and
+                # needs the `documents` table just rebuilt above to exist
+                # first (document_text.source_doc is a foreign key into it).
+                doc_text_rebuilt = rebuild_document_text_from_files(db, staging_dir)
         else:
             warnings.append(
                 "no labs-export.jsonl found in the bundle or the S3 backup; "
@@ -399,4 +415,5 @@ def restore_from_bucket(
         sources_restored=sources_restored,
         lab_rows_rebuilt=lab_rows_rebuilt,
         warnings=warnings,
+        doc_text_rebuilt=doc_text_rebuilt,
     )

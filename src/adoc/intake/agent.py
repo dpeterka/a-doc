@@ -67,11 +67,21 @@ from adoc.reason.safety import red_flag_screen, treatment_gate
 
 logger = logging.getLogger(__name__)
 
-INTAKE_AGENT_PROMPT_VERSION = "4"
+INTAKE_AGENT_PROMPT_VERSION = "5"
 INTAKE_TRANSCRIPT_RELPATH = "case/intake-transcript.jsonl"
 
 DOC_DIGEST_MAX_LINES = 60
 TRANSCRIPT_CONTEXT_TURNS = 20
+
+# docs/adr/0015-document-text-corpus.md: verbatim excerpts from documents the
+# patient has already provided (a written history, a doctor's note),
+# retrieved against the CURRENT message so the agent can say "your history
+# mentions X" instead of asking her to retype it. A smaller cap than
+# `reason.context`'s diagnostic-turn budget (`MAX_DOCUMENT_EXCERPT_CHARS`) —
+# the intake turn context is already large (coverage map, gate status,
+# active facts, doc digest, transcript), so this stays modest on purpose.
+DOC_EXCERPT_LIMIT = 4
+DOC_EXCERPT_MAX_CHARS = 2000
 
 # Defect fix (live blocker): a patient who pastes a long written history in
 # one message must never be truncated or refused, but the model needs an
@@ -277,6 +287,17 @@ test that plausibly matches one of these (similar date, similar description), sa
 explicitly and ask them to confirm or distinguish it -- e.g. "I have a record of an ER
 note dated 2024-03-02 -- is that this visit, or a different one?" Use their answer to
 either note the match in the fact's `statement` or keep the two as distinct events.
+
+DOCUMENT EXCERPTS (her own prior words -- system-retrieved, read-only to you):
+The "Relevant excerpts from her own prior documents" section below shows verbatim
+passages -- system-retrieved by matching THIS message against documents she has already
+provided (a written history she submitted, a doctor's note, a prior report) -- judged
+relevant to what she just said. These are her own words, already on record: reference
+them instead of asking her to retype something she already gave you (e.g. "your history
+mentions joint pain starting in March -- is that still going on, or has it changed?").
+"(none matched for this message)" just means nothing on file matched -- proceed normally,
+and never mention "excerpts," "retrieval," or any other internal mechanism by name to the
+patient.
 
 FACT CORROBORATION (system-computed -- read-only to you):
 Each active fact listed below carries a `corroboration` status computed by deterministic code
@@ -550,11 +571,39 @@ def _render_active_facts(facts_store: IntakeFactsStore) -> str:
     return "\n".join(lines)
 
 
+def _render_document_excerpts(db: LabsDb, text: str) -> str:
+    """Verbatim excerpts from documents already on file, ranked against the
+    patient's CURRENT message (docs/adr/0015-document-text-corpus.md) —
+    never paraphrased, capped at `DOC_EXCERPT_MAX_CHARS` total characters.
+    Genomic files are structurally excluded (nothing ever populates
+    `document_text` for one — see `ingest.doctext`'s module docstring), so
+    this can never surface genotype data even indirectly.
+    """
+    hits = db.search_document_text(text, limit=DOC_EXCERPT_LIMIT)
+    if not hits:
+        return "(none matched for this message)"
+
+    lines: list[str] = []
+    budget = DOC_EXCERPT_MAX_CHARS
+    for hit in hits:
+        snippet = hit.snippet.strip()
+        if not snippet or budget <= 0:
+            continue
+        line = f"- {hit.source_ref}: {snippet}"
+        if len(line) > budget:
+            line = line[: max(budget - 1, 0)].rstrip() + "…"
+        lines.append(line)
+        budget -= len(line)
+
+    return "\n".join(lines) if lines else "(none matched for this message)"
+
+
 def _build_turn_context(
     repo: DataRepo,
     db: LabsDb,
     coverage: CoverageState,
     facts_store: IntakeFactsStore,
+    text: str,
 ) -> str:
     transcript = _render_transcript(read_intake_transcript(repo, limit=TRANSCRIPT_CONTEXT_TURNS))
     return (
@@ -565,6 +614,9 @@ def _build_turn_context(
         f"{_render_gate_status(facts_store, coverage)}\n\n"
         f"## Active facts on file\n\n{_render_active_facts(facts_store)}\n\n"
         f"## Documents & encounters already on file\n\n{build_doc_digest(db, repo)}\n\n"
+        "## Relevant excerpts from her own prior documents, for THIS message "
+        "(her own words — reference them, don't re-ask)\n\n"
+        f"{_render_document_excerpts(db, text)}\n\n"
         f"## Recent conversation\n\n{transcript}\n"
     )
 
@@ -649,7 +701,7 @@ def run_intake_turn(client: LlmClient, repo: DataRepo, db: LabsDb, text: str) ->
     _auto_cover_document_drop(repo, coverage, when=now)
     facts_store = IntakeFactsStore(repo.root)
 
-    context = _build_turn_context(repo, db, coverage, facts_store)
+    context = _build_turn_context(repo, db, coverage, facts_store, text)
     user_content = f"{context}\n\n## Patient message\n\n{text}\n"
     # Never truncate or refuse a long paste -- just steer the model to
     # handle it gracefully (product direction on the live blocker: "the

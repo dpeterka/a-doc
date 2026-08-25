@@ -90,6 +90,7 @@ def test_load_model_bindings_has_all_roles() -> None:
         "classifier",
         "test_chooser",
         "intake_agent",
+        "entailment_verifier",
     }
     assert set(bindings.keys()) == expected_roles
 

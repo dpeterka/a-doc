@@ -63,7 +63,7 @@ def test_init_succeeds_with_valid_env(
     assert code == 0
     out = capsys.readouterr().out
     assert "data_dir=" in out
-    assert "loaded 8 model role bindings" in out
+    assert "loaded 9 model role bindings" in out
 
 
 def test_init_creates_data_repo_and_is_idempotent(
@@ -161,6 +161,86 @@ def test_backfill_fails_for_a_missing_directory(
 
     assert code == 1
     assert "not a directory" in capsys.readouterr().err
+
+
+def test_backfill_doc_text_extracts_and_commits(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`adoc backfill-doc-text` covers a document that predates the
+    document-text layer (docs/adr/0015): a `documents` row + archived
+    original with no `document_text` row yet."""
+    from adoc.ingest.archive import sha256_file
+
+    data_dir = tmp_path / "a-doc-data"
+    repo = DataRepo.init_at(data_dir)
+    monkeypatch.setenv("ADOC_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("ADOC_MODELS_FILE", str(REPO_ROOT / "models.yaml"))
+
+    original = tmp_path / "old-history.txt"
+    original.write_text("A pre-existing patient history.", encoding="utf-8")
+    sha = sha256_file(original)
+    archived = repo.root / "sources" / f"{sha}__old-history.txt"
+    archived.write_text("A pre-existing patient history.", encoding="utf-8")
+
+    db_path = data_dir / "labs.sqlite"
+    with LabsDb(db_path) as db:
+        db.upsert_document(
+            LabDocument(
+                sha256=sha,
+                filename="old-history.txt",
+                doc_type="other",
+                page_count=1,
+                status=DocumentStatus.NEEDS_REVIEW,
+            )
+        )
+
+    code = main(["backfill-doc-text"])
+
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "checked 1 non-genomic document" in out
+    assert "extracted 1" in out
+
+    text_path = repo.root / "doc-text" / f"{sha}.txt"
+    assert text_path.read_text(encoding="utf-8") == "A pre-existing patient history."
+
+    with LabsDb(db_path) as db:
+        assert db.get_document_text(sha) == "A pre-existing patient history."
+
+    git_repo = GitRepo(repo.root)
+    assert git_repo.head.commit.message.startswith("ingest: backfilled text for")
+
+
+def test_backfill_doc_text_is_idempotent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    data_dir = tmp_path / "a-doc-data"
+    DataRepo.init_at(data_dir)
+    monkeypatch.setenv("ADOC_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("ADOC_MODELS_FILE", str(REPO_ROOT / "models.yaml"))
+
+    first_code = main(["backfill-doc-text"])
+    assert first_code == 0
+    first_out = capsys.readouterr().out
+    assert "checked 0 non-genomic document" in first_out
+    assert "extracted 0" in first_out
+
+    second_code = main(["backfill-doc-text"])
+    assert second_code == 0
+    second_out = capsys.readouterr().out
+    assert "extracted 0" in second_out
+
+
+def test_backfill_doc_text_fails_without_an_initialized_data_repo(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("ADOC_DATA_DIR", str(tmp_path / "a-doc-data"))
+    monkeypatch.setenv("ADOC_MODELS_FILE", str(REPO_ROOT / "models.yaml"))
+
+    code = main(["backfill-doc-text"])
+
+    assert code == 1
+    assert "not initialized" in capsys.readouterr().err
 
 
 def test_onboard_fails_without_data_dir(

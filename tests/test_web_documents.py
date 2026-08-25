@@ -14,6 +14,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 from web_support import build_app, login
 
+from adoc.labs.db import DocumentTextPage
 from adoc.labs.models import DocumentStatus, ExtractionStatus, LabDocument, LabResult
 
 OLDER_SHA = "a" * 64
@@ -160,3 +161,116 @@ def test_consumed_page_requires_login(tmp_path: Path) -> None:
     response = client.get("/documents/consumed", follow_redirects=False)
 
     assert response.status_code in (302, 303, 307, 308)
+
+
+# --------------------------------------------------------------------------
+# Extracted-text view (docs/adr/0015-document-text-corpus.md)
+# --------------------------------------------------------------------------
+
+
+def test_consumed_page_links_to_text_view_when_text_is_on_file(tmp_path: Path) -> None:
+    app, _repo, db, _calls = build_app(tmp_path)
+    _seed(db)
+    db.replace_document_text(
+        OLDER_SHA,
+        [DocumentTextPage(page=1, text="Impression: unremarkable.")],
+        extracted_at=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+    client = TestClient(app)
+    login(client)
+
+    response = client.get("/documents/consumed")
+
+    assert f"/documents/consumed/{OLDER_SHA}/text" in response.text
+
+
+def test_consumed_page_shows_dash_when_no_text_on_file(tmp_path: Path) -> None:
+    app, _repo, db, _calls = build_app(tmp_path)
+    _seed(db)
+    client = TestClient(app)
+    login(client)
+
+    response = client.get("/documents/consumed")
+
+    assert f"/documents/consumed/{OLDER_SHA}/text" not in response.text
+    assert f"/documents/consumed/{GENOMIC_SHA}/text" not in response.text
+
+
+def test_text_view_renders_the_stored_text(tmp_path: Path) -> None:
+    app, _repo, db, _calls = build_app(tmp_path)
+    _seed(db)
+    db.replace_document_text(
+        OLDER_SHA,
+        [DocumentTextPage(page=1, text="Impression: unremarkable findings.")],
+        extracted_at=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+    client = TestClient(app)
+    login(client)
+
+    response = client.get(f"/documents/consumed/{OLDER_SHA}/text")
+
+    assert response.status_code == 200
+    assert "Impression: unremarkable findings." in response.text
+    assert "older-report.pdf" in response.text
+
+
+def test_text_view_404s_when_no_text_stored(tmp_path: Path) -> None:
+    app, _repo, db, _calls = build_app(tmp_path)
+    _seed(db)
+    client = TestClient(app)
+    login(client)
+
+    response = client.get(f"/documents/consumed/{OLDER_SHA}/text")
+
+    assert response.status_code == 404
+
+
+def test_text_view_404s_for_unknown_sha(tmp_path: Path) -> None:
+    app, _repo, _db, _calls = build_app(tmp_path)
+    client = TestClient(app)
+    login(client)
+
+    response = client.get(f"/documents/consumed/{'0' * 64}/text")
+
+    assert response.status_code == 404
+
+
+def test_text_view_404s_for_unsafe_sha(tmp_path: Path) -> None:
+    app, _repo, _db, _calls = build_app(tmp_path)
+    client = TestClient(app)
+    login(client)
+
+    response = client.get("/documents/consumed/../../etc/passwd/text")
+
+    assert response.status_code == 404
+
+
+def test_genomic_document_never_offers_a_text_view_even_if_somehow_present(
+    tmp_path: Path,
+) -> None:
+    """Defense in depth: even if a `document_text` row somehow existed for
+    a genomic sha (never happens in practice — see `ingest.doctext`'s
+    genomics exclusion), the route layer refuses to surface it: the
+    consumed-page row never links to a text view, and the text-view route
+    itself 404s.
+    """
+    app, _repo, db, _calls = build_app(tmp_path)
+    _seed(db)
+    db.replace_document_text(
+        GENOMIC_SHA,
+        [DocumentTextPage(page=None, text="this should never be reachable")],
+        extracted_at=datetime(2026, 7, 1, tzinfo=UTC),
+    )
+    client = TestClient(app)
+    login(client)
+
+    response = client.get("/documents/consumed")
+    body = response.text
+    genomic_row_start = body.index("23andme-export.txt")
+    genomic_row_end = body.index("</tr>", genomic_row_start)
+    genomic_row = body[genomic_row_start:genomic_row_end]
+    assert "View text" not in genomic_row
+    assert f"/documents/consumed/{GENOMIC_SHA}/text" not in genomic_row
+
+    text_response = client.get(f"/documents/consumed/{GENOMIC_SHA}/text")
+    assert text_response.status_code == 404

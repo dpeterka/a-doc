@@ -6,7 +6,7 @@ Fake `LlmClient` transports throughout — no network, ever.
 from __future__ import annotations
 
 import json
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 import pytest
@@ -14,12 +14,19 @@ import pytest
 from adoc.casefile.encounters import Encounter, EncounterFrontmatter, write_encounter
 from adoc.casefile.repo import DataRepo
 from adoc.config import ModelBinding
-from adoc.labs.db import LabsDb
+from adoc.labs.db import DocumentTextPage, LabsDb
 from adoc.labs.models import LabDocument, LabResult
 from adoc.reason.client import AnthropicProvider, LlmClient, TransportRequest, TransportResponse
 from adoc.reason.safety import RedFlagResult
 from adoc.reason.stages import run_informational_turn
-from adoc.reason.tools import answer_informational, list_encounters, query_labs, search_case
+from adoc.reason.tools import (
+    answer_informational,
+    informational_llm_result,
+    list_encounters,
+    query_labs,
+    search_case,
+    search_documents,
+)
 
 SHA = "c" * 64
 
@@ -99,6 +106,47 @@ def test_search_case_finds_lab_fts_matches(repo: DataRepo, db: LabsDb) -> None:
 def test_search_case_no_matches(repo: DataRepo, db: LabsDb) -> None:
     result = search_case(repo, db, "xyzzy-nonexistent-term")
     assert "No matches" in result
+
+
+# --- search_documents (docs/adr/0015-document-text-corpus.md) ---------------------------------
+
+
+def test_search_documents_finds_a_match_with_source_ref(db: LabsDb) -> None:
+    db.replace_document_text(
+        SHA,
+        [DocumentTextPage(page=1, text="Impression: findings consistent with early arthritis.")],
+        extracted_at=datetime(2026, 5, 3),
+    )
+    result = search_documents(db, "how is my arthritis")
+    assert "arthritis" in result.lower()
+    assert "doc:doc.pdf#p1" in result
+
+
+def test_search_documents_no_matches(db: LabsDb) -> None:
+    result = search_documents(db, "xyzzy-nonexistent-term")
+    assert "No document text matches" in result
+
+
+def test_search_documents_included_in_informational_deterministic_retrieval(
+    repo: DataRepo, db: LabsDb
+) -> None:
+    db.replace_document_text(
+        SHA,
+        [DocumentTextPage(page=1, text="Impression: findings consistent with early arthritis.")],
+        extracted_at=datetime(2026, 5, 3),
+    )
+    calls: list[TransportRequest] = []
+
+    def transport(request: TransportRequest) -> TransportResponse:
+        calls.append(request)
+        return TransportResponse(text="ok", tool_input=None, input_tokens=1, output_tokens=1)
+
+    client = _fake_client(transport)
+    informational_llm_result(client, repo, db, "how is my arthritis doing")
+
+    sent = "\n".join(m.content for m in calls[0].messages)
+    assert "search_documents" in sent
+    assert "arthritis" in sent.lower()
 
 
 # --- list_encounters --------------------------------------------------------------------------

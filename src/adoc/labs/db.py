@@ -50,6 +50,35 @@ class DocumentOverview:
 
 
 @dataclass(frozen=True)
+class DocumentTextPage:
+    """One page (or, for a non-paginated docx/text document, the whole
+    document) of extracted text, as written to `document_text` by
+    `LabsDb.replace_document_text()`. `page` is `None` for a document with
+    no page structure (docx/plain-text) — see `ingest.doctext`'s module
+    docstring for the form-feed-driven pagination rule."""
+
+    page: int | None
+    text: str
+
+
+@dataclass(frozen=True)
+class DocumentTextHit:
+    """One ranked FTS5 match from `LabsDb.search_document_text()`.
+
+    `source_ref` is PLAN.md's source-ref grammar rendering:
+    `doc:<filename>#p<page>` when `page` is known, `doc:<filename>`
+    otherwise — verbatim (never paraphrased) so a model can cite it and a
+    later verifier can check it against the source.
+    """
+
+    source_doc: str
+    filename: str
+    page: int | None
+    snippet: str
+    source_ref: str
+
+
+@dataclass(frozen=True)
 class PendingRow:
     """One PENDING lab row joined with its source document.
 
@@ -203,6 +232,43 @@ _MIGRATIONS: list[str] = [
         INSERT INTO labs_fts(rowid, name, name_raw) VALUES (new.id, new.name, new.name_raw);
     END;
     """,
+    # Migration 3: the document-TEXT layer (docs/adr/0015-document-text-corpus.md).
+    # One row per (source_doc, page) - `page` is NULL for a docx/plain-text
+    # document (no page structure); an `id` column (not `source_doc`) backs
+    # the FTS5 external-content table because FTS5's `content_rowid` must be
+    # an INTEGER PRIMARY KEY-backed rowid, and `source_doc` (a sha256 TEXT)
+    # can't serve as one - mirrors `labs`/`labs_fts`'s own `id`/`content_rowid`
+    # pairing above.
+    """
+    CREATE TABLE document_text (
+        id INTEGER PRIMARY KEY,
+        source_doc TEXT NOT NULL REFERENCES documents(sha256),
+        page INTEGER,
+        text TEXT NOT NULL,
+        extracted_at TEXT NOT NULL
+    );
+
+    CREATE INDEX document_text_by_source ON document_text(source_doc);
+
+    CREATE VIRTUAL TABLE document_text_fts USING fts5(
+        text, content='document_text', content_rowid='id'
+    );
+
+    CREATE TRIGGER document_text_ai AFTER INSERT ON document_text BEGIN
+        INSERT INTO document_text_fts(rowid, text) VALUES (new.id, new.text);
+    END;
+
+    CREATE TRIGGER document_text_ad AFTER DELETE ON document_text BEGIN
+        INSERT INTO document_text_fts(document_text_fts, rowid, text)
+        VALUES('delete', old.id, old.text);
+    END;
+
+    CREATE TRIGGER document_text_au AFTER UPDATE ON document_text BEGIN
+        INSERT INTO document_text_fts(document_text_fts, rowid, text)
+        VALUES('delete', old.id, old.text);
+        INSERT INTO document_text_fts(rowid, text) VALUES (new.id, new.text);
+    END;
+    """,
 ]
 
 _CORRECTABLE_FIELDS = {
@@ -268,12 +334,34 @@ def _fts_query(text: str) -> str:
     """Build a safe FTS5 MATCH query: AND of phrase-quoted tokens.
 
     Quoting each token as an FTS5 string literal avoids MATCH syntax errors
-    on punctuation in free-text search input.
+    on punctuation in free-text search input. Appropriate for a short,
+    deliberate search term (an analyte name, a case-file grep phrase) —
+    every token must match, which is the right default when the caller
+    picked every word on purpose.
     """
     tokens = re.findall(r"\w+", text)
     if not tokens:
         return '""'
     return " AND ".join(f'"{t}"' for t in tokens)
+
+
+def _fts_query_any(text: str) -> str:
+    """Build a safe FTS5 MATCH query: OR of phrase-quoted tokens, ranked by
+    FTS5's own bm25 relevance (`ORDER BY rank`).
+
+    Used by `search_document_text` (docs/adr/0015-document-text-corpus.md),
+    whose `query` is typically a whole, unedited conversational message
+    (a chat turn, a patient's intake reply) rather than a short deliberate
+    search phrase — requiring EVERY word to match (`_fts_query`'s AND
+    semantics) would make a full sentence match almost nothing in
+    practice. OR lets a passage sharing even one distinctive word rank and
+    surface, with bm25 naturally favoring a passage that matches more of
+    the query's terms over one that matches only one.
+    """
+    tokens = re.findall(r"\w+", text)
+    if not tokens:
+        return '""'
+    return " OR ".join(f'"{t}"' for t in tokens)
 
 
 # Deliberately private copies of `ingest.reconcile`'s `parse_ref_range`/
@@ -1216,6 +1304,109 @@ class LabsDb:
             (_fts_query(text),),
         ).fetchall()
         return [_row_to_lab(row) for row in rows]
+
+    # ----------------------------------------------------------------
+    # Document text (docs/adr/0015-document-text-corpus.md)
+    # ----------------------------------------------------------------
+
+    @_synchronized
+    def replace_document_text(
+        self, source_doc: str, pages: Sequence[DocumentTextPage], *, extracted_at: datetime
+    ) -> None:
+        """Replace every stored page of `source_doc`'s extracted text with
+        `pages` — delete-then-insert, so this is idempotent and also the
+        primitive both a fresh ingest and a from-scratch rebuild
+        (`ingest.doctext.rebuild_document_text_from_files`) share. `pages`
+        empty is a valid call (nothing to store — a caller that got no
+        pages back from extraction should simply not call this at all;
+        kept permissive here rather than raising, since "no rows" is a
+        harmless no-op for a delete-then-insert).
+        """
+        self._conn.execute("DELETE FROM document_text WHERE source_doc = ?", (source_doc,))
+        for page in pages:
+            self._conn.execute(
+                "INSERT INTO document_text (source_doc, page, text, extracted_at) "
+                "VALUES (?, ?, ?, ?)",
+                (source_doc, page.page, page.text, extracted_at.isoformat()),
+            )
+        self._conn.commit()
+
+    @_synchronized
+    def document_text_shas(self) -> set[str]:
+        """Every `source_doc` sha256 with at least one stored text row —
+        "already has text extracted" regardless of whether that text is
+        empty (a scanned-image PDF that `pdftotext` returned nothing for is
+        still covered, so `adoc backfill-doc-text` doesn't retry it forever).
+        """
+        rows = self._conn.execute("SELECT DISTINCT source_doc FROM document_text").fetchall()
+        return {row[0] for row in rows}
+
+    @_synchronized
+    def get_document_text(self, source_doc: str) -> str | None:
+        """`source_doc`'s full text, pages rejoined with the same form-feed
+        (`\\f`) separator `ingest.doctext` splits on — `None` if no text has
+        ever been stored for this document (never extracted, or extraction
+        failed every time it was attempted)."""
+        rows = self._conn.execute(
+            "SELECT text FROM document_text WHERE source_doc = ? ORDER BY (page IS NOT NULL), page",
+            (source_doc,),
+        ).fetchall()
+        if not rows:
+            return None
+        return "\f".join(row[0] for row in rows)
+
+    @_synchronized
+    def get_document_page_text(self, source_doc: str, page: int) -> str | None:
+        """One page's stored text, or `None` when this document's text was
+        stored whole (no per-page split) or that page has none.
+
+        Used by `reason.verify`'s source resolution so a `doc:<file>#p<n>`
+        evidence ref is entailment-checked against the page it actually
+        cites rather than the whole document — a claim is much easier to
+        judge against one page than against thirty."""
+        row = self._conn.execute(
+            "SELECT text FROM document_text WHERE source_doc = ? AND page = ?",
+            (source_doc, page),
+        ).fetchone()
+        return str(row[0]) if row is not None else None
+
+    @_synchronized
+    def search_document_text(self, query: str, *, limit: int = 5) -> list[DocumentTextHit]:
+        """Ranked FTS5 snippet search over every document's extracted text
+        (`reason.tools.search_documents`/`reason.context`'s document-excerpts
+        section). Each hit's `snippet` comes from sqlite's own `snippet()`
+        function (bracketed match highlighting, ~12 tokens of surrounding
+        context) — never hand-rolled truncation.
+        """
+        rows = self._conn.execute(
+            """
+            SELECT document_text.source_doc AS source_doc,
+                   document_text.page AS page,
+                   documents.filename AS filename,
+                   snippet(document_text_fts, 0, '[', ']', ' ... ', 12) AS snip
+            FROM document_text_fts
+            JOIN document_text ON document_text.id = document_text_fts.rowid
+            JOIN documents ON documents.sha256 = document_text.source_doc
+            WHERE document_text_fts MATCH ?
+            ORDER BY rank
+            LIMIT ?
+            """,
+            (_fts_query_any(query), limit),
+        ).fetchall()
+        hits: list[DocumentTextHit] = []
+        for row in rows:
+            page = row["page"]
+            ref = f"doc:{row['filename']}#p{page}" if page is not None else f"doc:{row['filename']}"
+            hits.append(
+                DocumentTextHit(
+                    source_doc=row["source_doc"],
+                    filename=row["filename"],
+                    page=page,
+                    snippet=row["snip"],
+                    source_ref=ref,
+                )
+            )
+        return hits
 
     # ----------------------------------------------------------------
     # JSONL export / rebuild (PLAN.md "State": sqlite is derived)

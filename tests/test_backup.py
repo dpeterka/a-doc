@@ -256,6 +256,36 @@ def test_restore_round_trip_reproduces_git_log_sources_and_labs(tmp_path: Path) 
         assert [r.value for r in series] == [1.2, 0.9]
 
 
+def test_restore_rebuilds_document_text_index(tmp_path: Path) -> None:
+    """docs/adr/0015-document-text-corpus.md: `doc-text/` is committed (the
+    bundle clone restores its files in full), and restore rebuilds the
+    derived `document_text`/`document_text_fts` sqlite side from those
+    files (`ingest.doctext.rebuild_document_text_from_files`)."""
+    src = tmp_path / "src-data"
+    DataRepo.init_at(src)
+    _seed_with_labs(src)
+
+    sha = "b" * 64  # matches _seed_with_labs's document sha
+    text_path = src / "doc-text" / f"{sha}.txt"
+    text_path.parent.mkdir(parents=True, exist_ok=True)
+    text_path.write_text("CRP trending down over time.", encoding="utf-8")
+    repo = DataRepo(src)
+    repo.commit("test: seed doc-text", paths=["doc-text"])
+
+    s3 = FakeS3Client()
+    run_backup(src, "bucket", s3)
+
+    dst = tmp_path / "restored-data"
+    report = restore_from_bucket("bucket", dst, s3_client=s3)
+
+    assert report.doc_text_rebuilt == 1
+    assert (dst / "doc-text" / f"{sha}.txt").read_text(encoding="utf-8") == (
+        "CRP trending down over time."
+    )
+    with LabsDb(dst / "labs.sqlite") as db:
+        assert db.get_document_text(sha) == "CRP trending down over time."
+
+
 def test_restore_requires_a_bucket(tmp_path: Path) -> None:
     with pytest.raises(RestoreError):
         restore_from_bucket("", tmp_path / "dst", s3_client=FakeS3Client())

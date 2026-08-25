@@ -9,6 +9,7 @@ network, mirroring the pattern in `tests/test_stages.py`.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -121,25 +122,45 @@ def default_visit_capture_transport(request: TransportRequest) -> TransportRespo
     return TransportResponse(text="", tool_input={"ops": []}, input_tokens=1, output_tokens=1)
 
 
+def entailed_entailment_transport(request: TransportRequest) -> TransportResponse:
+    """Default fake transport for role `entailment_verifier`: always judges
+    every claim it is sent as `entailed` (mirrors `tests/test_stages.py`'s
+    identical helper) — the web chat suite is not exercising entailment
+    quality, just that the wiring doesn't break a normal turn."""
+    _preamble, _blank, payload_text = request.messages[-1].content.partition("\n\n")
+    pairs = json.loads(payload_text)
+    judgments = [
+        {"claim_index": pair["claim_index"], "judgment": "entailed", "rationale": "matches"}
+        for pair in pairs
+    ]
+    return TransportResponse(
+        text="", tool_input={"judgments": judgments}, input_tokens=5, output_tokens=5
+    )
+
+
 def build_fake_client(
     primary_transport: Transport,
     challenger_transport: Transport,
     *,
     intake_agent_transport: Transport | None = None,
     visit_capture_transport: Transport | None = None,
+    entailment_transport: Transport | None = None,
 ) -> LlmClient:
-    """`primary_reasoner`/`classifier` -> anthropic; `challenger` -> openai —
-    same role/provider layout as `tests/test_stages.py`. `intake_agent`
-    also binds to the anthropic provider, defaulting to `primary_transport`
-    so any test not exercising onboarding never has to think about it;
-    `visit_capture_transport` defaults to `default_visit_capture_transport`
-    (empty ops) so a test not exercising interval-history capture never has
-    to think about it either."""
+    """`primary_reasoner`/`classifier` -> anthropic; `challenger` -> openai;
+    `entailment_verifier` -> featherless — same role/provider layout as
+    `tests/test_stages.py`. `intake_agent` also binds to the anthropic
+    provider, defaulting to `primary_transport` so any test not exercising
+    onboarding never has to think about it; `visit_capture_transport`
+    defaults to `default_visit_capture_transport` (empty ops) so a test not
+    exercising interval-history capture never has to think about it either;
+    `entailment_transport` defaults to always-`entailed` for the same
+    reason."""
     bindings: dict[str, list[ModelBinding]] = {
         "primary_reasoner": [ModelBinding(provider="anthropic", model="fake-primary")],
         "challenger": [ModelBinding(provider="openai", model="fake-challenger")],
         "classifier": [ModelBinding(provider="anthropic", model="fake-primary")],
         "intake_agent": [ModelBinding(provider="anthropic", model="fake-intake-agent")],
+        "entailment_verifier": [ModelBinding(provider="featherless", model="fake-verifier")],
     }
     providers = {
         "anthropic": AnthropicProvider(
@@ -151,6 +172,9 @@ def build_fake_client(
             ),
         ),
         "openai": OpenAIProvider(api_key=None, transport=challenger_transport),
+        "featherless": OpenAIProvider(
+            api_key=None, transport=entailment_transport or entailed_entailment_transport
+        ),
     }
     return LlmClient(bindings, providers)
 
