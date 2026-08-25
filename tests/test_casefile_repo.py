@@ -143,3 +143,48 @@ def test_commit_default_stages_everything(tmp_path: Path) -> None:
 def test_history_relpath_constant_matches_ledger_convention() -> None:
     assert HISTORY_RELPATH == "case/ledger-history.jsonl"
     assert LEDGER_RELPATH == "case/differential-ledger.yaml"
+
+
+def test_concurrent_commits_do_not_race_or_lose_a_commit(tmp_path: Path) -> None:
+    """`DataRepo` is a process-wide singleton (`app.state.repo`) driven from
+    FastAPI's sync-route thread pool, so two requests can call `commit()` at
+    the same moment. `commit()` is a read-modify-write over `.git/index` and
+    `HEAD`: unserialized, concurrent callers either collide on git's own
+    index.lock (`GitCommandError`) or silently lose one thread's commit by
+    racing the ref update. Every intake turn commits, so a lost commit is
+    lost patient-reported facts.
+
+    Sized so that failure without the lock is overwhelmingly likely rather
+    than occasional: 8 threads x 6 commits each, all contending on one repo.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    repo = DataRepo.init_at(tmp_path / "data")
+    baseline = sum(1 for _ in Repo(repo.root).iter_commits())
+
+    threads, per_thread = 8, 6
+
+    def _write_and_commit(worker: int) -> list[str]:
+        shas = []
+        for i in range(per_thread):
+            relpath = f"case/notes/worker-{worker}-{i}.md"
+            repo.write(relpath, f"worker {worker} note {i}\n")
+            shas.append(repo.commit(f"test: worker {worker} note {i}"))
+        return shas
+
+    with ThreadPoolExecutor(max_workers=threads) as pool:
+        results = list(pool.map(_write_and_commit, range(threads)))
+
+    all_shas = [sha for batch in results for sha in batch]
+    assert len(all_shas) == threads * per_thread
+    assert all(isinstance(sha, str) and sha for sha in all_shas)
+
+    # Every commit must actually be in history: a lost update would show up
+    # as a shortfall here even though commit() returned a sha to its caller.
+    final = sum(1 for _ in Repo(repo.root).iter_commits())
+    assert final == baseline + threads * per_thread
+
+    # And every file written is present in the final tree.
+    for worker in range(threads):
+        for i in range(per_thread):
+            assert (repo.root / f"case/notes/worker-{worker}-{i}.md").exists()

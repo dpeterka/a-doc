@@ -15,13 +15,15 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import threading
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
+from functools import wraps
 from pathlib import Path
 from types import TracebackType
-from typing import Any, Literal
+from typing import Any, Concatenate, Literal
 
 from adoc.labs.models import ExtractionStatus, LabDocument, LabFlag, LabResult, Specimen
 from adoc.labs.validate import canonical_rename_target
@@ -333,6 +335,41 @@ class ResolutionConvergedError(Exception):
         )
 
 
+def _synchronized[**P, T](
+    method: Callable[Concatenate[LabsDb, P], T],
+) -> Callable[Concatenate[LabsDb, P], T]:
+    """Serialize one `LabsDb` method call on the instance's `self._lock`.
+
+    Applied explicitly to every `LabsDb` method (public and private) that
+    touches `self._conn` in any way - `execute`/`executemany`/`executescript`,
+    `commit`, or a fresh `cursor()` - including ones that only touch it
+    indirectly by calling another such method. The `with self._lock:` spans
+    the WHOLE method body, so `execute(...)` and the `fetchall()`/
+    `fetchone()`/`commit()` that consumes its result always run as one
+    atomic unit from another thread's point of view; a lock that were
+    released between `execute` and `fetch` would not prevent the
+    interleaving that causes `sqlite3.InterfaceError: bad parameter or
+    other API misuse` (see `LabsDb.__init__`). `self._lock` is a
+    `threading.RLock`, not a plain `Lock`, because several of these methods
+    call other synchronized methods on `self` (e.g. `insert_results` calls
+    `_find_at_key`/`_insert_new_row`, `resolve_with_pass` calls `get_row`) -
+    a plain lock would deadlock a thread against itself on that re-entry.
+    A decorator (rather than a metaclass or `__getattribute__` override) so
+    the next reader can see exactly which methods are guarded just by
+    reading their definitions. Typed with `ParamSpec`/`Concatenate` (not
+    `Callable[..., _T]`) so each decorated method keeps its own precise
+    parameter types under mypy instead of degrading every call site to
+    `Any` args.
+    """
+
+    @wraps(method)
+    def wrapper(self: LabsDb, *args: P.args, **kwargs: P.kwargs) -> T:
+        with self._lock:
+            return method(self, *args, **kwargs)
+
+    return wrapper
+
+
 class LabsDb:
     """Sqlite-backed store for the `documents`/`labs` tables (stdlib sqlite3)."""
 
@@ -360,25 +397,46 @@ class LabsDb:
         self._path = path
         if str(path) != ":memory:":
             Path(path).parent.mkdir(parents=True, exist_ok=True)
-        # check_same_thread=False: a single LabsDb is shared across an ASGI
-        # server's worker threads (FastAPI's sync-route thread pool, or a
-        # test client's per-call portal thread) - the connection itself is
-        # never touched concurrently from two threads at once (this app is
-        # single-user/single-request-at-a-time), only sequentially from
-        # different ones, which sqlite3's default same-thread check would
-        # otherwise reject.
-        self._conn = sqlite3.connect(str(path), check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
-        self._conn.execute(f"PRAGMA journal_mode={journal_mode}")
-        self._conn.execute("PRAGMA foreign_keys=ON")
+        # `self._lock` is created before anything else touches `self._conn`
+        # (including `_migrate()` below) - every `@_synchronized` method
+        # assumes `self._lock` already exists, and `_migrate()` is one of
+        # them.
+        self._lock = threading.RLock()
+        with self._lock:
+            # check_same_thread=False: a single LabsDb instance is shared
+            # across an ASGI server's worker threads (FastAPI runs sync
+            # routes in a thread pool) and across a test client's per-call
+            # portal thread. This comment used to claim the shared
+            # connection was "never touched concurrently from two threads
+            # at once ... only sequentially from different ones" - that was
+            # FALSE: a browser issuing multiple requests (the user clicking
+            # between pages, or a slow page leaving a wide window) lands
+            # concurrently in the threadpool, and two threads driving one
+            # sqlite3 connection at the same time is exactly what produced
+            # the production crash this class now guards against
+            # (`sqlite3.InterfaceError: bad parameter or other API misuse`,
+            # raised from `LabsDb.series` while `/upload`, `/reviews`, and
+            # `/confirm` were being served in the same second). Sharing one
+            # connection across threads is only safe because every method
+            # below holds `self._lock` (a `threading.RLock`, see
+            # `_synchronized`) for the full duration of its sqlite3 calls;
+            # `check_same_thread=False` merely disables sqlite3's own
+            # (weaker, same-thread-only) guard so that sharing is allowed
+            # to happen at all - the RLock is what actually makes it safe.
+            self._conn = sqlite3.connect(str(path), check_same_thread=False)
+            self._conn.row_factory = sqlite3.Row
+            self._conn.execute(f"PRAGMA journal_mode={journal_mode}")
+            self._conn.execute("PRAGMA foreign_keys=ON")
         self._migrate()
 
+    @_synchronized
     def close(self) -> None:
         self._conn.close()
 
     def __enter__(self) -> LabsDb:
         return self
 
+    @_synchronized
     def __exit__(
         self,
         exc_type: type[BaseException] | None,
@@ -387,6 +445,7 @@ class LabsDb:
     ) -> None:
         self.close()
 
+    @_synchronized
     def _migrate(self) -> None:
         current: int = self._conn.execute("PRAGMA user_version").fetchone()[0]
         for version, script in enumerate(_MIGRATIONS, start=1):
@@ -400,6 +459,7 @@ class LabsDb:
     # Documents
     # ----------------------------------------------------------------
 
+    @_synchronized
     def upsert_document(self, doc: LabDocument) -> None:
         self._conn.execute(
             """
@@ -418,14 +478,17 @@ class LabsDb:
         )
         self._conn.commit()
 
+    @_synchronized
     def get_document(self, sha256: str) -> LabDocument | None:
         row = self._conn.execute("SELECT * FROM documents WHERE sha256 = ?", (sha256,)).fetchone()
         return _row_to_document(row) if row else None
 
+    @_synchronized
     def list_documents(self) -> list[LabDocument]:
         rows = self._conn.execute("SELECT * FROM documents ORDER BY ingested_at DESC").fetchall()
         return [_row_to_document(row) for row in rows]
 
+    @_synchronized
     def documents_overview(self) -> list[DocumentOverview]:
         """Every ingested document, newest first, alongside its
         accepted/awaiting-review lab-row counts — the "Documents >
@@ -459,6 +522,7 @@ class LabsDb:
     # Labs: insert + confirm queue
     # ----------------------------------------------------------------
 
+    @_synchronized
     def insert_results(self, results: Sequence[LabResult]) -> list[int | None]:
         """Insert lab rows, one `id | None` per input row (in order).
 
@@ -501,6 +565,7 @@ class LabsDb:
         self._conn.commit()
         return ids
 
+    @_synchronized
     def _find_at_key(self, row: LabResult) -> LabResult | None:
         """The row (any `extraction_status`) already occupying `row`'s
         `(date, name, specimen, source_doc)` UNIQUE key, if any."""
@@ -510,6 +575,7 @@ class LabsDb:
         ).fetchone()
         return _row_to_lab(found) if found else None
 
+    @_synchronized
     def _insert_new_row(self, row: LabResult) -> int | None:
         cur = self._conn.execute(
             """
@@ -524,6 +590,7 @@ class LabsDb:
         )
         return cur.lastrowid if cur.rowcount else None
 
+    @_synchronized
     def _revive_rejected_row(self, existing: LabResult, new: LabResult) -> int:
         """Case (b): a prior human rejection at this key, now superseded by
         a fresh extraction - overwrite the row's fields with the new
@@ -565,6 +632,7 @@ class LabsDb:
         )
         return existing.id
 
+    @_synchronized
     def _flip_to_pending_with_conflict(self, existing: LabResult, new: LabResult) -> int:
         """Case (d): the existing (already-resolved-one-way-or-another) row
         at this key disagrees with a fresh extraction's reading. The
@@ -589,6 +657,7 @@ class LabsDb:
         )
         return existing.id
 
+    @_synchronized
     def pending(self) -> list[LabResult]:
         """Rows awaiting human confirmation (the confirm queue)."""
         rows = self._conn.execute(
@@ -597,6 +666,7 @@ class LabsDb:
         ).fetchall()
         return [_row_to_lab(row) for row in rows]
 
+    @_synchronized
     def pending_grouped(self) -> list[PendingRow]:
         """PENDING rows joined with their document, ordered by document
         date descending (then by the row's own date/id).
@@ -637,6 +707,7 @@ class LabsDb:
             )
         return result
 
+    @_synchronized
     def lab_counts_by_document(self) -> dict[str, int]:
         """Total lab-row count (any `extraction_status`) per document
         `sha256`. The confirm queue's per-document header derives its
@@ -646,10 +717,12 @@ class LabsDb:
         ).fetchall()
         return {row["source_doc"]: row["n"] for row in rows}
 
+    @_synchronized
     def get_row(self, row_id: int) -> LabResult | None:
         row = self._conn.execute("SELECT * FROM labs WHERE id = ?", (row_id,)).fetchone()
         return _row_to_lab(row) if row else None
 
+    @_synchronized
     def confirm_row(self, row_id: int) -> None:
         self._conn.execute(
             "UPDATE labs SET extraction_status = ? WHERE id = ?",
@@ -657,6 +730,7 @@ class LabsDb:
         )
         self._conn.commit()
 
+    @_synchronized
     def bulk_confirm(self, ids: Sequence[int]) -> int:
         """Confirm every currently-PENDING row in `ids`; returns how many
         rows were actually updated.
@@ -678,6 +752,7 @@ class LabsDb:
         self._conn.commit()
         return cur.rowcount
 
+    @_synchronized
     def correct_row(self, row_id: int, **fields: Any) -> None:
         """Apply a human correction to `row_id` and mark it `corrected`.
 
@@ -709,6 +784,7 @@ class LabsDb:
         )
         self._conn.commit()
 
+    @_synchronized
     def resolve_with_pass(self, row_id: int, which: Literal["a", "b"]) -> None:
         """Apply pass A's or pass B's reading wholesale to a disagreement
         row and mark it `corrected` (queue-ergonomics slice item 1: the
@@ -790,6 +866,7 @@ class LabsDb:
         )
         self._conn.commit()
 
+    @_synchronized
     def reject_row(self, row_id: int) -> None:
         self._conn.execute(
             "UPDATE labs SET extraction_status = ? WHERE id = ?",
@@ -797,6 +874,7 @@ class LabsDb:
         )
         self._conn.commit()
 
+    @_synchronized
     def mark_single_pass_as_name_variant(self, row_id: int, *, other_name: str) -> None:
         """Upgrade a `single_pass` PENDING row that the twin sweep paired
         with its opposite-pass twin: the `single_pass` reason becomes
@@ -820,6 +898,7 @@ class LabsDb:
         )
         self._conn.commit()
 
+    @_synchronized
     def reclassify_row(self, row_id: int, *, reasons: list[str], auto: bool, at: datetime) -> None:
         """Apply `labs.reclassify.reclassify_pending`'s recomputed reason
         list to a still-PENDING row: `auto=True` flips `extraction_status`
@@ -846,6 +925,7 @@ class LabsDb:
         )
         self._conn.commit()
 
+    @_synchronized
     def reject_row_as_twin(
         self, row_id: int, *, twin_of: int, method: Literal["rule", "llm"]
     ) -> None:
@@ -868,6 +948,7 @@ class LabsDb:
         )
         self._conn.commit()
 
+    @_synchronized
     def resolved_rows_for_document(self, source_doc: str) -> list[LabResult]:
         """Rows in `source_doc` already past human/auto review (`auto`,
         `confirmed`, `corrected`) - the candidate pool for `labs/twins.py`'s
@@ -891,6 +972,7 @@ class LabsDb:
     # Read side
     # ----------------------------------------------------------------
 
+    @_synchronized
     def series(
         self, name: str, specimen: Specimen | None = None, *, include_rejected: bool = False
     ) -> list[LabResult]:
@@ -918,6 +1000,7 @@ class LabsDb:
         ).fetchall()
         return [_row_to_lab(row) for row in rows]
 
+    @_synchronized
     def series_by_key(
         self, *, include_rejected: bool = False
     ) -> dict[tuple[str, str], list[LabResult]]:
@@ -948,6 +1031,7 @@ class LabsDb:
             grouped[(result.name, result.specimen)].append(result)
         return dict(grouped)
 
+    @_synchronized
     def latest_panel(self) -> list[LabResult]:
         """Most recent non-rejected row per distinct (analyte name, specimen).
 
@@ -973,6 +1057,7 @@ class LabsDb:
         ).fetchall()
         return [_row_to_lab(row) for row in rows]
 
+    @_synchronized
     def abnormal_since(self, since: date) -> list[LabResult]:
         """Flagged rows on/after `since`, most recent first.
 
@@ -988,6 +1073,7 @@ class LabsDb:
         ).fetchall()
         return [_row_to_lab(row) for row in rows]
 
+    @_synchronized
     def all_non_rejected_rows(self) -> list[LabResult]:
         """Every lab row (any date/analyte) whose `extraction_status` isn't
         `rejected`, ordered by id - the working set for `adoc
@@ -998,6 +1084,7 @@ class LabsDb:
         ).fetchall()
         return [_row_to_lab(row) for row in rows]
 
+    @_synchronized
     def rejected_row_keys(self) -> set[tuple[str, str, str, str]]:
         """The `(date, name, specimen, source_doc)` keys currently held by
         REJECTED rows. The table's UNIQUE constraint spans rejected rows
@@ -1010,6 +1097,7 @@ class LabsDb:
         ).fetchall()
         return {(r[0], r[1], r[2], r[3]) for r in rows}
 
+    @_synchronized
     def rename_for_recanonicalization(self, row_id: int, new_name: str) -> None:
         """Set `row_id`'s `name` to `new_name` directly, without touching
         `extraction_status` (mirrors `update_specimen` - a deterministic
@@ -1019,6 +1107,7 @@ class LabsDb:
         self._conn.execute("UPDATE labs SET name = ? WHERE id = ?", (new_name, row_id))
         self._conn.commit()
 
+    @_synchronized
     def reject_row_as_recanonicalization_duplicate(self, row_id: int, *, kept_id: int) -> None:
         """Reject `row_id` (status -> REJECTED) as an exact-reading
         duplicate of `kept_id`, discovered when both rows would
@@ -1038,6 +1127,7 @@ class LabsDb:
         )
         self._conn.commit()
 
+    @_synchronized
     def flip_to_pending_for_recanonicalization_conflict(
         self, row_id: int, *, conflicting: LabResult
     ) -> None:
@@ -1070,6 +1160,7 @@ class LabsDb:
         )
         self._conn.commit()
 
+    @_synchronized
     def reject_row_as_superseded_by_recanonicalize_conflict(
         self, row_id: int, *, survivor_id: int
     ) -> None:
@@ -1093,6 +1184,7 @@ class LabsDb:
         )
         self._conn.commit()
 
+    @_synchronized
     def rows_with_unknown_specimen(self) -> list[LabResult]:
         """Every row (any `extraction_status`) whose `specimen` is still
         `"unknown"` — the working set for `adoc labs-infer-specimen`
@@ -1102,6 +1194,7 @@ class LabsDb:
         ).fetchall()
         return [_row_to_lab(row) for row in rows]
 
+    @_synchronized
     def update_specimen(self, row_id: int, specimen: Specimen) -> None:
         """Set `row_id`'s `specimen` directly, without touching
         `extraction_status` — used by `adoc labs-infer-specimen`'s
@@ -1110,6 +1203,7 @@ class LabsDb:
         self._conn.execute("UPDATE labs SET specimen = ? WHERE id = ?", (specimen, row_id))
         self._conn.commit()
 
+    @_synchronized
     def search(self, text: str) -> list[LabResult]:
         """Full-text search over `name`/`name_raw` via the FTS5 index."""
         rows = self._conn.execute(
@@ -1127,10 +1221,12 @@ class LabsDb:
     # JSONL export / rebuild (PLAN.md "State": sqlite is derived)
     # ----------------------------------------------------------------
 
+    @_synchronized
     def _all_lab_rows(self) -> list[LabResult]:
         rows = self._conn.execute("SELECT * FROM labs ORDER BY id").fetchall()
         return [_row_to_lab(row) for row in rows]
 
+    @_synchronized
     def export_jsonl(self, path: str | Path) -> None:
         """Write a deterministic full snapshot to `path`, one JSON object per line.
 
@@ -1150,6 +1246,7 @@ class LabsDb:
                 fh.write(json.dumps({"table": "lab", "row": row.model_dump(mode="json")}))
                 fh.write("\n")
 
+    @_synchronized
     def rebuild_from_jsonl(self, path: str | Path) -> None:
         """Replace this db's documents/labs content with a JSONL export's content.
 
@@ -1173,6 +1270,7 @@ class LabsDb:
                     raise ValueError(f"rebuild_from_jsonl: unknown table {payload['table']!r}")
         self._conn.commit()
 
+    @_synchronized
     def _insert_document_raw(self, doc: LabDocument) -> None:
         self._conn.execute(
             """
@@ -1183,6 +1281,7 @@ class LabsDb:
             _document_params(doc),
         )
 
+    @_synchronized
     def _insert_lab_raw(self, row: LabResult) -> None:
         self._conn.execute(
             """
