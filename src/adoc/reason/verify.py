@@ -41,15 +41,44 @@ itself produced garbage, not merely an imprecise claim, so
 `reason.stages.entailment_check_contract` still raises a
 `ContractViolation` in that one case. See the ADR for the measured
 over-block rate this fixes and why the threshold is "all", not "any".
+
+Latency (2026-08-25, "diagnostic-turn-latency"): a real, full-case-file
+diagnostic turn measured 930s (66% of total model time) in the
+`entailment_verifier` role alone, from a reasoning model (DeepSeek R1)
+burning ~13k output tokens per call on a comparatively easy judgment, times
+up to 4 calls/turn (a same-generation retry that is now redundant under
+"strip, don't reject" — a `not_entailed` claim is stripped either way, so
+paying for a second completion to maybe rescue one evidence item is not
+worth ~300s). Two changes address this without weakening what
+`not_entailed` catches:
+- `reason.stages` no longer retries the model on an entailment failure —
+  `verify_claims` is called exactly once per stage call ("verify once;
+  strip what fails").
+- `EntailmentCache` (below) caches a verdict by a hash of `(claim,
+  resolved source text)`, mirroring `reason.citations.EutilsPmidVerifier`'s
+  on-disk cache pattern (`work/`-scoped, gitignored, rebuildable). Unlike
+  the PMID cache's TTL for `not_found`, a judgment for an EXACT (claim,
+  source text) pair is cached forever once made — the pair is bytewise
+  identical, so the judgment can never go stale for THAT pair; a changed
+  claim or a changed source text (e.g. a corrected lab value) simply
+  hashes to a different key and misses, invalidating naturally. This also
+  means the DAG's independent postcondition/precondition re-checks
+  (`reason.stages.entailment_check_contract`, run moments after the stage
+  call on the same or a merged claim set) are cache hits, not a second
+  round of model calls — they remain genuine independent re-checks (same
+  code path, same judging logic), they are just free when the exact pair
+  was already judged this run.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from collections.abc import Sequence
 from datetime import UTC, date, datetime
-from typing import Literal, Protocol
+from pathlib import Path
+from typing import Any, Literal, Protocol
 
 from pydantic import BaseModel, Field
 
@@ -71,6 +100,60 @@ VERIFICATION_LOG_RELPATH = "logs/entailment-checks.jsonl"
 # decided by source-text resolution, before the model is ever called, never
 # by the model's own judgment (it never sees a pair it has no text for).
 _ModelEntailmentJudgment = Literal["entailed", "not_entailed"]
+
+
+# --------------------------------------------------------------------------
+# Entailment verdict cache (latency: "diagnostic-turn-latency" — see module
+# docstring for the measured problem this addresses)
+# --------------------------------------------------------------------------
+
+ENTAILMENT_CACHE_RELPATH = "work/entailment-cache.json"
+
+
+class EntailmentCache:
+    """On-disk cache of `(claim, source_text) -> judgment`, mirroring
+    `reason.citations.EutilsPmidVerifier`'s on-disk cache pattern
+    (`work/`-scoped, so it is gitignored and rebuildable — losing this file
+    only means re-paying for calls that were previously free, never a
+    correctness change).
+
+    Keyed on a hash of the claim text plus the RESOLVED source text (not
+    just the source ref), so a changed source — a corrected lab value, an
+    edited encounter file — invalidates naturally: same ref, different
+    resolved text, different key, a clean miss. No TTL: unlike the PMID
+    cache's `not_found` (which can flip true if NCBI indexes a PMID later),
+    an entailment judgment for a byte-identical `(claim, source_text)` pair
+    cannot become stale — the pair itself never changes underneath it.
+
+    Loads/saves the whole file per call, matching `EutilsPmidVerifier`'s
+    own simplicity; callers that need to check many claims in one pass
+    (`verify_claims`) load once and save once, not once per claim, to avoid
+    N redundant JSON round-trips.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+
+    @staticmethod
+    def key(claim: str, source_text: str) -> str:
+        digest = hashlib.sha256()
+        digest.update(claim.encode("utf-8"))
+        digest.update(b"\x1f")
+        digest.update(source_text.encode("utf-8"))
+        return digest.hexdigest()
+
+    def load(self) -> dict[str, dict[str, str]]:
+        if not self.path.exists():
+            return {}
+        try:
+            data: Any = json.loads(self.path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def save(self, entries: dict[str, dict[str, str]]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(json.dumps(entries, sort_keys=True), encoding="utf-8")
 
 
 # --------------------------------------------------------------------------
@@ -351,24 +434,38 @@ def verify_claims(
     db: LabsDb,
     repo: DataRepo,
     resolver: SourceTextResolver | None = None,
+    cache: EntailmentCache | None = None,
 ) -> VerificationReport:
     """Judge every claim in `claims`, role `entailment_verifier`.
 
     Source text is resolved first, per claim, via `resolver` (default
     `DefaultSourceTextResolver(db, repo)`). A claim whose source text cannot
     be resolved is `insufficient_source` and is never sent to the model at
-    all. Claims WITH resolved text are sent to the model in a single call
-    (one completion per `verify_claims` invocation, not one per claim) so a
-    turn carrying several evidence claims costs one verifier call, not N.
+    all.
+
+    When `cache` is given, a claim whose `(claim, resolved source text)`
+    pair was already judged (by ANY prior call sharing this cache, this run
+    or a previous one) is scored from the cache and never sent to the model
+    either — see `EntailmentCache`. Only claims that are neither
+    `insufficient_source` NOR a cache hit are sent to the model, in a
+    single call (one completion per `verify_claims` invocation, not one per
+    claim) so a turn carrying several evidence claims costs at most one
+    verifier call, not N.
 
     If the model's response omits a judgment for a claim it was sent (a
     schema-valid but incomplete response), that claim is scored
     `not_entailed` — fail closed: a claim the verifier did not actually
-    judge can never be assumed to have passed."""
+    judge can never be assumed to have passed. A judgment scored this way
+    (no real verdict from the model) is deliberately NOT written to the
+    cache — it is a response-shape artifact, not a genuine judgment about
+    the pair, and caching it could wrongly pin a transient glitch forever.
+    """
     checks: list[ClaimVerification] = []
     resolved_resolver = resolver or DefaultSourceTextResolver(db, repo)
+    cache_entries = cache.load() if cache is not None else {}
+    cache_dirty = False
 
-    pairs: list[tuple[int, Claim, str]] = []
+    pairs: list[tuple[int, Claim, str, str | None]] = []
     for claim in claims:
         source_text = resolved_resolver.resolve(claim.source)
         if source_text is None:
@@ -382,7 +479,25 @@ def verify_claims(
                 )
             )
             continue
-        pairs.append((len(pairs), claim, source_text))
+
+        cache_key = EntailmentCache.key(claim.claim, source_text) if cache is not None else None
+        cached_entry = cache_entries.get(cache_key) if cache_key is not None else None
+        if cached_entry is not None and cached_entry.get("judgment") in (
+            "entailed",
+            "not_entailed",
+        ):
+            checks.append(
+                ClaimVerification(
+                    source=claim.source,
+                    claim=claim.claim,
+                    judgment=cached_entry["judgment"],
+                    rationale=cached_entry.get("rationale", ""),
+                    hypothesis_id=claim.hypothesis_id,
+                )
+            )
+            continue
+
+        pairs.append((len(pairs), claim, source_text, cache_key))
 
     if not pairs:
         return VerificationReport(checks=checks)
@@ -395,7 +510,7 @@ def verify_claims(
             "source_ref": claim.source,
             "source_text": source_text,
         }
-        for idx, claim, source_text in pairs
+        for idx, claim, source_text, _cache_key in pairs
     ]
     user_content = (
         "Judge entailment for each claim/source pair below. Return one judgment per "
@@ -411,7 +526,7 @@ def verify_claims(
     assert isinstance(parsed, _EntailmentPayload)
     judgment_by_index = {j.claim_index: j for j in parsed.judgments}
 
-    for idx, claim, _source_text in pairs:
+    for idx, claim, _source_text, cache_key in pairs:
         judged = judgment_by_index.get(idx)
         if judged is None:
             checks.append(
@@ -424,6 +539,12 @@ def verify_claims(
                 )
             )
         else:
+            if cache_key is not None:
+                cache_entries[cache_key] = {
+                    "judgment": judged.judgment,
+                    "rationale": judged.rationale,
+                }
+                cache_dirty = True
             checks.append(
                 ClaimVerification(
                     source=claim.source,
@@ -433,6 +554,8 @@ def verify_claims(
                     hypothesis_id=claim.hypothesis_id,
                 )
             )
+    if cache is not None and cache_dirty:
+        cache.save(cache_entries)
     return VerificationReport(checks=checks)
 
 
@@ -467,6 +590,99 @@ def log_verification_report(repo: DataRepo, report: VerificationReport, *, dag_n
     }
     with path.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(record) + "\n")
+
+
+# --------------------------------------------------------------------------
+# Deferred verification queue (latency: "diagnostic-turn-latency",
+# 2026-08-25) — claims on `expanded`/`cant-miss` hypotheses are not
+# verified synchronously in a diagnostic turn (only `most-likely` evidence
+# drives this turn's patient-facing reply within the latency budget); this
+# is where they wait until the weekly review sweeps them
+# (`reason.review.sweep_deferred_entailment_claims`), so nothing is
+# silently skipped forever.
+# --------------------------------------------------------------------------
+
+DEFERRED_CLAIMS_RELPATH = "work/entailment-deferred.json"
+
+
+class DeferredClaim(BaseModel):
+    """One evidence claim whose entailment check was deferred out of a
+    diagnostic turn's synchronous path — enough identity to rebuild a
+    `Claim` and re-resolve its source text later."""
+
+    hypothesis_id: str
+    for_or_against: Literal["for", "against"]
+    claim: str
+    source: str
+    dag_node: str
+    deferred_at: datetime
+
+
+def _load_deferred_claims(path: Path) -> list[DeferredClaim]:
+    if not path.exists():
+        return []
+    try:
+        raw: Any = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return []
+    if not isinstance(raw, list):
+        return []
+    items: list[DeferredClaim] = []
+    for entry in raw:
+        try:
+            items.append(DeferredClaim.model_validate(entry))
+        except Exception:  # noqa: BLE001 - a malformed entry is dropped, never crashes the sweep
+            continue
+    return items
+
+
+def _save_deferred_claims(path: Path, items: Sequence[DeferredClaim]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps([item.model_dump(mode="json") for item in items], sort_keys=True),
+        encoding="utf-8",
+    )
+
+
+def queue_deferred_claims(
+    repo: DataRepo, claims: Sequence[Claim], *, dag_node: str, at: datetime | None = None
+) -> None:
+    """Append `claims` to the deferred-verification queue
+    (`work/entailment-deferred.json`, gitignored — losing this file loses
+    the deferral, not the underlying evidence, which stays exactly as
+    entailed/unverified as it always was; the weekly review simply has
+    nothing to sweep that run). A no-op when `claims` is empty."""
+    if not claims:
+        return
+    path = repo.root / DEFERRED_CLAIMS_RELPATH
+    existing = _load_deferred_claims(path)
+    deferred_at = at or datetime.now(UTC)
+    existing.extend(
+        DeferredClaim(
+            hypothesis_id=c.hypothesis_id,
+            for_or_against=c.for_or_against,
+            claim=c.claim,
+            source=c.source,
+            dag_node=dag_node,
+            deferred_at=deferred_at,
+        )
+        for c in claims
+    )
+    _save_deferred_claims(path, existing)
+
+
+def pop_deferred_claims(repo: DataRepo) -> list[DeferredClaim]:
+    """Read and CLEAR the deferred-verification queue in one step — the
+    weekly review sweep calls this exactly once per run so each deferred
+    claim is picked up exactly once (barring a review that fails before
+    committing, which is no worse than a diagnostic turn's own claims: the
+    underlying evidence is unchanged either way, only WHEN it gets
+    verified is affected)."""
+    path = repo.root / DEFERRED_CLAIMS_RELPATH
+    items = _load_deferred_claims(path)
+    if items:
+        _save_deferred_claims(path, [])
+    return items
 
 
 # --------------------------------------------------------------------------
@@ -936,7 +1152,11 @@ __all__ = [
     "ClaimVerification",
     "ComposerNumberCheck",
     "ComposerNumberMismatch",
+    "DEFERRED_CLAIMS_RELPATH",
     "DefaultSourceTextResolver",
+    "DeferredClaim",
+    "ENTAILMENT_CACHE_RELPATH",
+    "EntailmentCache",
     "EntailmentJudgment",
     "SourceTextResolver",
     "VerificationReport",
@@ -946,6 +1166,8 @@ __all__ = [
     "claims_from_ops",
     "log_stripped_claims",
     "log_verification_report",
+    "pop_deferred_claims",
+    "queue_deferred_claims",
     "strip_not_entailed_ops",
     "verify_claims",
 ]

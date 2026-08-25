@@ -37,6 +37,7 @@ from adoc.casefile.schema import (
     LedgerDiff,
     LedgerOp,
     Provenance,
+    Tier,
     UpdateHypothesis,
 )
 from adoc.ingest.pipeline import IngestReport
@@ -55,15 +56,17 @@ from adoc.reason.dag import Contract, Ctx, Dag, Node, require_prior_node, run
 from adoc.reason.prompts import Prompt, load_prompt
 from adoc.reason.safety import RedFlagResult, treatment_gate
 from adoc.reason.verify import (
+    ENTAILMENT_CACHE_RELPATH,
+    Claim,
     DefaultSourceTextResolver,
+    EntailmentCache,
     SourceTextResolver,
-    VerificationReport,
     build_composer_number_retry_feedback,
-    build_entailment_retry_feedback,
     check_composer_numbers,
     claims_from_ops,
     log_stripped_claims,
     log_verification_report,
+    queue_deferred_claims,
     strip_not_entailed_ops,
     verify_claims,
 )
@@ -160,7 +163,90 @@ def _build_provenance(prompt: Prompt, model_id: str, dag_node: str) -> Provenanc
 # PR #94). Still failing after the retry -> return as-is and let the
 # `citation_check` DAG contract fire; the deterministic gate stays the
 # final, unbypassable authority (CLAUDE.md rules 2/3 pattern).
+#
+# The entailment verifier does NOT get this retry loop (latency:
+# "diagnostic-turn-latency", 2026-08-25) — see `verify_claims`'s call
+# sites below and the module-level comment on `_maintainer_diff_ops` for
+# why: under "strip, don't reject" (ADR 0016 revised), a still-`not_
+# entailed` claim after a retry is stripped exactly the same as one caught
+# on the first attempt, so a retry only ever spends a second ~minutes-long
+# completion to maybe rescue one evidence item. Citations keep their
+# retry: `check_ops_citations` is pure code (no LLM), so a citation retry
+# costs nothing but another cheap model completion, and it fixes a
+# fabricated ref that would otherwise strip the claim wholesale.
 _CITATION_RETRY_ATTEMPTS = 2
+
+
+def _tier_by_hypothesis_id(ops: Sequence[LedgerOp], prior_ledger: Ledger | None) -> dict[str, Tier]:
+    """Every hypothesis id's TIER after `ops` is applied on top of
+    `prior_ledger` (or `prior_ledger` alone for an id `ops` doesn't touch).
+    The single source of truth `_partition_claims_by_tier`/`_most_likely_
+    ops` both build on for "which claims actually drive this turn's
+    patient-facing reply" (PLAN.md latency: only `most-likely`-tier
+    evidence does)."""
+    tiers: dict[str, Tier] = {}
+    if prior_ledger is not None:
+        for h in prior_ledger.hypotheses:
+            tiers[h.id] = h.tier
+    for op in ops:
+        if isinstance(op, AddHypothesis):
+            tiers[op.hypothesis.id] = op.hypothesis.tier
+        elif isinstance(op, UpdateHypothesis) and op.tier is not None:
+            tiers[op.id] = op.tier
+    return tiers
+
+
+def _partition_claims_by_tier(
+    claims: Sequence[Claim], ops: Sequence[LedgerOp], prior_ledger: Ledger | None
+) -> tuple[list[Claim], list[Claim]]:
+    """Split `claims` into `(synchronous, deferred)` by the tier of the
+    hypothesis each claim supports (PLAN.md latency: "verify only what
+    reaches the patient now; defer the rest" — claims supporting a
+    `most-likely` hypothesis drive this turn's patient-facing reply and
+    are verified synchronously; claims on `expanded`/`cant-miss` matter but
+    not within this turn's latency budget, and are deferred to the weekly
+    review sweep, `reason.review.sweep_deferred_entailment_claims` —
+    NEVER silently dropped, see `queue_deferred_claims`). A claim whose
+    hypothesis tier cannot be determined at all (should not happen for a
+    valid diff/prior-ledger pairing, but data can be messy) is verified
+    synchronously — fail toward the more expensive, safer path, never
+    toward silent deferral."""
+    tiers = _tier_by_hypothesis_id(ops, prior_ledger)
+    synchronous: list[Claim] = []
+    deferred: list[Claim] = []
+    for claim in claims:
+        tier = tiers.get(claim.hypothesis_id)
+        if tier is None or tier == "most-likely":
+            synchronous.append(claim)
+        else:
+            deferred.append(claim)
+    return synchronous, deferred
+
+
+def _most_likely_ops(ops: Sequence[LedgerOp], prior_ledger: Ledger | None) -> list[LedgerOp]:
+    """`ops` filtered down to the subset carrying evidence for a
+    `most-likely`-tier hypothesis — used ONLY by the entailment DAG
+    contracts (`entailment_check_contract`'s `ops_extractor`), never by the
+    citation contracts: citation checking is deterministic and cheap, so
+    it stays scoped to ALL ops regardless of tier (`_maintainer_diff_ops`/
+    `_merged_apply_ops`, unchanged). This mirrors `_partition_claims_by_
+    tier` exactly (same tier lookup, same synchronous-vs-deferred line) so
+    the contract re-checks precisely the claim set the stage function
+    itself already verified — never more (which would silently re-spend a
+    model call on a deferred claim the stage deliberately skipped) and
+    never less."""
+    tiers = _tier_by_hypothesis_id(ops, prior_ledger)
+    filtered: list[LedgerOp] = []
+    for op in ops:
+        if isinstance(op, AddHypothesis):
+            if tiers.get(op.hypothesis.id, "most-likely") == "most-likely":
+                filtered.append(op)
+        elif isinstance(op, AddEvidence):
+            if tiers.get(op.id, "most-likely") == "most-likely":
+                filtered.append(op)
+        else:
+            filtered.append(op)
+    return filtered
 
 
 def _render_diff_rationale(payload: _LedgerDiffPayload) -> str:
@@ -181,49 +267,54 @@ def ledger_maintainer_stage(
     patient_message: str,
     db: LabsDb,
     repo: DataRepo,
+    prior_ledger: Ledger | None = None,
     *,
     pmid_verifier: PmidVerifier | None = None,
     resolver: SourceTextResolver | None = None,
+    entailment_cache: EntailmentCache | None = None,
 ) -> LedgerDiff:
     """Ledger-Maintainer stage (role `primary_reasoner`, schema `LedgerDiff`
     payload). Proposes a `LedgerDiff` from the context pack plus this turn's
     raw patient message.
 
-    After the model returns a diff, two deterministic-then-model-judged
-    checks run in sequence, each with its own same-generation retry
-    (mirrors the composer's gate-guided rewrite loop, PR #94):
-    1. The citation checker (`reason.citations.check_ops_citations`)
-       resolves every evidence source ref; an `unresolved`/`mismatched` ref
-       retries with the failed ref(s) fed back.
-    2. Only once citations pass, the entailment verifier
-       (`reason.verify.verify_claims`, role `entailment_verifier`, a
-       DIFFERENT model family) judges whether each claim's cited source
-       TEXT actually supports it; a `not_entailed` claim retries with the
-       verifier's objection fed back.
-    The citation loop is still a pure quality loop, not the enforcement
-    point — `citation_check_ledger_maintainer` re-checks whatever this
-    function returns and fails the run if it is still bad.
+    After the model returns a diff, the citation checker
+    (`reason.citations.check_ops_citations`) resolves every evidence source
+    ref, with its own same-generation retry (mirrors the composer's
+    gate-guided rewrite loop, PR #94) — an `unresolved`/`mismatched` ref
+    retries with the failed ref(s) fed back. This loop is still a pure
+    quality loop, not the enforcement point — `citation_check_ledger_
+    maintainer` re-checks whatever this function returns and fails the run
+    if it is still bad.
 
-    The entailment loop is different (ADR 0016 revised, 2026-08-25, "strip,
-    don't reject"): once the retry budget is spent, a still-`not_entailed`
-    claim is no longer fed forward to fail the whole diff. Unless EVERY
-    claim in the diff is `not_entailed` (`VerificationReport.
-    all_not_entailed` — nothing survives, the one case treated as the
-    pipeline having produced garbage rather than an imprecise claim), the
-    offending evidence item(s) are stripped from `diff.ops` right here,
-    before the diff is returned, and logged
+    Once citations settle, evidence claims are split by hypothesis tier
+    (`_partition_claims_by_tier`, PLAN.md latency "diagnostic-turn-
+    latency"): claims supporting a `most-likely` hypothesis are verified
+    NOW, ONCE (`reason.verify.verify_claims`, role `entailment_verifier`, a
+    DIFFERENT model family) — no retry (ADR 0016 revised's "strip, don't
+    reject" already makes a still-`not_entailed` claim's fate identical
+    whether or not it got a second try, so paying for a second ~minutes-
+    long completion to maybe rescue one evidence item is not worth it).
+    Claims on `expanded`/`cant-miss` hypotheses are DEFERRED
+    (`queue_deferred_claims`) to the weekly review sweep rather than
+    verified here — they matter, but not within this turn's latency
+    budget, and the deferral is persisted, never silent.
+
+    Unless EVERY synchronously-checked claim is `not_entailed`
+    (`VerificationReport.all_not_entailed` — nothing survives, the one case
+    treated as the pipeline having produced garbage rather than an
+    imprecise claim), the offending evidence item(s) are stripped from
+    `diff.ops` right here, before the diff is returned, and logged
     (`reason.verify.log_stripped_claims`) — the turn proceeds on the
     remaining, verified evidence. `entailment_check_ledger_maintainer`
-    still independently re-checks whatever this function returns and
-    raises a `ContractViolation` in the all-`not_entailed` case."""
+    still independently re-checks the same most-likely-tier subset of
+    whatever this function returns and raises a `ContractViolation` in the
+    all-`not_entailed` case."""
     prompt = load_prompt("ledger_maintainer")
     user_content = f"{ctx.render()}\n\n## Patient Message\n\n{patient_message}\n"
     messages = [Message(role="user", content=user_content)]
 
     diff: LedgerDiff | None = None
-    verification_report: VerificationReport | None = None
     for _attempt in range(_CITATION_RETRY_ATTEMPTS):
-        verification_report = None
         result = client.complete(
             "primary_reasoner",
             system=prompt.text,
@@ -248,26 +339,21 @@ def ledger_maintainer_stage(
             ]
             continue
 
-        verification_report = verify_claims(
-            client, claims_from_ops(diff.ops), db=db, repo=repo, resolver=resolver
-        )
-        log_verification_report(repo, verification_report, dag_node="ledger_maintainer")
-        if verification_report.failing:
-            messages = [
-                *messages,
-                Message(role="assistant", content=payload.model_dump_json()),
-                Message(role="user", content=build_entailment_retry_feedback(verification_report)),
-            ]
-            continue
-
         break
 
     assert diff is not None
-    if (
-        verification_report is not None
-        and verification_report.failing
-        and not verification_report.all_not_entailed
-    ):
+
+    all_claims = claims_from_ops(diff.ops)
+    synchronous_claims, deferred_claims = _partition_claims_by_tier(
+        all_claims, diff.ops, prior_ledger
+    )
+    queue_deferred_claims(repo, deferred_claims, dag_node="ledger_maintainer")
+
+    verification_report = verify_claims(
+        client, synchronous_claims, db=db, repo=repo, resolver=resolver, cache=entailment_cache
+    )
+    log_verification_report(repo, verification_report, dag_node="ledger_maintainer")
+    if verification_report.failing and not verification_report.all_not_entailed:
         stripped_ops, removed = strip_not_entailed_ops(diff.ops, verification_report)
         log_stripped_claims(repo, removed, dag_node="ledger_maintainer")
         diff = diff.model_copy(update={"ops": stripped_ops})
@@ -280,9 +366,11 @@ def challenger_stage(
     ctx: ContextPack,
     db: LabsDb,
     repo: DataRepo,
+    prior_ledger: Ledger | None = None,
     *,
     pmid_verifier: PmidVerifier | None = None,
     resolver: SourceTextResolver | None = None,
+    entailment_cache: EntailmentCache | None = None,
 ) -> ChallengerVerdict:
     """Challenger stage (role `challenger` — cross-family per ADR-0005).
     Attacks `proposed_diff`; must produce >=1 substantive counter-argument
@@ -290,10 +378,11 @@ def challenger_stage(
 
     The Challenger's own `additional_ops` can carry evidence (e.g. a
     `record_challenge`-adjacent `add_hypothesis`/`add_evidence`), so it gets
-    the same citation-then-entailment retry loop as `ledger_maintainer_
-    stage` — see that function's docstring for the shape, but NOT its
-    all-`not_entailed`-is-a-hard-failure exception: any still-`not_entailed`
-    claim left after the retry is UNCONDITIONALLY stripped from
+    the same citation-retry-then-tier-partitioned-entailment-check shape as
+    `ledger_maintainer_stage` — see that function's docstring for the full
+    rationale — but NOT its all-`not_entailed`-is-a-hard-failure exception:
+    any still-`not_entailed` claim among the synchronously-checked
+    (most-likely-tier) subset is UNCONDITIONALLY stripped from
     `verdict.additional_ops` here (see the inline comment where that
     stripping happens for why this one differs from the Ledger-Maintainer's
     diff). On a clean verdict (no evidence in `additional_ops`, the common
@@ -305,9 +394,7 @@ def challenger_stage(
     messages = [Message(role="user", content=user_content)]
 
     verdict: ChallengerVerdict | None = None
-    verification_report: VerificationReport | None = None
     for _attempt in range(_CITATION_RETRY_ATTEMPTS):
-        verification_report = None
         result = client.complete(
             "challenger",
             system=prompt.text,
@@ -330,22 +417,22 @@ def challenger_stage(
             ]
             continue
 
-        verification_report = verify_claims(
-            client, claims_from_ops(verdict.additional_ops), db=db, repo=repo, resolver=resolver
-        )
-        log_verification_report(repo, verification_report, dag_node="challenger")
-        if verification_report.failing:
-            messages = [
-                *messages,
-                Message(role="assistant", content=verdict.model_dump_json()),
-                Message(role="user", content=build_entailment_retry_feedback(verification_report)),
-            ]
-            continue
-
         break
 
     assert verdict is not None
-    if verification_report is not None and verification_report.failing:
+
+    all_claims = claims_from_ops(verdict.additional_ops)
+    tier_ops = list(proposed_diff.ops) + list(verdict.additional_ops)
+    synchronous_claims, deferred_claims = _partition_claims_by_tier(
+        all_claims, tier_ops, prior_ledger
+    )
+    queue_deferred_claims(repo, deferred_claims, dag_node="challenger")
+
+    verification_report = verify_claims(
+        client, synchronous_claims, db=db, repo=repo, resolver=resolver, cache=entailment_cache
+    )
+    log_verification_report(repo, verification_report, dag_node="challenger")
+    if verification_report.failing:
         # Unconditional, unlike `ledger_maintainer_stage`'s strip: the
         # Ledger-Maintainer's diff IS the primary artifact its own
         # `entailment_check_ledger_maintainer` postcondition checks 1:1, so
@@ -578,6 +665,35 @@ def _merged_apply_ops(ctx: Ctx, value: BaseModel | None) -> Sequence[LedgerOp]:
     return list(diff.ops) + list(value.additional_ops)
 
 
+def _maintainer_diff_most_likely_ops(ctx: Ctx, value: BaseModel | None) -> Sequence[LedgerOp]:
+    """Ops extractor for the ledger_maintainer node's `entailment_check`
+    postcondition ONLY (never `citation_check` — citation checking stays
+    scoped to ALL ops via `_maintainer_diff_ops`, since it is deterministic
+    and cheap). Filtered to the `most-likely`-tier subset
+    (`_most_likely_ops`) so this contract re-checks exactly the claim set
+    `ledger_maintainer_stage` itself already verified — the same
+    `(claim, source_text)` pairs, so a cache hit, not a second model call
+    (PLAN.md latency "diagnostic-turn-latency")."""
+    assert isinstance(value, LedgerDiff)
+    prior = ctx.get("ledger")
+    prior_ledger = prior if isinstance(prior, Ledger) else None
+    return _most_likely_ops(value.ops, prior_ledger)
+
+
+def _merged_apply_most_likely_ops(ctx: Ctx, value: BaseModel | None) -> Sequence[LedgerOp]:
+    """Ops extractor for the apply node's `entailment_check` precondition
+    ONLY (see `_maintainer_diff_most_likely_ops`'s docstring for why this
+    is a separate extractor from `_merged_apply_ops`, which stays scoped to
+    ALL ops for citation checking)."""
+    diff = ctx["ledger_maintainer"]
+    assert isinstance(diff, LedgerDiff)
+    assert isinstance(value, ChallengerVerdict)
+    prior = ctx.get("ledger")
+    prior_ledger = prior if isinstance(prior, Ledger) else None
+    merged = list(diff.ops) + list(value.additional_ops)
+    return _most_likely_ops(merged, prior_ledger)
+
+
 def citation_check_contract(
     name: str,
     db: LabsDb,
@@ -619,12 +735,23 @@ def entailment_check_contract(
     ops_extractor: Callable[[Ctx, BaseModel | None], Sequence[LedgerOp]],
     *,
     resolver: SourceTextResolver | None = None,
+    cache: EntailmentCache | None = None,
 ) -> Contract:
     """A DAG contract (pre- or postcondition, per `ops_extractor`) that runs
     `reason.verify.verify_claims` over whatever `ops_extractor` pulls out of
     `(ctx, value)` — an independent re-check of whatever `ledger_maintainer_
     stage`/`challenger_stage` already did, exactly like
-    `citation_check_contract`.
+    `citation_check_contract`. `ops_extractor` must be one of the
+    `_most_likely_ops`-filtered extractors (`_maintainer_diff_most_likely_
+    ops`/`_merged_apply_most_likely_ops`) — NEVER the unfiltered
+    `_maintainer_diff_ops`/`_merged_apply_ops` used for citation checking
+    — so this contract only ever re-checks the `most-likely`-tier claims
+    the stage functions actually verified synchronously; a claim deferred
+    by `_partition_claims_by_tier` must never be re-derived and sent to the
+    model here (PLAN.md latency: deferral only saves the turn a model call
+    if the contract respects it too). Passing the SAME `cache` the stage
+    functions used makes this re-check a cache hit rather than a second
+    model call for every claim already judged this run.
 
     ADR 0016 revised (2026-08-25, "strip, don't reject"): a `not_entailed`
     claim on its own no longer fails this contract. By the time this
@@ -656,7 +783,9 @@ def entailment_check_contract(
 
     def predicate(ctx: Ctx, value: BaseModel | None) -> str | None:
         ops = ops_extractor(ctx, value)
-        report = verify_claims(client, claims_from_ops(ops), db=db, repo=repo, resolver=resolver)
+        report = verify_claims(
+            client, claims_from_ops(ops), db=db, repo=repo, resolver=resolver, cache=cache
+        )
         log_verification_report(repo, report, dag_node=name)
         if not report.all_not_entailed:
             return None
@@ -787,38 +916,51 @@ def build_diagnostic_dag(
     *,
     pmid_verifier: PmidVerifier | None = None,
     resolver: SourceTextResolver | None = None,
+    entailment_cache: EntailmentCache | None = None,
 ) -> Dag:
     """Assemble the chat-diagnostic-turn DAG (PLAN.md loop (b)):
     Ledger-Maintainer -> Challenger -> apply -> Composer.
 
     Contracts: the ledger_maintainer node's postconditions run the
-    deterministic citation checker (`reason.citations`) then the
-    cross-family entailment verifier (`reason.verify`, role
-    `entailment_verifier`) over its own diff; Challenger's postcondition
-    requires a substantive counter-argument for every most-likely
-    hypothesis; the apply node's PRECONDITIONS re-run both checks over the
-    Ledger-Maintainer's diff merged with the Challenger's `additional_ops`
-    (so a bad ref OR a non-entailed claim introduced by the Challenger
-    can't reach `apply` either), plus a THIRD precondition that no
-    `most-likely` hypothesis is being promoted with absent/unresolvable
-    evidence (PLAN.md Phase 2 "Abstention calibration") — deliberately a
-    precondition, not a postcondition, since `apply_stage` persists to disk
-    as a side effect, so this must be checked before that write, exactly
-    like the citation/entailment checks; its postcondition requires the
-    ledger version to have incremented; Composer's precondition requires
-    the Challenger node to have completed this run, and its postconditions
-    run the treatment/dosing output gate then the deterministic
-    quantitative grounding check (`reason.verify.check_composer_numbers`).
+    deterministic citation checker (`reason.citations`, over ALL evidence
+    ops) then the cross-family entailment verifier (`reason.verify`, role
+    `entailment_verifier`, over only the `most-likely`-tier subset — PLAN.md
+    latency "diagnostic-turn-latency": claims on `expanded`/`cant-miss`
+    hypotheses are deferred to the weekly review sweep, not checked
+    synchronously) over its own diff; Challenger's postcondition requires a
+    substantive counter-argument for every most-likely hypothesis; the
+    apply node's PRECONDITIONS re-run both checks over the Ledger-
+    Maintainer's diff merged with the Challenger's `additional_ops` (so a
+    bad ref OR a non-entailed claim introduced by the Challenger can't
+    reach `apply` either), plus a THIRD precondition that no `most-likely`
+    hypothesis is being promoted with absent/unresolvable evidence (PLAN.md
+    Phase 2 "Abstention calibration") — deliberately a precondition, not a
+    postcondition, since `apply_stage` persists to disk as a side effect,
+    so this must be checked before that write, exactly like the citation/
+    entailment checks; its postcondition requires the ledger version to
+    have incremented; Composer's precondition requires the Challenger node
+    to have completed this run, and its postconditions run the
+    treatment/dosing output gate then the deterministic quantitative
+    grounding check (`reason.verify.check_composer_numbers`).
 
     `pmid_verifier` defaults to a real `EutilsPmidVerifier` (NCBI
     E-utilities, cached at `<repo>/work/pmid-cache.json`) when omitted;
     `resolver` defaults to `reason.verify.DefaultSourceTextResolver(db,
-    repo)` when omitted — tests should always inject fakes explicitly so a
-    test run never touches the network.
+    repo)` when omitted; `entailment_cache` defaults to a real
+    `EntailmentCache` (cached at `<repo>/work/entailment-cache.json`) when
+    omitted, SHARED across the ledger_maintainer/challenger stage calls and
+    both `entailment_check_contract` instances in this one `build_
+    diagnostic_dag` call, so a claim judged once this turn is a cache hit
+    everywhere else it is re-checked this same turn (PLAN.md latency:
+    "cache verdicts by (claim, source_text) hash") — tests should always
+    inject fakes explicitly so a test run never touches the network or a
+    real cache file.
 
     Expected `run()` initial context: `{"context_pack": ContextPack,
     "patient_turn": PatientTurn, "ledger": Ledger}` (the ledger state this
-    turn started from, for the apply node's version-increment check).
+    turn started from, both for the apply node's version-increment check
+    and for tier-partitioning evidence claims by their hypothesis's CURRENT
+    tier when a diff doesn't itself touch that hypothesis).
 
     `sink`, if given, is populated by side effect with each node's
     validated output (keyed by node name) as the run proceeds — see the
@@ -830,12 +972,15 @@ def build_diagnostic_dag(
         repo.root / "work" / "pmid-cache.json"
     )
     resolved_resolver = resolver or DefaultSourceTextResolver(db, repo)
+    resolved_cache = entailment_cache or EntailmentCache(repo.root / ENTAILMENT_CACHE_RELPATH)
 
     def _ledger_maintainer_fn(ctx: Ctx) -> BaseModel:
         context_pack = ctx["context_pack"]
         assert isinstance(context_pack, ContextPack)
         patient_turn = ctx["patient_turn"]
         assert isinstance(patient_turn, PatientTurn)
+        prior = ctx.get("ledger")
+        prior_ledger = prior if isinstance(prior, Ledger) else None
 
         diff = ledger_maintainer_stage(
             client,
@@ -843,8 +988,10 @@ def build_diagnostic_dag(
             patient_turn.text,
             db,
             repo,
+            prior_ledger,
             pmid_verifier=resolved_pmid_verifier,
             resolver=resolved_resolver,
+            entailment_cache=resolved_cache,
         )
         results["ledger_maintainer"] = diff
         return diff
@@ -854,6 +1001,8 @@ def build_diagnostic_dag(
         assert isinstance(proposed_diff, LedgerDiff)
         context_pack = ctx["context_pack"]
         assert isinstance(context_pack, ContextPack)
+        prior = ctx.get("ledger")
+        prior_ledger = prior if isinstance(prior, Ledger) else None
 
         verdict = challenger_stage(
             client,
@@ -861,8 +1010,10 @@ def build_diagnostic_dag(
             context_pack,
             db,
             repo,
+            prior_ledger,
             pmid_verifier=resolved_pmid_verifier,
             resolver=resolved_resolver,
+            entailment_cache=resolved_cache,
         )
         results["challenger"] = verdict
         return verdict
@@ -913,8 +1064,9 @@ def build_diagnostic_dag(
                 client,
                 db,
                 repo,
-                _maintainer_diff_ops,
+                _maintainer_diff_most_likely_ops,
                 resolver=resolved_resolver,
+                cache=resolved_cache,
             ),
         ],
     )
@@ -946,8 +1098,9 @@ def build_diagnostic_dag(
                 client,
                 db,
                 repo,
-                _merged_apply_ops,
+                _merged_apply_most_likely_ops,
                 resolver=resolved_resolver,
+                cache=resolved_cache,
             ),
             most_likely_requires_resolved_evidence_contract(db, repo),
         ],
