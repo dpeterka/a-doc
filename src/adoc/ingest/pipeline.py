@@ -136,6 +136,7 @@ from adoc.ingest.vision import ImagePart, VisionClient, VisionError
 from adoc.labs.db import LabsDb
 from adoc.labs.models import DocumentStatus, ExtractionStatus, LabDocument, LabResult
 from adoc.reason.client import LlmClient, LlmError, Message
+from adoc.reason.review_trigger import mark_review_wanted
 
 logger = logging.getLogger(__name__)
 
@@ -243,6 +244,29 @@ def _to_lab_result(row: ReconciledRow, *, source_doc: str) -> LabResult:
         source_page=row.source_page,
         extraction_status=status,
         raw_json=row.raw_json,
+    )
+
+
+def _mark_review_wanted_for_report(
+    repo: DataRepo, report: IngestReport, *, clock: Callable[[], datetime]
+) -> None:
+    """Set the "review wanted" marker (docs/adr/0019-event-triggered-
+    review.md) once per pipeline call, over the WHOLE `IngestReport` — not
+    once per file — so a batch of N files (a Dropbox drop landing in one
+    `ingest_inbox` sweep, a multi-file `adoc backfill`) coalesces into ONE
+    marker update instead of firing N review considerations (ADR 0019's
+    "thrash and cost" rationale: the blind panel is three frontier models
+    over full context). A no-op when nothing was actually ingested this run
+    (every outcome was a duplicate or an error) — neither changes the case
+    file, so there's nothing new to re-review."""
+    ingested = [f for f in report.files if f.outcome == "ingested"]
+    if not ingested:
+        return
+    rows_added = sum(f.rows_auto + f.rows_pending for f in ingested)
+    mark_review_wanted(
+        repo,
+        f"ingest: {len(ingested)} new document(s), {rows_added} new lab row(s)",
+        at=clock(),
     )
 
 
@@ -961,7 +985,7 @@ def ingest_file(
     every other caller leaves it `None` so nothing is ever deleted or moved
     by surprise.
     """
-    return IngestReport(
+    report = IngestReport(
         files=_ingest_one(
             path,
             repo=repo,
@@ -972,6 +996,8 @@ def ingest_file(
             inbox_root=inbox_root,
         )
     )
+    _mark_review_wanted_for_report(repo, report, clock=clock)
+    return report
 
 
 def _scan_files(root: Path) -> list[Path]:
@@ -1046,7 +1072,9 @@ def ingest_inbox(
             outcome = FileOutcome(path=str(p), outcome="error", issues=[f"unexpected error: {exc}"])
             _apply_inbox_hygiene(p, outcome, repo=repo, inbox_root=inbox, clock=clock)
             outcomes.append(outcome)
-    return IngestReport(files=outcomes)
+    report = IngestReport(files=outcomes)
+    _mark_review_wanted_for_report(repo, report, clock=clock)
+    return report
 
 
 def ingest_directory(
@@ -1070,7 +1098,9 @@ def ingest_directory(
         outcomes.extend(
             _ingest_one(p, repo=repo, db=db, vision=vision, clock=clock, renderer=renderer)
         )
-    return IngestReport(files=outcomes)
+    report = IngestReport(files=outcomes)
+    _mark_review_wanted_for_report(repo, report, clock=clock)
+    return report
 
 
 __all__ = [

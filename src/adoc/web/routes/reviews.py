@@ -1,5 +1,15 @@
-"""Weekly review surface (PLAN.md session loop (c)): list + render of
-`case/reviews/*.md`.
+"""Deep-review surface (PLAN.md session loop (c)): per-review permalink
+rendering of `case/reviews/*.md`.
+
+`/reviews` (the old index of every review) is now a redirect to `/ledger`
+(docs/adr/0019-event-triggered-review.md "UI merge") — the live
+differential and the latest review live on one merged screen there, with
+every prior review still linked from its "Prior reviews" history section.
+Kept as a redirect rather than removed/404 because a link to `/reviews`
+may exist in a committed review's markdown or an old chat transcript entry
+(mirrors `web.routes.onboard`'s `/onboard` -> `/chat` redirect for the
+same reason). `/reviews/{filename}` — the actual permalink each review is
+reached by, the audit trail — is UNCHANGED.
 
 `reviews_detail` re-gates the persisted markdown at render time
 (`reason.tools.redact_gated_text`, CLAUDE.md rule 5) in addition to
@@ -14,7 +24,7 @@ from __future__ import annotations
 import re
 
 from fastapi import APIRouter, Depends, Request
-from starlette.responses import Response
+from starlette.responses import RedirectResponse, Response
 
 from adoc.casefile.repo import DataRepo
 from adoc.reason.tools import redact_gated_text
@@ -25,28 +35,12 @@ router = APIRouter(prefix="/reviews")
 
 _SAFE_REVIEW_FILENAME_RE = re.compile(r"^[A-Za-z0-9._-]+\.md$")
 
-# Human phrasing of the real weekly-review schedule — derived from
-# `deploy/cfn/ecs.yaml`'s `ReviewRule.Properties.ScheduleExpression`:
-# `"cron(0 6 ? * SUN *)"` (AWS cron: minute=0, hour=6 UTC, every Sunday).
-# Hardcoded here rather than parsed at runtime since it's an infrastructure
-# fact, not app config — if the schedule in ecs.yaml ever changes, this
-# string needs a matching edit.
-REVIEW_SCHEDULE_PHRASE = "every Sunday at 06:00 UTC"
-
 
 @router.get("")
-def reviews_index(request: Request, repo: DataRepo = Depends(get_repo)) -> Response:
-    reviews_dir = repo.root / "case" / "reviews"
-    filenames: list[str] = []
-    if reviews_dir.is_dir():
-        filenames = sorted(
-            (p.name for p in reviews_dir.iterdir() if p.suffix == ".md"), reverse=True
-        )
-    return templates.TemplateResponse(
-        request,
-        "reviews_index.html",
-        {"filenames": filenames, "review_schedule_phrase": REVIEW_SCHEDULE_PHRASE},
-    )
+def reviews_index(_request: Request) -> Response:
+    """Permanent redirect: the review index is now part of `/ledger`
+    (docs/adr/0019-event-triggered-review.md)."""
+    return RedirectResponse(url="/ledger", status_code=301)
 
 
 @router.get("/{filename}")

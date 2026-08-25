@@ -6,9 +6,11 @@ Settings/models.yaml, then creates the data-repo layout via
 `--reason` post-ingest reasoning pass) and `backfill <directory>` are
 wired to the real `ingest.pipeline` with a real `LlmClient`/`VisionClient`
 (`_build_llm_client`/`_build_vision_client` are the seams tests override
-with fakes); `review` runs the real weekly deep review
-(`reason.review.run_weekly_review`); `eval` runs the offline self-eval
-suites (`evals.runner`); `serve` builds the real `web.app.create_app()`
+with fakes); `review` runs a real event-triggered review tick
+(`reason.review.run_review_tick`, docs/adr/0019-event-triggered-review.md:
+cheap checks every invocation, a full review when the marker/cooldown/
+floor say it's due, or always with `--force`); `eval` runs the offline
+self-eval suites (`evals.runner`); `serve` builds the real `web.app.create_app()`
 and runs it under uvicorn (`_run_uvicorn` is the seam tests override so a
 test run never actually binds a socket). `onboard` is wired to the real
 intake wizard. `user add|list|remove` manages the web login credential
@@ -77,7 +79,7 @@ from adoc.privacy import (
     scaffold_identifiers_file,
 )
 from adoc.reason.client import LlmClient, LlmError
-from adoc.reason.review import run_weekly_review
+from adoc.reason.review import run_review_tick
 from adoc.reason.stages import render_new_evidence_note, run_post_ingest_dag
 from adoc.web.users import USERS_RELPATH, add_user, list_users, remove_user
 
@@ -825,7 +827,19 @@ def _cmd_backfill_doc_text(_args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_review(_args: argparse.Namespace) -> int:
+def _cmd_review(args: argparse.Namespace) -> int:
+    """The entry point both the frequent scheduled tick
+    (`deploy/cfn/ecs.yaml`'s `ReviewRule`) and a human at a terminal call —
+    `reason.review.run_review_tick` decides whether a full review
+    (blind panel + adjudication + staleness + test chooser + committed/
+    tagged artifact) is actually due this invocation (docs/adr/0019-event-
+    triggered-review.md), always doing the cheap deterministic parts
+    (trend scan, deferred-entailment sweep) regardless. `--force` bypasses
+    the marker/cooldown/floor gating entirely and always runs a full
+    review — how a human asks for one on demand, and how anything scripted
+    against `adoc review` for a guaranteed full run (`adoc eval`, a manual
+    on-call check) keeps working exactly as before.
+    """
     try:
         settings = Settings()
     except Exception as exc:  # noqa: BLE001 - surface any config error to the user
@@ -848,8 +862,22 @@ def _cmd_review(_args: argparse.Namespace) -> int:
 
     db_path = settings.data_dir / "labs.sqlite"
     with LabsDb(db_path, journal_mode=settings.sqlite_journal_mode) as db:
-        report = run_weekly_review(repo, db, client)
+        result = run_review_tick(repo, db, client, force=args.force)
 
+    if not result.ran_full_review:
+        print(f"review: skipped full review this tick ({result.decision_reason})")
+        print(f"review: trend scan found {len(result.trend_scan.findings)} finding(s)")
+        if result.deferred_verification.checked:
+            print(
+                f"review: deferred-entailment sweep checked "
+                f"{result.deferred_verification.checked} claim(s), "
+                f"{len(result.deferred_verification.not_entailed)} not entailed"
+            )
+        return 0
+
+    report = result.full_review
+    assert report is not None
+    print(f"review: full review ran ({result.decision_reason})")
     print(
         f"review: {report.review_date.isoformat()} — ledger {report.ledger_version_before} "
         f"-> {report.ledger_version_after}"
@@ -972,9 +1000,19 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     ingest_parser.set_defaults(func=_cmd_ingest)
-    subparsers.add_parser("review", help="run the weekly deep review").set_defaults(
-        func=_cmd_review
+    review_parser = subparsers.add_parser(
+        "review",
+        help=(
+            "run a review tick: always the cheap deterministic checks, plus a full "
+            "review (blind panel etc.) when the review-wanted marker/cooldown/floor say it's due"
+        ),
     )
+    review_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="always run a full review, bypassing the marker/cooldown/floor gating",
+    )
+    review_parser.set_defaults(func=_cmd_review)
     subparsers.add_parser(
         "backfill-doc-text",
         help=(

@@ -37,6 +37,7 @@ from adoc.reason.client import (
     TransportRequest,
     TransportResponse,
 )
+from adoc.reason.review_trigger import load_review_marker
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures" / "extractions"
 BGZF_MAGIC = bytes.fromhex("1f8b0804")
@@ -1246,3 +1247,89 @@ def test_ingest_inbox_continues_the_batch_after_an_unexpected_exception(
 # `test_casefile_repo.py`'s `test_commit_retries_on_lock_contention_then_
 # succeeds`/`test_commit_raises_after_exhausting_retry_attempts` for the
 # retry behavior tests, now exercised directly against `DataRepo.commit`.
+
+
+# --------------------------------------------------------------------------
+# "review wanted" marker (docs/adr/0019-event-triggered-review.md): set
+# once per pipeline call over the WHOLE batch, not once per file.
+# --------------------------------------------------------------------------
+
+
+def test_ingest_file_sets_the_review_marker(tmp_path: Path) -> None:
+    repo = DataRepo.init_at(tmp_path / "data-repo")
+    db = LabsDb(tmp_path / "labs.sqlite")
+    doc_path = tmp_path / "quest-2026-05-02.pdf"
+    doc_path.write_bytes(TINY_PDF_BYTES)
+    vision = FakeVisionClient("clean_agreement.json")
+
+    assert load_review_marker(repo) is None
+
+    _ingest(doc_path, repo=repo, db=db, vision=vision)
+
+    marker = load_review_marker(repo)
+    assert marker is not None
+    assert len(marker.reasons) == 1
+    assert "ingest: 1 new document(s)" in marker.reasons[0].reason
+
+
+def test_ingest_inbox_sets_the_review_marker_once_for_a_multi_file_batch(tmp_path: Path) -> None:
+    """A batch of several files coalesces into ONE marker update, not one
+    per file (ADR 0019's "thrash and cost" rationale — a real Dropbox drop
+    of a dozen files must not fire a dozen review considerations)."""
+    repo = DataRepo.init_at(tmp_path / "data-repo")
+    db = LabsDb(tmp_path / "labs.sqlite")
+    (repo.root / "inbox" / "a.pdf").write_bytes(TINY_PDF_BYTES)
+    (repo.root / "inbox" / "b.pdf").write_bytes(TINY_PDF_BYTES + b"\x00")
+    vision = FakeVisionClient("clean_agreement.json")
+
+    report = ingest_inbox(
+        repo=repo,
+        db=db,
+        vision=vision,
+        clock=_fixed_clock,
+        renderer=fake_page_renderer(1),  # type: ignore[arg-type]
+    )
+
+    assert len(report.files) == 2
+    marker = load_review_marker(repo)
+    assert marker is not None
+    assert len(marker.reasons) == 1
+    assert "ingest: 2 new document(s)" in marker.reasons[0].reason
+
+
+def test_ingest_inbox_duplicate_only_batch_does_not_set_the_review_marker(tmp_path: Path) -> None:
+    repo = DataRepo.init_at(tmp_path / "data-repo")
+    db = LabsDb(tmp_path / "labs.sqlite")
+    inbox_dir = repo.root / "inbox"
+    (inbox_dir / "first.pdf").write_bytes(TINY_PDF_BYTES)
+    vision = FakeVisionClient("clean_agreement.json")
+    ingest_inbox(
+        repo=repo, db=db, vision=vision, clock=_fixed_clock, renderer=fake_page_renderer(1)
+    )
+    from adoc.reason.review_trigger import clear_review_marker
+
+    clear_review_marker(repo)
+
+    # Identical bytes, dropped into the inbox again under a new name -
+    # ingests as a duplicate, which changes nothing in the case file.
+    (inbox_dir / "second.pdf").write_bytes(TINY_PDF_BYTES)
+    report = ingest_inbox(
+        repo=repo, db=db, vision=vision, clock=_fixed_clock, renderer=fake_page_renderer(1)
+    )
+
+    assert report.files[0].outcome == "duplicate"
+    assert load_review_marker(repo) is None
+
+
+def test_ingest_inbox_error_only_batch_does_not_set_the_review_marker(tmp_path: Path) -> None:
+    repo = DataRepo.init_at(tmp_path / "data-repo")
+    db = LabsDb(tmp_path / "labs.sqlite")
+    (repo.root / "inbox" / "corrupt.pdf").write_bytes(b"not really a pdf")
+    vision = FakeVisionClient("clean_agreement.json")
+
+    report = ingest_inbox(
+        repo=repo, db=db, vision=vision, clock=_fixed_clock, renderer=fake_page_renderer(1)
+    )
+
+    assert report.files[0].outcome == "error"
+    assert load_review_marker(repo) is None

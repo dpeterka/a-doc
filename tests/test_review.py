@@ -6,7 +6,7 @@ Fake `LlmClient` transports throughout — no network, ever.
 from __future__ import annotations
 
 import json
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +30,8 @@ from adoc.reason.context import build_context
 from adoc.reason.dag import ContractViolation
 from adoc.reason.dag import run as dag_run
 from adoc.reason.review import (
+    FULL_REVIEW_COOLDOWN,
+    FULL_REVIEW_FLOOR,
     AdjudicationResult,
     ChallengeSweepResult,
     DeferredVerificationSweepResult,
@@ -47,10 +49,13 @@ from adoc.reason.review import (
     ledger_churn,
     parse_audit_costs,
     render_review_markdown,
+    run_review_tick,
     run_weekly_review,
     scan_staleness,
+    should_run_full_review,
     sweep_deferred_entailment_claims,
 )
+from adoc.reason.review_trigger import ReviewMarker, ReviewMarkerReason, mark_review_wanted
 from adoc.reason.verify import DEFERRED_CLAIMS_RELPATH, Claim, queue_deferred_claims
 
 SLE_ID = "sle-01"
@@ -862,3 +867,341 @@ def test_render_review_markdown_redacts_dosing_language() -> None:
     # Surrounding content survives.
     assert "Lupus" in markdown
     assert "to confirm this diagnosis" in markdown
+
+
+def test_render_review_markdown_shows_trigger_summary_when_given() -> None:
+    empty_ledger = Ledger(version=1, updated=datetime(2026, 1, 1, tzinfo=UTC), hypotheses=[])
+    markdown = render_review_markdown(
+        review_date=date(2026, 1, 7),
+        trend_findings=[],
+        divergence_set=DivergenceSet(divergences=[]),
+        adjudication=AdjudicationResult(decisions=[]),
+        challenge_sweep=ChallengeSweepResult(notes=[]),
+        test_chooser=TestChooserResult(items=[]),
+        staleness=StalenessReport(),
+        deferred_verification=DeferredVerificationSweepResult(),
+        metrics=OpsMetrics(),
+        ledger_before=empty_ledger,
+        ledger_after=empty_ledger,
+        trigger_summary="ingest: 2 new document(s), 5 new lab row(s)",
+    )
+
+    assert "Why this review ran" in markdown
+    assert "ingest: 2 new document(s), 5 new lab row(s)" in markdown
+
+
+def test_render_review_markdown_omits_trigger_line_when_not_given() -> None:
+    empty_ledger = Ledger(version=1, updated=datetime(2026, 1, 1, tzinfo=UTC), hypotheses=[])
+    markdown = render_review_markdown(
+        review_date=date(2026, 1, 7),
+        trend_findings=[],
+        divergence_set=DivergenceSet(divergences=[]),
+        adjudication=AdjudicationResult(decisions=[]),
+        challenge_sweep=ChallengeSweepResult(notes=[]),
+        test_chooser=TestChooserResult(items=[]),
+        staleness=StalenessReport(),
+        deferred_verification=DeferredVerificationSweepResult(),
+        metrics=OpsMetrics(),
+        ledger_before=empty_ledger,
+        ledger_after=empty_ledger,
+    )
+
+    assert "Why this review ran" not in markdown
+
+
+# --------------------------------------------------------------------------
+# Event-triggered review (docs/adr/0019-event-triggered-review.md):
+# should_run_full_review (pure decision function) + run_review_tick.
+# --------------------------------------------------------------------------
+
+
+def _marker(*reasons: str, at: datetime) -> ReviewMarker:
+    return ReviewMarker(reasons=[ReviewMarkerReason(reason=r, at=at) for r in reasons])
+
+
+def test_should_run_full_review_when_no_full_review_has_ever_run() -> None:
+    should_run, reason = should_run_full_review(
+        marker=None, last_full_review_at=None, now=datetime(2026, 8, 23, tzinfo=UTC)
+    )
+    assert should_run is True
+    assert "no full review has ever run" in reason
+
+
+def test_should_run_full_review_marker_set_and_cooldown_elapsed() -> None:
+    last = datetime(2026, 8, 23, 0, 0, tzinfo=UTC)
+    now = last + FULL_REVIEW_COOLDOWN
+    marker = _marker("ingest: 1 new document(s), 0 new lab row(s)", at=last)
+
+    should_run, reason = should_run_full_review(marker=marker, last_full_review_at=last, now=now)
+
+    assert should_run is True
+    assert "cooldown" in reason
+
+
+def test_should_run_full_review_marker_set_but_cooldown_not_elapsed() -> None:
+    last = datetime(2026, 8, 23, 0, 0, tzinfo=UTC)
+    now = last + FULL_REVIEW_COOLDOWN - timedelta(minutes=1)
+    marker = _marker("chat turn applied a ledger diff (1 op(s))", at=last)
+
+    should_run, reason = should_run_full_review(marker=marker, last_full_review_at=last, now=now)
+
+    assert should_run is False
+    assert "cooldown" in reason
+
+
+def test_should_run_full_review_no_marker_but_floor_elapsed() -> None:
+    last = datetime(2026, 8, 1, 0, 0, tzinfo=UTC)
+    now = last + FULL_REVIEW_FLOOR
+
+    should_run, reason = should_run_full_review(marker=None, last_full_review_at=last, now=now)
+
+    assert should_run is True
+    assert "floor" in reason
+
+
+def test_should_run_full_review_no_marker_and_floor_not_elapsed() -> None:
+    last = datetime(2026, 8, 1, 0, 0, tzinfo=UTC)
+    now = last + FULL_REVIEW_FLOOR - timedelta(days=1)
+
+    should_run, reason = should_run_full_review(marker=None, last_full_review_at=last, now=now)
+
+    assert should_run is False
+    assert "floor" in reason
+
+
+def _empty_review_client() -> LlmClient:
+    """A fake client that answers every review-DAG role with an empty
+    result — valid against an empty ledger (no active hypotheses, so every
+    completeness postcondition is vacuously satisfied). Mirrors
+    `tests/test_cli.py`'s `_empty_review_fake_client`."""
+
+    def transport(request: TransportRequest) -> TransportResponse:
+        assert request.schema is not None
+        name = request.schema.__name__
+        tool_input: dict[str, Any]
+        if name == "BlindDifferentialPayload":
+            tool_input = {"items": []}
+        elif name == "AdjudicationPayload":
+            tool_input = {"decisions": []}
+        elif name == "ChallengeSweepPayload":
+            tool_input = {"notes": []}
+        elif name == "TestChooserPayload":
+            tool_input = {"items": []}
+        else:  # pragma: no cover - defensive
+            raise AssertionError(f"unexpected schema: {name}")
+        return TransportResponse(text="", tool_input=tool_input, input_tokens=1, output_tokens=1)
+
+    bindings: dict[str, list[ModelBinding]] = {
+        "blind_panel": _blind_panel_bindings(),
+        "challenger": [ModelBinding(provider="anthropic", model="fake-challenger")],
+        "test_chooser": [ModelBinding(provider="anthropic", model="fake-test-chooser")],
+    }
+    providers = {"anthropic": AnthropicProvider(api_key=None, transport=transport)}
+    return LlmClient(bindings, providers)
+
+
+def test_run_review_tick_force_always_runs_full_review_ignoring_marker_and_cooldown(
+    repo: DataRepo, db: LabsDb
+) -> None:
+    client = _empty_review_client()
+
+    result = run_review_tick(
+        repo,
+        db,
+        client,
+        clock=_fixed_clock,
+        force=True,
+        last_full_review_lookup=lambda: _fixed_clock(),  # "just ran" - deep inside cooldown
+    )
+
+    assert result.ran_full_review is True
+    assert "forced via `adoc review --force`" in result.decision_reason
+    assert result.full_review is not None
+
+
+def test_run_review_tick_suppresses_full_review_inside_cooldown_even_with_marker(
+    repo: DataRepo, db: LabsDb
+) -> None:
+    client = _empty_review_client()
+    last_full_review_at = _fixed_clock() - timedelta(hours=1)
+    mark_review_wanted(repo, "ingest: 1 new document(s), 0 new lab row(s)", at=last_full_review_at)
+
+    result = run_review_tick(
+        repo,
+        db,
+        client,
+        clock=_fixed_clock,
+        last_full_review_lookup=lambda: last_full_review_at,
+    )
+
+    assert result.ran_full_review is False
+    assert result.full_review is None
+    assert "cooldown" in result.decision_reason
+    # Cheap parts still ran.
+    assert isinstance(result.trend_scan, type(result.trend_scan))
+    # The marker survives an untaken tick.
+    from adoc.reason.review_trigger import load_review_marker
+
+    marker = load_review_marker(repo)
+    assert marker is not None
+    assert len(marker.reasons) == 1
+
+
+def test_run_review_tick_runs_full_review_when_marker_set_and_cooldown_elapsed(
+    repo: DataRepo, db: LabsDb
+) -> None:
+    client = _empty_review_client()
+    last_full_review_at = _fixed_clock() - FULL_REVIEW_COOLDOWN
+    mark_review_wanted(
+        repo,
+        "chat turn applied a ledger diff (1 op(s))",
+        at=last_full_review_at + timedelta(minutes=1),
+    )
+
+    result = run_review_tick(
+        repo,
+        db,
+        client,
+        clock=_fixed_clock,
+        last_full_review_lookup=lambda: last_full_review_at,
+    )
+
+    assert result.ran_full_review is True
+    assert result.full_review is not None
+    assert "cooldown" in result.decision_reason
+    assert "chat turn applied a ledger diff" in result.decision_reason
+
+
+def test_run_review_tick_runs_full_review_on_the_floor_with_no_marker_at_all(
+    repo: DataRepo, db: LabsDb
+) -> None:
+    client = _empty_review_client()
+    last_full_review_at = _fixed_clock() - FULL_REVIEW_FLOOR
+
+    from adoc.reason.review_trigger import load_review_marker
+
+    assert load_review_marker(repo) is None
+
+    result = run_review_tick(
+        repo,
+        db,
+        client,
+        clock=_fixed_clock,
+        last_full_review_lookup=lambda: last_full_review_at,
+    )
+
+    assert result.ran_full_review is True
+    assert result.full_review is not None
+    assert "floor" in result.decision_reason
+
+
+def test_run_review_tick_runs_full_review_when_no_full_review_has_ever_run(
+    repo: DataRepo, db: LabsDb
+) -> None:
+    """A brand new data repo, no marker, no prior review at all: the floor
+    condition's degenerate case (`should_run_full_review`'s `last_full_
+    review_at is None` branch) — reproduces the old weekly cron's guarantee
+    that the very first review runs on schedule rather than waiting a
+    further 7 days."""
+    client = _empty_review_client()
+
+    result = run_review_tick(
+        repo, db, client, clock=_fixed_clock, last_full_review_lookup=lambda: None
+    )
+
+    assert result.ran_full_review is True
+    assert "no full review has ever run" in result.decision_reason
+
+
+def test_run_review_tick_marker_survives_a_failed_full_review(repo: DataRepo, db: LabsDb) -> None:
+    """A client missing the `blind_panel` role binding makes `build_review_
+    dag` raise before a single node runs (`ValueError`) — the cleanest
+    possible "full review failed" case, with zero side effects to
+    disentangle from the marker-survival assertion."""
+    broken_client = LlmClient({}, {})
+    last_full_review_at = _fixed_clock() - FULL_REVIEW_FLOOR
+    mark_review_wanted(repo, "ingest: 1 new document(s), 0 new lab row(s)")
+
+    from adoc.reason.review_trigger import load_review_marker
+
+    with pytest.raises(ValueError, match="blind_panel"):
+        run_review_tick(
+            repo,
+            db,
+            broken_client,
+            clock=_fixed_clock,
+            last_full_review_lookup=lambda: last_full_review_at,
+        )
+
+    marker = load_review_marker(repo)
+    assert marker is not None
+    assert len(marker.reasons) == 1
+
+
+def test_run_review_tick_marker_is_cleared_after_a_successful_full_review(
+    repo: DataRepo, db: LabsDb
+) -> None:
+    client = _empty_review_client()
+    last_full_review_at = _fixed_clock() - FULL_REVIEW_FLOOR
+    mark_review_wanted(repo, "ingest: 1 new document(s), 0 new lab row(s)")
+
+    from adoc.reason.review_trigger import load_review_marker
+
+    result = run_review_tick(
+        repo,
+        db,
+        client,
+        clock=_fixed_clock,
+        last_full_review_lookup=lambda: last_full_review_at,
+    )
+
+    assert result.ran_full_review is True
+    assert load_review_marker(repo) is None
+
+
+def test_run_review_tick_cheap_parts_run_every_tick_when_full_review_is_suppressed(
+    repo: DataRepo, db: LabsDb
+) -> None:
+    """Trend scan and the deferred-entailment sweep run even when no full
+    review is due this tick — cheap, deterministic, no frontier-model call."""
+    client = _empty_review_client()
+    last_full_review_at = _fixed_clock() - timedelta(hours=1)
+
+    result = run_review_tick(
+        repo,
+        db,
+        client,
+        clock=_fixed_clock,
+        last_full_review_lookup=lambda: last_full_review_at,
+    )
+
+    assert result.ran_full_review is False
+    # A real (deterministic, no-LLM) trend scan ran, not a stub.
+    assert result.trend_scan.findings == []
+    assert result.deferred_verification.checked == 0
+
+
+def test_run_review_tick_full_review_report_carries_the_trigger_summary_into_the_markdown(
+    repo: DataRepo, db: LabsDb
+) -> None:
+    client = _empty_review_client()
+    last_full_review_at = _fixed_clock() - FULL_REVIEW_COOLDOWN
+    mark_review_wanted(
+        repo,
+        "ingest: 3 new document(s), 9 new lab row(s)",
+        at=last_full_review_at + timedelta(seconds=1),
+    )
+
+    result = run_review_tick(
+        repo,
+        db,
+        client,
+        clock=_fixed_clock,
+        last_full_review_lookup=lambda: last_full_review_at,
+    )
+
+    assert result.full_review is not None
+    assert result.full_review.trigger_summary == result.decision_reason
+    markdown = (repo.root / result.full_review.markdown_path).read_text(encoding="utf-8")
+    assert "Why this review ran" in markdown
+    assert "ingest: 3 new document(s), 9 new lab row(s)" in markdown

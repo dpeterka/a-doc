@@ -30,7 +30,6 @@ from adoc.intake.agent import (
     build_doc_digest,
     intake_is_complete,
     read_intake_transcript,
-    red_flag_warning_prefix,
     render_continuity_note,
     run_intake_turn,
 )
@@ -74,17 +73,6 @@ def _make_client(queue: list[dict[str, Any]]) -> tuple[LlmClient, ScriptedTransp
     return client, transport
 
 
-def _exploding_client() -> LlmClient:
-    def transport(_request: TransportRequest) -> TransportResponse:
-        raise AssertionError("the LLM transport must not be called for a red-flagged turn")
-
-    provider = AnthropicProvider(api_key=None, transport=transport)
-    return LlmClient(
-        {"intake_agent": [ModelBinding(provider="anthropic", model="claude-opus-5")]},
-        {"anthropic": provider},
-    )
-
-
 def _seed_all_topics_covered_except(repo: DataRepo, *uncovered_keys: str) -> None:
     from adoc.intake.coverage import save_coverage_state
 
@@ -114,18 +102,13 @@ def _turn(
     }
 
 
-# --- red-flag screen: warns, does not block (ADR 0014) ---------------------------------
+# --- ops applied and persisted; provenance stamped -------------------------------------
 
 
-def test_red_flag_turn_warns_but_still_records_the_history(tmp_path: Path) -> None:
-    """A flagged intake turn is annotated, not replaced (ADR 0014).
-
-    Recounting history is the whole point of an initial visit, and the
-    screen deliberately does no tense/negation detection, so historical
-    mentions of past emergencies match constantly. Blocking cost the
-    patient her entire turn each time. Now the warning rides along and the
-    facts still get captured.
-    """
+def test_intake_turn_recounting_history_is_recorded_and_replied_to(tmp_path: Path) -> None:
+    """Recounting past medical history — the whole point of an initial
+    visit — is recorded and replied to normally (no emergency screening of
+    any kind in this app, see `docs/adr/0021*.md`)."""
     repo = DataRepo.init_at(tmp_path / "data")
     db = LabsDb(":memory:")
     client, _transport = _make_client(
@@ -154,24 +137,8 @@ def test_red_flag_turn_warns_but_still_records_the_history(tmp_path: Path) -> No
     )
 
     assert outcome.kind == "reply"
-    assert outcome.text.startswith(red_flag_warning_prefix("cardiac_chest_pain"))
     assert "Noted — I've recorded that." in outcome.text
-    # The turn was NOT thrown away: her history is on file.
     assert (repo.root / INTAKE_FACTS_RELPATH).exists()
-
-
-def test_red_flag_warning_names_the_matched_category(tmp_path: Path) -> None:
-    repo = DataRepo.init_at(tmp_path / "data")
-    db = LabsDb(":memory:")
-    client, _transport = _make_client([_turn("Understood.")])
-
-    outcome = run_intake_turn(client, repo, db, "I'm having crushing chest pain and pressure")
-
-    assert "cardiac chest pain" in outcome.text
-    assert "Understood." in outcome.text
-
-
-# --- ops applied and persisted; provenance stamped -------------------------------------
 
 
 def test_ops_are_applied_and_persisted_with_stamped_provenance(tmp_path: Path) -> None:
@@ -850,8 +817,8 @@ def test_opener_message_is_a_plain_constant() -> None:
     # points at records that are ALREADY on file rather than asking her to
     # add what she has already provided. It carries no emergency disclaimer:
     # this is a single-patient tool whose operator knows what is and is not
-    # an emergency, and the red-flag screen still warns on the input that
-    # warrants it (ADR 0014).
+    # an emergency (see `docs/adr/0021*.md` -- there is no automated
+    # emergency screening anywhere in this app).
     lowered = INTAKE_OPENER_MESSAGE.lower()
     assert "old are you" in lowered
     assert "sex at birth" in lowered

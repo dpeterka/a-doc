@@ -440,6 +440,55 @@ def test_review_runs_end_to_end_with_a_fake_client(
     out = capsys.readouterr().out
     assert "ledger 0 -> 1" in out
     assert "tagged review-" in out
+    assert "full review ran (no full review has ever run)" in out
+
+
+def test_review_second_tick_is_gated_after_a_full_review_just_ran(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """docs/adr/0019-event-triggered-review.md: `adoc review` (no flags) is
+    the same gated tick the scheduled task calls — the very next tick,
+    seconds later with no new marker, must NOT run another full review."""
+    data_dir = tmp_path / "a-doc-data"
+    DataRepo.init_at(data_dir)
+    monkeypatch.setenv("ADOC_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("ADOC_MODELS_FILE", str(REPO_ROOT / "models.yaml"))
+    monkeypatch.setattr(cli, "_build_llm_client", lambda settings: _empty_review_fake_client())
+
+    assert main(["review"]) == 0
+    capsys.readouterr()
+
+    code = main(["review"])
+
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "skipped full review this tick" in out
+    assert "trend scan found" in out
+
+
+def test_review_force_runs_a_full_review_despite_the_cooldown(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    data_dir = tmp_path / "a-doc-data"
+    DataRepo.init_at(data_dir)
+    monkeypatch.setenv("ADOC_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("ADOC_MODELS_FILE", str(REPO_ROOT / "models.yaml"))
+    monkeypatch.setattr(cli, "_build_llm_client", lambda settings: _empty_review_fake_client())
+
+    assert main(["review"]) == 0
+    first_out = capsys.readouterr().out
+    first_tag = next(line for line in first_out.splitlines() if "tagged" in line)
+
+    code = main(["review", "--force"])
+
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "full review ran (forced via `adoc review --force`)" in out
+    second_tag = next(line for line in out.splitlines() if "tagged" in line)
+    # Two full reviews on the same calendar day get distinct tags/paths
+    # (`reason.review._review_relpath_and_tag`'s collision-safe naming) -
+    # this run proves that path end to end, not just in isolation.
+    assert first_tag != second_tag
 
 
 def test_labs_infer_specimen_fails_without_data_dir(

@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-08-25
+
+### Removed
+- **The red-flag emergency screen is gone** (ADR 0021, supersedes 0014). In live use it produced only false positives and never caught a real emergency — most memorably flagging a patient's plumbing, "our home has a septic system and a well", as sepsis. Intake is historical narrative by construction, so it matched constantly. Removed rather than tuned: it went block → warn → proposed-warn-on-question in a single day, which indicates the mechanism doesn't fit the product. **There is now no automated emergency detection anywhere in the system**, on the owner's reasoning that a patient having a genuine emergency does not type it into this app.
+
+### Fixed
+- The treatment/dosing gate no longer mistakes a measurement for a dose (ADR 0020). A real diagnostic reply was withheld — after the ledger had already committed — because it reported an ultrasound volume of `106.0 mL`. `mg`/`mcg`/`IU` still fire on their own; `g`/`mL`/`units` now require dosing context (an imperative verb or a frequency), because a dose is part of an instruction while a measurement is part of a finding. All blocked fixture cases still block, including a new liquid-dose case so the change can't become a hole.
+- A malformed fact operation no longer costs an entire intake turn. The model emitted an `add_fact` op with its fields flat beside `op` rather than nested under `fact`; that failed structured-output validation, which fails the whole turn *before* the per-op tolerance added earlier can see it — the patient lost a full message of family history. The flat shape is now lifted into place, and a parse failure retries once with the validation error fed back.
+- The composer's number check no longer mis-pairs values across analytes. When one sentence mentioned two analytes it cross-checked them — FSH's real value judged against LH's stored values, ALT's against AST's, a BMD against a T-score — and `hs-CRP` matched the substring `crp`. Numbers now bind to a governing mention, longest label wins, and genuine ambiguity fails safe.
+
+### Changed
+- **The deep review is event-triggered rather than weekly** (ADR 0019). New documents or a chat turn that actually changed the ledger set a marker; a 30-minute tick runs the cheap deterministic parts always, and a full review when the marker is set and a 6-hour cooldown has passed — so a multi-file drop coalesces into one review. A 7-day floor preserves the old weekly guarantee, because the blind panel's value is highest precisely when nothing new arrived.
+- **The ledger and review pages are now one screen.** Once reviews fire on evidence rather than a calendar, "the latest review" and "the current picture" are the same thing. `/ledger` shows the live differential, the latest review inline with what triggered it, and prior reviews as history; `/reviews` redirects.
+
 ## [0.9.0] - 2026-08-25
 
 ### Added

@@ -53,7 +53,7 @@ import json
 import re
 from collections import defaultdict
 from collections.abc import Callable
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
 
@@ -89,6 +89,11 @@ from adoc.reason.dag import (
     run,
 )
 from adoc.reason.prompts import load_prompt
+from adoc.reason.review_trigger import (
+    ReviewMarker,
+    clear_review_marker,
+    load_review_marker,
+)
 from adoc.reason.tools import redact_gated_text
 from adoc.reason.verify import (
     ENTAILMENT_CACHE_RELPATH,
@@ -293,6 +298,14 @@ class ReviewReport(BaseModel):
         default_factory=DeferredVerificationSweepResult
     )
     metrics: OpsMetrics
+    # docs/adr/0019-event-triggered-review.md: what made `run_review_tick`
+    # decide to run THIS full review — a `reason.review_trigger.
+    # ReviewMarker.summary()` rollup, or a floor/force-driven sentence when
+    # there was no marker at all. "" for a review produced by calling
+    # `run_weekly_review` directly (tests, scripts) rather than through
+    # `run_review_tick` — `render_review_markdown` renders no section for
+    # an empty string rather than a misleading placeholder.
+    trigger_summary: str = ""
 
 
 # --------------------------------------------------------------------------
@@ -761,10 +774,21 @@ def render_review_markdown(
     metrics: OpsMetrics,
     ledger_before: Ledger,
     ledger_after: Ledger,
+    trigger_summary: str = "",
 ) -> str:
     """Render the review report: plain-language "what changed"/"what to
     ask your doctor" up top for a non-technical reader, a metrics
     appendix at the bottom for anyone who wants the detail.
+
+    `trigger_summary` (docs/adr/0019-event-triggered-review.md), when
+    given, renders as a short "Why this review ran" line right under the
+    title — the marker reasons (or floor/force sentence) that made
+    `run_review_tick` decide to run this particular full review, so the
+    report can answer "what prompted this" without the reader needing to
+    correlate timestamps against `work/review-wanted.json` themselves. Left
+    out entirely when `trigger_summary` is `""` (a review produced by
+    calling this function/`run_weekly_review` directly, e.g. in a test or
+    script, with no tick-level trigger to report).
 
     Every model-written free-text field interpolated below — divergence
     names, adjudication rationales, test-chooser items — is passed through
@@ -783,6 +807,10 @@ def render_review_markdown(
     ]
 
     lines: list[str] = [f"# Weekly Review — {review_date.isoformat()}", ""]
+
+    if trigger_summary:
+        lines.append(f"_Why this review ran: {redact_gated_text(trigger_summary)}_")
+        lines.append("")
 
     lines.append("## What changed this week")
     lines.append("")
@@ -978,6 +1006,38 @@ def _review_version_incremented_contract() -> Contract:
 
 
 # --------------------------------------------------------------------------
+# Review artifact naming (docs/adr/0019-event-triggered-review.md)
+# --------------------------------------------------------------------------
+
+REVIEW_TAG_PREFIX = "review-"
+
+
+def _review_relpath_and_tag(repo: DataRepo, review_date: date, *, now: datetime) -> tuple[str, str]:
+    """The markdown path and git tag for a full review committing today.
+
+    Collision-safe: the event-triggered cooldown (docs/adr/0019) makes more
+    than one full review on the SAME calendar day possible (up to 4 a day
+    at the 6h cooldown), unlike the old once-a-week cron this replaces. If
+    today's plain `case/reviews/{date}-review.md` is already taken (an
+    earlier full review already ran today), a zero-padded `HHMMSS`
+    (colon-free, so it stays inside `web.routes.reviews`'s filename/tag
+    charset) suffix disambiguates both the path and the tag. The common
+    case — first (and historically only) full review of the day — is
+    byte-identical to the pre-0019 naming, so existing `report.tag ==
+    "review-2026-08-23"`-style assertions are unaffected.
+    """
+    base_relpath = f"case/reviews/{review_date.isoformat()}-review.md"
+    base_tag = f"{REVIEW_TAG_PREFIX}{review_date.isoformat()}"
+    if not (repo.root / base_relpath).exists():
+        return base_relpath, base_tag
+    suffix = now.strftime("%H%M%S")
+    return (
+        f"case/reviews/{review_date.isoformat()}T{suffix}-review.md",
+        f"{base_tag}T{suffix}",
+    )
+
+
+# --------------------------------------------------------------------------
 # DAG assembly
 # --------------------------------------------------------------------------
 
@@ -992,6 +1052,7 @@ def build_review_dag(
     sink: dict[str, BaseModel] | None = None,
     resolver: SourceTextResolver | None = None,
     entailment_cache: EntailmentCache | None = None,
+    trigger_summary: str = "",
 ) -> Dag:
     """Assemble the weekly-review DAG (PLAN.md loop (c)) — see the module
     docstring for topology and contracts.
@@ -1229,15 +1290,15 @@ def build_review_dag(
             metrics=metrics,
             ledger_before=ledger_before,
             ledger_after=ledger_after,
+            trigger_summary=trigger_summary,
         )
-        relpath = f"case/reviews/{review_date.isoformat()}-review.md"
+        relpath, tag_name = _review_relpath_and_tag(repo, review_date, now=clock())
         repo.write(relpath, markdown)
 
         commit_sha = repo.commit(
             f"review: weekly review {review_date.isoformat()}",
             paths=["case"],
         )
-        tag_name = f"review-{review_date.isoformat()}"
         repo.tag(tag_name, message=f"Weekly review {review_date.isoformat()}")
 
         report = ReviewReport(
@@ -1253,6 +1314,7 @@ def build_review_dag(
             staleness=staleness,
             deferred_verification=deferred_verification,
             metrics=metrics,
+            trigger_summary=trigger_summary,
         )
         results["render_report"] = report
         return report
@@ -1409,14 +1471,22 @@ def run_weekly_review(
     clock: Callable[[], datetime] | None = None,
     resolver: SourceTextResolver | None = None,
     entailment_cache: EntailmentCache | None = None,
+    trigger_summary: str = "",
 ) -> ReviewReport:
-    """Run the weekly deep review end to end (PLAN.md "Session loops (c)")
+    """Run the FULL deep review end to end (PLAN.md "Session loops (c)")
     and return the committed, tagged `ReviewReport`. See the module
     docstring for the DAG topology and contracts.
 
     `resolver`/`entailment_cache` are forwarded to `build_review_dag`'s
     `deferred_entailment_sweep` node (PLAN.md latency
     "diagnostic-turn-latency") — tests should inject fakes explicitly.
+
+    `trigger_summary` (docs/adr/0019-event-triggered-review.md) is recorded
+    verbatim into the committed report/markdown (`ReviewReport.
+    trigger_summary`, `render_review_markdown`'s "Why this review ran"
+    line) — this function itself does not gate on anything; `run_review_tick`
+    below is the entry point that decides WHETHER to call this at all and
+    supplies the reason.
     """
     clock = clock if clock is not None else _utcnow
     ledger_path = repo.root / LEDGER_RELPATH
@@ -1432,6 +1502,7 @@ def run_weekly_review(
         sink=sink,
         resolver=resolver,
         entailment_cache=entailment_cache,
+        trigger_summary=trigger_summary,
     )
     run(
         dag,
@@ -1446,7 +1517,210 @@ def run_weekly_review(
     return report
 
 
+# --------------------------------------------------------------------------
+# Event-triggered entry point (docs/adr/0019-event-triggered-review.md)
+# --------------------------------------------------------------------------
+
+# How long a marker-driven full review is suppressed after the last one,
+# even with the "review wanted" marker set (`reason.review_trigger`): the
+# blind panel is three frontier models over full context, so without a
+# ceiling, a burst of ingest ticks/chat turns (e.g. a multi-file Dropbox
+# drop trickling in, or an active diagnostic conversation) could each want
+# their own full review. 6 hours is short enough that a genuinely active
+# day of new evidence still gets same-day re-review (PLAN.md's whole point
+# — a stale-ledger period matters, but so does not sitting on fresh
+# evidence for a week), while comfortably absorbing the realistic burst
+# shapes above (a Dropbox sync completing over minutes, a single diagnostic
+# conversation lasting at most a few hours) as ONE full review rather than
+# several.
+FULL_REVIEW_COOLDOWN = timedelta(hours=6)
+
+# The upper bound on how long a full review can go without running AT ALL,
+# marker or no marker — this is what preserves the blind panel's original
+# purpose (ADR 0002/0019: it exists to counteract ledger anchoring most
+# precisely when nothing new has arrived to prompt a fresh look) and
+# `scan_staleness`'s inherently time-based drift check as a worst case, not
+# an afterthought: 7 days reproduces the exact guarantee the old
+# `cron(0 6 ? * SUN *)` schedule gave (a review AT LEAST weekly), so a
+# quiet case file is never worse off under event-triggering than it was
+# under the pure weekly cron this replaces.
+FULL_REVIEW_FLOOR = timedelta(days=7)
+
+
+def should_run_full_review(
+    *,
+    marker: ReviewMarker | None,
+    last_full_review_at: datetime | None,
+    now: datetime,
+    cooldown: timedelta = FULL_REVIEW_COOLDOWN,
+    floor: timedelta = FULL_REVIEW_FLOOR,
+) -> tuple[bool, str]:
+    """Pure decision function (docs/adr/0019): whether a full review should
+    run THIS tick, and a human-readable reason either way — deliberately
+    free of any I/O so it's trivially unit-testable against an injected
+    clock/marker/`last_full_review_at`, independent of `DataRepo`/git or a
+    real `LlmClient`. `run_review_tick` is the only real caller.
+    """
+    if last_full_review_at is None:
+        return True, "no full review has ever run"
+
+    since_last = now - last_full_review_at
+
+    if marker is not None and since_last >= cooldown:
+        return (
+            True,
+            f"review-wanted marker set ({marker.summary()}); "
+            f"{since_last} since the last full review >= the {cooldown} cooldown",
+        )
+
+    if since_last >= floor:
+        return (
+            True,
+            f"{since_last} since the last full review >= the {floor} floor "
+            "(no marker needed — this is the worst-case weekly guarantee)",
+        )
+
+    if marker is not None:
+        return (
+            False,
+            f"review-wanted marker set ({marker.summary()}), but only {since_last} has passed "
+            f"since the last full review — cooldown ({cooldown}) not yet elapsed",
+        )
+    return (
+        False,
+        f"no review-wanted marker set, and only {since_last} has passed since the last full "
+        f"review — floor ({floor}) not yet elapsed",
+    )
+
+
+class ReviewTickResult(BaseModel):
+    """What one `run_review_tick` call did: the cheap parts (always run,
+    unless superseded by a full review's own equivalent nodes — see
+    `run_review_tick`'s docstring) plus the full review, if one ran."""
+
+    ran_full_review: bool
+    decision_reason: str
+    trend_scan: TrendScanResult
+    deferred_verification: DeferredVerificationSweepResult
+    full_review: ReviewReport | None = None
+
+
+def run_review_tick(
+    repo: DataRepo,
+    db: LabsDb,
+    client: LlmClient,
+    *,
+    clock: Callable[[], datetime] | None = None,
+    resolver: SourceTextResolver | None = None,
+    entailment_cache: EntailmentCache | None = None,
+    force: bool = False,
+    cooldown: timedelta = FULL_REVIEW_COOLDOWN,
+    floor: timedelta = FULL_REVIEW_FLOOR,
+    last_full_review_lookup: Callable[[], datetime | None] | None = None,
+) -> ReviewTickResult:
+    """The single entry point both the frequent scheduled tick
+    (`deploy/cfn/ecs.yaml`'s `ReviewRule`, `rate(30 minutes)`) and `adoc
+    review` call (docs/adr/0019-event-triggered-review.md): decide whether
+    a FULL review (blind panel + adjudication + staleness + test chooser +
+    committed/tagged artifact) is due, and always do the cheap deterministic
+    work regardless.
+
+    Decision: `force=True` (CLI `--force`) always runs a full review,
+    bypassing marker/cooldown/floor entirely — this is how a human asks
+    for one on demand, and how `adoc eval`/deterministic test/script paths
+    get a guaranteed full run. Otherwise `should_run_full_review` decides
+    from the on-disk "review wanted" marker (`reason.review_trigger`) and
+    `DataRepo.latest_tag_time("review-")` (the committed, durable source of
+    truth for when the last full review ran — see that method's docstring
+    for why this is preferred over a separate persisted timestamp).
+
+    Cheap-tick work (`deterministic_trend_scan`, `sweep_deferred_
+    entailment_claims` — no blind panel, no frontier-model calls) is run
+    ONLY when a full review does NOT run this tick: `build_review_dag`
+    already includes both as nodes (`trend_scan`, `deferred_entailment_
+    sweep`), and `sweep_deferred_entailment_claims` POPS the deferred-claims
+    queue (`reason.verify.pop_deferred_claims` empties it) — running it a
+    second time standalone before a full review would silently starve the
+    full review's own sweep of the very claims it exists to verify. So a
+    tick that decides to run a full review delegates entirely to
+    `run_weekly_review`, which does its own trend scan and deferred sweep
+    as part of the DAG; a tick that doesn't run one does the cheap work
+    itself, since nothing else will this tick.
+
+    Marker lifecycle: cleared (`clear_review_marker`) ONLY after
+    `run_weekly_review` returns successfully — an exception (a DAG contract
+    violation, a transport error, ...) propagates straight out of this
+    function with the marker still on disk, so the FAILURE is not silently
+    absorbed and the very next tick tries again (task requirement: "marker
+    survives a failed run and is cleared after a successful one").
+
+    Concurrency: the full-review path is unchanged from `run_weekly_review`
+    — `apply_review_diff` still goes through `DataRepo.apply_ledger_diff`,
+    which holds `repo._lock` across load -> apply -> save -> append-history
+    -> commit in one critical section, same as every diagnostic chat turn's
+    `apply_stage` (`casefile.repo.DataRepo.apply_ledger_diff`'s docstring).
+    Nothing about event-triggering changes that path.
+
+    `last_full_review_lookup`, if given, replaces the default `lambda:
+    repo.latest_tag_time(REVIEW_TAG_PREFIX)` — a real git tag's commit time
+    always reflects actual wall-clock time regardless of what `clock`
+    returns, so tests that need a specific "time since the last full
+    review" (cooldown/floor boundary tests) inject a fake lookup here
+    rather than fighting git commit timestamps; production code never
+    passes this.
+    """
+    clock = clock if clock is not None else _utcnow
+    now = clock()
+    resolved_lookup = last_full_review_lookup or (lambda: repo.latest_tag_time(REVIEW_TAG_PREFIX))
+
+    if force:
+        should_run, decision_reason = True, "forced via `adoc review --force`"
+    else:
+        marker = load_review_marker(repo)
+        last_full_review_at = resolved_lookup()
+        should_run, decision_reason = should_run_full_review(
+            marker=marker,
+            last_full_review_at=last_full_review_at,
+            now=now,
+            cooldown=cooldown,
+            floor=floor,
+        )
+
+    if should_run:
+        full_review = run_weekly_review(
+            repo,
+            db,
+            client,
+            clock=clock,
+            resolver=resolver,
+            entailment_cache=entailment_cache,
+            trigger_summary=decision_reason,
+        )
+        clear_review_marker(repo)
+        return ReviewTickResult(
+            ran_full_review=True,
+            decision_reason=decision_reason,
+            trend_scan=TrendScanResult(findings=full_review.trend_findings),
+            deferred_verification=full_review.deferred_verification,
+            full_review=full_review,
+        )
+
+    trend_scan = deterministic_trend_scan(db)
+    deferred = sweep_deferred_entailment_claims(
+        client, repo, db, resolver=resolver, cache=entailment_cache
+    )
+    return ReviewTickResult(
+        ran_full_review=False,
+        decision_reason=decision_reason,
+        trend_scan=trend_scan,
+        deferred_verification=deferred,
+    )
+
+
 __all__ = [
+    "FULL_REVIEW_COOLDOWN",
+    "FULL_REVIEW_FLOOR",
+    "REVIEW_TAG_PREFIX",
     "AdjudicationResult",
     "BlindDifferential",
     "ChallengeSweepResult",
@@ -1456,6 +1730,7 @@ __all__ = [
     "DivergenceSet",
     "OpsMetrics",
     "ReviewReport",
+    "ReviewTickResult",
     "StalenessReport",
     "TestChooserResult",
     "TrendScanResult",
@@ -1469,7 +1744,9 @@ __all__ = [
     "ledger_churn",
     "parse_audit_costs",
     "render_review_markdown",
+    "run_review_tick",
     "run_weekly_review",
     "scan_staleness",
+    "should_run_full_review",
     "sweep_deferred_entailment_claims",
 ]

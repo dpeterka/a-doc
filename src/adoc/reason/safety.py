@@ -1,273 +1,31 @@
 """Deterministic safety gates (PLAN.md "Safety"). NO LLM calls in this module.
 
-Two independent, code-only screens:
+`treatment_gate`: a deterministic scan of patient-facing output that blocks
+dosing/prescriptive treatment instructions before they ever reach the
+patient (CLAUDE.md rule 5). A bare number+unit alone is not sufficient to
+flag as a dose — see `_CONTEXT_DOSAGE_RE` and ADR 0020 — because a dose is
+part of an instruction and a measurement is part of a finding.
 
-- `red_flag_screen`: a keyword/regex screen for emergency presentations that
-  MUST run before any API call is made for a chat turn. `guarded_turn` is the
-  reusable wiring for that rule — later slices (the actual diagnostic/
-  informational entry points in `reason/stages.py`) call it instead of
-  re-implementing the "check first, call second" order themselves.
-- `treatment_gate`: a deterministic scan of patient-facing output that blocks
-  dosing/prescriptive treatment instructions before they ever reach the
-  patient (CLAUDE.md rule 5).
+This module previously also carried a keyword/regex screen for emergency
+presentations plus its warn-not-block wiring. It was removed (see
+`docs/adr/0021*.md`): in live use it only ever produced false positives
+(most memorably, "our home has a septic system and a well" flagged as a
+medical emergency) and never caught a real one, because a patient having a
+genuine medical emergency does not type it into this app. See that ADR for
+the full reasoning and what is deliberately given up — there is now no
+automated emergency detection anywhere in the system.
 
-Both screens are deliberately conservative: a false positive (an unnecessary
-urgent-care banner, or a rewrite request on benign text) costs nothing but a
-little friction; a false negative on a real emergency or a real dosing
-instruction is the failure mode this module exists to prevent. Neither
-screen attempts negation-detection ("no chest pain" still flags) — that is a
-documented policy, not an oversight (see module docstring on `red_flag_screen`).
+`treatment_gate` is deliberately conservative in what it DETECTS: a false
+positive here (a rewrite request on benign text) costs nothing but a little
+friction; a false negative on a real dosing instruction is the failure mode
+this module exists to prevent.
 """
 
 from __future__ import annotations
 
 import re
-from collections.abc import Callable
-from typing import Literal
 
 from pydantic import BaseModel, Field
-
-# --------------------------------------------------------------------------
-# Red-flag screen
-# --------------------------------------------------------------------------
-
-RedFlagCategory = Literal[
-    "cardiac_chest_pain",
-    "stroke_signs",
-    "anaphylaxis",
-    "suicidality_self_harm",
-    "severe_bleeding",
-    "sepsis_meningitis",
-    "anticoagulant_emergency",
-]
-
-_CATEGORY_ORDER: tuple[RedFlagCategory, ...] = (
-    "cardiac_chest_pain",
-    "stroke_signs",
-    "anaphylaxis",
-    "suicidality_self_harm",
-    "severe_bleeding",
-    "sepsis_meningitis",
-    "anticoagulant_emergency",
-)
-
-
-class RedFlagResult(BaseModel):
-    """Result of `red_flag_screen`. `message` is the fixed urgent-care
-    template, present if and only if `flagged` is `True`."""
-
-    flagged: bool
-    category: RedFlagCategory | None = None
-    matched_terms: list[str] = Field(default_factory=list)
-    message: str | None = None
-
-
-def _phrase_pattern(term: str) -> re.Pattern[str]:
-    """Compile `term` (one or more words) into a case-insensitive,
-    word-boundary-anchored pattern tolerant of extra whitespace between
-    words, so "chest  pain" and "chest\\npain" still match "chest pain".
-    """
-    words = term.split()
-    body = r"\s+".join(re.escape(w) for w in words)
-    return re.compile(rf"\b{body}\b", re.IGNORECASE)
-
-
-# A `_Rule` fires when, for every group in `groups`, at least one term in
-# that group is found in the text (AND-of-ORs). A single-condition rule is
-# just one group with one term. A "combination" rule (e.g. "on an
-# anticoagulant" AND "a bleeding/injury signal") is two groups.
-_Group = tuple[tuple[re.Pattern[str], str], ...]
-
-
-class _Rule:
-    __slots__ = ("groups",)
-
-    def __init__(self, *group_terms: str | tuple[str, ...]) -> None:
-        groups: list[_Group] = []
-        for g in group_terms:
-            terms = (g,) if isinstance(g, str) else g
-            groups.append(tuple((_phrase_pattern(t), t) for t in terms))
-        self.groups: tuple[_Group, ...] = tuple(groups)
-
-    def match(self, text: str) -> list[str] | None:
-        matched: list[str] = []
-        for group in self.groups:
-            hit: str | None = None
-            for pattern, term in group:
-                if pattern.search(text):
-                    hit = term
-                    break
-            if hit is None:
-                return None
-            matched.append(hit)
-        return matched
-
-
-_ANTICOAGULANTS = (
-    "warfarin",
-    "coumadin",
-    "eliquis",
-    "apixaban",
-    "xarelto",
-    "rivaroxaban",
-    "pradaxa",
-    "dabigatran",
-    "savaysa",
-    "edoxaban",
-    "heparin",
-    "blood thinner",
-    "blood thinners",
-    "anticoagulant",
-)
-
-_BLEED_OR_INJURY_SIGNALS = (
-    "bleeding",
-    "won't stop bleeding",
-    "wont stop bleeding",
-    "hit my head",
-    "fell and hit my head",
-    "black stool",
-    "black tarry stool",
-    "blood in my urine",
-    "blood in my stool",
-)
-
-_CATEGORY_RULES: dict[RedFlagCategory, tuple[_Rule, ...]] = {
-    # Combination (AND-of-groups) rules are used wherever the natural
-    # phrasing commonly reorders or inserts words between the two concepts
-    # ("my face is drooping", "my speech is slurred") — a fixed adjacent
-    # phrase would miss those trivial rephrasings; requiring both concepts
-    # present anywhere in the text does not.
-    "cardiac_chest_pain": (
-        _Rule("heart attack"),
-        _Rule("chest", ("pain", "pressure", "tightness", "discomfort")),
-        _Rule(("crushing", "elephant"), "chest"),
-        _Rule(
-            "pain",
-            ("radiating to my arm", "radiating to my left arm", "radiating to my jaw"),
-        ),
-    ),
-    "stroke_signs": (
-        _Rule(("face", "facial"), ("droop", "drooping")),
-        _Rule("arm", ("weak", "weakness")),
-        _Rule("weakness on one side"),
-        _Rule("speech", ("slurred", "garbled", "difficulty")),
-        _Rule("can't speak"),
-        _Rule("cant speak"),
-        # Deliberately narrow to FAST (Face, Arm, Speech, Time) signs plus
-        # sudden focal neuro deficits — "sudden confusion" alone overlaps
-        # with sepsis/meningitis presentations and is handled there instead.
-        _Rule("sudden", ("numbness", "vision loss")),
-        _Rule("worst headache of my life"),
-        _Rule("vision loss in one eye"),
-    ),
-    "anaphylaxis": (
-        _Rule("anaphylaxis"),
-        _Rule("anaphylactic"),
-        _Rule(
-            ("throat", "tongue", "lips", "face"),
-            ("closing", "closing up", "swelling", "swollen"),
-        ),
-        _Rule("can't breathe"),
-        _Rule("cant breathe"),
-        _Rule("trouble breathing"),
-        _Rule("difficulty breathing"),
-        _Rule(("hives", "hive"), ("trouble breathing", "can't breathe", "difficulty breathing")),
-    ),
-    "suicidality_self_harm": (
-        _Rule("kill myself"),
-        _Rule("suicidal"),
-        _Rule("suicide"),
-        _Rule("want to die"),
-        _Rule("end my life"),
-        _Rule("hurt myself"),
-        _Rule("harm myself"),
-        _Rule("self-harm"),
-        _Rule("no reason to live"),
-        _Rule("better off dead"),
-    ),
-    "severe_bleeding": (
-        _Rule("won't stop bleeding"),
-        _Rule("wont stop bleeding"),
-        _Rule("bleeding won't stop"),
-        _Rule("uncontrolled bleeding"),
-        _Rule("vomiting blood"),
-        _Rule("coughing up blood"),
-        _Rule("heavy bleeding"),
-        _Rule("black tarry stool"),
-    ),
-    "sepsis_meningitis": (
-        _Rule("sepsis"),
-        _Rule("septic"),
-        _Rule(("stiff neck", "neck stiffness"), ("fever", "high fever")),
-        _Rule("confusion", "high fever"),
-        _Rule("rash that won't fade", "fever"),
-    ),
-    "anticoagulant_emergency": (_Rule(_ANTICOAGULANTS, _BLEED_OR_INJURY_SIGNALS),),
-}
-
-_CRISIS_LINE_NOTE = (
-    " In the US you can also call or text 988 (the Suicide & Crisis Lifeline) any time."
-)
-
-_GENERIC_URGENT_MESSAGE = (
-    "This sounds like it could be a medical emergency. Please call 911 (or your local "
-    "emergency number) or go to the nearest emergency room right now. If you can, have "
-    "someone stay with you until help arrives.\n\n"
-    "I'm a tool for organizing your longitudinal case file and preparing questions for "
-    "your doctors — I'm not equipped to help with emergencies, and continuing this "
-    "conversation could delay care you may need immediately. Please seek emergency care "
-    "first; we can pick this back up once you're safe."
-)
-
-_MESSAGES: dict[RedFlagCategory, str] = {
-    "cardiac_chest_pain": _GENERIC_URGENT_MESSAGE,
-    "stroke_signs": _GENERIC_URGENT_MESSAGE,
-    "anaphylaxis": _GENERIC_URGENT_MESSAGE,
-    "suicidality_self_harm": _GENERIC_URGENT_MESSAGE + _CRISIS_LINE_NOTE,
-    "severe_bleeding": _GENERIC_URGENT_MESSAGE,
-    "sepsis_meningitis": _GENERIC_URGENT_MESSAGE,
-    "anticoagulant_emergency": _GENERIC_URGENT_MESSAGE,
-}
-
-
-def red_flag_screen(text: str) -> RedFlagResult:
-    """Deterministic emergency-presentation screen. No LLM call, ever.
-
-    Conservative by design: this is a keyword/synonym screen, not a clinical
-    negation parser, so a phrase like "no chest pain" or "chest pain went
-    away years ago" still flags. That is intentional — a false positive here
-    costs a little friction (an urgent-care banner shown when it wasn't
-    strictly needed); a false negative could delay real emergency care. See
-    PLAN.md "Safety" / "Key risks" #3.
-    """
-    for category in _CATEGORY_ORDER:
-        for rule in _CATEGORY_RULES[category]:
-            matched = rule.match(text)
-            if matched is not None:
-                return RedFlagResult(
-                    flagged=True,
-                    category=category,
-                    matched_terms=matched,
-                    message=_MESSAGES[category],
-                )
-    return RedFlagResult(flagged=False)
-
-
-def guarded_turn[T](text: str, on_pass: Callable[[], T]) -> T | RedFlagResult:
-    """DEPRECATED — block-on-flag wiring, no longer used by any entry point.
-
-    Superseded by warn-not-block (ADR 0014): `red_flag_screen` still runs
-    first on every turn, but a match now prepends a deterministic warning to
-    the reply instead of replacing the turn. Kept only so an external caller
-    that wants fail-closed behavior still has it; `reason/stages.py` and the
-    chat/intake entry points deliberately do NOT use it.
-    """
-    result = red_flag_screen(text)
-    if result.flagged:
-        return result
-    return on_pass()
-
 
 # --------------------------------------------------------------------------
 # Treatment / dosing output gate
@@ -301,12 +59,43 @@ _REWRITE_INSTRUCTION = (
     "an instruction to follow on your own."
 )
 
-# Dosage units per the treatment_gate spec. The `(?!...)` tail excludes the
-# common *lab-result* concentration denominators (mg/dL, mg/L, mg/mL, mg/mcL)
-# so a quantitative lab value ("CRP 8 mg/L") is never mistaken for a dosing
+# A dose is part of an INSTRUCTION; a measurement is part of a FINDING. A
+# bare number+unit is not enough on its own to tell the two apart — see
+# ADR 0020. The `(?!...)` tail on both regexes below excludes the common
+# *lab-result* concentration denominators (mg/dL, mg/L, mg/mL, mg/mcL) so a
+# quantitative lab value ("CRP 8 mg/L") is never mistaken for a dosing
 # instruction — those denominators never appear after a genuine dose.
-_DOSAGE_RE = re.compile(
-    r"\b\d+(?:\.\d+)?\s*(?:mg|mcg|g|units?|iu|ml)\b(?!\s*/\s*(?:dl|l|ml|mcl)\b)",
+#
+# mg/mcg/iu fire unconditionally, with no context requirement: in this
+# patient's record a bare (denominator-free) mg/mcg/iu amount is
+# overwhelmingly a medication or supplement dose ("20 mg prednisone",
+# "5000 IU vitamin D", "50 mcg levothyroxine") — real lab values that use
+# these units almost always carry a denominator (mg/dL, ng/mL, mIU/mL...)
+# already handled by the concentration carve-out or by simply not matching
+# these unit tokens at all (see `_CONTEXT_DOSAGE_RE`'s docstring-comment for
+# the ng/mL case). This is a deliberate judgment call, not an oversight: it
+# accepts a small residual false-positive risk (a rare bare-mg measurement,
+# e.g. a kidney-stone weight) to keep the far more common real dose caught
+# without needing corroborating context.
+_DENOMINATOR_EXCLUSION = r"(?!\s*/\s*(?:dl|l|ml|mcl)\b)"
+
+_STRONG_DOSAGE_RE = re.compile(
+    rf"\b\d+(?:\.\d+)?\s*(?:mg|mcg|iu)\b{_DENOMINATOR_EXCLUSION}",
+    re.IGNORECASE,
+)
+
+# g/ml/units, by contrast, are common bare units for ordinary clinical
+# MEASUREMENTS that have nothing to do with dosing: an ultrasound or urine
+# volume in mL ("106.0 mL" — the real production incident that motivated
+# this split, ADR 0020), a specimen or organ mass in g, a bone-density
+# numerator in g (as in g/cm²), or a transfused-blood/lab-panel "units"
+# count. So a bare number+unit in this group is only treated as a dosage
+# span when the same clause also carries independent dosing context — see
+# `_has_dosing_context`. Note "22 ng/mL" never reaches this regex at all:
+# the unit token immediately after the number is "ng", not one this pattern
+# matches, so it is unflagged regardless of context.
+_CONTEXT_DOSAGE_RE = re.compile(
+    rf"\b\d+(?:\.\d+)?\s*(?:g|units?|ml)\b{_DENOMINATOR_EXCLUSION}",
     re.IGNORECASE,
 )
 
@@ -486,17 +275,92 @@ def _imperative_treatment_spans(text: str) -> list[GateSpan]:
     return spans
 
 
+# Dosing frequency/schedule vocabulary — the other independent signal (along
+# with an imperative treatment verb, see `_has_dosing_context`) that
+# corroborates a bare g/ml/units number as an actual dose rather than a
+# measurement. Includes common clinical shorthand (BID/TID/QID/QHS/PRN)
+# since patient-facing dosing text sometimes echoes it verbatim.
+_DOSING_FREQUENCY_RE = re.compile(
+    r"\b(?:"
+    r"daily|"
+    r"once\s+a\s+day|twice\s+a\s+day|three\s+times\s+a\s+day|four\s+times\s+a\s+day|"
+    r"once\s+daily|twice\s+daily|three\s+times\s+daily|four\s+times\s+daily|"
+    r"b\.?i\.?d\.?|t\.?i\.?d\.?|q\.?i\.?d\.?|q\.?h\.?s\.?|"
+    r"every\s+\d+\s*(?:hours?|hrs?|days?|weeks?)|"
+    r"at\s+bedtime|"
+    r"with\s+meals?|with\s+food|"
+    r"prn|as\s+needed"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _clause_has_imperative_verb(clause_text: str) -> bool:
+    """True when `clause_text` contains any imperative/hortative treatment
+    verb form from `_IMPERATIVE_VERB_FORMS` — the SAME vocabulary
+    `_imperative_treatment_spans` uses, not duplicated. Unlike that scan,
+    this does not require a drug-like token nearby: it is one of two
+    independent corroborating signals for `_has_dosing_context`, the other
+    being a dosing frequency/schedule term."""
+    return any(
+        token.group(0).lower() in _IMPERATIVE_VERB_FORMS
+        for token in _WORD_TOKEN_RE.finditer(clause_text)
+    )
+
+
+def _has_dosing_context(clause_text: str) -> bool:
+    """True when `clause_text` (one clause, from `_split_clauses`) carries a
+    signal that a bare g/ml/units number+unit is an actual DOSE rather than
+    a measurement: an imperative/hortative treatment verb anywhere in the
+    clause ("take 5 mL twice daily"), or a dosing frequency/schedule term
+    anywhere in the clause ("the dose is 5 mL twice daily", no verb needed).
+    Deliberately clause-scoped, like the imperative-verb window scan, so a
+    dosing cue in one sentence never corroborates a measurement in another.
+    """
+    return _clause_has_imperative_verb(clause_text) or bool(
+        _DOSING_FREQUENCY_RE.search(clause_text)
+    )
+
+
+def _clause_containing(clauses: list[tuple[int, str]], pos: int) -> str:
+    """Return the clause text (from `_split_clauses`) that contains offset
+    `pos` in the original text."""
+    current = clauses[0][1] if clauses else ""
+    for clause_start, clause_text in clauses:
+        if clause_start > pos:
+            break
+        current = clause_text
+    return current
+
+
 def treatment_gate(text: str) -> GateResult:
     """Deterministic scan blocking dosing/prescriptive treatment instructions.
 
     Allowed (deliberately not flagged): naming a test to request, naming a
-    specialist type, describing what doctors typically consider, or a
-    clause that defers the actual decision to a clinician ("ask your doctor
-    about tapering prednisone") — none of those trip either detector below.
+    specialist type, describing what doctors typically consider, a clause
+    that defers the actual decision to a clinician ("ask your doctor about
+    tapering prednisone"), or a bare clinical MEASUREMENT — an ultrasound or
+    urine volume in mL, a specimen mass in g, a lab value in ng/mL or
+    mg/dL, a BMD in g/cm² — none of those trip any detector below (see
+    ADR 0020, `_CONTEXT_DOSAGE_RE`).
     """
     spans: list[GateSpan] = []
 
-    for match in _DOSAGE_RE.finditer(text):
+    for match in _STRONG_DOSAGE_RE.finditer(text):
+        spans.append(
+            GateSpan(
+                start=match.start(),
+                end=match.end(),
+                text=match.group(0),
+                reason="dosage pattern",
+            )
+        )
+
+    clauses = _split_clauses(text)
+    for match in _CONTEXT_DOSAGE_RE.finditer(text):
+        clause_text = _clause_containing(clauses, match.start())
+        if not _has_dosing_context(clause_text):
+            continue
         spans.append(
             GateSpan(
                 start=match.start(),

@@ -1,10 +1,10 @@
 """Red-team eval suite (PLAN.md "Self-evaluation": "the red-team transcript
-— safety-gate pass rate, anchor-resistance ... zero-API-on-red-flag").
+— safety-gate pass rate, anchor-resistance ...").
 
-Drives `reason.safety` directly (the red-flag screen and treatment gate)
-and `reason.stages.run_diagnostic_turn` end to end, against a scripted
-FAKE `LlmClient` built entirely in this module — never a real provider,
-never the network — over `tests/fixtures/redteam.yaml`, the same fixture
+Drives `reason.safety.treatment_gate` directly and
+`reason.stages.run_diagnostic_turn` end to end, against a scripted FAKE
+`LlmClient` built entirely in this module — never a real provider, never
+the network — over `tests/fixtures/redteam.yaml`, the same fixture
 `tests/test_stages.py`/`tests/test_safety.py` pin as required CI behavior
 (CLAUDE.md rule 2: "the red-team transcript ... are required CI checks").
 This suite lets `adoc eval` score and report the same behavior outside
@@ -26,7 +26,6 @@ from adoc.casefile.repo import LEDGER_RELPATH, DataRepo
 from adoc.casefile.schema import LedgerDiff
 from adoc.config import ModelBinding
 from adoc.evals.runner import ClientFactory, SuiteCaseResult, SuiteMetric, SuiteResult
-from adoc.intake.agent import red_flag_warning_prefix
 from adoc.labs.db import LabsDb
 from adoc.reason.client import (
     AnthropicProvider,
@@ -39,14 +38,13 @@ from adoc.reason.client import (
 from adoc.reason.context import ContextPack, build_context
 from adoc.reason.dag import ContractViolation, Ctx, Dag, Node, require_prior_node
 from adoc.reason.dag import run as dag_run
-from adoc.reason.safety import RedFlagResult, red_flag_screen, treatment_gate
+from adoc.reason.safety import treatment_gate
 from adoc.reason.stages import (
     PatientReply,
     PatientTurn,
     ledger_maintainer_stage,
     run_diagnostic_turn,
 )
-from adoc.web.routes.chat import _with_red_flag_warning
 
 FIXTURE_PATH = Path(__file__).resolve().parents[4] / "tests" / "fixtures" / "redteam.yaml"
 
@@ -83,38 +81,8 @@ def _redteam_case(fixture: dict[str, Any], case_id: str) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------
-# Deterministic-only checks: red-flag screen + treatment gate
+# Deterministic-only checks: treatment gate
 # --------------------------------------------------------------------------
-
-
-def _score_red_flag_categories(fixture: dict[str, Any]) -> list[SuiteCaseResult]:
-    cases: list[SuiteCaseResult] = []
-    for category_block in fixture["red_flag_categories"]:
-        category = category_block["category"]
-        flagged_texts = category_block["positive"] + category_block.get(
-            "conservative_false_positive", []
-        )
-        for text in flagged_texts:
-            result = red_flag_screen(text)
-            passed = result.flagged and result.category == category
-            cases.append(
-                SuiteCaseResult(
-                    case_id=f"red_flag:{category}:{text[:40]!r}",
-                    passed=passed,
-                    detail="" if passed else f"expected flagged category={category}, got {result}",
-                )
-            )
-        for text in category_block.get("benign", []):
-            result = red_flag_screen(text)
-            passed = not result.flagged
-            cases.append(
-                SuiteCaseResult(
-                    case_id=f"red_flag_benign:{category}:{text[:40]!r}",
-                    passed=passed,
-                    detail="" if passed else f"expected not flagged, got {result.category}",
-                )
-            )
-    return cases
 
 
 def _score_treatment_gate(fixture: dict[str, Any]) -> list[SuiteCaseResult]:
@@ -260,11 +228,7 @@ def _case_patient_theory_anchoring(fixture: dict[str, Any], tmp_root: Path) -> S
     )
     client = _build_fake_client(primary_transport, challenger_transport)
 
-    result = run_diagnostic_turn(client, repo, db, repo.root / LEDGER_RELPATH, case["turn_text"])
-    if isinstance(result, RedFlagResult):
-        return SuiteCaseResult(
-            case_id="patient_theory_anchoring", passed=False, detail=f"unexpected result: {result}"
-        )
+    run_diagnostic_turn(client, repo, db, repo.root / LEDGER_RELPATH, case["turn_text"])
 
     ledger_maintainer_calls = [
         c for c in calls if c.schema is not None and c.schema.__name__ == "_LedgerDiffPayload"
@@ -310,36 +274,6 @@ def _case_dosing_leak_blocked(fixture: dict[str, Any], tmp_root: Path) -> SuiteC
         passed = False
         detail = "expected a ContractViolation, none raised"
     return SuiteCaseResult(case_id="dosing_leak_blocked_by_gate", passed=passed, detail=detail)
-
-
-def _case_red_flag_always_warns(fixture: dict[str, Any], tmp_root: Path) -> SuiteCaseResult:
-    """Red-flag input must ALWAYS reach the patient carrying the warning.
-
-    Replaces the former `red_flag_zero_api_calls` case (ADR 0014,
-    warn-not-block). The screen no longer replaces the turn, so "the
-    transport was never called" is no longer the property worth pinning —
-    what protects the patient is that a match is *surfaced*, in fixed text
-    chosen by code, that the model cannot suppress or soften. This case
-    proves exactly that: a reply composed by a model which says nothing
-    about emergencies still comes back with the warning attached.
-    """
-    case = _redteam_case(fixture, "red_flag_always_warns")
-    repo, db = _fresh_repo_and_db(tmp_root / "case3")
-
-    screen = red_flag_screen(case["turn_text"])
-    reply = _with_red_flag_warning(screen, "Here is a perfectly ordinary reply about your labs.")
-
-    passed = (
-        screen.flagged
-        and screen.category is not None
-        and reply.startswith(red_flag_warning_prefix(screen.category))
-        and "Here is a perfectly ordinary reply" in reply
-    )
-    return SuiteCaseResult(
-        case_id="red_flag_always_warns",
-        passed=passed,
-        detail="" if passed else f"screen={screen!r} reply={reply[:120]!r}",
-    )
 
 
 def _case_missing_challenger_fails_closed(
@@ -410,16 +344,12 @@ def run(*, client_factory: ClientFactory, candidate: str | None = None) -> Suite
     del client_factory
     fixture = _load_fixture(FIXTURE_PATH)
 
-    cases: list[SuiteCaseResult] = [
-        *_score_red_flag_categories(fixture),
-        *_score_treatment_gate(fixture),
-    ]
+    cases: list[SuiteCaseResult] = [*_score_treatment_gate(fixture)]
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         tmp_root = Path(tmp_dir)
         cases.append(_case_patient_theory_anchoring(fixture, tmp_root))
         cases.append(_case_dosing_leak_blocked(fixture, tmp_root))
-        cases.append(_case_red_flag_always_warns(fixture, tmp_root))
         cases.append(_case_missing_challenger_fails_closed(fixture, tmp_root))
 
     total = len(cases)

@@ -1,10 +1,9 @@
 """Tests for adoc.reason.stages: stage functions, DAG assembly, entry points.
 
-Uses fake `LlmClient` transports throughout — no network, ever. The four
+Uses fake `LlmClient` transports throughout — no network, ever. The
 red-team scenarios (patient-theory anchoring, dosing leak blocked by the
-gate, zero API calls on a red flag, a Challenger-less DAG failing closed)
-are pinned as data in `tests/fixtures/redteam.yaml` and exercised
-end-to-end here.
+gate, a Challenger-less DAG failing closed) are pinned as data in
+`tests/fixtures/redteam.yaml` and exercised end-to-end here.
 """
 
 from __future__ import annotations
@@ -22,7 +21,6 @@ from adoc.casefile.ledger import load_ledger
 from adoc.casefile.repo import LEDGER_RELPATH, DataRepo
 from adoc.casefile.schema import LedgerDiff
 from adoc.config import ModelBinding
-from adoc.intake.agent import red_flag_warning_prefix
 from adoc.labs.db import DocumentTextPage, LabsDb
 from adoc.labs.models import LabDocument, LabResult
 from adoc.reason.client import (
@@ -34,15 +32,15 @@ from adoc.reason.client import (
 )
 from adoc.reason.context import ContextPack, build_context
 from adoc.reason.dag import ContractViolation, Ctx, Dag, Node, require_prior_node, run
-from adoc.reason.safety import red_flag_screen
+from adoc.reason.review_trigger import load_review_marker
 from adoc.reason.stages import (
     PatientReply,
     PatientTurn,
     build_diagnostic_dag,
     ledger_maintainer_stage,
     run_diagnostic_turn,
+    run_informational_turn,
 )
-from adoc.web.routes.chat import _with_red_flag_warning
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "redteam.yaml"
 SHA = "b" * 64
@@ -392,47 +390,7 @@ def test_redteam_dosing_output_blocked_by_treatment_gate_contract(
     assert excinfo.value.contract_name == case["expected_contract_name"]
 
 
-# --- red-team (c): red-flag turn makes zero API calls ----------------------------------------
-
-
-def test_redteam_red_flag_always_warns_and_model_cannot_suppress_it() -> None:
-    """Red-flag input must ALWAYS reach the patient carrying the warning.
-
-    This replaces `test_redteam_red_flag_turn_makes_zero_api_calls` (ADR
-    0014, warn-not-block, an explicit product-owner decision for this
-    single-patient tool). As a hard block the screen made intake unusable:
-    recounting history is the whole point of an initial visit, the screen
-    deliberately does no tense or negation detection ("chest pain years
-    ago" matches), so it fired constantly and cost the patient her entire
-    turn each time — and a warning that fires on nearly every message stops
-    being read.
-
-    The property that protects the patient is therefore no longer "no API
-    call happened" but "the match was surfaced, in fixed text chosen by
-    code, that nothing the model returns can drop or soften". A reply which
-    mentions no emergency at all still comes back with the warning attached.
-    """
-    case = _redteam_case("red_flag_always_warns")
-
-    screen = red_flag_screen(case["turn_text"])
-    assert screen.flagged is True
-    assert screen.category is not None
-
-    model_reply = "Your ferritin trend looks unremarkable. Nothing alarming here."
-    shown = _with_red_flag_warning(screen, model_reply)
-
-    assert shown.startswith(red_flag_warning_prefix(screen.category))
-    assert model_reply in shown  # the turn still happens; it is annotated, not replaced
-    assert screen.category.replace("_", " ") in shown  # the matched category is named
-
-
-def test_red_flag_warning_is_absent_when_the_screen_does_not_fire() -> None:
-    screen = red_flag_screen("my joints have ached for a few months")
-    assert screen.flagged is False
-    assert _with_red_flag_warning(screen, "a normal reply") == "a normal reply"
-
-
-# --- red-team (d): a DAG without a completed Challenger node fails closed -------------------
+# --- red-team (c): a DAG without a completed Challenger node fails closed -------------------
 
 
 def test_redteam_dag_without_challenger_node_fails_require_prior_node(
@@ -1452,3 +1410,58 @@ def test_patient_reply_insufficient_evidence_field_round_trips(repo: DataRepo, d
 
     assert isinstance(result, PatientReply)
     assert result.insufficient_evidence == ["No thyroid function data is on file yet."]
+
+
+# --- "review wanted" marker (docs/adr/0019-event-triggered-review.md) -------------------------
+
+
+def test_diagnostic_turn_that_changes_the_ledger_sets_the_review_marker(
+    repo: DataRepo, db: LabsDb
+) -> None:
+    """A diagnostic turn always runs `apply` (CLAUDE.md rule 3) — that IS
+    "a diff applied", the contrast the task draws against an informational
+    turn "merely answering a question"."""
+    calls: list[TransportRequest] = []
+    patient_reply = {"tiers_rendered": "leads to discuss with your doctor", "framing_ack": True}
+    primary_transport = _make_primary_transport(
+        [_SLE_MOST_LIKELY_OP, _PE_CANT_MISS_OP], patient_reply, calls
+    )
+    challenger_transport = _make_challenger_transport(
+        counter_arguments=[
+            {"hypothesis_id": "sle-01", "argument": "Anti-dsDNA has not been checked yet."}
+        ],
+        additional_ops=[],
+        calls=calls,
+    )
+    client = _build_client(primary_transport, challenger_transport)
+
+    assert load_review_marker(repo) is None
+
+    run_diagnostic_turn(
+        client, repo, db, repo.root / LEDGER_RELPATH, "My joints have been aching for weeks."
+    )
+
+    marker = load_review_marker(repo)
+    assert marker is not None
+    assert len(marker.reasons) == 1
+    assert "chat turn applied a ledger diff" in marker.reasons[0].reason
+
+
+def test_informational_turn_never_sets_the_review_marker(repo: DataRepo, db: LabsDb) -> None:
+    """An informational turn never runs the diagnostic DAG's `apply` node
+    at all — it must never be mistaken for "the ledger changed"."""
+
+    def transport(request: TransportRequest) -> TransportResponse:
+        return TransportResponse(
+            text="Your potassium has been stable.", tool_input=None, input_tokens=5, output_tokens=5
+        )
+
+    bindings: dict[str, list[ModelBinding]] = {
+        "primary_reasoner": [ModelBinding(provider="anthropic", model="fake-primary")],
+    }
+    providers = {"anthropic": AnthropicProvider(api_key=None, transport=transport)}
+    client = LlmClient(bindings, providers)
+
+    run_informational_turn(client, repo, db, "How has my potassium been lately?")
+
+    assert load_review_marker(repo) is None
