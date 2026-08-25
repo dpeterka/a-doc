@@ -53,7 +53,7 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from ruamel.yaml import YAML
 
 from adoc.casefile.schema import Provenance
@@ -214,6 +214,30 @@ class NewFact(BaseModel):
 class AddFact(BaseModel):
     op: Literal["add_fact"] = "add_fact"
     fact: NewFact
+
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_flat_shape(cls, data: Any) -> Any:
+        """Accept the fact's fields written flat alongside `op`.
+
+        Observed live: the model emitted
+        `{"op": "add_fact", "id": ..., "section": ..., "fields": {...}}`
+        instead of nesting them under `fact`. That failed structured-output
+        validation, which fails the WHOLE turn before `apply_ops`'s
+        per-op tolerance can salvage anything — so one shape slip cost the
+        patient an entire message of family history.
+
+        The nested form remains what the prompt asks for and what this
+        emits; this only lifts an unambiguous flat payload into place. It
+        does nothing when `fact` is present, and anything still malformed
+        after lifting fails validation exactly as before.
+        """
+        if not isinstance(data, dict) or "fact" in data:
+            return data
+        lifted = {k: v for k, v in data.items() if k != "op"}
+        if not lifted:
+            return data
+        return {"op": data.get("op", "add_fact"), "fact": lifted}
 
 
 class UpdateFact(BaseModel):

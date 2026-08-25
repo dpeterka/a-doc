@@ -91,10 +91,20 @@ def main() -> int:
         # process - never span text, which is generated clinical content.
         known_labels = ("dosage pattern", "imperative/hortative treatment instruction")
         histogram = {label: exc.message.count(f"({label})") for label in known_labels}
+        # The full message names the offending spans, which is what makes a
+        # contract failure diagnosable at all. Write it to the data repo
+        # (where clinical content already lives) rather than stdout, which
+        # ends up in terminals and transcripts.
+        failure_path = repo.root / "case" / "experiments" / "dag-failure.txt"
+        failure_path.parent.mkdir(parents=True, exist_ok=True)
+        failure_path.write_text(
+            f"node={exc.node}\ncontract={exc.contract_name}\n\n{exc.message}\n",
+            encoding="utf-8",
+        )
         print(
             f"METADATA: profile=dag CONTRACT-VIOLATION node={exc.node} "
             f"contract={exc.contract_name} duration={duration:.0f}s span_reasons={histogram} "
-            f"message_chars={len(exc.message)}"
+            f"message_chars={len(exc.message)} detail_written={failure_path.name}"
         )
         return 2
     duration = time.monotonic() - start

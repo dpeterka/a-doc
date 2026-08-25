@@ -1,12 +1,13 @@
 """The conversational intake engine — a single "initial visit" conversation
 (`docs/adr/0012-initial-visit-conversation.md`, superseding 0011's sectioned
 stepping while keeping its fact model, deterministic gates, and writer
-reuse). Every patient message is screened
-(`reason.safety.red_flag_screen`, CLAUDE.md rule 2/5), then handed with the
-current onboarding context to the `intake_agent` model role, which
-proposes typed `intake.facts` ops plus, optionally, `topics_covered` and
-`intake_complete` — never writes a case file directly and never decides,
-on its own say-so, that a topic or the whole intake is "done."
+reuse). Every patient message is handed with the current onboarding context
+to the `intake_agent` model role, which proposes typed `intake.facts` ops
+plus, optionally, `topics_covered` and `intake_complete` — never writes a
+case file directly and never decides, on its own say-so, that a topic or
+the whole intake is "done." There is no automated emergency screening here
+(see `docs/adr/0021*.md` for why): intake is historical narrative by
+construction.
 
 There is no UI stepper and no "current topic": the internal topic keys
 (`intake.sections.SECTIONS`) still exist because the same schemas/writers
@@ -64,7 +65,7 @@ from adoc.intake.sections import SECTIONS, SectionSpec
 from adoc.intake.wizard import write_section
 from adoc.labs.db import LabsDb
 from adoc.reason.client import LlmClient, LlmError, Message
-from adoc.reason.safety import red_flag_screen, treatment_gate
+from adoc.reason.safety import treatment_gate
 
 logger = logging.getLogger(__name__)
 
@@ -150,39 +151,6 @@ _WITHHELD_MESSAGE = (
     "guard that blocks treatment/dosing language everywhere in this app). Nothing is "
     "wrong with your case file. Please try rephrasing, and we'll pick this back up."
 )
-
-# Red-flag handling is WARN-NOT-BLOCK (ADR 0014). `reason.safety.red_flag_screen`
-# still runs first on every turn, deterministically, before any model call,
-# and its rules/terms/matching are untouched. What changed is the RESPONSE:
-# a match no longer replaces the turn. The warning below is prepended to the
-# reply by code -- the model cannot suppress, soften, or reword it -- and the
-# conversation continues normally.
-#
-# Why: as a hard block it made intake unusable. Recounting medical history is
-# the entire point of an initial visit, so historical mentions of past
-# emergencies matched constantly (the screen deliberately does no negation or
-# tense detection -- "chest pain years ago" matches). Every match cost the
-# patient her whole turn, and a warning that fires on nearly every message
-# stops being read at all. The operator here is a single informed adult who
-# knows what is and is not an emergency; a visible warning serves her, an
-# unskippable gate does not.
-_RED_FLAG_WARNING_PREFIX = (
-    "⚠️ Heads up: something you wrote matches a pattern a-doc watches for "
-    "({category}). If any of it is happening right now, please get medical care "
-    "first -- I'm not able to help with an emergency. If you were describing "
-    "your history, carry on and I'll keep recording it.\n\n---\n\n"
-)
-
-
-def red_flag_warning_prefix(category: str | None) -> str:
-    """The deterministic warning prepended to a flagged turn's reply.
-
-    Code-inserted, never model-generated, so it cannot be suppressed or
-    softened by anything the model returns (see `_RED_FLAG_WARNING_PREFIX`).
-    """
-    label = (category or "possible emergency").replace("_", " ")
-    return _RED_FLAG_WARNING_PREFIX.format(category=label)
-
 
 # Human phrasing for each internal topic key — used ONLY in the
 # deterministic wrap-up steering line (never shown as a list/checklist;
@@ -493,7 +461,7 @@ class IntakeOutcome(BaseModel):
     """What `run_intake_turn` returns to a caller (CLI REPL or the web
     chat route)."""
 
-    kind: Literal["urgent", "reply", "withheld", "error"]
+    kind: Literal["reply", "withheld", "error"]
     text: str
 
 
@@ -804,14 +772,8 @@ def _build_ops_retry_feedback(rejected: list[str]) -> str:
 def run_intake_turn(client: LlmClient, repo: DataRepo, db: LabsDb, text: str) -> IntakeOutcome:
     """Run one conversational onboarding turn.
 
-    Red-flag screening always runs first and short-circuits before any
-    client call or persistence (mirroring `reason.stages`'s red-flag-first
-    ordering) — zero API calls, nothing written, on a flagged turn. The
-    screen's own message/rules/matching are never touched here
-    (`reason.safety.red_flag_screen`); this only appends a deterministic
-    next-step note so an intake turn — where the patient is often recounting
-    PAST history rather than describing a live emergency — isn't a dead end
-    (`_INTAKE_URGENT_NEXT_STEP_NOTE`).
+    No automated emergency screening (see `docs/adr/0021*.md` for why):
+    intake is historical narrative by construction, and matched constantly.
 
     A malformed fact op must never cost the patient her whole turn (the live
     incident this fixes: one op with an unrecognized `section` raised
@@ -827,13 +789,6 @@ def run_intake_turn(client: LlmClient, repo: DataRepo, db: LabsDb, text: str) ->
     call that itself fails) are simply dropped and logged; the turn still
     replies normally either way.
     """
-    # Warn, don't block (ADR 0014): the screen still runs first, before any
-    # model call, and a match is still surfaced to the patient verbatim by
-    # code below -- but the turn proceeds so her history still gets recorded.
-    screen = red_flag_screen(text)
-    if screen.flagged:
-        logger.info("red-flag screen matched during intake: category=%s", screen.category)
-
     now = datetime.now(UTC)
     coverage = load_coverage_state(repo.root / INTAKE_STATE_RELPATH)
     _auto_cover_document_drop(repo, coverage, when=now)
@@ -852,6 +807,10 @@ def run_intake_turn(client: LlmClient, repo: DataRepo, db: LabsDb, text: str) ->
     last_parsed: IntakeTurnResult | None = None
     applied = AppliedResult()
     retry_feedback: str | None = None
+    # A schema retry spends one of the same bounded attempts the ops retry
+    # uses, so a turn is never more than `_OPS_RETRY_ATTEMPTS` model calls
+    # however it fails.
+    schema_retry_used = False
 
     for _attempt in range(_OPS_RETRY_ATTEMPTS):
         if retry_feedback is not None:
@@ -870,6 +829,31 @@ def run_intake_turn(client: LlmClient, repo: DataRepo, db: LabsDb, text: str) ->
             )
         except LlmError as exc:
             if turn is None:
+                # A schema-validation failure on the FIRST attempt would
+                # otherwise cost the patient her whole message — observed
+                # live, when the model emitted an `add_fact` op's fields
+                # flat instead of nested and a turn of family history was
+                # lost. `facts.AddFact` now lifts that specific shape, but
+                # the general case still needs a second chance: retry once,
+                # feeding the validation error back so the model can
+                # re-emit. Only then give up.
+                if not schema_retry_used:
+                    schema_retry_used = True
+                    logger.warning("intake turn: schema validation failed, retrying once: %s", exc)
+                    messages = [
+                        *messages,
+                        Message(
+                            role="user",
+                            content=(
+                                "Your previous reply could not be parsed into the required "
+                                f"structure. The validation error was:\n\n{exc}\n\n"
+                                "Re-send the SAME turn, correcting only the structure. Each op "
+                                'must be shaped exactly as {"op": "add_fact", "fact": {...}} — '
+                                "the fact's own fields belong inside `fact`, never beside `op`."
+                            ),
+                        ),
+                    ]
+                    continue
                 return IntakeOutcome(kind="error", text=f"Sorry, I couldn't process that: {exc}")
             logger.warning("intake turn: ops-retry call failed, keeping first attempt: %s", exc)
             break
@@ -943,11 +927,6 @@ def run_intake_turn(client: LlmClient, repo: DataRepo, db: LabsDb, text: str) ->
             wrapup_note = "\n\n" + _render_wrapup_refusal(coverage, blockers_anywhere)
 
     reply_text = turn.message + wrapup_note
-    # Prepended AFTER the model has produced its reply and OUTSIDE the
-    # treatment gate's rewrite concerns: the warning is fixed text chosen by
-    # code, so nothing the model returns can drop or soften it (ADR 0014).
-    if screen.flagged:
-        reply_text = red_flag_warning_prefix(screen.category) + reply_text
     gate = treatment_gate(reply_text)
     outcome = (
         IntakeOutcome(kind="reply", text=reply_text)
@@ -1093,10 +1072,9 @@ def _opening_line(delta: timedelta) -> str:
 
 def render_continuity_note(info: ContinuityInfo, *, now: datetime) -> str | None:
     """A short, conversational note for the first reply of a new post-intake
-    visit -- code-composed (not model-authored), the same pattern
-    `red_flag_warning_prefix` already uses, so it is deterministic and
-    testable and `web.routes.chat` can prepend it exactly like the red-flag
-    warning. Returns `None` when there is nothing worth saying (no prior
+    visit -- code-composed (not model-authored), so it is deterministic and
+    testable and `web.routes.chat` can prepend it. Returns `None` when there
+    is nothing worth saying (no prior
     visit on file yet) — never a status dump: at most one line naming how
     long it's been, plus at most one more line naming the single most
     relevant open item (a follow-up first, then an unresolved fact, then a

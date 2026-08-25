@@ -4,21 +4,20 @@
 deterministic, no-LLM retrieval helpers — `search_documents`
 (docs/adr/0015-document-text-corpus.md) is the document-TEXT-layer one,
 over `LabsDb.search_document_text`'s FTS5 index. `answer_informational` is a
-thin, red-flag-screened wrapper around `informational_llm_result`: the
-red-flag screen runs first (zero API calls on a match), then every
-deterministic retrieval helper runs unconditionally over the question
-text, and their results are folded into ONE LLM call alongside a full
-context pack (`include_ledger=True` — informational answers are read-only
-and never mutate the ledger, but the patient may reasonably ask about it).
+thin wrapper around `informational_llm_result`: every deterministic
+retrieval helper runs unconditionally over the question text, and their
+results are folded into ONE LLM call alongside a full context pack
+(`include_ledger=True` — informational answers are read-only and never
+mutate the ledger, but the patient may reasonably ask about it). There is
+no automated emergency screening anywhere in this module (see
+`docs/adr/0021*.md` for why).
 
 `informational_llm_result` itself runs `safety.treatment_gate` on the
 model's answer (CLAUDE.md rule 5) — see its docstring for the
 gate-guided-rewrite-then-withhold shape, mirroring `stages.composer_stage`.
 Gating lives here, at the source, rather than in `answer_informational` or
 in `reason/stages.py`'s `run_informational_turn`, so every caller of
-`informational_llm_result` inherits the gate automatically — see
-docs/adr/0014-red-flag-warn-not-block.md's note #5 on why the enforcement
-point must not depend on which entry point happens to call in.
+`informational_llm_result` inherits the gate automatically.
 
 This module also exposes `redact_gated_text`, a render/generation-time
 helper used outside this module's own call path (`web/routes/ledger.py`,
@@ -52,7 +51,7 @@ from adoc.labs.queries import trend_series
 from adoc.labs.validate import canonicalize
 from adoc.reason.client import LlmClient, LlmResult, Message
 from adoc.reason.context import build_context
-from adoc.reason.safety import GateResult, RedFlagResult, guarded_turn, treatment_gate
+from adoc.reason.safety import GateResult, treatment_gate
 
 _MAX_SERIES_POINTS = 8
 _MAX_GREP_HITS = 10
@@ -242,19 +241,16 @@ def informational_llm_result(
 ) -> LlmResult:
     """The single LLM call behind the informational-turn MVP tool loop:
     a full context pack (`include_ledger=True`) plus this question's
-    deterministic retrieval results. Callers are responsible for running
-    the red-flag screen first (see `answer_informational` /
-    `reason.stages.run_informational_turn`) — this function always makes
-    at least one call.
+    deterministic retrieval results. This function always makes at least
+    one call.
 
     `safety.treatment_gate` screens the answer HERE, at the source
     (CLAUDE.md rule 5 — no treatment/dosing advice may reach the patient),
     rather than leaving it to whichever caller happens to invoke this
     function: `reason.stages.run_informational_turn` (the production
     `web/routes/chat.py` path) previously called this function directly
-    with no gate at all, while the only gated path (`answer_informational`,
-    below) was orphaned when ADR 0014 deprecated `guarded_turn`. Gating at
-    the source means every current and future caller inherits it.
+    with no gate at all. Gating at the source means every current and
+    future caller inherits it.
 
     Mirrors `stages.composer_stage`'s gate-guided rewrite loop: on a gate
     failure, the model gets ONE rewrite attempt (fed the blocked phrases
@@ -306,23 +302,12 @@ def informational_llm_result(
 def answer_informational(client: LlmClient, repo: DataRepo, db: LabsDb, question: str) -> str:
     """Entry point for the informational-turn MVP tool loop (PLAN.md loop (b)).
 
-    Red-flag screen first (zero API calls on a match — the flagged
-    template is returned as plain text; `guarded_turn` is block-on-flag,
-    fine here since no production caller uses this function — see ADR
-    0014's note #5. Production entry points instead call
-    `reason.safety.red_flag_screen` directly and warn-not-block). On pass:
-    delegates entirely to `informational_llm_result`, which now runs
+    Delegates entirely to `informational_llm_result`, which runs
     `safety.treatment_gate` itself — this function does not duplicate that
-    check.
+    check. No automated emergency screening (see `docs/adr/0021*.md` for
+    why).
     """
-
-    def _proceed() -> str:
-        return informational_llm_result(client, repo, db, question).text
-
-    outcome = guarded_turn(question, _proceed)
-    if isinstance(outcome, RedFlagResult):
-        return outcome.message or ""
-    return outcome
+    return informational_llm_result(client, repo, db, question).text
 
 
 def redact_gated_text(text: str) -> str:
