@@ -1,0 +1,110 @@
+[
+  {
+    "id": "crp-value-entailed",
+    "claim": "Your CRP was 8.5, elevated above the reference range.",
+    "source_text": "CRP on 2026-05-02: 8.5; unit mg/L; reference range 0.0-5.0; flag H",
+    "expected": "entailed"
+  },
+  {
+    "id": "ana-titer-entailed",
+    "claim": "Your ANA titer was 1:640, a positive result.",
+    "source_text": "ANA on 2026-05-02: 1:640; flag H",
+    "expected": "entailed"
+  },
+  {
+    "id": "crp-value-mismatch-not-entailed",
+    "claim": "Your CRP was 15.0, markedly elevated.",
+    "source_text": "CRP on 2026-05-02: 8.5; unit mg/L; reference range 0.0-5.0; flag H",
+    "expected": "not_entailed"
+  },
+  {
+    "id": "ana-titer-contradicted-not-entailed",
+    "claim": "Your ANA titer came back negative.",
+    "source_text": "ANA on 2026-05-02: 1:640; flag H",
+    "expected": "not_entailed"
+  },
+  {
+    "id": "complement-normal-entailed",
+    "claim": "Your complement C3 remained within normal limits.",
+    "source_text": "Complement C3 on 2026-05-02: 110; unit mg/dL; reference range 90.0-180.0",
+    "expected": "entailed"
+  },
+  {
+    "id": "complement-overstated-not-entailed",
+    "claim": "Your complement C3 was low, suggesting active disease.",
+    "source_text": "Complement C3 on 2026-05-02: 110; unit mg/dL; reference range 90.0-180.0",
+    "expected": "not_entailed"
+  },
+  {
+    "id": "encounter-followup-entailed",
+    "claim": "The rheumatology note recommends rechecking the complement panel in three months.",
+    "source_text": "Rheumatology follow-up.\n\nANA titer remains elevated at 1:640.\n\nRecheck complement panel in 3 months.",
+    "expected": "entailed"
+  },
+  {
+    "id": "encounter-fabricated-diagnosis-not-entailed",
+    "claim": "The rheumatology note confirms a diagnosis of lupus.",
+    "source_text": "Rheumatology follow-up.\n\nANA titer remains elevated at 1:640.\n\nRecheck complement panel in 3 months.",
+    "expected": "not_entailed"
+  },
+  {
+    "id": "platelet-normal-entailed",
+    "claim": "Your platelet count was 250, within the normal range.",
+    "source_text": "Platelets on 2026-05-02: 250; unit x10^3/uL; reference range 150.0-400.0",
+    "expected": "entailed"
+  },
+  {
+    "id": "platelet-fabricated-value-not-entailed",
+    "claim": "Your platelet count was critically low at 40.",
+    "source_text": "Platelets on 2026-05-02: 250; unit x10^3/uL; reference range 150.0-400.0",
+    "expected": "not_entailed"
+  },
+  {
+    "id": "tsh-normal-entailed",
+    "claim": "Your TSH was 2.1, a normal result.",
+    "source_text": "TSH on 2026-05-02: 2.1; unit mIU/L; reference range 0.4-4.0",
+    "expected": "entailed"
+  },
+  {
+    "id": "tsh-overstated-not-entailed",
+    "claim": "Your TSH indicates hypothyroidism.",
+    "source_text": "TSH on 2026-05-02: 2.1; unit mIU/L; reference range 0.4-4.0",
+    "expected": "not_entailed"
+  },
+  {
+    "id": "a1c-normal-entailed",
+    "claim": "Your hemoglobin A1c was 5.4%, consistent with normal glucose regulation.",
+    "source_text": "Hemoglobin A1c on 2026-05-02: 5.4; unit %; reference range 4.0-5.6",
+    "expected": "entailed"
+  },
+  {
+    "id": "a1c-overstated-not-entailed",
+    "claim": "Your hemoglobin A1c of 5.4% indicates diabetes.",
+    "source_text": "Hemoglobin A1c on 2026-05-02: 5.4; unit %; reference range 4.0-5.6",
+    "expected": "not_entailed"
+  },
+  {
+    "id": "hard-paraphrased-elevated-entailed",
+    "claim": "Your inflammatory marker panel from this visit came back above the reference range.",
+    "source_text": "CRP on 2026-05-02: 8.5; unit mg/L; reference range 0.0-5.0; flag H",
+    "expected": "entailed"
+  },
+  {
+    "id": "hard-paraphrased-normal-entailed",
+    "claim": "Your kidney function markers were unremarkable on your last panel.",
+    "source_text": "Creatinine on 2026-05-02: 0.9; unit mg/dL; reference range 0.6-1.2",
+    "expected": "entailed"
+  },
+  {
+    "id": "hard-wrong-analyte-not-entailed",
+    "claim": "Your vitamin D level was 8.5, severely deficient.",
+    "source_text": "CRP on 2026-05-02: 8.5; unit mg/L; reference range 0.0-5.0; flag H",
+    "expected": "not_entailed"
+  },
+  {
+    "id": "hard-semantic-overreach-not-entailed",
+    "claim": "Your ferritin was 45, consistent with early iron deficiency.",
+    "source_text": "Ferritin on 2026-05-02: 45; unit ng/mL; reference range 20.0-250.0",
+    "expected": "not_entailed"
+  }
+]

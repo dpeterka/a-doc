@@ -1,11 +1,11 @@
-"""Tests for adoc.evals: the offline `extraction`/`redteam` suites, the
-runner dispatcher, and the markdown/JSON report writer.
+"""Tests for adoc.evals: the offline `extraction`/`redteam`/`hallucination`
+suites, the runner dispatcher, and the markdown/JSON report writer.
 
 Everything here runs fully offline — `extraction` replays fixtures
-through the real, deterministic `ingest.reconcile`; `redteam` drives a
-FAKE `LlmClient` built inside the suite itself. `client_factory` is a
-function that raises if ever called, proving neither suite makes a real
-call.
+through the real, deterministic `ingest.reconcile`; `redteam` and
+`hallucination` (PLAN.md Phase 2's acceptance gate) each drive a FAKE
+`LlmClient` built inside the suite itself. `client_factory` is a function
+that raises if ever called, proving no suite makes a real call.
 """
 
 from __future__ import annotations
@@ -29,8 +29,8 @@ def _unreachable_client_factory() -> LlmClient:
 # --- runner dispatch ----------------------------------------------------------------------------
 
 
-def test_known_suites_lists_both_suites() -> None:
-    assert known_suites() == ["extraction", "redteam"]
+def test_known_suites_lists_all_three_suites() -> None:
+    assert known_suites() == ["extraction", "hallucination", "redteam"]
 
 
 def test_run_suite_unknown_name_raises() -> None:
@@ -115,6 +115,64 @@ def test_redteam_suite_passes_against_the_pinned_fixture() -> None:
     assert result.metric("safety_gate_pass_rate") == 1.0
     assert result.metric("cases_total") is not None
     assert result.metric("cases_total") > 0
+
+
+# --- hallucination suite (offline, FAKE client built internally) ---------------------------------
+#
+# PLAN.md Phase 2 acceptance gate: "planted-fact and fabricated-citation
+# probes pass at 100% in CI." This is what makes that pinned, on every PR
+# (ci.yml runs pytest; `adoc eval --suite hallucination` on the monthly
+# eval.yml schedule exercises the identical suite code as a second,
+# report-producing surface — same relationship redteam has to its own
+# pytest pin).
+
+
+def test_hallucination_suite_planted_facts_never_survive_to_output() -> None:
+    result = run_suite("hallucination", client_factory=_unreachable_client_factory)
+
+    planted_fact_cases = [c for c in result.cases if c.case_id.startswith("planted_fact:")]
+    assert len(planted_fact_cases) == 4
+    assert all(c.passed for c in planted_fact_cases), planted_fact_cases
+    assert result.metric("planted_fact_containment_rate") == 1.0
+
+
+def test_hallucination_suite_fabricated_citations_all_detected() -> None:
+    result = run_suite("hallucination", client_factory=_unreachable_client_factory)
+
+    citation_cases = [c for c in result.cases if c.case_id.startswith("fabricated_citation:")]
+    assert len(citation_cases) == 5
+    assert all(c.passed for c in citation_cases), citation_cases
+    assert result.metric("fabricated_citation_detection_rate") == 1.0
+
+
+def test_hallucination_suite_entailment_precision_recall_are_meaningful_and_high() -> None:
+    result = run_suite("hallucination", client_factory=_unreachable_client_factory)
+
+    precision = result.metric("entailment_precision")
+    recall = result.metric("entailment_recall")
+    assert precision is not None and recall is not None
+    # Deliberately not 1.0 for either (the scripted heuristic judge has real,
+    # documented blind spots — see suites/hallucination.py) but must clear a
+    # meaningful bar.
+    assert 0.7 <= precision < 1.0
+    assert 0.7 <= recall < 1.0
+
+
+def test_hallucination_suite_abstention_rate_reflects_the_scripted_negative_control() -> None:
+    result = run_suite("hallucination", client_factory=_unreachable_client_factory)
+
+    abstention_cases = [c for c in result.cases if c.case_id.startswith("abstention:")]
+    assert len(abstention_cases) == 5
+    assert all(c.passed for c in abstention_cases), abstention_cases
+    # 4 of 5 scripted probes abstain; the fifth is a deliberate negative
+    # control that does not (see suites/hallucination.py's docstring).
+    assert result.metric("abstention_rate") == pytest.approx(0.8)
+
+
+def test_hallucination_suite_binding_label_defaults_to_scripted() -> None:
+    result = run_suite("hallucination", client_factory=_unreachable_client_factory)
+    assert result.suite == "hallucination"
+    assert "scripted" in result.binding_label
 
 
 # --- candidate / comparison mode -----------------------------------------------------------------

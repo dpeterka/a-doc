@@ -754,10 +754,10 @@ def _eval_out_dir(explicit: str | None) -> Path:
 
 
 def _eval_client_factory() -> LlmClient:
-    """Both current suites (`extraction`, `redteam`) never call the client
-    this builds — see `evals.runner`'s module docstring — so this raises
-    rather than silently returning something misleading if a future suite
-    ever does call it without a real one wired in.
+    """No current suite (`extraction`, `redteam`, `hallucination`) ever
+    calls the client this builds — see `evals.runner`'s module docstring —
+    so this raises rather than silently returning something misleading if
+    a future suite ever does call it without a real one wired in.
     """
     raise LlmError("no real LlmClient is wired into `adoc eval` for this suite")
 
