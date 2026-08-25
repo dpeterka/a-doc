@@ -358,6 +358,7 @@ cmd_start() {
   local workdir="$DEFAULT_WORKDIR"
   local port="$DEFAULT_PORT"
   local force=0 reindex=0 intake_reset=0 experiment="" no_wait=0 follow=0 no_start=0
+  local reset_users=0
 
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -380,6 +381,7 @@ cmd_start() {
       --force) force=1; shift ;;
       --re-index) reindex=1; shift ;;
       --intake) intake_reset=1; shift ;;
+      --reset-users) reset_users=1; shift ;;
       --experiment)
         [ $# -ge 2 ] || { err "start: --experiment requires a value"; exit 2; }
         experiment="$2"
@@ -447,16 +449,40 @@ cmd_start() {
   if [ -d "$workdir_abs" ]; then
     if [ "$force" -eq 1 ]; then
       guard_safe_to_delete "$workdir_abs" || exit 1
+      # `work/` is gitignored in the data repo, so `work/users.yaml` — the
+      # web login store — is never in a clone. Recreating the working dir
+      # therefore used to take the login with it, and `user-create-local`
+      # needs an interactive TTY, so a clean slate could not be scripted.
+      # Carry the credential across the recreate; --reset-users opts out.
+      local saved_users=""
+      if [ "$reset_users" -eq 0 ] && [ -f "$workdir_abs/work/users.yaml" ]; then
+        saved_users=$(mktemp)
+        cp -- "$workdir_abs/work/users.yaml" "$saved_users"
+        info "start: --force — preserving the existing login store (pass --reset-users to drop it)"
+      fi
       info "start: --force given; removing existing working dir '$workdir_abs'"
       rm -rf -- "$workdir_abs"
       clone_from_safe_store "$workdir_abs"
       cloned=1
+      if [ -n "$saved_users" ]; then
+        mkdir -p "$workdir_abs/work"
+        cp -- "$saved_users" "$workdir_abs/work/users.yaml"
+        rm -f -- "$saved_users"
+      fi
     else
       info "start: reusing existing working dir '$workdir_abs' as-is (pass --force to recreate from the safe store)"
     fi
   else
     clone_from_safe_store "$workdir_abs"
     cloned=1
+  fi
+
+  # A working dir with no login store is unusable: the app has no way to
+  # sign in and every page redirects to /login. Say so at start time rather
+  # than letting it surface as a mystery 401 later.
+  if [ ! -f "$workdir_abs/work/users.yaml" ]; then
+    info "start: no login store in '$workdir_abs' — create one with:"
+    info "start:      ./scripts/user-create-local <name> --dir '$workdir_abs'"
   fi
 
   if [ "$cloned" -eq 1 ] && [ "$reindex" -eq 0 ]; then
