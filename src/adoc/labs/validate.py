@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import re
 import statistics
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING, Literal
@@ -2449,7 +2450,9 @@ def validate_row(row: LabResult) -> list[ValidationIssue]:
     return issues
 
 
-def trend_deviation(db: LabsDb, row: LabResult) -> float | None:
+def trend_deviation(
+    db: LabsDb, row: LabResult, *, series: Sequence[LabResult] | None = None
+) -> float | None:
     """Relative deviation of `row.value` from the median of all EARLIER
     readings (by collection date) of the same canonical analyte AND THE
     SAME SPECIMEN as `row`; None when fewer than TREND_OUTLIER_MIN_PRIORS
@@ -2464,14 +2467,24 @@ def trend_deviation(db: LabsDb, row: LabResult) -> float | None:
     one) compares against other `"unknown"`-specimen priors of the same
     canonical name — i.e. exactly today's behavior, unchanged, since
     pre-migration data is entirely `"unknown"`.
+
+    `series`, when given, is used in place of querying
+    `db.series(canonical, row.specimen)` — identical rows, identical
+    filtering, but supplied by a caller that already bulk-fetched every
+    analyte's rows in one query (e.g. `LabsDb.series_by_key()`) instead of
+    paying a fresh `labs.sqlite` round trip per row. `labs.sqlite` lives on
+    EFS/NFS in the deployed app, where each query costs milliseconds, so a
+    sweep over every current analyte
+    (`reason.review.deterministic_trend_scan`) or every pending row
+    (`labs.reclassify.reclassify_pending`) turns into real latency without
+    this. Defaults to `None`, which queries exactly as before.
     """
     if row.value is None:
         return None
     canonical = canonicalize(row.name) or row.name
+    candidates = db.series(canonical, row.specimen) if series is None else series
     priors = [
-        r.value
-        for r in db.series(canonical, row.specimen)
-        if r.value is not None and r.id != row.id and r.date < row.date
+        r.value for r in candidates if r.value is not None and r.id != row.id and r.date < row.date
     ]
     if len(priors) < TREND_OUTLIER_MIN_PRIORS:
         return None
@@ -2481,14 +2494,17 @@ def trend_deviation(db: LabsDb, row: LabResult) -> float | None:
     return abs(row.value - median) / abs(median)
 
 
-def trend_outlier(db: LabsDb, row: LabResult) -> ValidationIssue | None:
-    """Flag a >40% jump vs. the median of the patient's earlier readings
-    (>=3 priors) OF THE SAME SPECIMEN. Catches decimal-shift extraction
-    errors (e.g. potassium 4.1 misread as 41) without any clinical
-    knowledge — pure statistics on this patient's own history for the same
-    canonical analyte and specimen (see `trend_deviation`'s docstring).
+def outlier_issue_from_deviation(row: LabResult, ratio: float | None) -> ValidationIssue | None:
+    """The `ValidationIssue` `trend_outlier` would build from an
+    already-computed `trend_deviation` ratio.
+
+    Split out so a caller that needs BOTH the outlier gate and the raw
+    ratio for something else (`ingest.reconcile._evaluate_pair` also uses
+    the ratio for its cross-pass decimal-signature check) computes
+    `trend_deviation` exactly ONCE per row instead of once via
+    `trend_outlier` and once again directly — each `trend_deviation` call
+    is a `labs.sqlite` query when no pre-fetched `series` is supplied.
     """
-    ratio = trend_deviation(db, row)
     if ratio is not None and ratio > TREND_OUTLIER_RATIO:
         canonical = canonicalize(row.name) or row.name
         return ValidationIssue(
@@ -2497,3 +2513,18 @@ def trend_outlier(db: LabsDb, row: LabResult) -> ValidationIssue | None:
             f"earlier readings - possible decimal error",
         )
     return None
+
+
+def trend_outlier(
+    db: LabsDb, row: LabResult, *, series: Sequence[LabResult] | None = None
+) -> ValidationIssue | None:
+    """Flag a >40% jump vs. the median of the patient's earlier readings
+    (>=3 priors) OF THE SAME SPECIMEN. Catches decimal-shift extraction
+    errors (e.g. potassium 4.1 misread as 41) without any clinical
+    knowledge — pure statistics on this patient's own history for the same
+    canonical analyte and specimen (see `trend_deviation`'s docstring).
+
+    `series` is forwarded to `trend_deviation` unchanged — see its
+    docstring.
+    """
+    return outlier_issue_from_deviation(row, trend_deviation(db, row, series=series))
