@@ -17,7 +17,6 @@ from adoc.config import ModelBinding
 from adoc.labs.db import DocumentTextPage, LabsDb
 from adoc.labs.models import LabDocument, LabResult
 from adoc.reason.client import AnthropicProvider, LlmClient, TransportRequest, TransportResponse
-from adoc.reason.safety import RedFlagResult
 from adoc.reason.stages import run_informational_turn
 from adoc.reason.tools import (
     answer_informational,
@@ -182,20 +181,6 @@ def test_list_encounters_none_recorded(repo: DataRepo) -> None:
 
 
 # --- answer_informational ---------------------------------------------------------------------
-
-
-def test_answer_informational_red_flag_makes_zero_api_calls(repo: DataRepo, db: LabsDb) -> None:
-    calls: list[TransportRequest] = []
-
-    def _explode(request: TransportRequest) -> TransportResponse:
-        calls.append(request)
-        raise AssertionError("must never call the transport on a red flag")
-
-    client = _fake_client(_explode)
-    answer = answer_informational(client, repo, db, "crushing chest pain radiating to my left arm")
-
-    assert calls == []
-    assert "911" in answer or "emergency" in answer.lower()
 
 
 def test_answer_informational_happy_path_includes_retrieval_and_gates(
@@ -369,7 +354,6 @@ def test_run_informational_turn_delegates_to_tools_with_ledger_and_retrieval(
     client = _fake_client(transport)
     result = run_informational_turn(client, repo, db, "How has my potassium been?")
 
-    assert not isinstance(result, RedFlagResult)
     assert result.text == "An answer."
     assert len(calls) == 1
     sent = "\n".join(m.content for m in calls[0].messages)
@@ -377,15 +361,10 @@ def test_run_informational_turn_delegates_to_tools_with_ledger_and_retrieval(
     assert "Differential Ledger" in sent  # include_ledger=True, unlike the old bare implementation
 
 
-def test_run_informational_turn_no_longer_screens_internally(repo: DataRepo, db: LabsDb) -> None:
-    """The stage entry points do NOT screen (ADR 0014, warn-not-block).
-
-    Screening moved to the entry points that own the patient conversation
-    (`web/routes/chat.py`, `intake/agent.py`), which run it before any model
-    call and prepend a mandatory warning to the reply. Screening here as
-    well would re-introduce the block those callers deliberately removed —
-    see `tests/test_web_chat.py` for the end-to-end warning contract.
-    """
+def test_run_informational_turn_never_screens_content(repo: DataRepo, db: LabsDb) -> None:
+    """There is no automated emergency screening anywhere in this app (see
+    `docs/adr/0021*.md`): the turn always reaches the model regardless of
+    what the patient's message contains."""
     calls: list[TransportRequest] = []
 
     def _record(request: TransportRequest) -> TransportResponse:
@@ -393,7 +372,6 @@ def test_run_informational_turn_no_longer_screens_internally(repo: DataRepo, db:
         return TransportResponse(text="ok", tool_input=None, input_tokens=1, output_tokens=1)
 
     client = _fake_client(_record)
-    result = run_informational_turn(client, repo, db, "I want to kill myself")
+    run_informational_turn(client, repo, db, "I want to kill myself")
 
-    assert not isinstance(result, RedFlagResult)
-    assert calls, "the stage runs the turn; the caller owns the screen and the warning"
+    assert calls

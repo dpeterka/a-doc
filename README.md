@@ -4,8 +4,8 @@
 for one specific patient to hold the whole picture across specialists, labs,
 and time, and to produce evidence-linked *leads* — things to bring up with a
 doctor — never diagnoses or treatment instructions. Every patient-facing
-output is framed that way, and a deterministic red-flag screen and output
-gate enforce it in code, not just in prompts.
+output is framed that way, and a deterministic output gate enforces it in
+code, not just in prompts.
 
 ## Architecture, in brief
 

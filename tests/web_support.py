@@ -41,7 +41,7 @@ Transport = Callable[[TransportRequest], TransportResponse]
 
 def exploding_transport(calls: list[TransportRequest]) -> Transport:
     """A transport that fails the test loudly if ever invoked — used for
-    the red-flag "zero client calls" assertions."""
+    "this path must make zero client calls" assertions."""
 
     def _transport(request: TransportRequest) -> TransportResponse:
         calls.append(request)

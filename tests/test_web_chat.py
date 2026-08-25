@@ -1,5 +1,6 @@
-"""Chat surface tests: the red-flag screen runs before any model call, and
-a diagnostic turn renders the three-tier differential.
+"""Chat surface tests: a diagnostic turn renders the three-tier
+differential. There is no automated emergency screening anywhere in this
+app (see `docs/adr/0021*.md`).
 
 `docs/adr/0012-initial-visit-conversation.md` merged onboarding into this
 same surface: while intake is incomplete every turn routes through
@@ -102,12 +103,12 @@ _PATIENT_REPLY = {
 }
 
 
-def test_red_flag_message_during_intake_warns_but_the_turn_still_happens(
+def test_intake_message_recounting_history_records_the_turn_normally(
     tmp_path: Path,
 ) -> None:
-    """Warn, don't block (ADR 0014): the warning rides along with a real
-    reply instead of replacing it, so a patient recounting past history
-    still gets her turn recorded."""
+    """No automated emergency screening anywhere in this app (see
+    `docs/adr/0021*.md`): a patient recounting past history during intake
+    just gets her turn recorded normally, with no warning banner."""
     intake_transport = _intake_transport(
         [
             {
@@ -129,10 +130,8 @@ def test_red_flag_message_during_intake_warns_but_the_turn_still_happens(
 
     assert response.status_code == 200
     body_lower = response.text.lower()
-    assert "heads up" in body_lower  # the mandatory, code-inserted warning
-    assert "cardiac chest pain" in body_lower  # naming the matched category
-    # The turn still happened: the model's reply is there alongside the
-    # warning (apostrophes are HTML-escaped in the rendered bubble).
+    assert "heads up" not in body_lower  # no warning banner of any kind
+    # The turn happened normally: the model's reply is there.
     assert "recorded that 2019 episode" in body_lower
 
 
@@ -629,11 +628,13 @@ def test_successful_diagnostic_turn_triggers_visit_capture(tmp_path: Path) -> No
     assert fact.provenance.dag_node == "visit-capture"
 
 
-def test_red_flag_turn_still_carries_the_warning_after_intake_is_complete(
+def test_diagnostic_turn_never_carries_an_emergency_warning(
     tmp_path: Path,
 ) -> None:
-    """The warning is not intake-only: a flagged message in an ordinary
-    post-onboarding visit is annotated the same way (ADR 0014)."""
+    """No automated emergency screening anywhere in this app (see
+    `docs/adr/0021*.md`): an ordinary post-onboarding diagnostic turn, even
+    one mentioning symptoms that would once have matched the removed
+    screen, carries no warning banner."""
     calls: list = []
     primary = make_primary_transport([_SLE_MOST_LIKELY_OP, _PE_CANT_MISS_OP], _PATIENT_REPLY, calls)
     challenger = make_challenger_transport(
@@ -656,7 +657,7 @@ def test_red_flag_turn_still_carries_the_warning_after_intake_is_complete(
     )
 
     assert response.status_code == 200
-    assert "heads up" in response.text.lower()
+    assert "heads up" not in response.text.lower()
     assert "Most Likely" in response.text, "the diagnostic turn still runs"
 
 
