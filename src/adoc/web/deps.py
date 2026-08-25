@@ -42,3 +42,13 @@ def get_vision(request: Request) -> VisionClient:
 def get_renderer(request: Request) -> PageRenderer:
     renderer: PageRenderer = request.app.state.renderer
     return renderer
+
+
+def get_privacy_warning(request: Request) -> str | None:
+    """`None` once `case/identifiers.yaml` has at least one name configured;
+    otherwise the loud warning `app.py` also prints at startup (see its
+    docstring) — a seam for any route/template that wants to show this to
+    the operator (e.g. a dismissible banner), without every such call site
+    reaching into `app.state` directly."""
+    warning: str | None = request.app.state.privacy_warning
+    return warning

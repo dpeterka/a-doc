@@ -8,7 +8,7 @@ a-doc is a single-patient, longitudinal medical-diagnostic assistant (Python). R
 - Test: `uv run pytest` (coverage gate enforced in CI)
 - Lint/format: `uv run ruff check --fix . && uv run ruff format .`
 - Types: `uv run mypy src`
-- App CLI: `uv run adoc <init|onboard|ingest|review|serve|backfill|backfill-doc-text|eval|user|backup|restore|bootstrap-data|labs-infer-specimen|labs-dedupe-twins|labs-reclassify|labs-recanonicalize|intake-corroborate>` (17 subcommands; `user` has `add`/`list`/`remove`)
+- App CLI: `uv run adoc <init|onboard|ingest|review|serve|backfill|backfill-doc-text|eval|user|identifiers|backup|restore|bootstrap-data|labs-infer-specimen|labs-dedupe-twins|labs-reclassify|labs-recanonicalize|intake-corroborate>` (18 subcommands; `user` has `add`/`list`/`remove`; `identifiers` has `show`/`add`/`remove`)
 
 ## Hard rules
 
