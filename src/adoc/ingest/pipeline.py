@@ -40,6 +40,22 @@ partway through a zip leaves already-processed members' commits standing
 and reports the zip itself as `"error"` (routed to `work/failed/` by the
 usual inbox hygiene, same as any other failed file).
 
+**Document text** (docs/adr/0015-document-text-corpus.md): for a *new*
+(non-duplicate) document, `_ingest_pdf`/`_ingest_text_like` extract the full
+plain text (`_best_effort_extract_text` for pdf, via
+`ingest.doctext.extract_text_for_kind` -> `pdftotext`; docx/text already have
+it in hand from classification) and thread it down as `doc_text` into
+`_ingest_lab_report`/`_ingest_non_lab`, which store it
+(`_store_text_best_effort` -> `ingest.doctext.store_document_text`) right
+after the document's `documents` row is inserted and before that same
+function's `repo.commit()` - so it rides along in the SAME commit as the
+rest of the document's ingest (`doc-text/<sha>.txt`, committed, plus
+`labs.sqlite`'s `document_text`/`document_text_fts`). This NEVER fails the
+ingest - a missing `pdftotext` binary or any other extraction/storage
+failure is logged and the pipeline proceeds exactly as if the call had
+never been made; lab-row extraction remains the primary job. Genomic files
+never reach this call at all (see "genomic" below).
+
 Either way, exactly one `DataRepo.commit` per document (genomic: per
 archived file, committing only the regenerated inventory - see
 `ingest.genomics`). This module deliberately does NOT touch
@@ -71,6 +87,7 @@ hygiene. See `test_ingest_pipeline.py`'s
 
 from __future__ import annotations
 
+import logging
 import shutil
 import tempfile
 import zipfile
@@ -91,10 +108,12 @@ from adoc.casefile.repo import DataRepo
 from adoc.ingest.archive import (
     ArchivedDoc,
     ArchiveError,
+    DocKind,
     PageRenderer,
     archive_document,
     pdftoppm_renderer,
 )
+from adoc.ingest.doctext import DOC_TEXT_RELDIR, extract_text_for_kind, store_document_text
 from adoc.ingest.docx import DocxExtractionError, extract_docx_text
 from adoc.ingest.extract import double_pass_extract, double_pass_extract_text
 from adoc.ingest.failures import FAILED_DIR_RELPATH, FailureRecord, append_failure, flatten_relpath
@@ -111,6 +130,8 @@ from adoc.ingest.vision import ImagePart, VisionClient, VisionError
 from adoc.labs.db import LabsDb
 from adoc.labs.models import DocumentStatus, ExtractionStatus, LabDocument, LabResult
 from adoc.reason.client import LlmClient, LlmError, Message
+
+logger = logging.getLogger(__name__)
 
 MAX_ZIP_MEMBERS = 200
 MAX_ZIP_UNCOMPRESSED_BYTES = 2 * 1024**3  # 2 GiB
@@ -224,6 +245,52 @@ def _commit_message(*, label: str, doc_date: date | None, rows_auto: int, rows_p
     return f"ingest: {label} {date_part} ({rows_auto} rows, {rows_pending} queued)"
 
 
+def _commit_paths_with_doc_text(base: list[str], repo: DataRepo) -> list[str]:
+    """`base` plus `"doc-text"` when that directory actually has something
+    to stage. `doc-text/` may not exist at all yet (extraction never
+    succeeded even once, e.g. `pdftotext` isn't installed) — passing a
+    nonexistent path to `DataRepo.commit`'s `git add` would raise, so this
+    only adds it when there is something there to add.
+    """
+    if (repo.root / DOC_TEXT_RELDIR).is_dir():
+        return [*base, DOC_TEXT_RELDIR]
+    return base
+
+
+def _best_effort_extract_text(kind: DocKind, path: Path) -> str | None:
+    """Best-effort document-text extraction for the pdf archived kind
+    (docs/adr/0015-document-text-corpus.md) — docx/text kinds never call
+    this, since `_ingest_text_like` already has their full text in hand
+    (see that function). NEVER raises: lab-row extraction is the primary
+    job of this pipeline (module docstring), so a text-layer failure
+    (missing `pdftotext`, a corrupt file, anything) is logged and the
+    ingest proceeds exactly as if this call had never been made.
+
+    Never reached for a genomic file — `_ingest_one` routes `"genomic"`-kind
+    files to `_ingest_genomic` before `archive_document` is ever called
+    (CRITICAL DESIGN RULE, module docstring); `kind` here is `DocKind`,
+    which has no `"genomic"` member at all.
+    """
+    try:
+        return extract_text_for_kind(kind, path)
+    except Exception as exc:  # noqa: BLE001 - text extraction must never fail an ingest
+        logger.warning("doc-text extraction failed for %s: %s", path.name, exc)
+        return None
+
+
+def _store_text_best_effort(repo: DataRepo, db: LabsDb, sha256: str, text: str) -> None:
+    """Best-effort document-text storage (docs/adr/0015) — called with text
+    already in hand (either just-extracted for a pdf, or already-extracted
+    for docx/text). NEVER raises, same rationale as
+    `_best_effort_extract_text`: storage (disk write + sqlite insert)
+    failing must never fail the surrounding ingest.
+    """
+    try:
+        store_document_text(repo, db, sha256, text)
+    except Exception as exc:  # noqa: BLE001 - text storage must never fail an ingest
+        logger.warning("doc-text storage failed for %s: %s", sha256, exc)
+
+
 def _ingest_lab_report(
     path: Path,
     *,
@@ -235,6 +302,7 @@ def _ingest_lab_report(
     pass_b: DocumentExtraction,
     sha256: str,
     page_count: int,
+    doc_text: str | None = None,
 ) -> FileOutcome:
     reconciled = reconcile(pass_a, pass_b, db)
 
@@ -247,7 +315,8 @@ def _ingest_lab_report(
             issues.append(f"{row.name_raw}: could not build a lab row: {exc}")
 
     # `labs.source_doc` is a foreign key into `documents.sha256` - the
-    # document row must exist before any lab row referencing it is inserted.
+    # document row must exist before any lab row (or document_text row,
+    # docs/adr/0015) referencing it is inserted.
     db.upsert_document(
         LabDocument(
             sha256=sha256,
@@ -259,6 +328,8 @@ def _ingest_lab_report(
             status=DocumentStatus.COMPLETE,
         )
     )
+    if doc_text is not None:
+        _store_text_best_effort(repo, db, sha256, doc_text)
     db.insert_results(lab_rows)
     db.export_jsonl(repo.root / "labs-export.jsonl")
 
@@ -270,7 +341,9 @@ def _ingest_lab_report(
     message = _commit_message(
         label=facility, doc_date=doc_date, rows_auto=rows_auto, rows_pending=rows_pending
     )
-    commit_sha = repo.commit(message, paths=["sources", "labs-export.jsonl"])
+    commit_sha = repo.commit(
+        message, paths=_commit_paths_with_doc_text(["sources", "labs-export.jsonl"], repo)
+    )
 
     return FileOutcome(
         path=str(path),
@@ -298,6 +371,7 @@ def _ingest_non_lab(
     encounter_type_map: dict[str, EncounterType],
     default_encounter_type: EncounterType,
     extracted_text: str = "",
+    doc_text: str | None = None,
 ) -> FileOutcome:
     encounter = Encounter(
         frontmatter=EncounterFrontmatter(
@@ -321,9 +395,17 @@ def _ingest_non_lab(
             status=DocumentStatus.NEEDS_REVIEW,
         )
     )
+    # docs/adr/0015: `doc_text` is independent of `extracted_text` above -
+    # `extracted_text` only controls the encounter's rendered `## Extracted
+    # text` markdown section (docx/text only, per ADR 0008); `doc_text` is
+    # what gets stored for the document-TEXT layer (pdf too).
+    if doc_text is not None:
+        _store_text_best_effort(repo, db, sha256, doc_text)
 
     message = _commit_message(label=path.name, doc_date=doc_date, rows_auto=0, rows_pending=0)
-    commit_sha = repo.commit(message, paths=["sources", "case/encounters"])
+    commit_sha = repo.commit(
+        message, paths=_commit_paths_with_doc_text(["sources", "case/encounters"], repo)
+    )
 
     return FileOutcome(
         path=str(path),
@@ -357,6 +439,9 @@ def _ingest_pdf(
 
     doc_date = classify.doc_date or clock().date()
     page_count = len(archived.page_paths)
+    # docs/adr/0015: extracted once here (pdftotext), then threaded into
+    # whichever branch below actually stores/commits it - never re-derived.
+    doc_text = _best_effort_extract_text("pdf", archived.original_path)
 
     if classify.doc_type == "lab_report":
         try:
@@ -375,6 +460,7 @@ def _ingest_pdf(
             pass_b=pass_b,
             sha256=archived.sha256,
             page_count=page_count,
+            doc_text=doc_text,
         )
 
     return _ingest_non_lab(
@@ -389,6 +475,7 @@ def _ingest_pdf(
         page_count=page_count,
         encounter_type_map=_ENCOUNTER_TYPE_BY_DOC_TYPE,
         default_encounter_type="specialist-visit",
+        doc_text=doc_text,
     )
 
 
@@ -445,6 +532,7 @@ def _ingest_text_like(
             pass_b=pass_b,
             sha256=archived.sha256,
             page_count=page_count,
+            doc_text=text,
         )
 
     return _ingest_non_lab(
@@ -460,6 +548,7 @@ def _ingest_text_like(
         encounter_type_map=_DOCX_ENCOUNTER_TYPE_BY_DOC_TYPE,
         default_encounter_type="patient-report",
         extracted_text=text,
+        doc_text=text,
     )
 
 
@@ -781,6 +870,16 @@ def _ingest_one(
         _apply_inbox_hygiene(path, outcome, repo=repo, inbox_root=inbox_root, clock=clock)
         return [outcome]
 
+    # Document-TEXT layer (docs/adr/0015): each of these three branches
+    # extracts (pdf: `_best_effort_extract_text`; docx/text: already have
+    # the full text in hand) and stores it (`_store_text_best_effort`, via
+    # `_ingest_lab_report`/`_ingest_non_lab`'s `doc_text` parameter) AFTER
+    # `db.upsert_document` inserts this document's row but BEFORE that same
+    # function's `repo.commit()` — one commit per document is preserved,
+    # and `document_text.source_doc`'s foreign key is always satisfied by
+    # the time it's written. Only reached for a genuinely NEW document — a
+    # duplicate already has its text stored from the first ingest (see the
+    # `already_ingested` return above).
     if archived.kind == "docx":
         outcome = _ingest_docx(
             path, repo=repo, db=db, client=vision.client, clock=clock, archived=archived

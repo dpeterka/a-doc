@@ -16,6 +16,7 @@
             <th>Type</th>
             <th>Status</th>
             <th>Rows</th>
+            <th>Text</th>
           </tr>
         </thead>
         <tbody>
@@ -36,6 +37,13 @@
                   stored for later genomic analysis
                 {% else %}
                   {{ row.accepted_count }} accepted / {{ row.awaiting_review_count }} awaiting review
+                {% endif %}
+              </td>
+              <td>
+                {% if row.has_text %}
+                  <a href="/documents/consumed/{{ row.sha256 }}/text">View text</a>
+                {% else %}
+                  <span class="muted">—</span>
                 {% endif %}
               </td>
             </tr>

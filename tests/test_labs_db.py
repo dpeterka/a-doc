@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import json
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 import pytest
 
-from adoc.labs.db import LabsDb
+from adoc.labs.db import DocumentTextPage, LabsDb
 from adoc.labs.models import DocumentStatus, ExtractionStatus, LabDocument, LabFlag, LabResult
 
 SHA_A = "a" * 64
@@ -62,14 +62,14 @@ def db(tmp_path: Path) -> LabsDb:
 
 def test_schema_created_with_user_version(db: LabsDb) -> None:
     version = db._conn.execute("PRAGMA user_version").fetchone()[0]
-    assert version == 2
+    assert version == 3
     tables = {
         row[0]
         for row in db._conn.execute(
             "SELECT name FROM sqlite_master WHERE type IN ('table', 'view')"
         ).fetchall()
     }
-    assert {"documents", "labs", "labs_fts"} <= tables
+    assert {"documents", "labs", "labs_fts", "document_text", "document_text_fts"} <= tables
 
 
 def test_foreign_keys_and_wal_enabled(db: LabsDb) -> None:
@@ -312,7 +312,7 @@ def test_rebuild_from_jsonl_is_idempotent_and_replaces_existing_content(
 
 def test_migration_adds_specimen_column_with_unknown_default(db: LabsDb) -> None:
     version = db._conn.execute("PRAGMA user_version").fetchone()[0]
-    assert version == 2
+    assert version == 3
     columns = {row[1] for row in db._conn.execute("PRAGMA table_info(labs)").fetchall()}
     assert "specimen" in columns
 
@@ -758,3 +758,103 @@ def test_insert_results_case_d_differing_reextraction_flips_pending_row_too(db: 
     assert row.extraction_status == ExtractionStatus.PENDING
     payload = row.raw_payload()
     assert payload["re_extraction_conflict"]["value"] == 41.0
+
+
+# --------------------------------------------------------------------------
+# document_text / document_text_fts (docs/adr/0015-document-text-corpus.md)
+# --------------------------------------------------------------------------
+
+
+def test_replace_document_text_stores_paginated_rows(db: LabsDb) -> None:
+    db.replace_document_text(
+        SHA_A,
+        [DocumentTextPage(page=1, text="page one text"), DocumentTextPage(page=2, text="page two")],
+        extracted_at=datetime(2026, 5, 3, tzinfo=UTC),
+    )
+    rows = db._conn.execute(
+        "SELECT page, text FROM document_text WHERE source_doc = ? ORDER BY page", (SHA_A,)
+    ).fetchall()
+    assert [(r["page"], r["text"]) for r in rows] == [(1, "page one text"), (2, "page two")]
+
+
+def test_get_document_text_rejoins_pages_with_form_feed(db: LabsDb) -> None:
+    db.replace_document_text(
+        SHA_A,
+        [DocumentTextPage(page=1, text="alpha"), DocumentTextPage(page=2, text="beta")],
+        extracted_at=datetime(2026, 5, 3, tzinfo=UTC),
+    )
+    assert db.get_document_text(SHA_A) == "alpha\fbeta"
+
+
+def test_get_document_text_returns_none_when_never_stored(db: LabsDb) -> None:
+    assert db.get_document_text(SHA_A) is None
+
+
+def test_replace_document_text_is_idempotent(db: LabsDb) -> None:
+    db.replace_document_text(
+        SHA_A,
+        [DocumentTextPage(page=None, text="first")],
+        extracted_at=datetime(2026, 5, 3, tzinfo=UTC),
+    )
+    db.replace_document_text(
+        SHA_A,
+        [DocumentTextPage(page=None, text="second, replacing the first")],
+        extracted_at=datetime(2026, 5, 4, tzinfo=UTC),
+    )
+    rows = db._conn.execute(
+        "SELECT text FROM document_text WHERE source_doc = ?", (SHA_A,)
+    ).fetchall()
+    assert [r["text"] for r in rows] == ["second, replacing the first"]
+
+
+def test_document_text_shas_reflects_coverage_including_empty_text(db: LabsDb) -> None:
+    assert db.document_text_shas() == set()
+    db.replace_document_text(
+        SHA_A, [DocumentTextPage(page=None, text="")], extracted_at=datetime(2026, 5, 3, tzinfo=UTC)
+    )
+    assert db.document_text_shas() == {SHA_A}
+
+
+def test_search_document_text_finds_a_match_with_source_ref(db: LabsDb) -> None:
+    db.replace_document_text(
+        SHA_A,
+        [
+            DocumentTextPage(page=1, text="Nothing relevant here."),
+            DocumentTextPage(page=2, text="Impression: findings consistent with early arthritis."),
+        ],
+        extracted_at=datetime(2026, 5, 3, tzinfo=UTC),
+    )
+    hits = db.search_document_text("arthritis")
+    assert len(hits) == 1
+    assert hits[0].source_doc == SHA_A
+    assert hits[0].page == 2
+    assert hits[0].source_ref == "doc:quest-2026-05-02.pdf#p2"
+    assert "arthritis" in hits[0].snippet.lower()
+
+
+def test_search_document_text_ref_has_no_page_suffix_when_unpaginated(db: LabsDb) -> None:
+    db.replace_document_text(
+        SHA_A,
+        [DocumentTextPage(page=None, text="Patient-authored narrative mentions joint pain.")],
+        extracted_at=datetime(2026, 5, 3, tzinfo=UTC),
+    )
+    hits = db.search_document_text("joint pain")
+    assert len(hits) == 1
+    assert hits[0].page is None
+    assert hits[0].source_ref == "doc:quest-2026-05-02.pdf"
+
+
+def test_search_document_text_no_match_returns_empty(db: LabsDb) -> None:
+    db.replace_document_text(
+        SHA_A,
+        [DocumentTextPage(page=None, text="unrelated content")],
+        extracted_at=datetime(2026, 5, 3, tzinfo=UTC),
+    )
+    assert db.search_document_text("nonexistent-token-xyz") == []
+
+
+def test_search_document_text_respects_limit(db: LabsDb) -> None:
+    pages = [DocumentTextPage(page=i, text=f"biopsy result {i}") for i in range(1, 8)]
+    db.replace_document_text(SHA_A, pages, extracted_at=datetime(2026, 5, 3, tzinfo=UTC))
+    hits = db.search_document_text("biopsy", limit=3)
+    assert len(hits) == 3

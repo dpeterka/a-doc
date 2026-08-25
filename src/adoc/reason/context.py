@@ -37,6 +37,19 @@ LEDGER_SECTION_KEY = "ledger"
 PATIENT_THEORIES_SECTION_KEY = "patient_theories"
 GENOMICS_INVENTORY_RELPATH = "case/genomics-inventory.md"
 
+DOCUMENT_EXCERPTS_SECTION_KEY = "document_excerpts"
+
+# Hard cap on the TOTAL characters of document-text excerpts folded into one
+# context pack (docs/adr/0015-document-text-corpus.md "Retrieval"). 121+
+# documents of full text cannot go into a prompt - this keeps one turn's
+# excerpt budget small and predictable regardless of how many/how long the
+# FTS5 matches are, while still being generous enough for several genuinely
+# relevant quoted passages (a few hundred words). A module constant, not a
+# per-call parameter, so the cap is one place to retune.
+MAX_DOCUMENT_EXCERPT_CHARS = 4000
+
+MAX_DOCUMENT_EXCERPTS = 5
+
 
 class ContextSection(BaseModel):
     """One rendered section of a `ContextPack`, in a fixed, stable order."""
@@ -175,6 +188,49 @@ def _labs_section(db: LabsDb) -> ContextSection:
     )
 
 
+def _document_excerpts_section(db: LabsDb, query: str | None) -> ContextSection | None:
+    """Relevant excerpts from ingested documents' full text
+    (docs/adr/0015-document-text-corpus.md), ranked by
+    `LabsDb.search_document_text` against `query` (typically the current
+    chat turn's text). Returns `None` — never an empty section — when
+    `query` is falsy or nothing matches, so a turn with no relevant
+    document text looks exactly like it did before this feature existed.
+
+    Excerpts are quoted VERBATIM with their `doc:<filename>#p<page>`-style
+    source ref, never paraphrased (module docstring: "the point is verbatim
+    text the model can cite and a later verifier can check"), and the total
+    rendered content is capped at `MAX_DOCUMENT_EXCERPT_CHARS` characters —
+    a snippet that would blow the remaining budget is truncated with a
+    trailing ellipsis rather than dropped outright, so at least a partial
+    quote survives.
+    """
+    if not query or not query.strip():
+        return None
+    hits = db.search_document_text(query, limit=MAX_DOCUMENT_EXCERPTS)
+    if not hits:
+        return None
+
+    blocks: list[str] = []
+    budget = MAX_DOCUMENT_EXCERPT_CHARS
+    for hit in hits:
+        snippet = hit.snippet.strip()
+        if not snippet or budget <= 0:
+            continue
+        block = f"> {snippet}\n— {hit.source_ref}"
+        if len(block) > budget:
+            block = block[: max(budget - 1, 0)].rstrip() + "…"
+        blocks.append(block)
+        budget -= len(block)
+
+    if not blocks:
+        return None
+    return ContextSection(
+        key=DOCUMENT_EXCERPTS_SECTION_KEY,
+        title="Relevant Document Excerpts",
+        content="\n\n".join(blocks),
+    )
+
+
 def _render_ledger_section(ledger: Ledger) -> ContextSection:
     if not ledger.hypotheses:
         content = "_No hypotheses on the ledger yet._"
@@ -195,6 +251,7 @@ def build_context(
     *,
     include_ledger: bool,
     recent_encounters_limit: int = DEFAULT_RECENT_ENCOUNTERS,
+    query: str | None = None,
 ) -> ContextPack:
     """Build a `ContextPack` in the fixed PLAN.md section order.
 
@@ -206,11 +263,23 @@ def build_context(
       5. genomics inventory (`case/genomics-inventory.md`), only if present
       6. open questions (`case/questions-open.md`)
       7. differential-ledger.yaml, ONLY when `include_ledger=True`
+      8. relevant document excerpts (`query`-dependent), ONLY when `query`
+         is given and something matches (docs/adr/0015)
 
     A blind-review caller passes `include_ledger=False`, which both omits
     the ledger section from `.render()`'s text and keeps `"ledger"` out of
     `.keys` — the property a `forbid_context_key("ledger")` DAG contract
     can check for blindness.
+
+    `query` (typically the current chat turn's raw text) drives the
+    document-excerpts section — deliberately LAST, after every other
+    section (including the ledger): every other section is fully
+    determined by repo/db state alone, so keeping the one query-dependent,
+    per-turn-variable section at the very end means its variability never
+    invalidates a prompt cache prefix built over the earlier, stable
+    sections. `query=None` (the default) omits the section entirely —
+    every existing caller that doesn't pass `query` sees the exact same
+    `ContextPack` as before this parameter existed.
     """
     sections: list[ContextSection] = []
 
@@ -247,5 +316,9 @@ def build_context(
     if include_ledger:
         ledger = load_ledger(repo.root / LEDGER_RELPATH)
         sections.append(_render_ledger_section(ledger))
+
+    excerpts_section = _document_excerpts_section(db, query)
+    if excerpts_section is not None:
+        sections.append(excerpts_section)
 
     return ContextPack(sections=sections, include_ledger=include_ledger)

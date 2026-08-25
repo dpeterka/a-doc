@@ -20,7 +20,15 @@ from adoc.casefile.schema import Ledger
 _COMMIT_ACTOR = Actor("adoc", "adoc@localhost")
 
 _CASE_SUBDIRS = ("encounters", "reviews")
-_TOP_LEVEL_DIRS = ("sources", "inbox", "work", "logs")
+_TOP_LEVEL_DIRS = ("sources", "doc-text", "inbox", "work", "logs")
+"""`doc-text/` (docs/adr/0015-document-text-corpus.md) holds one committed,
+human-diffable `<sha256>.txt` per ingested non-genomic document's extracted
+full text — derived from `sources/`, but its own top-level directory rather
+than living inside it: `sources/` is documented as immutable originals only,
+and `doc-text/`'s files are re-derivable (re-running extraction reproduces
+them), which `sources/`'s never are. Like `sources/`, it is NOT gitignored
+(see `_GITIGNORE` below) — it must be committed, since re-deriving every
+document's text on every fresh checkout is not free."""
 
 _GITIGNORE = (
     "labs.sqlite\nlabs.sqlite-shm\nlabs.sqlite-wal\nlabs.sqlite-journal\n"
@@ -91,9 +99,11 @@ class DataRepo:
             (root / "case" / sub / ".gitkeep").touch()
         for sub in _TOP_LEVEL_DIRS:
             (root / sub).mkdir(parents=True, exist_ok=True)
-        # sources/ is not gitignored (immutable originals) so it needs a
-        # .gitkeep to be committed while still empty.
+        # sources/ and doc-text/ are not gitignored (immutable originals /
+        # derived text) so each needs a .gitkeep to be committed while still
+        # empty.
         (root / "sources" / ".gitkeep").touch()
+        (root / "doc-text" / ".gitkeep").touch()
 
         (root / ".gitignore").write_text(_GITIGNORE, encoding="utf-8")
 
@@ -111,6 +121,7 @@ class DataRepo:
             paths=[
                 "case",
                 "sources",
+                "doc-text",
                 ".gitignore",
             ],
         )
