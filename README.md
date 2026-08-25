@@ -14,9 +14,9 @@ specialty personas** — a Ledger-Maintainer, a mandatory cross-family
 Challenger, a Test-Chooser, and a Composer — as an explicit, code-defined DAG
 (`src/adoc/reason/dag.py`) where every node has pre/postcondition contracts
 enforced by code (e.g. the Challenger must produce a substantive
-counter-argument or the run fails). This targets anchoring, the single
-biggest measured failure mode for this use case, structurally rather than by
-hoping a prompt holds.
+counter-argument or the run fails). This targets anchoring, the primary
+failure mode for this use case, structurally rather than by hoping a prompt
+holds.
 
 State is split across **two git repositories**: this code repo, and a
 separate PHI-only data repo (`ADOC_DATA_DIR`) with no remote, holding
@@ -29,28 +29,31 @@ The UI is **FastAPI + Jinja2 + HTMX + SSE + Plotly.js**, not a chat
 framework — most of the surface area (confirm queue, ledger dashboard, trend
 charts) is page CRUD, and only part of it is chat.
 
-See `PLAN.md` for the full research-backed rationale, phasing, and schemas,
-and `CLAUDE.md` for agent/contributor rules.
+See `PLAN.md` for the full architecture, phasing, and schemas, and
+`CLAUDE.md` for agent/contributor rules.
 
 ## Supported input types
 
-The Dropbox inbox / manual upload accept two document kinds, detected by
-content (never by filename extension alone — see `ingest/filetypes.py`):
+The Dropbox inbox / manual upload accept document kinds detected by content
+(never by filename extension alone — see `ingest/filetypes.py`):
 
 - **PDF** (`%PDF-` magic): archived immutably, page images rendered via
   `pdftoppm`, and read by the vision double-pass extractor (a PDF-native
   pass + a rendered-page-image pass, cross-model).
-- **`.docx`** (a real OOXML zip package, `.docx` suffix): archived
-  immutably like a PDF but with **no page rendering** — a-doc reads it
-  directly as TEXT with `python-docx` (a pure-Python dependency; no
+- **`.docx`** (a real OOXML zip package): archived immutably like a PDF but
+  with **no page rendering** — read directly as TEXT with `python-docx` (no
   LibreOffice/PDF conversion step). A lab-classified `.docx` goes through
   the same cross-model double-pass and reconcile/confirm-queue gates as a
   PDF lab report (page numbers default to 1 — a `.docx` has no page
-  structure); a narrative `.docx` (clinical history, supplement plan)
-  becomes a full-text `patient-report`/`imaging` encounter carrying the
-  complete extracted text.
+  structure); a narrative `.docx` becomes a full-text
+  `patient-report`/`imaging` encounter carrying the complete extracted
+  text.
+- **`.txt`/`.md`**: read verbatim.
+- **`.zip`**: expanded, each member re-classified.
+- **Genomic files** (23andMe raw export, `.vcf`/`.bcf`/BAM/FASTQ): archived
+  byte-for-byte, never sent to any LLM — see "Genomic data" below.
 
-Anything else is rejected with a clear error asking for a PDF or `.docx`.
+Anything else is rejected with a clear error asking for a supported type.
 Because a `.docx` has no page image, its confirm-queue rows show a text
 fallback panel instead of a source-page image.
 
@@ -78,30 +81,27 @@ uv run adoc init       # validates Settings + models.yaml load cleanly
 **Image-based deploys.** All AWS resources are CloudFormation stacks in
 `deploy/cfn/`; the application ships as a container image (root
 `Dockerfile`) built and pushed to ECR by `.github/workflows/deploy.yml`, and
-run on **ECS Fargate** tasks with data on **EFS** — see ADR 0006 for why
-this replaced the original EC2 + `install.sh` + systemd-timers design.
-Stack deploy order: `ci` (once, manually — see note below) → build/push the
-image → `network` → `backup` → `alb` → `ecs`. Deploys after the initial
-bootstrap run from GitHub Actions via an OIDC-assumed role
-(`deploy/cfn/ci.yaml`) — no long-lived AWS credentials are stored in the
-repo.
+runs on **ECS Fargate** tasks with data on **EFS** (ADR 0006). Stack deploy
+order: `ci` (once, manually — see note below) → build/push the image →
+`network` → `backup` → `alb` → `ecs`. Deploys after the initial bootstrap
+run from GitHub Actions via an OIDC-assumed role (`deploy/cfn/ci.yaml`) — no
+long-lived AWS credentials are stored in the repo.
 
-`ci.yaml` creates the very IAM role that GitHub Actions needs in order to
-deploy anything, including `ci.yaml` itself (and the `a-doc` ECR repository
-the image is pushed to) — that first deployment is a manual, one-time
-bootstrap (e.g. `aws cloudformation deploy` from a local admin session),
-after which its `DeployRoleArn` output is copied into the
-`AWS_DEPLOY_ROLE_ARN` repository variable so future deploys are automated.
+`ci.yaml` creates the IAM role GitHub Actions needs to deploy anything,
+including `ci.yaml` itself (and the ECR repository the image is pushed to)
+— that first deployment is a manual, one-time bootstrap (e.g.
+`aws cloudformation deploy` from a local admin session), after which its
+`DeployRoleArn` output is copied into the `AWS_DEPLOY_ROLE_ARN` repository
+variable so future deploys are automated.
 
 **Patient access is via a public ALB** at `https://adoc.petabloc.io`
-(`deploy/cfn/alb.yaml`) — an explicit user decision that replaced the
-original Tailscale-only design, unchanged by the Fargate migration. The
-app itself still has no direct public ingress: `deploy/cfn/ecs.yaml`'s
-`ServiceSecurityGroup` admits inbound port 8080 from the ALB's security
-group only. In-app authentication (username/password, scrypt-hashed, with
-in-app rate limiting) is the only auth layer in front of the app — see
-"User provisioning" and "How the patient reaches the UI" below. There is
-deliberately no WAF and no TOTP in this design.
+(`deploy/cfn/alb.yaml`, ADR 0007). The app itself has no direct public
+ingress: `deploy/cfn/ecs.yaml`'s `ServiceSecurityGroup` admits inbound port
+8080 from the ALB's security group only. In-app authentication
+(username/password, scrypt-hashed, with in-app rate limiting) is the only
+auth layer in front of the app — see "User provisioning" and "How the
+patient reaches the UI" below. There is deliberately no WAF and no TOTP in
+this design.
 
 ### One-time SSM parameters
 
@@ -116,9 +116,7 @@ omit `--key-id` when creating them, since `a-doc-task-execution-role`'s
 `kms:Decrypt` grant in `deploy/cfn/ecs.yaml` is scoped to that default key
 only. If a customer-managed KMS key is ever used for one of these instead,
 that key's own key policy must separately grant `kms:Decrypt` to
-`a-doc-task-execution-role` (the default key's policy already permits any
-IAM-permitted principal in the account, which the execution role's policy
-statement grants; a custom key's policy does not, by default).
+`a-doc-task-execution-role`.
 
 ```bash
 # rclone config defining the "dropbox" remote the ingest task's
@@ -139,12 +137,9 @@ aws ssm put-parameter --name /a-doc/featherless-api-key \
   --type SecureString --value "xxxxxxxxxxxxxxxx"
 ```
 
-There is no SSM parameter for web login credentials — those are created
-via an ECS Exec one-off (see "User provisioning" below), not threaded
-through SSM/task secrets. There is no `github-token` parameter (deploys
-never needed one) and the old `/a-doc/session-passphrase` parameter is
-gone from the required set entirely — it was legacy even under the EC2
-design and nothing in the ECS task definitions reads it.
+There is no SSM parameter for web login credentials — those are created via
+an ECS Exec one-off (see "User provisioning" below), not threaded through
+SSM/task secrets.
 
 To rotate any of these later, add `--overwrite` and re-run the same
 command, then force a new deployment of the web service (`aws ecs
@@ -154,10 +149,9 @@ task-launch time, not live-reloaded by a running task.
 
 **These parameters must exist *before* the ecs stack is deployed for the
 first time.** A task that fails to resolve a secret fails to start
-entirely (no partial provisioning state to recover, unlike the old
-UserData/install.sh boot sequence) — fix the parameter and either
-`update-service --force-new-deployment` (web) or wait for/manually invoke
-the next scheduled rule (jobs).
+entirely — fix the parameter and either `update-service
+--force-new-deployment` (web) or wait for/manually invoke the next
+scheduled rule (jobs).
 
 ### User provisioning
 
@@ -192,54 +186,49 @@ tradeoff — see `src/adoc/web/security.py`).
 `alb` → `ecs`, matching `.github/workflows/deploy.yml`. `ecs.yaml` must
 come after `network`/`backup`/`alb` because it imports all three (VPC and
 subnet/security-group ids; the backup bucket name and KMS key; the ALB's
-target group ARN) via `Fn::ImportValue`. There is no `instance` stack any
-more.
+target group ARN) via `Fn::ImportValue`.
 
 ### Single-writer discipline (SQLite + git on EFS)
 
-SQLite + git-as-database want exactly one writer, same as the EC2 design.
-Two mechanisms enforce that on Fargate:
+SQLite and git-as-database want exactly one writer. Two mechanisms enforce
+that on Fargate:
 
 - **Deployment configuration**: the web service's
   `DeploymentConfiguration` is `MaximumPercent: 100` /
-  `MinimumHealthyPercent: 0` — CloudFormation/ECS always stops the old
-  task before starting its replacement, so two web tasks never run
-  concurrently against the same EFS-mounted data directory (at the cost of
-  a brief availability gap on each deploy — an accepted tradeoff for a
-  single-patient app, in exchange for never risking two writers).
+  `MinimumHealthyPercent: 0` — ECS always stops the old task before
+  starting its replacement, so two web tasks never run concurrently against
+  the same EFS-mounted data directory (at the cost of a brief availability
+  gap on each deploy).
 - **SQLite journal mode**: `labs.sqlite`'s journal mode is `TRUNCATE` in
   the deployed environment (`ADOC_SQLITE_JOURNAL_MODE=TRUNCATE` in
   `deploy/cfn/ecs.yaml`'s task definitions), not the local/dev default
   `WAL`. WAL relies on a shared-memory index file coordinated via `mmap` +
-  POSIX advisory locks, which is unsafe on NFS-family filesystems like
-  EFS and can silently corrupt the database; TRUNCATE is a plain
+  POSIX advisory locks, which is unsafe on NFS-family filesystems like EFS
+  and can silently corrupt the database; TRUNCATE is a plain
   rollback-journal mode with no such requirement. See
   `src/adoc/labs/db.py`'s `LabsDb.__init__` docstring and ADR 0006.
 
 The scheduled ingest/review/backup jobs are **not** mutually excluded from
-each other or from the web task by any lock — this is an accepted gap
-(cadence and single-patient scale make a collision low-probability, not
-impossible), not a solved problem.
+each other or from the web task by any lock — an accepted gap at
+single-patient scale, not a solved problem.
 
 **Expect a brief 503 window on every web-service deploy.** Because
 `MaximumPercent: 100`/`MinimumHealthyPercent: 0` always stops the old task
-before starting its replacement (above), the ALB has zero healthy targets
-for the new task's cold-start + health-check time — requests during that
-window get a 503 from the ALB, not from the app. `HealthCheckGracePeriodSeconds`
+before starting its replacement, the ALB has zero healthy targets for the
+new task's cold-start + health-check time. `HealthCheckGracePeriodSeconds`
 is `900` (`deploy/cfn/ecs.yaml`'s `WebService`), sized generously so a
 first-boot `adoc bootstrap-data` restore (git clone + `sources/`/JSONL sync
 + `labs.sqlite` rebuild from S3) has time to finish before ECS starts
-health-checking; a plain code deploy against an already-seeded EFS
-finishes in well under that. This is an accepted tradeoff for a
-single-patient app in exchange for never risking two writers, not a bug —
-plan deploys for a moment when a brief outage is acceptable.
+health-checking; a plain code deploy against an already-seeded EFS finishes
+well under that. Plan deploys for a moment when a brief outage is
+acceptable.
 
 ### Seeding a deployment from local onboarding
 
 The approved onboarding flow is: run `adoc onboard` (and any initial
 `adoc backfill`/`adoc ingest`) **locally first**, curate the case file
 until it's in good shape, then hand it to the deployed remote — not the
-other way around. Concretely:
+other way around.
 
 1. Locally, with `ADOC_DATA_DIR` pointed at your curated data repo:
    `ADOC_BACKUP_BUCKET=<backup-bucket> uv run adoc backup`. This is the
@@ -247,12 +236,11 @@ other way around. Concretely:
    git-bundles the full history + `labs-export.jsonl` + `sources/` to
    `s3://<backup-bucket>/latest/`.
 2. On the remote side, nothing further is required: the next task to
-   start against an **empty EFS** filesystem (i.e. `<data_dir>` missing
-   or empty) runs `adoc bootstrap-data` (via `docker-entrypoint.sh`),
-   which sees `ADOC_BACKUP_BUCKET` set, finds the backup, and restores
-   it automatically — `git clone` of the bundle (full history, checked
-   out, remote stripped), `sources/`, `labs-export.jsonl`, and a rebuilt
-   `labs.sqlite`. No manual restore step for this path any more.
+   start against an **empty EFS** filesystem runs `adoc bootstrap-data`
+   (via `docker-entrypoint.sh`), which sees `ADOC_BACKUP_BUCKET` set,
+   finds the backup, and restores it automatically — `git clone` of the
+   bundle (full history, checked out, remote stripped), `sources/`,
+   `labs-export.jsonl`, and a rebuilt `labs.sqlite`.
 3. Once seeded, ongoing Dropbox ingestion on the remote is safe to layer
    on top: `sources/` documents are sha256-addressed and `labs` rows are
    deduped on `(date, name, source_doc)` (see `labs/db.py`), so
@@ -261,16 +249,14 @@ other way around. Concretely:
 
 ### Restore-from-backup drill (release gate)
 
-PLAN.md's Phase-1 acceptance criteria and `CLAUDE.md`/ADR 0004 call a
-tested restore a release gate — do this before considering a deploy
-"done," not just once at setup. Restore is now one command,
-`adoc restore` (`src/adoc/backup.py`'s `restore_from_bucket`, the tested
-inverse of `run_backup` — see `tests/test_backup.py`), which refuses to
-run over an already-initialized data repo (no `--force` is offered) and
-fails clearly if the bucket has no backup. Unlike the EC2 design, EFS is
-not destroyed by a routine task/service replacement, so this drill
-specifically exercises restoring onto a **freshly created** filesystem
-(e.g. after deleting and redeploying the `ecs` stack, or standing up a new
+`PLAN.md`/`CLAUDE.md`/ADR 0004 call a tested restore a release gate — do
+this before considering a deploy "done," not just once at setup. Restore is
+one command, `adoc restore` (`src/adoc/backup.py`'s `restore_from_bucket`,
+the tested inverse of `run_backup` — see `tests/test_backup.py`), which
+refuses to run over an already-initialized data repo (no `--force`) and
+fails clearly if the bucket has no backup. This drill specifically
+exercises restoring onto a **freshly created** filesystem (e.g. after
+deleting and redeploying the `ecs` stack, or standing up a new
 environment):
 
 1. Confirm a real backup exists: `aws s3 ls
@@ -280,8 +266,7 @@ environment):
    running web task (or scale the ECS service to 0 and back to 1) after
    emptying `<data_dir>` on EFS — the next task to start runs
    `adoc bootstrap-data`, which restores from the bucket since it's set
-   and has a backup. This is the manual re-seed procedure: **stop task /
-   scale 0→1 after clearing EFS**, nothing more.
+   and has a backup.
    - To restore by hand instead (e.g. to inspect the result before
      swapping it in), get a shell via ECS Exec (see "User provisioning")
      and run `adoc restore --bucket <backup-bucket>` with `ADOC_DATA_DIR`
@@ -291,56 +276,34 @@ environment):
    at the same `ADOC_DATA_DIR`) reports "already initialized" rather than
    creating a new empty case file.
 4. Confirm `https://adoc.petabloc.io/healthz` returns `ok` and the ALB
-   target group shows the task healthy (below).
-5. **Re-provision logins.** `<data_dir>/work/users.yaml` (the web login
-   credential store — see "User provisioning" above) lives under the
-   gitignored `work/` directory, which `adoc backup`/`restore` deliberately
-   never ships to or from S3 (`backup.py`'s `_OPERATIONAL_DIRS` are
-   recreated empty on restore, not populated from any backed-up content —
-   see ADR 0009). A restore therefore always comes back with **zero** web
-   logins, even though every other piece of state (case file, ledger,
-   labs, sources) is fully restored. Every restore drill must re-run the
-   ECS Exec `adoc user add <username>` step (see "User provisioning") before
-   declaring the drill complete — a restored deployment nobody can log
-   into is not a passing drill.
+   target group shows the task healthy.
+5. **Re-provision logins.** `<data_dir>/work/users.yaml` lives under the
+   gitignored `work/` directory, which `adoc backup`/`restore` never ships
+   to or from S3 (ADR 0009). A restore therefore always comes back with
+   **zero** web logins, even though every other piece of state (case file,
+   ledger, labs, sources) is fully restored. Every restore drill must
+   re-run the ECS Exec `adoc user add <username>` step before declaring
+   the drill complete.
 
 ### How the patient reaches the UI
 
 The web task's `adoc serve` binds `0.0.0.0:8080` — safe to bind widely
 because `deploy/cfn/ecs.yaml`'s `ServiceSecurityGroup` admits inbound 8080
-from the ALB's security group only, so nothing else can reach it.
-`deploy/cfn/alb.yaml` puts a public, internet-facing Application Load
-Balancer in front of it: an ACM certificate for `adoc.petabloc.io`
-(DNS-validated against the `petabloc.io` Route53 hosted zone,
-`Z009458513KFY2WNUS7C0` — CloudFormation creates the validation record and
-waits for issuance automatically, no manual step), an HTTPS:443 listener
-forwarding to a `TargetType: ip` target group (registered/deregistered
-dynamically by the ECS service — no static instance target any more), an
+from the ALB's security group only. `deploy/cfn/alb.yaml` puts a public,
+internet-facing Application Load Balancer in front of it: an ACM
+certificate for `adoc.petabloc.io` (DNS-validated against the
+`petabloc.io` Route53 hosted zone, `Z009458513KFY2WNUS7C0` —
+CloudFormation creates the validation record and waits for issuance
+automatically), an HTTPS:443 listener forwarding to a `TargetType: ip`
+target group (registered/deregistered dynamically by the ECS service), an
 HTTP:80 listener that redirects to HTTPS, and a Route53 alias A record
 pointing `adoc.petabloc.io` at the ALB. The target group's health check
 hits the unauthenticated `/healthz` route.
 
 For the patient: open `https://adoc.petabloc.io/` in any browser and sign
 in with a username/password provisioned via `adoc user add` (see "User
-provisioning" above). There is no VPN/tailnet step any more — the
-in-app login and its rate limiting are the only gate, by explicit user
-decision (no WAF, no TOTP in this design).
-
-### Cutover from the EC2 instance
-
-The prior EC2 deployment (`a-doc-instance` stack, `deploy/install.sh`,
-`deploy/systemd/*`) is superseded by this ECS/EFS design but is **not**
-deleted by any of this work — CloudFormation stacks are never torn down
-from application code changes. Once the `a-doc-ecs` service is deployed
-and confirmed healthy behind the ALB (target group shows the Fargate task
-healthy, `/healthz` returns `ok`, a manual smoke test of chat/ingest
-succeeds), the operator deletes the old instance stack by hand:
-`aws cloudformation delete-stack --stack-name a-doc-instance`. Do this only
-after the data on EFS has been confirmed current (e.g. via a manual
-`adoc backup` on the old instance and a restore drill onto EFS, or a
-direct one-time copy) — the EC2 instance's `/data` EBS volume and the new
-EFS filesystem start out as two independent, unsynchronized copies of the
-data repo.
+provisioning" above). The in-app login and its rate limiting are the only
+gate, by design (no VPN/tailnet, no WAF, no TOTP).
 
 ## Lab maintenance commands
 
@@ -365,15 +328,12 @@ housekeeping:
   the same document (deterministic candidate gate on value/page/unit/
   specimen, then a rule-based name match, falling back to exactly one
   `classifier`-role LLM call only when the rule can't decide) and
-  auto-rejects the duplicate half. Use this once after upgrading past the
-  RESCUE-pass reconcile fix, or periodically if single-pass extraction
-  rows are still trickling in.
+  auto-rejects the duplicate half.
 - **`adoc labs-infer-specimen`** (`labs/specimen.py`) — deterministically
   back-fills `specimen` (serum/plasma/urine/etc.) for existing rows still
-  carrying the pre-migration `unknown` default, from their source
-  document's filename/`doc_type` keywords only. Use this once after
-  upgrading past the specimen-dimension migration, so older rows join the
-  correct per-specimen trend series instead of being excluded from trend
+  carrying the `unknown` default, from their source document's
+  filename/`doc_type` keywords only, so older rows join the correct
+  per-specimen trend series instead of being excluded from trend
   comparison.
 
 All three are read-modify-write passes over already-extracted data — none
@@ -387,16 +347,15 @@ Raw genotype files (a 23andMe-style raw text export, per-chromosome
 imputed `.bcf`/`.vcf` files, BAM/FASTQ) are a supported intake kind
 (`ingest/filetypes.py` sniffs content, not filename) but are handled
 completely differently from documents: they are archived byte-for-byte
-under `sources/genomics/` (gitignored — `.gitignore` excludes it from the
-data repo's git history so a patient's raw genotype files never bloat the
-git bundle) and folded into one regenerated `case/genomics-inventory.md`
-summary table, never a per-file encounter. **A genomic file's content
-never reaches any model** — no vision call, no text-extraction call is
-ever made against it; this is a CRITICAL DESIGN RULE (`ingest/genomics.py`),
-not just a default. `sources/genomics/` is still backed up: `adoc backup`
-syncs the whole `sources/` tree on disk to S3 regardless of what git
-tracks, so the bytes are safe even though they're not in git history. See
-ADR 0010.
+under `sources/genomics/` (gitignored — a patient's raw genotype files
+never bloat the git bundle) and folded into one regenerated
+`case/genomics-inventory.md` summary table, never a per-file encounter.
+**A genomic file's content never reaches any model** — no vision call, no
+text-extraction call is ever made against it; this is a CRITICAL DESIGN
+RULE (`ingest/genomics.py`), not just a default. `sources/genomics/` is
+still backed up: `adoc backup` syncs the whole `sources/` tree on disk to
+S3 regardless of what git tracks, so the bytes are safe even though
+they're not in git history. See ADR 0010.
 
 ## Currently deployed
 
@@ -410,7 +369,9 @@ document is still current.
 | Phase | Description | Status |
 |---|---|---|
 | 0 | Project scaffold | complete |
-| 1 | MVP (onboarding, ingestion, DAG reasoning, web UI, AWS deploy) | code complete — ECS Fargate + EFS deploy verification pending (see ADR 0006) |
-| 2 | Grounding & anti-hallucination hardening | not started |
+| 1 | MVP (onboarding, ingestion, DAG reasoning, web UI, AWS deploy) | complete |
+| 2 | Grounding & anti-hallucination hardening | complete |
 | 3 | Knowledge layer (HPO/LIRICAL/Monarch, ACR/EULAR criteria) + full eval | not started |
 | 4 | Extras (Apple Health import, specialist finder, notifications) | not started |
+
+See `PLAN.md` for phase acceptance criteria.
