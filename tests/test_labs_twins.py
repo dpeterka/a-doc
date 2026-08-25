@@ -14,6 +14,7 @@ from adoc.config import ModelBinding
 from adoc.labs.db import LabsDb
 from adoc.labs.models import DocumentStatus, ExtractionStatus, LabDocument, LabResult
 from adoc.labs.twins import (
+    TWIN_CLASSIFY_PROMPT_VERSION,
     find_candidate,
     names_equivalent_by_rule,
     read_last_sweep_summary,
@@ -306,8 +307,59 @@ def test_sweep_rejects_an_llm_path_twin(tmp_path: Path) -> None:
     row = db.get_row(pending_id)
     assert row is not None
     assert row.extraction_status == ExtractionStatus.REJECTED
-    assert row.raw_payload()["method"] == "llm"
-    assert row.raw_payload()["auto_rejected_twin_of"] == resolved_id
+    payload = row.raw_payload()
+    assert payload["method"] == "llm"
+    assert payload["auto_rejected_twin_of"] == resolved_id
+    # CONFIRMED bug fix (CLAUDE.md provenance rule): an LLM-decided twin
+    # rejection must carry the resolved model_id and prompt version it was
+    # decided under, not just "method": "llm" - otherwise rebinding the
+    # classifier role or bumping TWIN_CLASSIFY_PROMPT_VERSION leaves no way
+    # to tell which already-rejected rows were decided under a stale
+    # binding/prompt (PLAN.md staleness/re-evaluation policy).
+    assert payload["model_id"] == "fake-haiku"
+    assert payload["prompt_template_version"] == TWIN_CLASSIFY_PROMPT_VERSION
+    assert "rejected_at" in payload
+
+
+def test_sweep_rule_path_twin_carries_no_model_provenance(tmp_path: Path) -> None:
+    """A `method="rule"` rejection never called an LLM at all, so it must
+    NOT carry a `model_id`/`prompt_template_version` - stamping one would
+    fabricate provenance for a decision no model made."""
+    db = LabsDb(tmp_path / "labs.sqlite")
+    db.upsert_document(_doc())
+    db.insert_results(
+        [
+            _row(
+                "FRAX 10-year probability of hip fracture",
+                value=-1.2,
+                page=5,
+                status=ExtractionStatus.AUTO,
+            )
+        ]
+    )
+    (pending_id,) = db.insert_results(
+        [
+            _row(
+                "frax 10-year probability of hip fracture is",  # exact match after cleaning
+                value=-1.2,
+                page=5,
+                status=ExtractionStatus.PENDING,
+                reasons=["single_pass"],
+            )
+        ]
+    )
+    assert pending_id is not None
+
+    report = sweep_twins(db, _client(None))  # LLM must never be called here
+
+    assert report.rejected_rule == 1
+    row = db.get_row(pending_id)
+    assert row is not None
+    payload = row.raw_payload()
+    assert payload["method"] == "rule"
+    assert "model_id" not in payload
+    assert "prompt_template_version" not in payload
+    assert "rejected_at" in payload
 
 
 def test_sweep_leaves_row_untouched_when_llm_says_different_measurement(tmp_path: Path) -> None:

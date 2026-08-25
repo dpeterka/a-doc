@@ -642,6 +642,38 @@ def test_reject_row_as_twin_marks_rejected_with_audit_note(db: LabsDb) -> None:
     assert payload["method"] == "rule"
 
 
+def test_reject_row_as_twin_stamps_llm_provenance_when_given(db: LabsDb) -> None:
+    """CONFIRMED bug fix (CLAUDE.md provenance rule): an `llm`-method
+    rejection persists `model_id`/`prompt_template_version`/`rejected_at`
+    when the caller supplies them (`labs/twins.py` always does for its
+    `method="llm"` path) - a `rule`-method rejection never gets a
+    model_id/prompt_template_version stamped (no model was ever called).
+    """
+    (auto_id,) = db.insert_results([_lab(extraction_status=ExtractionStatus.AUTO)])
+    (pending_id,) = db.insert_results(
+        [_lab(name="sodium", value=140.0, extraction_status=ExtractionStatus.PENDING)]
+    )
+    assert auto_id is not None and pending_id is not None
+    at = datetime(2026, 5, 3, 12, 0, 0, tzinfo=UTC)
+
+    db.reject_row_as_twin(
+        pending_id,
+        twin_of=auto_id,
+        method="llm",
+        model_id="claude-fake-haiku",
+        prompt_template_version="twin-classifier-v1",
+        at=at,
+    )
+
+    row = db.get_row(pending_id)
+    assert row is not None
+    payload = row.raw_payload()
+    assert payload["method"] == "llm"
+    assert payload["model_id"] == "claude-fake-haiku"
+    assert payload["prompt_template_version"] == "twin-classifier-v1"
+    assert datetime.fromisoformat(payload["rejected_at"]) == at
+
+
 def test_resolved_rows_for_document_excludes_pending_and_other_documents(db: LabsDb) -> None:
     (auto_id,) = db.insert_results([_lab(extraction_status=ExtractionStatus.AUTO)])
     (confirmed_id,) = db.insert_results(
