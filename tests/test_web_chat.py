@@ -99,43 +99,38 @@ _PATIENT_REPLY = {
 }
 
 
-def test_red_flag_message_returns_urgent_template_with_zero_llm_calls(
+def test_red_flag_message_during_intake_warns_but_the_turn_still_happens(
     tmp_path: Path,
 ) -> None:
-    app, _repo, _db, calls = build_app(tmp_path)
-    client = TestClient(app)
-    login(client)
-
-    response = client.post(
-        "/chat/send", data={"text": "I have crushing chest pain radiating to my left arm"}
+    """Warn, don't block (ADR 0014): the warning rides along with a real
+    reply instead of replacing it, so a patient recounting past history
+    still gets her turn recorded."""
+    intake_transport = _intake_transport(
+        [
+            {
+                "message": "Thanks for telling me — I've recorded that 2019 episode.",
+                "ops": [],
+                "topics_covered": [],
+                "intake_complete": False,
+            }
+        ]
     )
-
-    assert response.status_code == 200
-    assert "call 911" in response.text.lower() or "emergency" in response.text.lower()
-    assert calls == []
-
-
-def test_red_flag_message_during_intake_gives_next_step_guidance_not_a_dead_end(
-    tmp_path: Path,
-) -> None:
-    """Defect fix (live blocker): during an (incomplete) intake conversation,
-    the urgent message must not strand a patient recounting past history --
-    it gets extra next-step guidance on top of the untouched
-    `red_flag_screen` message, still with zero LLM calls."""
-    app, _repo, _db, calls = build_app(tmp_path)  # intake incomplete by default
+    app, _repo, _db, _calls = build_app(tmp_path, intake_agent_transport=intake_transport)
     client = TestClient(app)
     login(client)
 
     response = client.post(
-        "/chat/send", data={"text": "I have crushing chest pain radiating to my left arm"}
+        "/chat/send",
+        data={"text": "Back in 2019 I had crushing chest pain radiating to my left arm"},
     )
 
     assert response.status_code == 200
     body_lower = response.text.lower()
-    assert "call 911" in body_lower or "emergency" in body_lower
-    assert "please get care first" in body_lower
-    assert "one thing at a time" in body_lower
-    assert calls == []
+    assert "heads up" in body_lower  # the mandatory, code-inserted warning
+    assert "cardiac chest pain" in body_lower  # naming the matched category
+    # The turn still happened: the model's reply is there alongside the
+    # warning (apostrophes are HTML-escaped in the rendered bubble).
+    assert "recorded that 2019 episode" in body_lower
 
 
 def test_diagnostic_turn_renders_the_three_tiers(tmp_path: Path) -> None:
@@ -516,12 +511,25 @@ def test_successful_diagnostic_turn_triggers_visit_capture(tmp_path: Path) -> No
     assert fact.provenance.dag_node == "visit-capture"
 
 
-def test_red_flag_turn_never_triggers_visit_capture(tmp_path: Path) -> None:
-    capture_calls: list = []
-    app, repo, _db, _calls = build_app(
-        tmp_path, visit_capture_transport=exploding_transport(capture_calls)
+def test_red_flag_turn_still_carries_the_warning_after_intake_is_complete(
+    tmp_path: Path,
+) -> None:
+    """The warning is not intake-only: a flagged message in an ordinary
+    post-onboarding visit is annotated the same way (ADR 0014)."""
+    calls: list = []
+    primary = make_primary_transport([_SLE_MOST_LIKELY_OP, _PE_CANT_MISS_OP], _PATIENT_REPLY, calls)
+    challenger = make_challenger_transport(
+        counter_arguments=[
+            {"hypothesis_id": "sle-01", "argument": "Anti-dsDNA has not been checked yet."}
+        ],
+        additional_ops=[],
+        calls=calls,
+    )
+    app, repo, db, _calls = build_app(
+        tmp_path, primary_transport=primary, challenger_transport=challenger
     )
     mark_intake_complete(repo)
+    _seed_ana_titer_row(db)
     client = TestClient(app)
     login(client)
 
@@ -530,7 +538,8 @@ def test_red_flag_turn_never_triggers_visit_capture(tmp_path: Path) -> None:
     )
 
     assert response.status_code == 200
-    assert capture_calls == []
+    assert "heads up" in response.text.lower()
+    assert "Most Likely" in response.text, "the diagnostic turn still runs"
 
 
 def test_withheld_turn_never_triggers_visit_capture(tmp_path: Path) -> None:
