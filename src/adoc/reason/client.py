@@ -12,6 +12,18 @@ cost/duration/scrub_count — never message content), (c) retries a bounded
 number of times with backoff on transient transport errors, and (d) raises
 `LlmError` for anything else.
 
+`from_settings` — the real-wiring factory every production caller (`cli.py`,
+`web/app.py`) uses — defaults `scrubber` to a real `Scrubber` built from
+`settings.data_dir/case/identifiers.yaml` (`adoc.privacy.IDENTIFIERS_RELPATH`)
+when the caller doesn't pass one explicitly. This is deliberate: the safe
+path is the default, and a caller who wants no scrubbing must say so
+explicitly (`scrubber=Scrubber.noop()`) rather than getting it by omission.
+The bare `LlmClient(bindings, providers)` constructor still defaults
+`scrubber` to `Scrubber.noop()` — that constructor has no `Settings`/
+`data_dir` to build a real one from, and its callers are exclusively tests
+and `evals/suites/*.py` (which only ever wire fake, non-network transports
+— see those modules), never a real outbound call path.
+
 Providers are thin wrappers over an injectable transport function
 (`_TransportFn`) so unit tests can supply a fake transport and never touch
 the network or construct a real SDK client — see `AnthropicProvider` /
@@ -34,7 +46,7 @@ from typing import Any, Literal, Protocol
 from pydantic import BaseModel, ConfigDict
 
 from adoc.config import ModelBinding, Settings, load_model_bindings
-from adoc.privacy import Scrubber
+from adoc.privacy import IDENTIFIERS_RELPATH, Scrubber
 
 FEATHERLESS_BASE_URL = "https://api.featherless.ai/v1"
 
@@ -481,10 +493,23 @@ class LlmClient:
     ) -> None:
         self._bindings = bindings
         self._providers = providers
+        # NOTE: this bare-constructor default is intentionally a no-op — see
+        # the module docstring. `from_settings` (the real-wiring path) does
+        # NOT use this default; it builds a real `Scrubber` unless the
+        # caller opts out explicitly.
         self._scrubber = scrubber if scrubber is not None else Scrubber.noop()
         self._audit_log_path = audit_log_path
         self._max_retries = max_retries
         self._backoff_base_seconds = backoff_base_seconds
+
+    @property
+    def privacy_warning(self) -> str | None:
+        """`None` if this client's scrubber is either an explicit no-op or
+        has at least one name configured to match; otherwise a
+        human-readable warning naming the exact identifiers file to
+        create/populate. See `Scrubber.coverage_warning` — surfaced here so
+        `cli.py`/`web/app.py` never have to reach into `_scrubber`."""
+        return self._scrubber.coverage_warning
 
     @classmethod
     def from_settings(
@@ -499,6 +524,10 @@ class LlmClient:
     ) -> LlmClient:
         """Build a client from `Settings` + `models.yaml`.
 
+        `scrubber`, if omitted, defaults to a real `Scrubber` built from
+        `settings.data_dir/case/identifiers.yaml` — see the module
+        docstring. Pass `scrubber=Scrubber.noop()` explicitly to opt out.
+
         `transports` (keyed by provider name: `anthropic`/`openai`/
         `featherless`) lets callers (tests, or a caller wanting a shared
         connection pool) inject a provider's transport; omitted providers
@@ -506,6 +535,8 @@ class LlmClient:
         """
         bindings = load_model_bindings(settings.models_file)
         transports = transports or {}
+        if scrubber is None:
+            scrubber = Scrubber.from_file(settings.data_dir / IDENTIFIERS_RELPATH)
 
         anthropic_key = (
             settings.anthropic_api_key.get_secret_value() if settings.anthropic_api_key else None

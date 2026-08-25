@@ -7,6 +7,14 @@ repo, sqlite file, or network. `vision`/`renderer` are additional,
 optional seams for the same reason (the upload route's ingestion pipeline
 needs both) — real callers (`cli.py`'s `serve` command) never pass them.
 
+The default `client` (`LlmClient.from_settings(resolved_settings)`) scrubs
+direct patient identifiers from every outbound call by default — see
+`reason/client.py`'s module docstring and `privacy.py`. If the identifiers
+file is missing or has no name configured, that is surfaced loudly at
+startup (stderr) rather than silently degrading; `app.state.privacy_warning`
+(also reachable via `web.deps.get_privacy_warning`) carries the same
+message for any route/template that wants to show it.
+
 Everything except `/login`, `/healthz` (the ALB health check target), and
 `/static/*` requires a valid session cookie (see
 `web.security.SessionAuthMiddleware`).
@@ -14,6 +22,7 @@ Everything except `/login`, `/healthz` (the ALB health check target), and
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -67,6 +76,10 @@ def create_app(
     resolved_vision = vision if vision is not None else VisionClient(resolved_client)
     resolved_renderer = renderer if renderer is not None else pdftoppm_renderer
 
+    privacy_warning = resolved_client.privacy_warning
+    if privacy_warning is not None:
+        print(f"adoc serve: WARNING: {privacy_warning}", file=sys.stderr)
+
     app = FastAPI(title="a-doc")
     app.state.settings = resolved_settings
     app.state.repo = resolved_repo
@@ -74,6 +87,7 @@ def create_app(
     app.state.client = resolved_client
     app.state.vision = resolved_vision
     app.state.renderer = resolved_renderer
+    app.state.privacy_warning = privacy_warning
     app.state.session_secret = load_or_create_session_secret(resolved_repo)
     app.state.login_rate_limiter = LoginRateLimiter()
 
