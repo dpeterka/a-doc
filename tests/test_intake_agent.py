@@ -21,7 +21,6 @@ from adoc.ingest.genomics import GENOMIC_DOC_TYPE
 from adoc.intake.agent import (
     INTAKE_AGENT_PROMPT_VERSION,
     INTAKE_OPENER_MESSAGE,
-    INTAKE_TRANSCRIPT_RELPATH,
     LONG_MESSAGE_THRESHOLD_CHARS,
     ContinuityInfo,
     IntakeTurnResult,
@@ -712,7 +711,14 @@ def test_correction_to_a_covered_topic_regenerates_case_file(tmp_path: Path) -> 
 # --- error paths: nothing persisted -----------------------------------------------------
 
 
-def test_llm_error_persists_nothing(tmp_path: Path) -> None:
+def test_llm_error_persists_no_facts_but_still_records_the_exchange_in_the_transcript(
+    tmp_path: Path,
+) -> None:
+    """Structured-output parsing failing on BOTH attempts leaves nothing to
+    apply as facts (there ARE no ops), so `INTAKE_FACTS_RELPATH` is
+    correctly untouched. But the patient's own words must not vanish
+    without a trace either -- see `run_intake_turn`'s docstring -- so the
+    raw exchange is still written to the transcript even on this path."""
     repo = DataRepo.init_at(tmp_path / "data")
     db = LabsDb(":memory:")
 
@@ -732,7 +738,8 @@ def test_llm_error_persists_nothing(tmp_path: Path) -> None:
 
     assert outcome.kind == "error"
     assert not (repo.root / INTAKE_FACTS_RELPATH).exists()
-    assert not (repo.root / INTAKE_TRANSCRIPT_RELPATH).exists()
+    entries = read_intake_transcript(repo)
+    assert [e["text"] for e in entries] == ["I'm 41.", outcome.text]
 
 
 def test_duplicate_fact_id_op_is_rejected_but_turn_still_replies_and_persists(
@@ -1051,6 +1058,185 @@ def test_run_intake_turn_can_flag_a_fact_follow_up(tmp_path: Path) -> None:
     assert fact is not None
     assert fact.follow_up is True
     assert [f.id for f in active_follow_ups(store)] == ["rash-followup"]
+
+
+# --- the stated invariant: no malformed field/op/artifact may cost the whole turn -------
+#
+# Five separate live incidents broke this same shape (see `run_intake_turn`'s docstring):
+# an unrecognized `section` value, a flat `add_fact` shape, a placeholder date string, a
+# rigidly-typed `age_at_onset`, and a source-ref pattern rejecting real filenames. Rather
+# than pin each incident as its own regression test, this drives ONE turn with a batch of
+# adversarial-but-plausible inputs covering that whole class at once, against topics
+# already marked covered so the writer path that actually crashed in production runs this
+# turn (not just fact capture).
+
+
+def test_run_intake_turn_survives_a_batch_of_adversarial_but_plausible_inputs(
+    tmp_path: Path,
+) -> None:
+    repo = DataRepo.init_at(tmp_path / "data")
+    db = LabsDb(":memory:")
+    _seed_all_topics_covered_except(repo)  # every topic already covered -> amend-mode writes
+
+    oversized_description = "chronic fatigue and joint pain " * 2000  # ~64KB, one field
+
+    client, _transport = _make_client(
+        [
+            _turn(
+                "Got all of that, thank you for walking me through it.",
+                ops=[
+                    # 1. Flat shape (no "fact" wrapper) + a vague age -- both
+                    #    `AddFact._accept_flat_shape` and the now-free-form
+                    #    `Relative.age_at_onset` must hold.
+                    {
+                        "op": "add_fact",
+                        "id": "father-diabetes",
+                        "section": "family_history",
+                        "kind": "relative",
+                        "statement": "Patient's father had diabetes.",
+                        "fields": {
+                            "relation": "father",
+                            "conditions": "diabetes",
+                            "age_at_onset": "late 30s",
+                        },
+                    },
+                    # 2. A null where a "required" text field is concerned:
+                    #    no `relation` in `fields` at all.
+                    {
+                        "op": "add_fact",
+                        "fact": {
+                            "id": "unnamed-relative",
+                            "section": "family_history",
+                            "kind": "relative",
+                            "statement": "An unspecified relative with early heart disease.",
+                            "fields": {"conditions": "heart disease"},
+                        },
+                    },
+                    # 3. A vague year + an out-of-vocabulary `status` value.
+                    {
+                        "op": "add_fact",
+                        "fact": {
+                            "id": "mother-lupus",
+                            "section": "prior_diagnoses",
+                            "kind": "diagnosis",
+                            "statement": "Doctor diagnosed the patient with lupus.",
+                            "attribution": "doctor_diagnosed",
+                            "precision": "approx",
+                            "fields": {
+                                "by_whom": "Dr. Patel",
+                                "year": "a few years ago",
+                                "status": "not-a-real-status",
+                            },
+                        },
+                    },
+                    # 4. A vague age on a basics fact.
+                    {
+                        "op": "add_fact",
+                        "fact": {
+                            "id": "basic-age-vague",
+                            "section": "basics",
+                            "kind": "basic",
+                            "statement": "Patient is in her mid-40s.",
+                            "fields": {"age": "mid-40s"},
+                        },
+                    },
+                    # 5. A vague date + an oversized field.
+                    {
+                        "op": "add_fact",
+                        "fact": {
+                            "id": "long-event",
+                            "section": "events",
+                            "kind": "event",
+                            "statement": "A long-ago hospitalization.",
+                            "date_approx": "recently",
+                            "precision": "approx",
+                            "fields": {"description": oversized_description},
+                        },
+                    },
+                ],
+            )
+        ]
+    )
+
+    outcome = run_intake_turn(client, repo, db, "Let me tell you about my family and history.")
+
+    # The turn still replies -- nothing here escapes as a 500.
+    assert outcome.kind == "reply"
+    assert "Got all of that" in outcome.text
+
+    # Every syntactically-valid fact persisted, including the adversarial ones.
+    store = IntakeFactsStore(repo.root)
+    persisted_ids = {f.id for f in store.active_facts()}
+    assert persisted_ids == {
+        "father-diabetes",
+        "unnamed-relative",
+        "mother-lupus",
+        "basic-age-vague",
+        "long-event",
+    }
+    father = store.get("father-diabetes")
+    assert father is not None
+    assert father.fields["age_at_onset"] == "late 30s"
+
+    # And the writers actually ran and rendered what survived -- the
+    # original production crash happened HERE, not at fact capture.
+    family_history = repo.read("case/family-history.md")
+    assert "late 30s" in family_history
+
+    theories = repo.read("case/patient-theories.md")
+    assert "lupus" in theories.lower()
+    assert "confirmed" in theories  # out-of-vocabulary status clamped, not raised
+
+    case_summary = repo.read("case/case-summary.md")
+    assert "mid-40s" in case_summary
+
+
+def test_run_intake_turn_degrades_when_a_writer_raises_instead_of_losing_the_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A writer failure (any reason -- future schema drift, a bad
+    `wizard._write_*`, disk trouble) must degrade to "skip this artifact,
+    log it," never cost the reply or the already-applied facts."""
+    repo = DataRepo.init_at(tmp_path / "data")
+    db = LabsDb(":memory:")
+    _seed_all_topics_covered_except(repo)
+
+    def _boom(*_args: object, **_kwargs: object) -> list[str]:
+        raise RuntimeError("simulated writer failure")
+
+    monkeypatch.setattr(agent_module, "_write_section_from_facts", _boom)
+
+    client, _transport = _make_client(
+        [
+            _turn(
+                "Got it, noted.",
+                ops=[
+                    {
+                        "op": "add_fact",
+                        "fact": {
+                            "id": "penicillin-allergy",
+                            "section": "allergies",
+                            "kind": "allergy",
+                            "statement": "Allergic to penicillin, hives.",
+                            "fields": {"allergen": "penicillin", "reaction": "hives"},
+                        },
+                    }
+                ],
+            )
+        ]
+    )
+
+    outcome = run_intake_turn(client, repo, db, "I'm allergic to penicillin, it gives me hives.")
+
+    # The reply still comes back -- the writer's raise never escaped.
+    assert outcome.kind == "reply"
+    assert "Got it, noted." in outcome.text
+
+    # The fact is still persisted even though rendering it failed.
+    store = IntakeFactsStore(repo.root)
+    fact = store.get("penicillin-allergy")
+    assert fact is not None
+    assert fact.status == "active"
 
 
 # --- post-intake continuity: docs/adr/0018-intake-clinical-progression-and-continuity.md ---

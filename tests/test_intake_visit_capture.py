@@ -10,6 +10,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import pytest
+
+import adoc.intake.agent as agent_module
 from adoc.casefile.repo import DataRepo
 from adoc.config import ModelBinding
 from adoc.intake.agent import (
@@ -207,6 +210,62 @@ def test_follow_up_marked_in_one_visit_appears_in_the_next_visits_context(tmp_pa
     sent_content = calls[0].messages[-1].content
     assert "Follow-ups flagged on a prior visit" in sent_content
     assert "Rash spreading on her arm." in sent_content
+
+
+def test_writer_failure_degrades_instead_of_raising_into_the_calling_chat_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same protection as `run_intake_turn`: `web.routes.chat` calls this
+    function AFTER the diagnostic/informational reply has already
+    succeeded, so a writer failure here must never raise back into that
+    turn -- it must degrade, and the fact this pass applied must still be
+    persisted (via the early `facts_store.save()` before any writer runs)."""
+    from adoc.intake.coverage import (
+        INTAKE_STATE_RELPATH,
+        CoverageState,
+        TopicCoverage,
+        save_coverage_state,
+    )
+
+    repo = DataRepo.init_at(tmp_path / "data")
+    db = LabsDb(":memory:")
+    save_coverage_state(
+        repo.root / INTAKE_STATE_RELPATH,
+        CoverageState(topics={"allergies": TopicCoverage(covered=True)}),
+    )
+    repo.commit("chore: seed covered allergies topic")
+
+    def _boom(*_args: object, **_kwargs: object) -> list[str]:
+        raise RuntimeError("simulated writer failure")
+
+    monkeypatch.setattr(agent_module, "_write_section_from_facts", _boom)
+
+    client = _make_client(
+        [
+            {
+                "op": "add_fact",
+                "fact": {
+                    "id": "new-allergy",
+                    "section": "allergies",
+                    "kind": "allergy",
+                    "statement": "Allergic to shellfish.",
+                    "fields": {"allergen": "shellfish"},
+                },
+            }
+        ]
+    )
+
+    result = run_visit_capture(client, repo, db, "Oh, I'm also allergic to shellfish.")
+
+    # No exception escaped, and this isn't reported as a capture error --
+    # only the artifact rendering degraded, not the fact capture itself.
+    assert result.error is None
+    assert result.applied.added == ["new-allergy"]
+
+    store = IntakeFactsStore(repo.root)
+    fact = store.get("new-allergy")
+    assert fact is not None
+    assert fact.status == "active"
 
 
 def test_duplicate_fact_id_op_is_rejected_not_an_error_and_persists_nothing(

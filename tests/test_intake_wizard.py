@@ -68,10 +68,10 @@ def _make_client(queues: dict[str, list[dict[str, Any]]]) -> tuple[LlmClient, Sc
 # --- canned scripted-persona extractions -----------------------------------------------
 
 BASICS = {
-    "age": 41,
+    "age": "41",
     "sex_at_birth": "female",
-    "height_cm": 165.0,
-    "weight_kg": 63.0,
+    "height_cm": "165cm",
+    "weight_kg": "63kg",
     "occupation": "software engineer",
     "exposures": ["mold exposure at a prior workplace"],
 }
@@ -124,7 +124,7 @@ EVENTS = {
 
 PRIOR_DIAGNOSES = {
     "diagnoses": [
-        {"name": "Hypothyroidism", "by_whom": "Dr. Lee", "year": 2018, "status": "confirmed"}
+        {"name": "Hypothyroidism", "by_whom": "Dr. Lee", "year": "2018", "status": "confirmed"}
     ],
     "patient_suspected": [
         {
@@ -139,7 +139,7 @@ FAMILY_HISTORY = {
         {
             "relation": "mother",
             "conditions": ["Hashimoto's thyroiditis"],
-            "age_at_onset": 35,
+            "age_at_onset": "35",
             "deceased": False,
             "age_at_death": None,
         },
@@ -148,7 +148,7 @@ FAMILY_HISTORY = {
             "conditions": ["rheumatoid arthritis"],
             "age_at_onset": None,
             "deceased": True,
-            "age_at_death": 72,
+            "age_at_death": "72",
         },
     ]
 }
@@ -406,10 +406,10 @@ def test_revise_merges_corrections_over_prior_draft_without_losing_untouched_fie
         {
             "BasicsSection": [
                 {
-                    "age": 41,
+                    "age": "41",
                     "sex_at_birth": "female",
-                    "height_cm": 165.0,
-                    "weight_kg": 63.0,
+                    "height_cm": "165cm",
+                    "weight_kg": "63kg",
                     "occupation": None,
                     "exposures": [],
                 },

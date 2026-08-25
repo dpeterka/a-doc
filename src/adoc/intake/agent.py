@@ -748,6 +748,37 @@ def _write_section_from_facts(
     return write_section(repo, section_key, section_data)
 
 
+def _write_section_from_facts_safe(
+    repo: DataRepo, facts_store: IntakeFactsStore, section_key: str
+) -> list[str]:
+    """Best-effort wrapper around `_write_section_from_facts` -- the
+    stated invariant this module upholds end to end (see `run_intake_turn`'s
+    and `run_visit_capture`'s docstrings): facts are the source of truth,
+    a case-file artifact is always DERIVED from them, and a failure while
+    deriving one (`facts_to_section_data`'s conversion, the section
+    schema's `model_validate`, or a `wizard._write_*` writer) must degrade
+    -- log the topic and the reason, skip just that one artifact -- rather
+    than raise and cost the patient her whole turn. The live incident this
+    fixes: a family-history relative's `age_at_onset` didn't survive
+    `model_validate` because the schema forced an exact integer (see
+    `intake.sections.Relative.age_at_onset`'s docstring); that field is now
+    fixed at the source, but this wrapper is the general backstop for
+    every OTHER way rendering a topic's artifact could fail, known or not
+    yet discovered -- the facts themselves are unaffected either way and
+    the artifact can always be regenerated once whatever broke is fixed.
+    """
+    try:
+        return _write_section_from_facts(repo, facts_store, section_key)
+    except Exception:
+        logger.exception(
+            "intake turn: writer for topic %r failed; skipping this artifact this turn "
+            "(the underlying facts are already persisted and unaffected -- the artifact "
+            "can be regenerated on a later turn once the cause is fixed)",
+            section_key,
+        )
+        return []
+
+
 def _build_ops_retry_feedback(rejected: list[str]) -> str:
     """Feedback text for the ONE ops-retry `run_intake_turn` spends when
     `IntakeFactsStore.apply_ops` rejects part of a turn's ops -- same shape
@@ -775,19 +806,36 @@ def run_intake_turn(client: LlmClient, repo: DataRepo, db: LabsDb, text: str) ->
     No automated emergency screening (see `docs/adr/0021*.md` for why):
     intake is historical narrative by construction, and matched constantly.
 
-    A malformed fact op must never cost the patient her whole turn (the live
-    incident this fixes: one op with an unrecognized `section` raised
-    `IntakeError`, and the WHOLE turn — reply included — was lost).
-    `IntakeFactsStore.apply_ops` itself is tolerant (applies every valid op,
-    collects the rest in `.rejected`); on top of that, this function spends
-    ONE feedback-guided retry — mirroring `reason.stages.composer_stage`'s
-    gate-guided rewrite and the citation checker's retry — naming exactly
-    which ops were rejected and why, so the model can re-emit corrected
-    versions. `message`/`topics_covered`/`intake_complete` always come from
-    the FIRST attempt: the retry is narrowly about fixing `ops`, never about
-    re-deciding what to say. Still-rejected ops after the retry (or a retry
+    **The invariant this function upholds end to end:** no single malformed
+    field, op, artifact conversion, or derived write may cost the patient
+    her turn. At most she loses the one detail that was actually
+    unrecoverable (never the message, and never facts that DID apply
+    cleanly). This has broken in five different shapes in production so
+    far — an unrecognized `section` value aborting the whole op batch, an
+    `add_fact` emitted flat instead of nested failing structured-output
+    parsing outright, a placeholder date string crashing `confirm()`, a
+    rigidly-typed `age_at_onset` rejecting "late 30s", and a source-ref
+    pattern rejecting real filenames — different layers, same shape: a
+    strict boundary meeting real variability. Concretely, in THIS function:
+    `IntakeFactsStore.apply_ops` is tolerant by design (applies every valid
+    op, collects the rest in `.rejected`, never raises); this function
+    spends ONE feedback-guided retry on top of that — mirroring
+    `reason.stages.composer_stage`'s gate-guided rewrite and the citation
+    checker's retry — naming exactly which ops were rejected and why, so
+    the model can re-emit corrected versions (`message`/`topics_covered`/
+    `intake_complete` always come from the FIRST attempt: the retry is
+    narrowly about fixing `ops`). Facts are persisted BEFORE anything
+    derived from them is attempted (a rendering failure must never risk
+    losing what was already captured); every per-topic artifact write goes
+    through `_write_section_from_facts_safe`, which degrades to "skip this
+    artifact, log why" rather than raising; and the corroboration sweep is
+    similarly non-fatal. Still-rejected ops after the retry (or a retry
     call that itself fails) are simply dropped and logged; the turn still
-    replies normally either way.
+    replies normally either way. The one case this function cannot fully
+    protect against is structured-output parsing failing on BOTH attempts —
+    there are no ops to apply at all in that case — but even then the raw
+    exchange is still written to the transcript before returning, so the
+    patient's own words are never silently dropped from the record.
     """
     now = datetime.now(UTC)
     coverage = load_coverage_state(repo.root / INTAKE_STATE_RELPATH)
@@ -854,7 +902,18 @@ def run_intake_turn(client: LlmClient, repo: DataRepo, db: LabsDb, text: str) ->
                         ),
                     ]
                     continue
-                return IntakeOutcome(kind="error", text=f"Sorry, I couldn't process that: {exc}")
+                # Genuinely nothing to apply here (structured-output parsing
+                # failed twice) -- there are no facts to persist, but the
+                # patient's own words must not vanish without a trace: still
+                # write the exchange to the transcript so a later turn's
+                # context (and any human review) sees that she said
+                # something here, even though it couldn't be captured as
+                # structured facts.
+                error_outcome = IntakeOutcome(
+                    kind="error", text=f"Sorry, I couldn't process that: {exc}"
+                )
+                _append_transcript_turn(repo, text, error_outcome)
+                return error_outcome
             logger.warning("intake turn: ops-retry call failed, keeping first attempt: %s", exc)
             break
 
@@ -886,6 +945,16 @@ def run_intake_turn(client: LlmClient, repo: DataRepo, db: LabsDb, text: str) ->
     for reason in applied.rejected:
         logger.warning("intake turn: dropping fact op that failed to apply: %s", reason)
 
+    # Persist the facts BEFORE attempting anything derived from them:
+    # facts are the source of truth (a case-file artifact is always
+    # regenerable from them, never the reverse), so a failure in the
+    # rendering below must never risk losing what this turn already
+    # captured. This is a bare `.save()` -- the git commit (which also
+    # covers coverage state, the transcript, and any artifacts) still
+    # happens once at the end of the turn, but the on-disk facts file
+    # itself is never left depending on a writer's success.
+    facts_store.save()
+
     touched_ids = [*applied.added, *applied.updated, *applied.retracted]
     touched_topics = {
         fact.section for fact_id in touched_ids if (fact := facts_store.get(fact_id)) is not None
@@ -896,10 +965,11 @@ def run_intake_turn(client: LlmClient, repo: DataRepo, db: LabsDb, text: str) ->
     # Amend mode: a correction/addition to an already-covered topic
     # regenerates that topic's case-file artifact(s) immediately, even
     # though this turn isn't newly covering anything (facts are editable
-    # at any time, during AND after the initial visit).
+    # at any time, during AND after the initial visit). A writer failure
+    # here is never fatal to the turn -- see `_write_section_from_facts_safe`.
     for topic_key in touched_topics:
         if _is_covered(coverage, topic_key):
-            artifacts.extend(_write_section_from_facts(repo, facts_store, topic_key))
+            artifacts.extend(_write_section_from_facts_safe(repo, facts_store, topic_key))
 
     # --- deterministic topic-coverage veto: code, not the model, decides ---
     for topic_key in turn.topics_covered:
@@ -907,7 +977,7 @@ def run_intake_turn(client: LlmClient, repo: DataRepo, db: LabsDb, text: str) ->
             continue
         if section_completion_blockers(facts_store.facts, topic_key):
             continue  # vetoed silently — routine turns never surface gate mechanics
-        artifacts.extend(_write_section_from_facts(repo, facts_store, topic_key))
+        artifacts.extend(_write_section_from_facts_safe(repo, facts_store, topic_key))
         _mark_covered(coverage, topic_key, when=now)
 
     # --- wrap-up: intake_complete is accepted only when every topic is
@@ -937,15 +1007,27 @@ def run_intake_turn(client: LlmClient, repo: DataRepo, db: LabsDb, text: str) ->
     # Corroboration sweep (deterministic, no LLM call): re-check every fact
     # this turn added or updated against already-ingested documentation.
     # Skipped on a pure-retract turn (nothing new to corroborate) —
-    # `docs/adr/0013-fact-corroboration.md`.
+    # `docs/adr/0013-fact-corroboration.md`. Non-fatal like the writers
+    # above: this reads documents/encounters/labs off disk and is not
+    # immune to a malformed source (e.g. a broken encounter file), and a
+    # failure here must degrade to "corroboration state stays as it was"
+    # rather than cost the turn its reply, its facts, or its commit.
     if applied.added or applied.updated:
-        corroboration_updates = corroborate_facts(facts_store.facts, db, repo)
-        facts_store.apply_corroboration(corroboration_updates, at=now)
+        try:
+            corroboration_updates = corroborate_facts(facts_store.facts, db, repo)
+            facts_store.apply_corroboration(corroboration_updates, at=now)
+        except Exception:  # noqa: BLE001 - see comment above: must never cost the turn
+            logger.exception(
+                "intake turn: corroboration sweep failed; leaving facts' corroboration state "
+                "unchanged for this turn"
+            )
 
-    # Persist (an LlmError above already returned before any of this —
-    # nothing is written for that turn; a rejected op never blocks the
-    # persist of everything else that DID apply — see this function's
-    # docstring).
+    # Persist again to capture the corroboration sweep's updates on top of
+    # the early save above (which already protected this turn's own facts
+    # regardless of what happens below). An LlmError above already returned
+    # before any of this — nothing is written for that turn; a rejected op
+    # never blocks the persist of everything else that DID apply — see
+    # this function's docstring.
     facts_store.save()
     save_coverage_state(repo.root / INTAKE_STATE_RELPATH, coverage)
     _append_transcript_turn(repo, text, outcome)
@@ -1185,17 +1267,24 @@ def run_visit_capture(client: LlmClient, repo: DataRepo, db: LabsDb, text: str) 
     provenance and no reply/coverage/wrap-up handling (there is nothing left
     to onboard).
 
-    Deliberately fails soft: an `LlmError` from the client call is caught,
-    logged, and reported back via `CaptureResult.error` — it must NEVER
-    raise and break the calling chat turn, whose diagnostic/informational
-    reply has already succeeded by the time this runs (`web.routes.chat`).
-    `apply_ops` itself is tolerant of a bad op (unknown/duplicate id — see
-    `intake.facts`), so a single malformed op never costs this pass its
-    other, valid ones; anything rejected is logged and otherwise ignored
-    (this pass is silent, so there is no reply to append it to). Persists
-    (and commits) only when at least one op actually changed the store —
-    the common case (a turn with nothing new to capture, or one whose only
-    ops were all rejected) touches disk not at all.
+    Deliberately fails soft end to end, never just at the LLM call: an
+    `LlmError` from the client call is caught, logged, and reported back via
+    `CaptureResult.error`. `apply_ops` itself is tolerant of a bad op
+    (unknown/duplicate id — see `intake.facts`), so a single malformed op
+    never costs this pass its other, valid ones; anything rejected is
+    logged and otherwise ignored (this pass is silent, so there is no reply
+    to append it to). Facts are persisted BEFORE any artifact is derived
+    from them (same reasoning as `run_intake_turn`), each artifact write
+    goes through `_write_section_from_facts_safe` so a rendering failure
+    only skips that one artifact, and everything after that early save
+    (corroboration, the final save, the commit) is wrapped so a failure
+    there degrades to a reported `.error` rather than raising. This
+    function must NEVER raise and break the calling chat turn, whose
+    diagnostic/informational reply has already succeeded by the time this
+    runs (`web.routes.chat`, which documents exactly this contract).
+    Persists (and commits) only when at least one op actually changed the
+    store — the common case (a turn with nothing new to capture, or one
+    whose only ops were all rejected) touches disk not at all.
     """
     facts_store = IntakeFactsStore(repo.root)
     user_content = (
@@ -1238,6 +1327,11 @@ def run_visit_capture(client: LlmClient, repo: DataRepo, db: LabsDb, text: str) 
         # above -- some other no-op case): touch disk not at all.
         return CaptureResult(applied=applied)
 
+    # Persist BEFORE attempting anything derived from the facts -- same
+    # reasoning as `run_intake_turn`: a failure below must never cost this
+    # silent pass the facts it already applied.
+    facts_store.save()
+
     coverage = load_coverage_state(repo.root / INTAKE_STATE_RELPATH)
     touched_topics = {
         fact.section for fact_id in touched_ids if (fact := facts_store.get(fact_id)) is not None
@@ -1245,13 +1339,25 @@ def run_visit_capture(client: LlmClient, repo: DataRepo, db: LabsDb, text: str) 
     artifacts: list[str] = []
     for topic_key in touched_topics:
         if _is_covered(coverage, topic_key):
-            artifacts.extend(_write_section_from_facts(repo, facts_store, topic_key))
+            artifacts.extend(_write_section_from_facts_safe(repo, facts_store, topic_key))
 
-    corroboration_updates = corroborate_facts(facts_store.facts, db, repo)
-    facts_store.apply_corroboration(corroboration_updates, at=now)
+    # Everything past this point (corroboration, the final save, the
+    # commit) touches the filesystem/db in ways this pass cannot fully
+    # guarantee against, and per the module contract this function must
+    # never raise into the calling chat turn -- degrade to a reported
+    # `.error` instead. The facts themselves are already safely persisted
+    # by the early save above regardless of what happens here.
+    try:
+        corroboration_updates = corroborate_facts(facts_store.facts, db, repo)
+        facts_store.apply_corroboration(corroboration_updates, at=now)
 
-    facts_store.save()
-    paths = [INTAKE_FACTS_RELPATH, *sorted(set(artifacts))]
-    repo.commit("feat(intake): visit-capture pass", paths=paths)
+        facts_store.save()
+        paths = [INTAKE_FACTS_RELPATH, *sorted(set(artifacts))]
+        repo.commit("feat(intake): visit-capture pass", paths=paths)
+    except Exception as exc:  # noqa: BLE001 - see module docstring: must never crash the chat turn
+        logger.exception(
+            "visit-capture: post-write step failed; facts were already persisted above"
+        )
+        return CaptureResult(applied=applied, error=str(exc))
 
     return CaptureResult(applied=applied)

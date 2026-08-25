@@ -269,14 +269,18 @@ def _replace_block(text: str, marker: str, heading: str, body: str) -> str:
 
 def _write_basics(repo: DataRepo, data: BasicsSection) -> list[str]:
     lines = []
-    if data.age is not None:
+    if data.age:
         lines.append(f"- Age: {data.age}")
     if data.sex_at_birth:
         lines.append(f"- Sex at birth: {data.sex_at_birth}")
-    if data.height_cm is not None:
-        lines.append(f"- Height: {data.height_cm} cm")
-    if data.weight_kg is not None:
-        lines.append(f"- Weight: {data.weight_kg} kg")
+    if data.height_cm:
+        # Free-form (see `BasicsSection.height_cm`'s docstring) -- never
+        # assume a unit is missing and append one; the patient's own text
+        # (or the extraction prompt's steer to keep whatever unit they
+        # used) already carries it when given.
+        lines.append(f"- Height: {data.height_cm}")
+    if data.weight_kg:
+        lines.append(f"- Weight: {data.weight_kg}")
     if data.occupation:
         lines.append(f"- Occupation: {data.occupation}")
     if data.exposures:
@@ -368,7 +372,7 @@ def _write_patient_theories(repo: DataRepo, data: PriorDiagnosesSection) -> list
     if data.diagnoses:
         for diagnosis in data.diagnoses:
             who = f" (by {diagnosis.by_whom})" if diagnosis.by_whom else ""
-            year = f", {diagnosis.year}" if diagnosis.year is not None else ""
+            year = f", {diagnosis.year}" if diagnosis.year else ""
             lines.append(f"- {diagnosis.name}{who}{year} — status: {diagnosis.status}")
     else:
         lines.append("_None recorded._")
@@ -398,12 +402,10 @@ def _write_family_history(repo: DataRepo, data: FamilyHistorySection) -> list[st
         lines.append("_Not yet populated._")
     for relative in data.relatives:
         conditions = ", ".join(relative.conditions) if relative.conditions else "none reported"
-        onset = f", onset age {relative.age_at_onset}" if relative.age_at_onset is not None else ""
+        onset = f", onset age {relative.age_at_onset}" if relative.age_at_onset else ""
         death = ""
         if relative.deceased:
-            death_age = (
-                f", age {relative.age_at_death}" if relative.age_at_death is not None else ""
-            )
+            death_age = f", age {relative.age_at_death}" if relative.age_at_death else ""
             death = f" (deceased{death_age})"
         lines.append(f"- **{relative.relation}**: {conditions}{onset}{death}")
     content = "\n".join(lines) + "\n"
