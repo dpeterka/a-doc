@@ -417,6 +417,13 @@ Resources:
       # uvicorn starts, and the grace window must cover it — a real cutover
       # saw the restore succeed and the task get killed anyway by a stale
       # unhealthy verdict from the 120s window.
+      #
+      # This does NOT slow a healthy deploy: it is the window in which a
+      # failing task is tolerated, not a wait before a passing one serves
+      # traffic (that is the target group's health-check interval x healthy
+      # threshold, alb.yaml). Do not shorten it to speed up deploys — the
+      # deploy cost was the target group's deregistration delay, fixed
+      # there. Shortening this only risks killing a legitimate slow restore.
       HealthCheckGracePeriodSeconds: 900
       # Enables `aws ecs execute-command` for one-off shells (README "User
       # provisioning": `adoc user add`), replacing SSM Session Manager
