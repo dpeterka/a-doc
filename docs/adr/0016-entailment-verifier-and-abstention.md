@@ -330,3 +330,40 @@ rule 4 forbids — the responsible call is to leave `models.yaml` unchanged
 and land the retry/cache/deferral optimizations (which need no model
 change) now, with the rebinding as a follow-up once a human can run a live
 comparison against real credentials.
+
+## Revised again (2026-08-25) — binding changed to DeepSeek V3, with live evidence
+
+The `perf/diagnostic-turn-latency` work correctly REFUSED to rebind this
+role, because the hallucination eval suite is fully offline and scripted:
+every candidate scored byte-identically, which is not evidence. CLAUDE.md
+rule 4 wants a real comparison, so one was run — the same 20 labelled
+pairs from `tests/fixtures/entailment/pairs.json`, sent to each candidate
+for real:
+
+| model | latency (20 pairs) | agreement with labels | judgment split |
+|---|---|---|---|
+| deepseek-ai/DeepSeek-R1-0528 (incumbent) | 78s | 17/20 (85%) | 10 entailed / 10 not_entailed |
+| deepseek-ai/DeepSeek-V3-0324 | 20s | 19/20 (95%) | 12 / 8 |
+| gpt-5.2 | 10s | 19/20 (95%) | 12 / 8 |
+
+Two conclusions, one of them uncomfortable:
+
+1. The reasoning model was **both slower and less accurate**. Choosing R1
+   assumed this was a hard judgment; it is a short factual comparison, and
+   the extra deliberation bought nothing.
+2. R1 skewed toward `not_entailed` (10 vs 8 for both candidates). The
+   over-blocking incident earlier this date was therefore not purely a
+   prompt problem, as the first revision assumed — the model contributed,
+   and the prompt fix alone would have left a bias in place.
+
+**V3 chosen over the marginally faster gpt-5.2** to preserve three
+distinct families: Anthropic proposes, OpenAI challenges, DeepSeek
+verifies. Putting the challenger and the verifier on one family would let
+a shared blind spot clear both gates, which is the exact property ADR 0005
+exists to protect. Ten seconds inside a multi-minute turn does not buy
+that back.
+
+**Follow-up:** the offline suite could not have caught this, and cannot
+catch the next one. A live-comparison mode for `adoc eval --candidate`
+(currently Phase 3 scope) is what makes rule 4 enforceable rather than
+aspirational.
