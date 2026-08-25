@@ -35,7 +35,6 @@ from adoc.labs.db import LabsDb
 from adoc.privacy import Scrubber
 from adoc.reason.client import LlmClient
 from adoc.reason.dag import ContractViolation
-from adoc.reason.safety import RedFlagResult
 from adoc.reason.stages import run_diagnostic_turn
 
 PROMPT = (
@@ -108,10 +107,6 @@ def main() -> int:
         )
         return 2
     duration = time.monotonic() - start
-
-    if isinstance(outcome, RedFlagResult):
-        print(f"METADATA: profile=dag red-flagged (no DAG run) duration={duration:.0f}s")
-        return 0
 
     ledger_raw: dict[str, Any] = yaml.safe_load((repo.root / LEDGER_RELPATH).read_text()) or {}
     hyps = ledger_raw.get("hypotheses", [])
