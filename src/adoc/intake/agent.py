@@ -997,7 +997,21 @@ def run_intake_turn(client: LlmClient, repo: DataRepo, db: LabsDb, text: str) ->
             wrapup_note = "\n\n" + _render_wrapup_refusal(coverage, blockers_anywhere)
 
     reply_text = turn.message + wrapup_note
-    gate = treatment_gate(reply_text)
+    # `recording_only`: intake is a SCRIBE conversation — asking "which
+    # medication, and what dose?" and reading a list back for confirmation
+    # is its job (the `medications`/`supplements` topics require exactly
+    # that). The bare-dosage rule made it withhold its own reply to a
+    # patient who had just said she could not remember her medication.
+    # Instruction-shaped output ("start taking 50 mcg daily") still trips
+    # the imperative rule, which is what rule 5 actually guards.
+    gate = treatment_gate(reply_text, recording_only=True)
+    if not gate.passed:
+        # Previously invisible: a withheld intake reply logged nothing, so
+        # the only way to notice was reading the conversation.
+        logger.warning(
+            "intake: reply withheld by the treatment gate; offending span(s): %s",
+            "; ".join(f"{s.text!r} ({s.reason})" for s in gate.spans),
+        )
     outcome = (
         IntakeOutcome(kind="reply", text=reply_text)
         if gate.passed
