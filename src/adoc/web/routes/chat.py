@@ -1,12 +1,6 @@
 """Chat surface (PLAN.md "Session loops (b)"; onboarding merged in per
-`docs/adr/0012-initial-visit-conversation.md`): the red-flag screen runs
-server-side, before any model call, for every turn — this module calls
-`safety.red_flag_screen` itself, first, rather than relying on it only
-happening inside `run_diagnostic_turn`/`run_informational_turn`/
-`run_intake_turn`, because `route_turn` (which decides which diagnostic
-runner to call) is itself a model call. On a flagged turn, `route_turn` and
-every runner are skipped entirely — zero client calls, matching the
-red-team contract in `tests/test_stages.py`.
+`docs/adr/0012-initial-visit-conversation.md`). There is no automated
+emergency screening anywhere in this app (see `docs/adr/0021*.md` for why).
 
 **One chat surface.** While the initial-visit conversation is incomplete
 (`intake.agent.intake_is_complete` is false), every turn — including the
@@ -27,10 +21,10 @@ history.
 complete, every successful informational/diagnostic turn also runs
 `intake.agent.run_visit_capture` — a silent pass that may add or update
 `IntakeFact`s from the patient's message, never touching the DAG or its
-contracts. Skipped entirely on a red-flag/urgent, withheld, or error
-outcome (only a turn that actually reached the patient is worth capturing
-from); failures inside `run_visit_capture` itself are swallowed there, so
-this route never needs to handle them.
+contracts. Skipped entirely on a withheld or error outcome (only a turn
+that actually reached the patient is worth capturing from); failures
+inside `run_visit_capture` itself are swallowed there, so this route never
+needs to handle them.
 
 **Post-intake continuity** (`docs/adr/0018-intake-clinical-progression-and-
 continuity.md`): the first successful informational/diagnostic reply of a
@@ -38,8 +32,8 @@ new "visit" (the gap since the previous chat-transcript entry, captured
 BEFORE this turn's patient message is appended, exceeds `intake.agent.
 VISIT_GAP_THRESHOLD_HOURS`) is prefixed with a short, deterministic,
 code-composed continuity note (`intake.agent.render_continuity_note`) —
-same pattern as `red_flag_warning_prefix`: fixed text the model cannot
-suppress or soften, applied after the model has already spoken.
+fixed text the model cannot suppress or soften, applied after the model
+has already spoken.
 """
 
 from __future__ import annotations
@@ -59,7 +53,6 @@ from adoc.intake.agent import (
     VISIT_GAP_THRESHOLD_HOURS,
     build_continuity_info,
     intake_is_complete,
-    red_flag_warning_prefix,
     render_continuity_note,
     run_intake_turn,
     run_visit_capture,
@@ -68,7 +61,6 @@ from adoc.intake.facts import IntakeFactsStore
 from adoc.labs.db import LabsDb
 from adoc.reason.client import LlmClient, LlmError, LlmResult
 from adoc.reason.dag import ContractViolation
-from adoc.reason.safety import RedFlagResult, red_flag_screen
 from adoc.reason.stages import PatientReply, route_turn, run_diagnostic_turn, run_informational_turn
 from adoc.web.casefile_helpers import append_chat_entry, last_chat_at, read_recent_chat
 from adoc.web.deps import get_client, get_db, get_repo
@@ -105,20 +97,6 @@ _LEDGER_INVARIANT_MESSAGE = (
 )
 
 
-def _with_red_flag_warning(screen: RedFlagResult, reply: str) -> str:
-    """Prepend the deterministic red-flag warning to `reply` on a match.
-
-    Warn-not-block (ADR 0014): the screen still runs before any model call,
-    but a match annotates the turn instead of replacing it. The warning text
-    is fixed in code (`intake.agent.red_flag_warning_prefix`) and applied
-    after the model has spoken, so nothing the model returns can drop or
-    soften it.
-    """
-    if not screen.flagged:
-        return reply
-    return red_flag_warning_prefix(screen.category) + reply
-
-
 def _continuity_note_for_new_visit(
     repo: DataRepo, *, prior_chat_at: datetime | None, now: datetime
 ) -> str | None:
@@ -146,41 +124,32 @@ def _handle_intake_turn(
     text: str, *, client: LlmClient, repo: DataRepo, db: LabsDb
 ) -> dict[str, Any]:
     """One turn of the initial-visit conversation, while intake is
-    incomplete. `run_intake_turn` owns its own red-flag screening,
-    fact-op application, and coverage/wrap-up gating; this just maps its
-    outcome onto the same `{kind, text, tests_to_request}` shape
-    `_handle_turn` returns, so the shared `_chat_turn.html` template and
-    transcript persistence need no branching on which path produced a
-    turn."""
+    incomplete. `run_intake_turn` owns fact-op application and
+    coverage/wrap-up gating; this just maps its outcome onto the same
+    `{kind, text, tests_to_request}` shape `_handle_turn` returns, so the
+    shared `_chat_turn.html` template and transcript persistence need no
+    branching on which path produced a turn."""
     outcome = run_intake_turn(client, repo, db, text)
     return {"kind": outcome.kind, "text": outcome.text, "tests_to_request": []}
 
 
 def _handle_turn(text: str, *, client: LlmClient, repo: DataRepo, db: LabsDb) -> dict[str, Any]:
     """Run one chat turn. Returns a dict of template context for the
-    assistant's rendered turn: `kind`
-    (urgent/informational/diagnostic/error/withheld), `text`, and
-    `tests_to_request` (diagnostic only).
+    assistant's rendered turn: `kind` (informational/diagnostic/error/
+    withheld), `text`, and `tests_to_request` (diagnostic only).
 
     `ContractViolation` and `LedgerInvariantError` are caught alongside
     `LlmError` around every DAG-running call: both are expected,
     safety-driven outcomes of the diagnostic DAG (CLAUDE.md rules 2/3/5) —
     never a reason to let a bare 500/traceback reach the patient.
     """
-    # Warn, don't block (ADR 0014): the screen still runs first, before any
-    # model call, and its match is surfaced verbatim by code at the end of
-    # this function - but it no longer replaces the turn.
-    screen = red_flag_screen(text)
-    if screen.flagged:
-        logger.info("red-flag screen matched: category=%s", screen.category)
-
     try:
         route = route_turn(client, text)
     except LlmError as exc:
         return {"kind": "error", "text": str(exc), "tests_to_request": []}
 
     if route.route == "informational":
-        outcome: LlmResult | RedFlagResult | PatientReply
+        outcome: LlmResult | PatientReply
         try:
             outcome = run_informational_turn(client, repo, db, text)
         except LlmError as exc:
@@ -195,14 +164,8 @@ def _handle_turn(text: str, *, client: LlmClient, repo: DataRepo, db: LabsDb) ->
         except LedgerInvariantError:
             logger.warning("informational chat turn hit a LedgerInvariantError")
             return {"kind": "withheld", "text": _LEDGER_INVARIANT_MESSAGE, "tests_to_request": []}
-        if isinstance(outcome, RedFlagResult):
-            return {"kind": "urgent", "text": outcome.message or "", "tests_to_request": []}
         run_visit_capture(client, repo, db, text)
-        return {
-            "kind": "informational",
-            "text": _with_red_flag_warning(screen, outcome.text),
-            "tests_to_request": [],
-        }
+        return {"kind": "informational", "text": outcome.text, "tests_to_request": []}
 
     try:
         outcome = run_diagnostic_turn(client, repo, db, repo.root / LEDGER_RELPATH, text)
@@ -227,12 +190,10 @@ def _handle_turn(text: str, *, client: LlmClient, repo: DataRepo, db: LabsDb) ->
     except LedgerInvariantError:
         logger.warning("diagnostic chat turn hit a LedgerInvariantError")
         return {"kind": "withheld", "text": _LEDGER_INVARIANT_MESSAGE, "tests_to_request": []}
-    if isinstance(outcome, RedFlagResult):
-        return {"kind": "urgent", "text": outcome.message or "", "tests_to_request": []}
     run_visit_capture(client, repo, db, text)
     return {
         "kind": "diagnostic",
-        "text": _with_red_flag_warning(screen, outcome.tiers_rendered),
+        "text": outcome.tiers_rendered,
         "tests_to_request": outcome.tests_to_request,
     }
 

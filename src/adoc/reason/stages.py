@@ -1,13 +1,9 @@
 """Stage functions and DAG assembly for the diagnostic chat turn (PLAN.md
 "Session loops (b)"): Ledger-Maintainer -> Challenger -> apply -> Composer.
 
-The deterministic red-flag screen runs in the entry points that own the
-patient conversation (`web/routes/chat.py`, `intake/agent.py`), before any
-client call, and a match prepends a fixed warning to the reply rather than
-replacing the turn (ADR 0014, warn-not-block). It is deliberately NOT run
-again here — doing so would re-introduce the block those callers removed.
-CLAUDE.md rule 3 ("stage order is enforced by code, not prompts") still
-governs everything below.
+There is no automated emergency screening anywhere in this app (see
+`docs/adr/0021*.md` for why). CLAUDE.md rule 3 ("stage order is enforced by
+code, not prompts") still governs everything below.
 
 `dag.run()` only returns an audit `DagRun`, not the node outputs
 themselves (dag.py is deliberately a thin, unopinionated runner). The DAG
@@ -54,7 +50,7 @@ from adoc.reason.client import LlmClient, LlmResult, Message
 from adoc.reason.context import ContextPack, build_context
 from adoc.reason.dag import Contract, Ctx, Dag, Node, require_prior_node, run
 from adoc.reason.prompts import Prompt, load_prompt
-from adoc.reason.safety import RedFlagResult, treatment_gate
+from adoc.reason.safety import GateResult, treatment_gate
 from adoc.reason.verify import (
     ENTAILMENT_CACHE_RELPATH,
     Claim,
@@ -512,6 +508,48 @@ def _render_ledger_for_prompt(ledger: Ledger) -> str:
 _COMPOSER_GATE_ATTEMPTS = 2
 
 
+def _composer_gate_feedback(gate: GateResult) -> str:
+    """Build the retry message for a `composer_stage` draft that tripped
+    `safety.treatment_gate`, naming the exact offending span(s) and giving
+    distinct guidance for the two kinds `treatment_gate` can produce
+    (ADR 0020):
+
+    - a "dosage pattern" span is, after the ADR 0020 narrowing, always a
+      genuine dose (a bare mg/mcg/iu amount, or a g/mL/units amount with
+      corroborating dosing context) — tell the model to drop the dose/
+      frequency, not the finding it's attached to.
+    - an "imperative/hortative treatment instruction" span is a start/stop/
+      change instruction — tell the model to reframe it as a lead to
+      discuss with the patient's doctor.
+
+    Before this, the same generic "remove any specific drug name, dose, or
+    instruction" line was sent regardless of which fired, which read as a
+    confusing instruction to strip a measurement on the rare case that
+    happened (the production incident that motivated ADR 0020) and is
+    imprecise even now that only genuine doses reach here.
+    """
+    assert gate.spans, "only call this when the gate actually blocked something"
+    dosage_spans = [s for s in gate.spans if s.reason == "dosage pattern"]
+    other_spans = [s for s in gate.spans if s.reason != "dosage pattern"]
+    parts = [gate.rewrite_instruction or ""]
+    if dosage_spans:
+        doses = "; ".join(repr(s.text) for s in dosage_spans)
+        parts.append(
+            f"These are dosing amounts, not measurements to report verbatim: {doses}. "
+            "If this names a medication or supplement the patient already takes, name "
+            "it WITHOUT the dose or frequency."
+        )
+    if other_spans:
+        instructions = "; ".join(repr(s.text) for s in other_spans)
+        parts.append(
+            f"These read as instructions to start/stop/change a medication: {instructions}. "
+            "Reframe as a lead to discuss with the patient's doctor, not an instruction to "
+            "follow on their own."
+        )
+    parts.append("Return the complete corrected reply in the same schema.")
+    return " ".join(p for p in parts if p)
+
+
 def composer_stage(client: LlmClient, ledger: Ledger, ctx: ContextPack, db: LabsDb) -> PatientReply:
     """Composer/Steward stage (role `primary_reasoner`, schema `PatientReply`).
     Renders the post-challenge ledger for the patient.
@@ -579,9 +617,8 @@ def composer_stage(client: LlmClient, ledger: Ledger, ctx: ContextPack, db: Labs
 
 
 def route_turn(client: LlmClient, text: str) -> TurnRoute:
-    """Router stage (role `classifier`). Callers must have already run the
-    red-flag screen on `text` before reaching this — this call itself is an
-    API call, so it can never be the first thing an unscreened turn touches."""
+    """Router stage (role `classifier`): decides informational vs
+    diagnostic routing for one chat turn."""
     prompt = load_prompt("classifier")
     result = client.complete(
         "classifier",
@@ -1120,7 +1157,7 @@ def build_diagnostic_dag(
 
 
 # --------------------------------------------------------------------------
-# Entry points — red-flag screen runs before any client call
+# Entry points
 # --------------------------------------------------------------------------
 
 
@@ -1130,53 +1167,39 @@ def run_diagnostic_turn(
     db: LabsDb,
     ledger_path: Path,
     text: str,
-) -> PatientReply | RedFlagResult:
+) -> PatientReply:
     """Entry point for one diagnostic chat turn (PLAN.md loop (b)).
 
-    The red-flag screen is NOT applied here (ADR 0014, warn-not-block): the
-    entry points that own the patient conversation — `web/routes/chat.py`
-    and `intake/agent.py` — run `safety.red_flag_screen` first, before any
-    model call, and prepend a deterministic warning to the reply on a match.
-    Screening here as well would re-introduce the block this stage's callers
-    deliberately removed. The `RedFlagResult` arm of the return type is kept
-    for callers that still pattern-match on it."""
+    No automated emergency screening anywhere in this path (see
+    `docs/adr/0021*.md` for why): the DAG reasons over the whole
+    longitudinal record, it is not triaging an acute presentation."""
+    context_pack = build_context(repo, db, include_ledger=True, query=text)
+    prior_ledger = load_ledger(ledger_path)
+    sink: dict[str, BaseModel] = {}
+    dag = build_diagnostic_dag(client, repo, ledger_path, db, sink)
 
-    def _proceed() -> PatientReply:
-        context_pack = build_context(repo, db, include_ledger=True, query=text)
-        prior_ledger = load_ledger(ledger_path)
-        sink: dict[str, BaseModel] = {}
-        dag = build_diagnostic_dag(client, repo, ledger_path, db, sink)
+    run(
+        dag,
+        {
+            "context_pack": context_pack,
+            "patient_turn": PatientTurn(text=text),
+            "ledger": prior_ledger,
+        },
+    )
 
-        run(
-            dag,
-            {
-                "context_pack": context_pack,
-                "patient_turn": PatientTurn(text=text),
-                "ledger": prior_ledger,
-            },
-        )
-
-        reply = sink["composer"]
-        assert isinstance(reply, PatientReply)
-        return reply
-
-    return _proceed()
+    reply = sink["composer"]
+    assert isinstance(reply, PatientReply)
+    return reply
 
 
-def run_informational_turn(
-    client: LlmClient, repo: DataRepo, db: LabsDb, text: str
-) -> LlmResult | RedFlagResult:
+def run_informational_turn(client: LlmClient, repo: DataRepo, db: LabsDb, text: str) -> LlmResult:
     """Entry point for one informational chat turn (PLAN.md loop (b)).
 
     Delegates the actual call to `reason.tools.informational_llm_result` —
     the MVP tool loop (`query_labs`/`search_case`/`list_encounters`, PLAN.md
     "Reasoner integration": "Chat tool-use ... runs inside a single
-    whitelisted-tools node"). This entry point still owns the red-flag
-    screen (so it runs before any client call, exactly as the diagnostic
-    path does) and keeps this function's `LlmResult | RedFlagResult`
-    return type stable for existing callers; `tools.answer_informational`
-    is the string-returning, treatment-gated variant for direct use (e.g.
-    from a future chat route).
+    whitelisted-tools node"). No automated emergency screening anywhere in
+    this path (see `docs/adr/0021*.md` for why).
     """
     # Imported here, not at module level: `reason.tools` is a later slice
     # that this module now delegates to, and importing it lazily avoids
@@ -1228,8 +1251,9 @@ def run_post_ingest_dag(
     supply `evidence_note` from `render_new_evidence_note` and are
     responsible for skipping the call entirely when no rows were added.
 
-    No red-flag screen here: this is triggered by document ingestion, not
-    by free-text patient chat, so there is no patient utterance to screen.
+    This is triggered by document ingestion, not by free-text patient chat,
+    so there is no patient utterance here at all (and, per `docs/adr/
+    0021*.md`, no emergency screening anywhere in this app regardless).
     Returns the applied `Ledger` (the DAG's `apply` node output); the
     Composer's rendered reply is also produced (the DAG contract requires
     it) but is not the point of this entry point and is discarded.

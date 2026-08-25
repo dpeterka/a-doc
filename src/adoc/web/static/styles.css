@@ -433,7 +433,7 @@ button.button-danger {
   border: 1px solid var(--color-border);
 }
 
-.chat-kind-urgent {
+.chat-kind-withheld {
   background: var(--color-urgent-bg);
   border-color: var(--color-urgent-border);
 }
