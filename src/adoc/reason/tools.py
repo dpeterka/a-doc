@@ -3,13 +3,32 @@
 `query_labs`/`search_case`/`search_documents`/`list_encounters` are
 deterministic, no-LLM retrieval helpers — `search_documents`
 (docs/adr/0015-document-text-corpus.md) is the document-TEXT-layer one,
-over `LabsDb.search_document_text`'s FTS5 index. `answer_informational` is the
+over `LabsDb.search_document_text`'s FTS5 index. `answer_informational` is a
+thin, red-flag-screened wrapper around `informational_llm_result`: the
 red-flag screen runs first (zero API calls on a match), then every
 deterministic retrieval helper runs unconditionally over the question
 text, and their results are folded into ONE LLM call alongside a full
 context pack (`include_ledger=True` — informational answers are read-only
 and never mutate the ledger, but the patient may reasonably ask about it).
-`safety.treatment_gate` screens the model's answer before it is returned.
+
+`informational_llm_result` itself runs `safety.treatment_gate` on the
+model's answer (CLAUDE.md rule 5) — see its docstring for the
+gate-guided-rewrite-then-withhold shape, mirroring `stages.composer_stage`.
+Gating lives here, at the source, rather than in `answer_informational` or
+in `reason/stages.py`'s `run_informational_turn`, so every caller of
+`informational_llm_result` inherits the gate automatically — see
+docs/adr/0014-red-flag-warn-not-block.md's note #5 on why the enforcement
+point must not depend on which entry point happens to call in.
+
+This module also exposes `redact_gated_text`, a render/generation-time
+helper used outside this module's own call path (`web/routes/ledger.py`,
+`web/routes/reviews.py`, `reason/review.py`) to gate OTHER model-written
+free text that reaches the patient outside the Composer/informational
+paths — ledger evidence claims, discriminators, challenger notes, and
+weekly-review markdown. Unlike the withhold-the-whole-reply shape above,
+it replaces only the offending span(s) with a short marker, since that
+text sits alongside a lot of legitimate, unrelated content a blanket
+withhold would needlessly destroy.
 
 This is deliberately the simplest thing that satisfies PLAN.md's "one
 streamed tool-runner call (query_labs / search_case / web literature)"
@@ -33,7 +52,7 @@ from adoc.labs.queries import trend_series
 from adoc.labs.validate import canonicalize
 from adoc.reason.client import LlmClient, LlmResult, Message
 from adoc.reason.context import build_context
-from adoc.reason.safety import RedFlagResult, guarded_turn, treatment_gate
+from adoc.reason.safety import GateResult, RedFlagResult, guarded_turn, treatment_gate
 
 _MAX_SERIES_POINTS = 8
 _MAX_GREP_HITS = 10
@@ -194,6 +213,16 @@ _GATE_BLOCKED_MESSAGE = (
     "showing it to you. {rewrite_instruction}"
 )
 
+# How many completions `informational_llm_result` may spend on one answer:
+# the first attempt plus one gate-guided rewrite — same budget and shape as
+# `stages.composer_stage`'s `_COMPOSER_GATE_ATTEMPTS` (see that constant's
+# comment for why one rewrite pass is worth it before withholding: a
+# legitimate answer that merely restates a dose the patient already takes
+# can usually be rephrased without it).
+_INFORMATIONAL_GATE_ATTEMPTS = 2
+
+_WITHHELD_MARKER = "[withheld: this passage failed a-doc's dosing/treatment safety gate]"
+
 
 def _deterministic_retrieval(repo: DataRepo, db: LabsDb, question: str) -> str:
     """Run every deterministic retrieval helper unconditionally (the MVP
@@ -216,7 +245,24 @@ def informational_llm_result(
     deterministic retrieval results. Callers are responsible for running
     the red-flag screen first (see `answer_informational` /
     `reason.stages.run_informational_turn`) — this function always makes
-    the call.
+    at least one call.
+
+    `safety.treatment_gate` screens the answer HERE, at the source
+    (CLAUDE.md rule 5 — no treatment/dosing advice may reach the patient),
+    rather than leaving it to whichever caller happens to invoke this
+    function: `reason.stages.run_informational_turn` (the production
+    `web/routes/chat.py` path) previously called this function directly
+    with no gate at all, while the only gated path (`answer_informational`,
+    below) was orphaned when ADR 0014 deprecated `guarded_turn`. Gating at
+    the source means every current and future caller inherits it.
+
+    Mirrors `stages.composer_stage`'s gate-guided rewrite loop: on a gate
+    failure, the model gets ONE rewrite attempt (fed the blocked phrases
+    and `GateResult.rewrite_instruction` as targeted feedback) before the
+    answer is withheld outright. This is a quality loop, not the
+    enforcement point — the returned `LlmResult.text` is guaranteed to
+    pass `treatment_gate` (or be the fixed withheld message) either way,
+    so no caller needs to gate it again.
     """
     context_pack = build_context(repo, db, include_ledger=True)
     retrieval = _deterministic_retrieval(repo, db, question)
@@ -224,30 +270,54 @@ def informational_llm_result(
         f"{context_pack.render()}\n\n## Deterministic Retrieval Results\n\n{retrieval}\n\n"
         f"## Patient Question\n\n{question}\n"
     )
-    return client.complete(
-        "primary_reasoner",
-        system=_INFORMATIONAL_SYSTEM,
-        messages=[Message(role="user", content=user_content)],
-    )
+    messages: list[Message] = [Message(role="user", content=user_content)]
+    result: LlmResult | None = None
+    gate: GateResult | None = None
+    for _attempt in range(_INFORMATIONAL_GATE_ATTEMPTS):
+        result = client.complete(
+            "primary_reasoner",
+            system=_INFORMATIONAL_SYSTEM,
+            messages=messages,
+        )
+        gate = treatment_gate(result.text)
+        if gate.passed:
+            return result
+        offending = "; ".join(f"{span.text!r} ({span.reason})" for span in gate.spans)
+        messages = [
+            *messages,
+            Message(role="assistant", content=result.text),
+            Message(
+                role="user",
+                content=(
+                    f"{gate.rewrite_instruction} The blocked phrases were: {offending}. "
+                    "Reporting a dose the patient already takes counts as blocked dosing "
+                    "language - describe the medication or supplement WITHOUT its dose. "
+                    "Return the complete corrected answer."
+                ),
+            ),
+        ]
+
+    assert result is not None
+    assert gate is not None
+    withheld_text = _GATE_BLOCKED_MESSAGE.format(rewrite_instruction=gate.rewrite_instruction or "")
+    return result.model_copy(update={"text": withheld_text})
 
 
 def answer_informational(client: LlmClient, repo: DataRepo, db: LabsDb, question: str) -> str:
     """Entry point for the informational-turn MVP tool loop (PLAN.md loop (b)).
 
     Red-flag screen first (zero API calls on a match — the flagged
-    template is returned as plain text). On pass: one LLM call
-    (`informational_llm_result`) over the context pack + deterministic
-    retrieval results; `safety.treatment_gate` screens the answer before
-    it is ever returned, exactly as CLAUDE.md rule 5 requires for any
-    patient-facing output.
+    template is returned as plain text; `guarded_turn` is block-on-flag,
+    fine here since no production caller uses this function — see ADR
+    0014's note #5. Production entry points instead call
+    `reason.safety.red_flag_screen` directly and warn-not-block). On pass:
+    delegates entirely to `informational_llm_result`, which now runs
+    `safety.treatment_gate` itself — this function does not duplicate that
+    check.
     """
 
     def _proceed() -> str:
-        result = informational_llm_result(client, repo, db, question)
-        gate = treatment_gate(result.text)
-        if gate.passed:
-            return result.text
-        return _GATE_BLOCKED_MESSAGE.format(rewrite_instruction=gate.rewrite_instruction or "")
+        return informational_llm_result(client, repo, db, question).text
 
     outcome = guarded_turn(question, _proceed)
     if isinstance(outcome, RedFlagResult):
@@ -255,11 +325,50 @@ def answer_informational(client: LlmClient, repo: DataRepo, db: LabsDb, question
     return outcome
 
 
+def redact_gated_text(text: str) -> str:
+    """Run `safety.treatment_gate` over `text` and replace only the
+    offending span(s) with a short, fixed marker, preserving everything
+    else — unlike `informational_llm_result`'s withhold-the-whole-answer
+    shape, this is for model-written free text that is rendered ALONGSIDE
+    a lot of unrelated, legitimate content: ledger evidence claims and
+    discriminators, hypothesis challenger notes (`web/routes/ledger.py`),
+    and weekly-review markdown, both at generation time (`reason/review.py`)
+    and at render time for already-persisted reviews
+    (`web/routes/reviews.py`) — see CLAUDE.md rule 5.
+
+    Adjacent/overlapping spans (e.g. a dosage-pattern span nested inside a
+    wider imperative-treatment-instruction span) are merged into one
+    replacement so the marker never appears twice back-to-back.
+    """
+    if not text:
+        return text
+    gate = treatment_gate(text)
+    if gate.passed:
+        return text
+
+    merged: list[list[int]] = []
+    for span in gate.spans:
+        if merged and span.start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], span.end)
+        else:
+            merged.append([span.start, span.end])
+
+    pieces: list[str] = []
+    cursor = 0
+    for start, end in merged:
+        pieces.append(text[cursor:start])
+        pieces.append(_WITHHELD_MARKER)
+        cursor = end
+    pieces.append(text[cursor:])
+    return "".join(pieces)
+
+
 __all__ = [
     "answer_informational",
     "informational_llm_result",
     "list_encounters",
     "query_labs",
+    "redact_gated_text",
     "search_case",
     "search_documents",
 ]
