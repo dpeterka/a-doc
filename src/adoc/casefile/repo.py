@@ -8,6 +8,7 @@ other modules should use.
 
 from __future__ import annotations
 
+import threading
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -54,6 +55,18 @@ class DataRepo:
 
     def __init__(self, root: Path) -> None:
         self.root = root
+        # One `DataRepo` is shared process-wide (`app.state.repo`) and its
+        # write path is driven from FastAPI's sync-route thread pool, so two
+        # requests really can call `commit()` at the same moment — the same
+        # shared-singleton-across-threads shape that produced a live
+        # `sqlite3.InterfaceError` in `labs.db` (see that module's lock).
+        # `commit()` is a read-modify-write over `.git/index` and `HEAD`:
+        # concurrent calls either collide on git's own index.lock (a raised
+        # `GitCommandError`) or, worse, silently lose one thread's commit by
+        # racing the ref update. Every intake turn commits, so a lost commit
+        # is lost patient-reported facts. RLock, not Lock: `init_at` and
+        # future callers may nest repo operations.
+        self._lock = threading.RLock()
 
     @property
     def is_initialized(self) -> bool:
@@ -115,13 +128,14 @@ class DataRepo:
         """Stage `paths` (default: everything) and commit. Returns the new
         commit's hexsha. Never touches a remote.
         """
-        repo = Repo(self.root)
-        if paths is None:
-            repo.git.add(A=True)
-        else:
-            repo.index.add(paths)
-        commit = repo.index.commit(message, author=_COMMIT_ACTOR, committer=_COMMIT_ACTOR)
-        return commit.hexsha
+        with self._lock:
+            repo = Repo(self.root)
+            if paths is None:
+                repo.git.add(A=True)
+            else:
+                repo.index.add(paths)
+            commit = repo.index.commit(message, author=_COMMIT_ACTOR, committer=_COMMIT_ACTOR)
+            return commit.hexsha
 
     def tag(self, name: str, *, ref: str | None = None, message: str | None = None) -> str:
         """Create a git tag named `name` (PLAN.md "State": "weekly reviews
@@ -133,19 +147,20 @@ class DataRepo:
         (CLAUDE.md/PLAN.md constraint on the merged foundation): no
         existing method's signature or behavior is touched.
         """
-        repo = Repo(self.root)
-        target = repo.commit(ref) if ref is not None else repo.head.commit
-        # Annotated tags need a committer identity; supply the same explicit
-        # actor commits use so this never depends on host git config
-        # (CI runners have none — "Committer identity unknown").
-        with repo.git.custom_environment(
-            GIT_COMMITTER_NAME=_COMMIT_ACTOR.name,
-            GIT_COMMITTER_EMAIL=_COMMIT_ACTOR.email,
-            GIT_AUTHOR_NAME=_COMMIT_ACTOR.name,
-            GIT_AUTHOR_EMAIL=_COMMIT_ACTOR.email,
-        ):
-            if message is not None:
-                repo.create_tag(name, ref=target, message=message)
-            else:
-                repo.create_tag(name, ref=target)
+        with self._lock:
+            repo = Repo(self.root)
+            target = repo.commit(ref) if ref is not None else repo.head.commit
+            # Annotated tags need a committer identity; supply the same explicit
+            # actor commits use so this never depends on host git config
+            # (CI runners have none — "Committer identity unknown").
+            with repo.git.custom_environment(
+                GIT_COMMITTER_NAME=_COMMIT_ACTOR.name,
+                GIT_COMMITTER_EMAIL=_COMMIT_ACTOR.email,
+                GIT_AUTHOR_NAME=_COMMIT_ACTOR.name,
+                GIT_AUTHOR_EMAIL=_COMMIT_ACTOR.email,
+            ):
+                if message is not None:
+                    repo.create_tag(name, ref=target, message=message)
+                else:
+                    repo.create_tag(name, ref=target)
         return name
