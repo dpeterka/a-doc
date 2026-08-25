@@ -63,7 +63,7 @@ def test_init_succeeds_with_valid_env(
     assert code == 0
     out = capsys.readouterr().out
     assert "data_dir=" in out
-    assert "loaded 8 model role bindings" in out
+    assert "loaded 9 model role bindings" in out
 
 
 def test_init_creates_data_repo_and_is_idempotent(

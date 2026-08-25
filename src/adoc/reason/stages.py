@@ -30,7 +30,9 @@ from adoc import __version__
 from adoc.casefile.ledger import apply_and_save, load_ledger
 from adoc.casefile.repo import HISTORY_RELPATH, DataRepo
 from adoc.casefile.schema import (
+    AddEvidence,
     AddHypothesis,
+    Evidence,
     Ledger,
     LedgerDiff,
     LedgerOp,
@@ -43,6 +45,7 @@ from adoc.reason.citations import (
     EutilsPmidVerifier,
     PmidVerifier,
     build_retry_feedback,
+    check_evidence_citations,
     check_ops_citations,
     log_citation_report,
 )
@@ -51,6 +54,16 @@ from adoc.reason.context import ContextPack, build_context
 from adoc.reason.dag import Contract, Ctx, Dag, Node, require_prior_node, run
 from adoc.reason.prompts import Prompt, load_prompt
 from adoc.reason.safety import RedFlagResult, treatment_gate
+from adoc.reason.verify import (
+    DefaultSourceTextResolver,
+    SourceTextResolver,
+    build_composer_number_retry_feedback,
+    build_entailment_retry_feedback,
+    check_composer_numbers,
+    claims_from_ops,
+    log_verification_report,
+    verify_claims,
+)
 
 # --------------------------------------------------------------------------
 # Stage-IO models
@@ -90,6 +103,23 @@ class PatientReply(BaseModel):
     tiers_rendered: str
     tests_to_request: list[str] = Field(default_factory=list)
     framing_ack: bool
+    # PLAN.md Phase 2 "Abstention calibration": a first-class way for the
+    # Composer to say "the case file does not yet support an answer here"
+    # instead of silently omitting the topic or rendering false confidence.
+    # Not a magic string inside `tiers_rendered` — a structured signal an
+    # eval probe (or a future UI) can check for directly.
+    insufficient_evidence: list[str] = Field(default_factory=list)
+
+
+class InsufficientEvidenceNote(BaseModel):
+    """One explicit abstention note on a Ledger-Maintainer diff (PLAN.md
+    Phase 2 "Abstention calibration"): "I looked for evidence on `topic`
+    and the case file does not yet support a claim" — the model's way to
+    say so as data, not by fabricating a citation to fill the gap or by
+    silently dropping the topic."""
+
+    topic: str
+    reason: str
 
 
 class _LedgerDiffPayload(BaseModel):
@@ -100,6 +130,7 @@ class _LedgerDiffPayload(BaseModel):
 
     rationale: str
     ops: list[LedgerOp] = Field(default_factory=list)
+    insufficient_evidence: list[InsufficientEvidenceNote] = Field(default_factory=list)
 
 
 def _build_provenance(prompt: Prompt, model_id: str, dag_node: str) -> Provenance:
@@ -129,6 +160,18 @@ def _build_provenance(prompt: Prompt, model_id: str, dag_node: str) -> Provenanc
 _CITATION_RETRY_ATTEMPTS = 2
 
 
+def _render_diff_rationale(payload: _LedgerDiffPayload) -> str:
+    """`payload.rationale`, with any `insufficient_evidence` notes appended
+    to the audit trail (PLAN.md Phase 2 "Abstention calibration") — the
+    notes are a first-class field on the payload, not folded into free text
+    by the model itself; this is the one place code renders them for the
+    persisted `LedgerDiff.rationale`."""
+    if not payload.insufficient_evidence:
+        return payload.rationale
+    notes = "; ".join(f"{n.topic}: {n.reason}" for n in payload.insufficient_evidence)
+    return f"{payload.rationale}\n\nInsufficient evidence: {notes}"
+
+
 def ledger_maintainer_stage(
     client: LlmClient,
     ctx: ContextPack,
@@ -137,19 +180,27 @@ def ledger_maintainer_stage(
     repo: DataRepo,
     *,
     pmid_verifier: PmidVerifier | None = None,
+    resolver: SourceTextResolver | None = None,
 ) -> LedgerDiff:
     """Ledger-Maintainer stage (role `primary_reasoner`, schema `LedgerDiff`
     payload). Proposes a `LedgerDiff` from the context pack plus this turn's
     raw patient message.
 
-    After the model returns a diff, the deterministic citation checker
-    (`reason.citations.check_ops_citations`) resolves every evidence source
-    ref; an `unresolved`/`mismatched` ref triggers ONE retry that feeds the
-    exact failed ref(s) and the reason back to the model, with an
-    instruction to cite only sources that exist or drop the claim. This is
-    a quality loop, not the enforcement point — the `citation_check`
-    contract on this node (`build_diagnostic_dag`) still re-checks whatever
-    this function returns and fails the run if it is still bad."""
+    After the model returns a diff, two deterministic-then-model-judged
+    checks run in sequence, each with its own same-generation retry
+    (mirrors the composer's gate-guided rewrite loop, PR #94):
+    1. The citation checker (`reason.citations.check_ops_citations`)
+       resolves every evidence source ref; an `unresolved`/`mismatched` ref
+       retries with the failed ref(s) fed back.
+    2. Only once citations pass, the entailment verifier
+       (`reason.verify.verify_claims`, role `entailment_verifier`, a
+       DIFFERENT model family) judges whether each claim's cited source
+       TEXT actually supports it; a `not_entailed` claim retries with the
+       verifier's objection fed back.
+    Both are quality loops, not the enforcement point — the
+    `citation_check`/`entailment_check` contracts on this node
+    (`build_diagnostic_dag`) still re-check whatever this function returns
+    and fail the run if either is still bad."""
     prompt = load_prompt("ledger_maintainer")
     user_content = f"{ctx.render()}\n\n## Patient Message\n\n{patient_message}\n"
     messages = [Message(role="user", content=user_content)]
@@ -166,17 +217,33 @@ def ledger_maintainer_stage(
         assert isinstance(payload, _LedgerDiffPayload)
 
         provenance = _build_provenance(prompt, result.model_id, "ledger_maintainer")
-        diff = LedgerDiff(provenance=provenance, rationale=payload.rationale, ops=payload.ops)
+        diff = LedgerDiff(
+            provenance=provenance, rationale=_render_diff_rationale(payload), ops=payload.ops
+        )
 
-        report = check_ops_citations(diff.ops, db, repo, pmid_verifier=pmid_verifier)
-        log_citation_report(repo, report, dag_node="ledger_maintainer")
-        if not report.failing:
-            break
-        messages = [
-            *messages,
-            Message(role="assistant", content=payload.model_dump_json()),
-            Message(role="user", content=build_retry_feedback(report)),
-        ]
+        citation_report = check_ops_citations(diff.ops, db, repo, pmid_verifier=pmid_verifier)
+        log_citation_report(repo, citation_report, dag_node="ledger_maintainer")
+        if citation_report.failing:
+            messages = [
+                *messages,
+                Message(role="assistant", content=payload.model_dump_json()),
+                Message(role="user", content=build_retry_feedback(citation_report)),
+            ]
+            continue
+
+        verification_report = verify_claims(
+            client, claims_from_ops(diff.ops), db=db, repo=repo, resolver=resolver
+        )
+        log_verification_report(repo, verification_report, dag_node="ledger_maintainer")
+        if verification_report.failing:
+            messages = [
+                *messages,
+                Message(role="assistant", content=payload.model_dump_json()),
+                Message(role="user", content=build_entailment_retry_feedback(verification_report)),
+            ]
+            continue
+
+        break
 
     assert diff is not None
     return diff
@@ -190,6 +257,7 @@ def challenger_stage(
     repo: DataRepo,
     *,
     pmid_verifier: PmidVerifier | None = None,
+    resolver: SourceTextResolver | None = None,
 ) -> ChallengerVerdict:
     """Challenger stage (role `challenger` — cross-family per ADR-0005).
     Attacks `proposed_diff`; must produce >=1 substantive counter-argument
@@ -197,10 +265,11 @@ def challenger_stage(
 
     The Challenger's own `additional_ops` can carry evidence (e.g. a
     `record_challenge`-adjacent `add_hypothesis`/`add_evidence`), so it gets
-    the same citation-checker retry loop as `ledger_maintainer_stage` — see
-    that function's docstring. On a clean verdict (no evidence in
-    `additional_ops`, the common case) this never spends a second
-    completion."""
+    the same citation-then-entailment retry loop as `ledger_maintainer_
+    stage` — see that function's docstring. On a clean verdict (no evidence
+    in `additional_ops`, the common case) this never spends a second
+    completion, and never calls the entailment verifier at all (nothing to
+    verify)."""
     prompt = load_prompt("challenger")
     diff_json = proposed_diff.model_dump_json(indent=2)
     user_content = f"{ctx.render()}\n\n## Proposed Ledger Diff\n\n```json\n{diff_json}\n```\n"
@@ -218,15 +287,31 @@ def challenger_stage(
         assert isinstance(parsed, ChallengerVerdict)
         verdict = parsed
 
-        report = check_ops_citations(verdict.additional_ops, db, repo, pmid_verifier=pmid_verifier)
-        log_citation_report(repo, report, dag_node="challenger")
-        if not report.failing:
-            break
-        messages = [
-            *messages,
-            Message(role="assistant", content=verdict.model_dump_json()),
-            Message(role="user", content=build_retry_feedback(report)),
-        ]
+        citation_report = check_ops_citations(
+            verdict.additional_ops, db, repo, pmid_verifier=pmid_verifier
+        )
+        log_citation_report(repo, citation_report, dag_node="challenger")
+        if citation_report.failing:
+            messages = [
+                *messages,
+                Message(role="assistant", content=verdict.model_dump_json()),
+                Message(role="user", content=build_retry_feedback(citation_report)),
+            ]
+            continue
+
+        verification_report = verify_claims(
+            client, claims_from_ops(verdict.additional_ops), db=db, repo=repo, resolver=resolver
+        )
+        log_verification_report(repo, verification_report, dag_node="challenger")
+        if verification_report.failing:
+            messages = [
+                *messages,
+                Message(role="assistant", content=verdict.model_dump_json()),
+                Message(role="user", content=build_entailment_retry_feedback(verification_report)),
+            ]
+            continue
+
+        break
 
     assert verdict is not None
     return verdict
@@ -283,16 +368,21 @@ def _render_ledger_for_prompt(ledger: Ledger) -> str:
 _COMPOSER_GATE_ATTEMPTS = 2
 
 
-def composer_stage(client: LlmClient, ledger: Ledger, ctx: ContextPack) -> PatientReply:
+def composer_stage(client: LlmClient, ledger: Ledger, ctx: ContextPack, db: LabsDb) -> PatientReply:
     """Composer/Steward stage (role `primary_reasoner`, schema `PatientReply`).
     Renders the post-challenge ledger for the patient.
 
-    The output gate (`safety.treatment_gate`) is consulted here to give the
-    model ONE rewrite pass when its draft trips the gate (fed back via
-    `GateResult.rewrite_instruction` plus the offending spans). This is a
-    quality loop, not the enforcement point: `build_diagnostic_dag` still
-    applies the same gate as a DAG postcondition on whatever this function
-    returns, so a reply that is still gated after the rewrite surfaces as a
+    Two deterministic checks are consulted here to give the model ONE
+    rewrite pass when its draft trips either (fed back as targeted
+    instructions), in sequence:
+    1. The output gate (`safety.treatment_gate`) — no dosing/prescriptive
+       language (CLAUDE.md rule 5).
+    2. Only once the gate passes, the quantitative grounding check
+       (`reason.verify.check_composer_numbers`) — every number attributed
+       to a lab value must match `labs.sqlite` exactly (PLAN.md Phase 2).
+    Both are quality loops, not the enforcement point: `build_diagnostic_dag`
+    still applies both as DAG postconditions on whatever this function
+    returns, so a reply still failing either after the rewrite surfaces as a
     `ContractViolation` with the run stopped in place (CLAUDE.md rule 5 -
     the deterministic gate remains the final, unbypassable authority)."""
     prompt = load_prompt("composer")
@@ -312,23 +402,34 @@ def composer_stage(client: LlmClient, ledger: Ledger, ctx: ContextPack) -> Patie
         assert isinstance(parsed, PatientReply)
         reply = parsed
         gate = treatment_gate(reply.tiers_rendered)
-        if gate.passed:
-            return reply
-        offending = "; ".join(f"{span.text!r} ({span.reason})" for span in gate.spans)
-        messages = [
-            *messages,
-            Message(role="assistant", content=reply.tiers_rendered),
-            Message(
-                role="user",
-                content=(
-                    f"{gate.rewrite_instruction} The blocked phrases were: "
-                    f"{offending}. Reporting a dose the patient already takes "
-                    "counts as blocked dosing language - describe the "
-                    "medication or supplement WITHOUT its dose. Return the "
-                    "complete corrected reply in the same schema."
+        if not gate.passed:
+            offending = "; ".join(f"{span.text!r} ({span.reason})" for span in gate.spans)
+            messages = [
+                *messages,
+                Message(role="assistant", content=reply.tiers_rendered),
+                Message(
+                    role="user",
+                    content=(
+                        f"{gate.rewrite_instruction} The blocked phrases were: "
+                        f"{offending}. Reporting a dose the patient already takes "
+                        "counts as blocked dosing language - describe the "
+                        "medication or supplement WITHOUT its dose. Return the "
+                        "complete corrected reply in the same schema."
+                    ),
                 ),
-            ),
-        ]
+            ]
+            continue
+
+        number_check = check_composer_numbers(reply.tiers_rendered, db)
+        if not number_check.passed:
+            messages = [
+                *messages,
+                Message(role="assistant", content=reply.tiers_rendered),
+                Message(role="user", content=build_composer_number_retry_feedback(number_check)),
+            ]
+            continue
+
+        return reply
     assert reply is not None
     return reply
 
@@ -453,6 +554,110 @@ def citation_check_contract(
     return Contract(name=name, predicate=predicate)
 
 
+def entailment_check_contract(
+    name: str,
+    client: LlmClient,
+    db: LabsDb,
+    repo: DataRepo,
+    ops_extractor: Callable[[Ctx, BaseModel | None], Sequence[LedgerOp]],
+    *,
+    resolver: SourceTextResolver | None = None,
+) -> Contract:
+    """A DAG contract (pre- or postcondition, per `ops_extractor`) that runs
+    `reason.verify.verify_claims` over whatever `ops_extractor` pulls out of
+    `(ctx, value)` and fails closed on any `not_entailed` claim (PLAN.md
+    Phase 2: "non-entailed claims bounce the diff back ... with the
+    verifier's objection"). `insufficient_source` (no source TEXT available
+    yet, e.g. a `doc:` ref before the document-text corpus lands) is
+    deliberately NOT a rejection — same principle as the citation checker's
+    `unverifiable`.
+
+    Wired the same way `citation_check_contract` is, immediately after it:
+    as the `ledger_maintainer` node's postcondition (checks its own diff)
+    and as the `apply` node's precondition (checks the diff merged with the
+    Challenger's `additional_ops`)."""
+
+    def predicate(ctx: Ctx, value: BaseModel | None) -> str | None:
+        ops = ops_extractor(ctx, value)
+        report = verify_claims(client, claims_from_ops(ops), db=db, repo=repo, resolver=resolver)
+        log_verification_report(repo, report, dag_node=name)
+        if not report.failing:
+            return None
+        details = "; ".join(f"{c.source} [{c.judgment}]: {c.rationale}" for c in report.failing)
+        return f"non-entailed evidence claim(s): {details}"
+
+    return Contract(name=name, predicate=predicate)
+
+
+def most_likely_requires_resolved_evidence_contract(db: LabsDb, repo: DataRepo) -> Contract:
+    """PRECONDITION on `apply`: a hypothesis whose supporting evidence is
+    absent or unresolvable can never sit in tier `most-likely` (PLAN.md
+    Phase 2 "Abstention calibration": "a contract that a hypothesis whose
+    supporting evidence is absent/unresolvable cannot be placed in
+    most-likely").
+
+    Deliberately a PRECONDITION, not a postcondition: `apply_stage` persists
+    the ledger to disk (`casefile.ledger.apply_and_save`) as a side effect
+    of running, so checking the OUTPUT after the fact (like the citation/
+    entailment checks correctly avoid) would let the bad state reach disk
+    before the violation is ever raised. Instead this inspects the merged
+    ops (Ledger-Maintainer diff + Challenger `additional_ops`) plus the
+    PRIOR ledger (for a hypothesis being promoted via `update_hypothesis`
+    rather than created fresh), exactly mirroring `citation_check_contract`'s
+    `apply`-precondition shape.
+
+    Deliberately checks only citation RESOLUTION here (no LLM call — this
+    is the fully deterministic half of abstention calibration): every claim
+    on these same merged ops has already passed `entailment_check_apply` as
+    an earlier precondition on this same node, so a resolved claim is
+    already known-good; what this contract additionally catches is the case
+    citation/entailment checks structurally cannot — a hypothesis promoted
+    to most-likely with ZERO evidence_for at all."""
+
+    def predicate(ctx: Ctx, _value: BaseModel | None) -> str | None:
+        diff = ctx["ledger_maintainer"]
+        assert isinstance(diff, LedgerDiff)
+        verdict = ctx["challenger"]
+        assert isinstance(verdict, ChallengerVerdict)
+        prior = ctx.get("ledger")
+        prior_by_id = {h.id: h for h in prior.hypotheses} if isinstance(prior, Ledger) else {}
+
+        ops = list(diff.ops) + list(verdict.additional_ops)
+        most_likely_ids: set[str] = set()
+        evidence_added: dict[str, list[Evidence]] = {}
+        for op in ops:
+            if isinstance(op, AddHypothesis):
+                evidence_added.setdefault(op.hypothesis.id, []).extend(op.hypothesis.evidence_for)
+                if op.hypothesis.tier == "most-likely":
+                    most_likely_ids.add(op.hypothesis.id)
+            elif isinstance(op, UpdateHypothesis):
+                if op.tier == "most-likely":
+                    most_likely_ids.add(op.id)
+            elif isinstance(op, AddEvidence):
+                if op.for_or_against == "for":
+                    evidence_added.setdefault(op.id, []).append(op.evidence)
+
+        problems: list[str] = []
+        for hyp_id in most_likely_ids:
+            effective_evidence = list(evidence_added.get(hyp_id, []))
+            prior_hyp = prior_by_id.get(hyp_id)
+            if prior_hyp is not None:
+                effective_evidence = list(prior_hyp.evidence_for) + effective_evidence
+            if not effective_evidence:
+                problems.append(f"{hyp_id!r}: placed at most-likely with no evidence_for at all")
+                continue
+            report = check_evidence_citations(effective_evidence, db, repo)
+            if not any(c.outcome == "resolved" for c in report.checks):
+                problems.append(
+                    f"{hyp_id!r}: placed at most-likely but no evidence_for citation resolves"
+                )
+        if problems:
+            return "; ".join(problems)
+        return None
+
+    return Contract(name="most_likely_requires_resolved_evidence", predicate=predicate)
+
+
 def treatment_gate_contract() -> Contract:
     """Postcondition: the Composer's rendered patient-facing text must pass
     `safety.treatment_gate`, or the run stops with a `ContractViolation`
@@ -470,6 +675,27 @@ def treatment_gate_contract() -> Contract:
     return Contract(name="treatment_gate", predicate=predicate)
 
 
+def composer_number_check_contract(db: LabsDb) -> Contract:
+    """Postcondition: every number the Composer's rendered text attributes
+    to a lab value must match `labs.sqlite` exactly (PLAN.md Phase 2:
+    "every number in patient-facing output that is attributable to a lab
+    value must match labs.sqlite exactly"). Deterministic, no LLM call
+    (`reason.verify.check_composer_numbers`)."""
+
+    def predicate(_ctx: Ctx, value: BaseModel | None) -> str | None:
+        assert isinstance(value, PatientReply)
+        check = check_composer_numbers(value.tiers_rendered, db)
+        if check.passed:
+            return None
+        details = "; ".join(
+            f"{m.quoted_number!r} near {m.analyte_label!r} (stored: {m.stored_values})"
+            for m in check.mismatches
+        )
+        return f"quoted number(s) do not match stored lab value(s): {details}"
+
+    return Contract(name="composer_number_check", predicate=predicate)
+
+
 # --------------------------------------------------------------------------
 # DAG assembly
 # --------------------------------------------------------------------------
@@ -483,25 +709,35 @@ def build_diagnostic_dag(
     sink: dict[str, BaseModel] | None = None,
     *,
     pmid_verifier: PmidVerifier | None = None,
+    resolver: SourceTextResolver | None = None,
 ) -> Dag:
     """Assemble the chat-diagnostic-turn DAG (PLAN.md loop (b)):
     Ledger-Maintainer -> Challenger -> apply -> Composer.
 
-    Contracts: the ledger_maintainer node's postcondition runs the
-    deterministic citation checker (`reason.citations`) over its own diff;
-    Challenger's postcondition requires a substantive counter-argument for
-    every most-likely hypothesis; the apply node's PRECONDITION re-runs the
-    citation checker over the Ledger-Maintainer's diff merged with the
-    Challenger's `additional_ops` (so a bad ref introduced by the
-    Challenger can't reach `apply` either) and its postcondition requires
-    the ledger version to have incremented; Composer's precondition
-    requires the Challenger node to have completed this run, and its
-    postcondition runs the treatment/dosing output gate.
+    Contracts: the ledger_maintainer node's postconditions run the
+    deterministic citation checker (`reason.citations`) then the
+    cross-family entailment verifier (`reason.verify`, role
+    `entailment_verifier`) over its own diff; Challenger's postcondition
+    requires a substantive counter-argument for every most-likely
+    hypothesis; the apply node's PRECONDITIONS re-run both checks over the
+    Ledger-Maintainer's diff merged with the Challenger's `additional_ops`
+    (so a bad ref OR a non-entailed claim introduced by the Challenger
+    can't reach `apply` either), plus a THIRD precondition that no
+    `most-likely` hypothesis is being promoted with absent/unresolvable
+    evidence (PLAN.md Phase 2 "Abstention calibration") — deliberately a
+    precondition, not a postcondition, since `apply_stage` persists to disk
+    as a side effect, so this must be checked before that write, exactly
+    like the citation/entailment checks; its postcondition requires the
+    ledger version to have incremented; Composer's precondition requires
+    the Challenger node to have completed this run, and its postconditions
+    run the treatment/dosing output gate then the deterministic
+    quantitative grounding check (`reason.verify.check_composer_numbers`).
 
     `pmid_verifier` defaults to a real `EutilsPmidVerifier` (NCBI
-    E-utilities, cached at `<repo>/work/pmid-cache.json`) when omitted —
-    tests should always inject a fake verifier explicitly so a test run
-    never touches the network.
+    E-utilities, cached at `<repo>/work/pmid-cache.json`) when omitted;
+    `resolver` defaults to `reason.verify.DefaultSourceTextResolver(db,
+    repo)` when omitted — tests should always inject fakes explicitly so a
+    test run never touches the network.
 
     Expected `run()` initial context: `{"context_pack": ContextPack,
     "patient_turn": PatientTurn, "ledger": Ledger}` (the ledger state this
@@ -516,6 +752,7 @@ def build_diagnostic_dag(
     resolved_pmid_verifier = pmid_verifier or EutilsPmidVerifier(
         repo.root / "work" / "pmid-cache.json"
     )
+    resolved_resolver = resolver or DefaultSourceTextResolver(db, repo)
 
     def _ledger_maintainer_fn(ctx: Ctx) -> BaseModel:
         context_pack = ctx["context_pack"]
@@ -530,6 +767,7 @@ def build_diagnostic_dag(
             db,
             repo,
             pmid_verifier=resolved_pmid_verifier,
+            resolver=resolved_resolver,
         )
         results["ledger_maintainer"] = diff
         return diff
@@ -541,7 +779,13 @@ def build_diagnostic_dag(
         assert isinstance(context_pack, ContextPack)
 
         verdict = challenger_stage(
-            client, proposed_diff, context_pack, db, repo, pmid_verifier=resolved_pmid_verifier
+            client,
+            proposed_diff,
+            context_pack,
+            db,
+            repo,
+            pmid_verifier=resolved_pmid_verifier,
+            resolver=resolved_resolver,
         )
         results["challenger"] = verdict
         return verdict
@@ -569,7 +813,7 @@ def build_diagnostic_dag(
         context_pack = ctx["context_pack"]
         assert isinstance(context_pack, ContextPack)
 
-        reply = composer_stage(client, ledger, context_pack)
+        reply = composer_stage(client, ledger, context_pack, db)
         results["composer"] = reply
         return reply
 
@@ -586,7 +830,15 @@ def build_diagnostic_dag(
                 repo,
                 _maintainer_diff_ops,
                 pmid_verifier=resolved_pmid_verifier,
-            )
+            ),
+            entailment_check_contract(
+                "entailment_check_ledger_maintainer",
+                client,
+                db,
+                repo,
+                _maintainer_diff_ops,
+                resolver=resolved_resolver,
+            ),
         ],
     )
     challenger_node = Node(
@@ -612,6 +864,15 @@ def build_diagnostic_dag(
                 _merged_apply_ops,
                 pmid_verifier=resolved_pmid_verifier,
             ),
+            entailment_check_contract(
+                "entailment_check_apply",
+                client,
+                db,
+                repo,
+                _merged_apply_ops,
+                resolver=resolved_resolver,
+            ),
+            most_likely_requires_resolved_evidence_contract(db, repo),
         ],
         postconditions=[_apply_ledger_version_incremented_contract()],
     )
@@ -622,7 +883,7 @@ def build_diagnostic_dag(
         output_model=PatientReply,
         depends_on="apply",
         preconditions=[require_prior_node("challenger")],
-        postconditions=[treatment_gate_contract()],
+        postconditions=[treatment_gate_contract(), composer_number_check_contract(db)],
     )
 
     return Dag([ledger_maintainer_node, challenger_node, apply_node, composer_node])
