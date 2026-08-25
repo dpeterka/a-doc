@@ -14,6 +14,21 @@ input and those gates only ever look at scalar keys (`by_whom`, `year`,
 expected to record it as a single comma-separated string under the plural
 key (`fields["conditions"] = "Hashimoto's, vitiligo"`); this module is
 what splits it back into a list on the way to the section schema.
+
+**Type-coercion boundary.** `IntakeFact.fields` values are typed
+`str | int | float | bool | None` (facts.py) with no further constraint per
+key, but the section schemas in `intake.sections` are pure rendering DTOs
+now (the conversational agent, not these schemas, is what the model fills
+in) — so every text-typed schema field this module populates from `fields`
+reads through `_as_text` below, and `PriorDiagnosis.status` (the one
+closed-vocabulary field sourced from `fields`) reads through
+`_diagnosis_status`, which clamps to the schema's own default instead of
+letting an out-of-vocabulary value raise. This is what keeps a fact whose
+`fields` happen to hold the "wrong" JSON type (an int where a model phrased
+a value that way) from failing `model_validate` the way `Relative.
+age_at_onset` used to when it was typed `int` — see that field's docstring
+in `intake.sections`. `intake.agent._write_section_from_facts_safe` is
+still the last-resort backstop for anything even this boundary misses.
 """
 
 from __future__ import annotations
@@ -52,6 +67,52 @@ def _split_list(raw: Any) -> list[str]:
     return [part.strip() for part in str(raw).split(",") if part.strip()]
 
 
+def _as_text(raw: Any) -> str | None:
+    """Coerce a fact field's loosely-typed value (`IntakeFact.fields` is
+    `dict[str, str | int | float | bool | None]` — `intake.facts`) to the
+    free-form text a section-schema `str`/`str | None` field expects.
+
+    `fields` is deliberately untyped per-key: a model may record an age as
+    the JSON number `41` or the JSON string `"41"` depending on how it
+    phrases an extraction, and neither is wrong. Every text-typed field
+    below reads through this helper (matching the `str(raw)` convention
+    `_split_list` above already used) so that boundary is safe by
+    construction, rather than trusting each call site to remember it. A
+    real crash motivated this: `Relative.age_at_onset` used to be typed
+    `int`, but the same class of mismatch — any `fields` value landing in
+    a `str`-typed schema field, e.g. a model emitting an int for a field
+    named `notes` — is possible for every field in this module, not just
+    that one. `agent.py`'s `_write_section_from_facts_safe` is the
+    last-resort backstop for anything this (or a future schema change)
+    still misses; this is what keeps the ordinary case from ever needing
+    that backstop.
+    """
+    if raw is None:
+        return None
+    return str(raw)
+
+
+_VALID_DIAGNOSIS_STATUS = frozenset({"confirmed", "suspected", "ruled-out"})
+
+
+def _diagnosis_status(raw: Any, *, default: str) -> str:
+    """Clamp a fact's free-form `fields["status"]` to `sections.
+    DiagnosisStatus`'s closed 3-value vocabulary. Unlike the free-form text
+    fields this module otherwise widens via `_as_text`, `status` stays a
+    `Literal` in the schema on purpose (see `PriorDiagnosis.status`'s
+    docstring) — it's a downstream classification the case file and, later,
+    the Ledger-Maintainer's `origin: patient` ingestion key off, not
+    patient-verbatim text. So the boundary responsibility is the opposite
+    of `_as_text`'s: instead of widening the schema, this narrows whatever
+    came out of the loosely-typed `fields` dict (a typo, an unexpected
+    value, or nothing recorded) down to a value the schema actually
+    accepts, falling back to `default` rather than letting
+    `model_validate` raise on an out-of-vocabulary string.
+    """
+    text = _as_text(raw)
+    return text if text in _VALID_DIAGNOSIS_STATUS else default
+
+
 def _active(facts: Sequence[IntakeFact], section_key: str) -> list[IntakeFact]:
     return [f for f in facts if f.status == "active" and f.section == section_key]
 
@@ -69,7 +130,7 @@ def _basics_data(facts: Sequence[IntakeFact]) -> dict[str, Any]:
         if fact.kind != "basic":
             continue
         for key in ("age", "sex_at_birth", "height_cm", "weight_kg", "occupation"):
-            value = fact.fields.get(key)
+            value = _as_text(fact.fields.get(key))
             if value is not None:
                 merged[key] = value
         exposures.extend(_split_list(fact.fields.get("exposures")))
@@ -85,52 +146,52 @@ def _basics_data(facts: Sequence[IntakeFact]) -> dict[str, Any]:
 
 def _symptom_data(fact: IntakeFact) -> dict[str, Any]:
     return {
-        "description": fact.fields.get("description") or fact.statement,
-        "onset": fact.fields.get("onset") or fact.date_approx,
-        "frequency": fact.fields.get("frequency"),
-        "triggers": fact.fields.get("triggers"),
-        "severity": fact.fields.get("severity"),
+        "description": _as_text(fact.fields.get("description")) or fact.statement,
+        "onset": _as_text(fact.fields.get("onset")) or fact.date_approx,
+        "frequency": _as_text(fact.fields.get("frequency")),
+        "triggers": _as_text(fact.fields.get("triggers")),
+        "severity": _as_text(fact.fields.get("severity")),
     }
 
 
 def _event_data(fact: IntakeFact) -> dict[str, Any]:
     return {
         "date_approx": fact.date_approx,
-        "title": fact.fields.get("title") or fact.statement,
-        "description": fact.fields.get("description") or fact.statement,
+        "title": _as_text(fact.fields.get("title")) or fact.statement,
+        "description": _as_text(fact.fields.get("description")) or fact.statement,
     }
 
 
 def _diagnosis_data(fact: IntakeFact) -> dict[str, Any]:
     return {
-        "name": fact.fields.get("name") or fact.statement,
-        "by_whom": fact.fields.get("by_whom"),
-        "year": fact.fields.get("year"),
-        "status": fact.fields.get("status") or "confirmed",
+        "name": _as_text(fact.fields.get("name")) or fact.statement,
+        "by_whom": _as_text(fact.fields.get("by_whom")),
+        "year": _as_text(fact.fields.get("year")),
+        "status": _diagnosis_status(fact.fields.get("status"), default="confirmed"),
     }
 
 
 def _patient_suspected_data(fact: IntakeFact) -> dict[str, Any]:
     return {
-        "name": fact.fields.get("name") or fact.statement,
-        "why": fact.fields.get("reasoning") or "",
+        "name": _as_text(fact.fields.get("name")) or fact.statement,
+        "why": _as_text(fact.fields.get("reasoning")) or "",
     }
 
 
 def _relative_data(fact: IntakeFact) -> dict[str, Any]:
     return {
-        "relation": fact.fields.get("relation") or "",
+        "relation": _as_text(fact.fields.get("relation")) or "",
         "conditions": _split_list(fact.fields.get("conditions")),
-        "age_at_onset": fact.fields.get("age_at_onset"),
+        "age_at_onset": _as_text(fact.fields.get("age_at_onset")),
         "deceased": bool(fact.fields.get("deceased", False)),
-        "age_at_death": fact.fields.get("age_at_death"),
+        "age_at_death": _as_text(fact.fields.get("age_at_death")),
     }
 
 
 def _residence_data(fact: IntakeFact) -> dict[str, Any]:
     return {
-        "place": fact.fields.get("place") or fact.statement,
-        "date_approx": fact.date_approx or fact.fields.get("date_approx"),
+        "place": _as_text(fact.fields.get("place")) or fact.statement,
+        "date_approx": fact.date_approx or _as_text(fact.fields.get("date_approx")),
         "current": bool(fact.fields.get("current", False)),
     }
 
@@ -146,12 +207,12 @@ def _geography_data(facts: Sequence[IntakeFact]) -> dict[str, Any]:
         if f.fields.get("category", "residence") == "residence"
     ]
     travel = [
-        str(f.fields.get("place") or f.statement)
+        _as_text(f.fields.get("place")) or f.statement
         for f in location_facts
         if f.fields.get("category") == "travel"
     ]
     exposures = [
-        str(f.fields.get("description") or f.statement)
+        _as_text(f.fields.get("description")) or f.statement
         for f in location_facts
         if f.fields.get("category") == "exposure"
     ]
@@ -160,27 +221,27 @@ def _geography_data(facts: Sequence[IntakeFact]) -> dict[str, Any]:
 
 def _medication_like_data(fact: IntakeFact) -> dict[str, Any]:
     return {
-        "name": fact.fields.get("name") or fact.statement,
-        "dose": fact.fields.get("dose"),
-        "frequency": fact.fields.get("frequency"),
+        "name": _as_text(fact.fields.get("name")) or fact.statement,
+        "dose": _as_text(fact.fields.get("dose")),
+        "frequency": _as_text(fact.fields.get("frequency")),
         "still_taking": bool(fact.fields.get("still_taking", True)),
-        "notes": fact.fields.get("notes") or "",
+        "notes": _as_text(fact.fields.get("notes")) or "",
     }
 
 
 def _allergy_data(fact: IntakeFact) -> dict[str, Any]:
     return {
-        "allergen": fact.fields.get("allergen") or fact.statement,
-        "reaction": fact.fields.get("reaction") or "",
-        "severity": fact.fields.get("severity"),
+        "allergen": _as_text(fact.fields.get("allergen")) or fact.statement,
+        "reaction": _as_text(fact.fields.get("reaction")) or "",
+        "severity": _as_text(fact.fields.get("severity")),
     }
 
 
 def _provider_data(fact: IntakeFact) -> dict[str, Any]:
     return {
-        "name": fact.fields.get("name") or fact.statement,
-        "specialty": fact.fields.get("specialty"),
-        "org": fact.fields.get("org"),
+        "name": _as_text(fact.fields.get("name")) or fact.statement,
+        "specialty": _as_text(fact.fields.get("specialty")),
+        "org": _as_text(fact.fields.get("org")),
     }
 
 
@@ -226,7 +287,7 @@ def facts_to_section_data(facts: Sequence[IntakeFact], section_key: str) -> dict
         providers = [_provider_data(f) for f in active if f.kind == "provider"]
         insurer = next(
             (
-                str(f.fields["insurer"])
+                _as_text(f.fields["insurer"])
                 for f in active
                 if f.kind == "insurance" and f.fields.get("insurer")
             ),

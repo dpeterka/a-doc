@@ -60,15 +60,23 @@ def test_every_section_schema_validates_an_empty_object() -> None:
 
 def test_basics_section_round_trip() -> None:
     data = {
-        "age": 41,
+        "age": "41",
         "sex_at_birth": "female",
-        "height_cm": 165.0,
-        "weight_kg": 63.5,
+        "height_cm": "165cm",
+        "weight_kg": "63.5kg",
         "occupation": "software engineer",
         "exposures": ["mold at a prior workplace"],
     }
     section = BasicsSection.model_validate(data)
     assert section.model_dump(mode="json") == data
+
+
+def test_basics_section_accepts_vague_age() -> None:
+    """A real intake answer, not just a clean number -- forcing this to an
+    exact int is the same rigidity that crashed onboarding for
+    `Relative.age_at_onset` (see that field's docstring)."""
+    section = BasicsSection.model_validate({"age": "mid-40s"})
+    assert section.age == "mid-40s"
 
 
 def test_symptoms_section_round_trip() -> None:
@@ -101,7 +109,7 @@ def test_prior_diagnoses_section_keeps_patient_suspected_separate() -> None:
                 {
                     "name": "Hypothyroidism",
                     "by_whom": "Dr. Lee",
-                    "year": 2018,
+                    "year": "2018",
                     "status": "confirmed",
                 }
             ],
@@ -112,6 +120,13 @@ def test_prior_diagnoses_section_keeps_patient_suspected_separate() -> None:
     assert section.patient_suspected[0].name == "Lupus"
 
 
+def test_prior_diagnosis_accepts_vague_year() -> None:
+    section = PriorDiagnosesSection.model_validate(
+        {"diagnoses": [{"name": "Hypothyroidism", "year": "a few years ago"}]}
+    )
+    assert section.diagnoses[0].year == "a few years ago"
+
+
 def test_family_history_section_round_trip() -> None:
     section = FamilyHistorySection.model_validate(
         {
@@ -119,7 +134,7 @@ def test_family_history_section_round_trip() -> None:
                 {
                     "relation": "mother",
                     "conditions": ["Hashimoto's"],
-                    "age_at_onset": 35,
+                    "age_at_onset": "35",
                     "deceased": False,
                     "age_at_death": None,
                 }
@@ -127,6 +142,27 @@ def test_family_history_section_round_trip() -> None:
         }
     )
     assert section.relatives[0].relation == "mother"
+
+
+def test_family_history_accepts_vague_ages() -> None:
+    """The live crash this schema shipped with: `age_at_onset: int | None`
+    rejected "late 30s" outright and lost the whole patient turn."""
+    section = FamilyHistorySection.model_validate(
+        {
+            "relatives": [
+                {"relation": "father", "age_at_onset": "late 30s"},
+                {
+                    "relation": "sister",
+                    "age_at_onset": "approx. 5 years old",
+                    "deceased": True,
+                    "age_at_death": "mid-40s",
+                },
+            ]
+        }
+    )
+    assert section.relatives[0].age_at_onset == "late 30s"
+    assert section.relatives[1].age_at_onset == "approx. 5 years old"
+    assert section.relatives[1].age_at_death == "mid-40s"
 
 
 def test_medications_and_supplements_sections_are_independent_schemas() -> None:

@@ -82,6 +82,9 @@ def test_prior_diagnoses_conversion_splits_doctor_diagnosed_and_patient_assumpti
         attribution="doctor_diagnosed",
         fields={"by_whom": "Dr. Lee", "year": 2018, "status": "confirmed"},
     )
+    # `year` deliberately left as an int here (facts.fields' loosely-typed
+    # convention -- see `IntakeFact.fields`), proving `_diagnosis_data`
+    # coerces it to the text the schema now expects.
     assumption = _fact(
         id="f2",
         section="prior_diagnoses",
@@ -103,12 +106,38 @@ def test_prior_diagnoses_conversion_splits_doctor_diagnosed_and_patient_assumpti
     assert len(section.diagnoses) == 1
     assert section.diagnoses[0].name == "Hypothyroidism."
     assert section.diagnoses[0].by_whom == "Dr. Lee"
-    assert section.diagnoses[0].year == 2018
+    assert section.diagnoses[0].year == "2018"
 
     assert len(section.patient_suspected) == 2
     names = {s.name for s in section.patient_suspected}
     assert "Patient suspects lupus." in names
     assert "Patient theory: something autoimmune." in names
+
+
+def test_prior_diagnosis_conversion_accepts_vague_year_and_clamps_bad_status() -> None:
+    vague_year = _fact(
+        section="prior_diagnoses",
+        kind="diagnosis",
+        statement="Hypothyroidism.",
+        attribution="doctor_diagnosed",
+        fields={"by_whom": "Dr. Lee", "year": "a few years ago"},
+    )
+    bad_status = _fact(
+        id="f2",
+        section="prior_diagnoses",
+        kind="diagnosis",
+        statement="Lupus, confirmed by rheumatology.",
+        attribution="doctor_diagnosed",
+        fields={"by_whom": "Dr. Patel", "status": "not-a-real-status"},
+    )
+    data = facts_to_section_data([vague_year, bad_status], "prior_diagnoses")
+    section = PriorDiagnosesSection.model_validate(data)
+
+    by_name = {d.name: d for d in section.diagnoses}
+    assert by_name["Hypothyroidism."].year == "a few years ago"
+    # An out-of-vocabulary status clamps to the doctor-diagnosed default
+    # ("confirmed") instead of raising -- see `convert._diagnosis_status`.
+    assert by_name["Lupus, confirmed by rheumatology."].status == "confirmed"
 
 
 def test_family_history_conversion_splits_comma_separated_conditions() -> None:
@@ -127,9 +156,22 @@ def test_family_history_conversion_splits_comma_separated_conditions() -> None:
     section = FamilyHistorySection.model_validate(data)
     assert section.relatives[0].relation == "mother"
     assert section.relatives[0].conditions == ["Hashimoto's", "vitiligo"]
-    # Ages are free-form text now (people say "late 30s"); a numeric input
-    # is accepted and kept as its own text rather than rejected.
     assert section.relatives[0].age_at_onset == "35"
+
+
+def test_family_history_conversion_accepts_a_vague_age_at_onset() -> None:
+    """The live crash this module's schema boundary caused: the intake
+    agent captured "late 30s" verbatim in `fields`, and the (then-`int`)
+    `Relative.age_at_onset` rejected it, losing the whole turn."""
+    fact = _fact(
+        section="family_history",
+        kind="relative",
+        statement="Patient's father.",
+        fields={"relation": "father", "age_at_onset": "late 30s"},
+    )
+    data = facts_to_section_data([fact], "family_history")
+    section = FamilyHistorySection.model_validate(data)
+    assert section.relatives[0].age_at_onset == "late 30s"
 
 
 def test_geography_conversion_splits_residences_travel_and_exposures() -> None:
@@ -256,7 +298,7 @@ def test_basics_conversion_merges_across_multiple_facts_and_dedupes_exposures() 
         fields={"occupation": "software engineer", "exposure": "mold"},
     )
     data = facts_to_section_data([first, second], "basics")
-    assert data["age"] == 41
+    assert data["age"] == "41"  # coerced to text -- see convert._as_text
     assert data["occupation"] == "software engineer"
     assert data["exposures"] == ["mold", "asbestos"]  # deduped, first-seen order
 

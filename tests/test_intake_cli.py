@@ -103,10 +103,10 @@ def test_back_returns_cursor_to_the_previous_section(tmp_path: Path) -> None:
 
 def test_submit_then_confirmation_phrase_commits_the_section(tmp_path: Path) -> None:
     basics = {
-        "age": 41,
+        "age": "41",
         "sex_at_birth": "female",
-        "height_cm": 165.0,
-        "weight_kg": 63.0,
+        "height_cm": "165cm",
+        "weight_kg": "63kg",
         "occupation": "software engineer",
         "exposures": [],
     }
@@ -124,10 +124,10 @@ def test_submit_then_confirmation_phrase_commits_the_section(tmp_path: Path) -> 
 
 def test_correction_text_after_playback_revises_instead_of_confirming(tmp_path: Path) -> None:
     basics_1 = {
-        "age": 41,
+        "age": "41",
         "sex_at_birth": "female",
-        "height_cm": 165.0,
-        "weight_kg": 63.0,
+        "height_cm": "165cm",
+        "weight_kg": "63kg",
         "occupation": None,
         "exposures": [],
     }
