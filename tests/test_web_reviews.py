@@ -1,7 +1,7 @@
-"""Weekly review surface tests: list + render of `case/reviews/*.md`, and
-(when none exist yet) an explanation of what a weekly review is, when the
-next one runs, and that the first one needs a diagnostic conversation on
-file first.
+"""Deep-review surface tests: `/reviews` redirects to the merged `/ledger`
+page (docs/adr/0019-event-triggered-review.md "UI merge"); `/reviews/
+{filename}` — the permalink each review is actually reached by — is
+unchanged. `tests/test_web_ledger.py` covers the merged page itself.
 """
 
 from __future__ import annotations
@@ -11,40 +11,16 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 from web_support import build_app, login
 
-from adoc.web.routes.reviews import REVIEW_SCHEDULE_PHRASE
 
-
-def test_reviews_index_empty_state_explains_the_mechanism_and_schedule(tmp_path: Path) -> None:
+def test_reviews_index_redirects_to_ledger(tmp_path: Path) -> None:
     app, _repo, _db, _calls = build_app(tmp_path)
     client = TestClient(app)
     login(client)
 
-    response = client.get("/reviews")
+    response = client.get("/reviews", follow_redirects=False)
 
-    assert response.status_code == 200
-    body = response.text
-    assert "No reviews yet." not in body
-    assert "blind re-differential panel" in body
-    assert "without" in body.lower()
-    assert REVIEW_SCHEDULE_PHRASE in body
-    assert "at least one diagnostic conversation" in body
-    assert 'href="/chat"' in body
-
-
-def test_reviews_index_lists_review_files(tmp_path: Path) -> None:
-    app, repo, _db, _calls = build_app(tmp_path)
-    reviews_dir = repo.root / "case" / "reviews"
-    reviews_dir.mkdir(parents=True, exist_ok=True)
-    (reviews_dir / "2026-06-01-weekly.md").write_text(
-        "# Weekly review\n\n- churn: low\n", encoding="utf-8"
-    )
-    client = TestClient(app)
-    login(client)
-
-    response = client.get("/reviews")
-
-    assert response.status_code == 200
-    assert "2026-06-01-weekly.md" in response.text
+    assert response.status_code == 301
+    assert response.headers["location"] == "/ledger"
 
 
 def test_reviews_detail_renders_markdown(tmp_path: Path) -> None:
@@ -62,6 +38,7 @@ def test_reviews_detail_renders_markdown(tmp_path: Path) -> None:
     assert response.status_code == 200
     assert "<h1>Weekly review</h1>" in response.text
     assert "<li>churn: low</li>" in response.text
+    assert 'href="/ledger"' in response.text
 
 
 def test_reviews_detail_redacts_dosing_language_in_persisted_markdown(tmp_path: Path) -> None:

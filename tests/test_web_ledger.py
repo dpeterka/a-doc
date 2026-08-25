@@ -3,6 +3,10 @@ status/origin chips (including an `origin: patient` chip) and links
 evidence source-refs back to their documents where resolvable — and, when
 no hypotheses exist yet, an explanation state instead of the "complete,
 unfiltered record" framing (which is only true once there's a record).
+
+Also (docs/adr/0019-event-triggered-review.md "UI merge"): `/ledger` now
+also shows the latest deep review inline and links prior reviews as
+history — the merge of what used to be a separate `/reviews` index page.
 """
 
 from __future__ import annotations
@@ -208,3 +212,88 @@ def test_ledger_view_resolves_many_doc_refs_without_requerying_per_ref(
     # listings. The memoized implementation issues exactly one of each.
     assert len(document_selects) == 1, f"expected 1 documents query, got {len(document_selects)}"
     assert len(listings) == 1, f"expected 1 page-image directory listing, got {len(listings)}"
+
+
+# --------------------------------------------------------------------------
+# Merged deep-review section (docs/adr/0019-event-triggered-review.md)
+# --------------------------------------------------------------------------
+
+
+def test_ledger_view_deep_review_empty_state_describes_the_trigger_model(tmp_path: Path) -> None:
+    app, _repo, _db, _calls = build_app(tmp_path)
+    client = TestClient(app)
+    login(client)
+
+    response = client.get("/ledger")
+
+    assert response.status_code == 200
+    body = response.text
+    assert "blind re-differential panel" in body
+    assert "without" in body.lower()
+    # Trigger phrasing describes the event-triggered mechanism, not a fixed
+    # weekly cron.
+    assert "whenever something new arrives" in body
+    assert "at most once every 6 hours" in body
+    assert "at least once every 7 days" in body
+    assert "None have run yet" in body
+
+
+def test_ledger_view_shows_the_latest_review_inline(tmp_path: Path) -> None:
+    app, repo, _db, _calls = build_app(tmp_path)
+    reviews_dir = repo.root / "case" / "reviews"
+    reviews_dir.mkdir(parents=True, exist_ok=True)
+    (reviews_dir / "2026-06-01-review.md").write_text(
+        "# Weekly Review — 2026-06-01\n\n_Why this review ran: ingest: 1 new document(s)_\n\n"
+        "## What changed this week\n\nNothing new.\n",
+        encoding="utf-8",
+    )
+    client = TestClient(app)
+    login(client)
+
+    response = client.get("/ledger")
+
+    assert response.status_code == 200
+    body = response.text
+    assert "Why this review ran" in body
+    assert "ingest: 1 new document(s)" in body
+    assert 'href="/reviews/2026-06-01-review.md"' in body
+    # The empty-state copy is gone once a real review exists.
+    assert "None have run yet" not in body
+
+
+def test_ledger_view_lists_prior_reviews_as_history_excluding_the_latest(tmp_path: Path) -> None:
+    app, repo, _db, _calls = build_app(tmp_path)
+    reviews_dir = repo.root / "case" / "reviews"
+    reviews_dir.mkdir(parents=True, exist_ok=True)
+    (reviews_dir / "2026-05-01-review.md").write_text("# Weekly Review — 2026-05-01\n", "utf-8")
+    (reviews_dir / "2026-06-01-review.md").write_text("# Weekly Review — 2026-06-01\n", "utf-8")
+    client = TestClient(app)
+    login(client)
+
+    response = client.get("/ledger")
+
+    assert response.status_code == 200
+    body = response.text
+    # Latest review is rendered inline (its own permalink still appears
+    # once, as the "full report" link) plus once more in history — the
+    # OLDER review appears as a plain history link.
+    assert 'href="/reviews/2026-05-01-review.md"' in body
+    assert 'href="/reviews/2026-06-01-review.md"' in body
+
+
+def test_reviews_index_redirect_still_reaches_the_review_list(tmp_path: Path) -> None:
+    """Old bookmarked `/reviews` links must not 404 (they may be embedded
+    in committed review markdown or a chat transcript entry) — following
+    the redirect lands on the same merged page."""
+    app, repo, _db, _calls = build_app(tmp_path)
+    reviews_dir = repo.root / "case" / "reviews"
+    reviews_dir.mkdir(parents=True, exist_ok=True)
+    (reviews_dir / "2026-06-01-review.md").write_text("# Weekly Review — 2026-06-01\n", "utf-8")
+    client = TestClient(app)
+    login(client)
+
+    response = client.get("/reviews")
+
+    assert response.status_code == 200
+    assert response.url.path == "/ledger"
+    assert 'href="/reviews/2026-06-01-review.md"' in response.text

@@ -517,8 +517,13 @@ Resources:
     Type: AWS::Events::Rule
     Properties:
       Name: a-doc-review
-      Description: Weekly deep review (`adoc review`) - replaces adoc-review.timer.
-      ScheduleExpression: "cron(0 6 ? * SUN *)"
+      Description: >-
+        Event-triggered review tick (`adoc review`, docs/adr/0019-event-triggered-review.md):
+        every 30 minutes, `adoc review` itself decides whether to run a full review (the
+        review-wanted marker is set and a 6h cooldown has elapsed, or no full review has run
+        in 7 days) or just the cheap deterministic checks. Replaces the old weekly-only
+        `cron(0 6 ? * SUN *)` schedule and adoc-review.timer.
+      ScheduleExpression: rate(30 minutes)
       State: ENABLED
       Targets:
         - Id: a-doc-review-target
