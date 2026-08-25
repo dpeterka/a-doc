@@ -438,17 +438,30 @@ cmd_start() {
     exit 1
   fi
 
+  # A clone carries committed content only, so `labs.sqlite` (gitignored,
+  # derived) is never in it. Without a rebuild the app would come up with an
+  # empty labs database — no analytes, no trends — which defeats the point of
+  # copying the store. So a fresh clone always implies --re-index; the flag
+  # remains useful on its own for refreshing an existing working dir.
+  local cloned=0
   if [ -d "$workdir_abs" ]; then
     if [ "$force" -eq 1 ]; then
       guard_safe_to_delete "$workdir_abs" || exit 1
       info "start: --force given; removing existing working dir '$workdir_abs'"
       rm -rf -- "$workdir_abs"
       clone_from_safe_store "$workdir_abs"
+      cloned=1
     else
       info "start: reusing existing working dir '$workdir_abs' as-is (pass --force to recreate from the safe store)"
     fi
   else
     clone_from_safe_store "$workdir_abs"
+    cloned=1
+  fi
+
+  if [ "$cloned" -eq 1 ] && [ "$reindex" -eq 0 ]; then
+    info "start: freshly cloned working dir — rebuilding derived indexes (implied --re-index)"
+    reindex=1
   fi
 
   if [ "$reindex" -eq 1 ]; then
