@@ -22,11 +22,32 @@
     {% endfor %}
   </div>
 
-  <form hx-post="/chat/send" hx-target="#chat-transcript" hx-swap="beforeend" hx-on--after-request="this.reset()">
+  {#
+    A turn is SLOW: once the initial visit is complete, a diagnostic question
+    runs the whole DAG (Ledger-Maintainer -> Challenger -> apply -> Composer,
+    plus the entailment verifier) — several sequential model calls, minutes of
+    wall clock. Without `hx-indicator`/`hx-disabled-elt` the page did not move
+    at all while that ran, and htmx queues a repeat submit on the same form
+    behind the in-flight one, so pressing Send again also did nothing. The
+    honest read of that is "the Send button stopped working after intake" —
+    which is exactly how it was reported. The wait is inherent; hiding it is
+    the bug.
+  #}
+  <form hx-post="/chat/send"
+        hx-target="#chat-transcript"
+        hx-swap="beforeend"
+        hx-indicator="#chat-pending"
+        hx-disabled-elt="find button"
+        hx-on--after-request="this.reset()">
     <label for="chat-text" class="sr-only">Message</label>
     <textarea id="chat-text" name="text" rows="3" placeholder="Type a message..." required></textarea>
     <div class="button-row">
       <button type="submit">Send</button>
+      <span id="chat-pending" class="chat-pending" role="status" aria-live="polite">
+        <span class="chat-pending-dot" aria-hidden="true"></span>
+        Thinking. A question about your differential works through your whole case
+        file and can take a few minutes — you can leave this page open.
+      </span>
     </div>
   </form>
 

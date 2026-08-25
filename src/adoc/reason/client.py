@@ -35,6 +35,7 @@ no transport was injected.
 from __future__ import annotations
 
 import json
+import logging
 import re
 import time
 from collections.abc import Callable, Sequence
@@ -47,6 +48,13 @@ from pydantic import BaseModel, ConfigDict
 
 from adoc.config import ModelBinding, Settings, load_model_bindings
 from adoc.privacy import IDENTIFIERS_RELPATH, Scrubber
+
+# A single call can legitimately block for minutes (`_ANTHROPIC_TIMEOUT_SECONDS`
+# is 300s per attempt, over `_max_retries` attempts), and a diagnostic turn
+# makes several in sequence. Without a log line on either side of the call,
+# a slow turn is indistinguishable from a hung one — the audit log only
+# gains its record once the call has already returned.
+logger = logging.getLogger(__name__)
 
 FEATHERLESS_BASE_URL = "https://api.featherless.ai/v1"
 
@@ -628,10 +636,22 @@ class LlmClient:
             max_tokens=max_tokens,
         )
 
+        # Content is never logged — only the routing metadata (role, provider,
+        # model) and, afterwards, timing/token counts. Same rule the audit log
+        # follows.
+        logger.info(
+            "llm: role=%s provider=%s model=%s calling", role, binding.provider, binding.model
+        )
         started = time.monotonic()
         try:
             response = self._call_with_retry(provider, request)
         except LlmError:
+            logger.warning(
+                "llm: role=%s model=%s FAILED after %.1fs",
+                role,
+                binding.model,
+                time.monotonic() - started,
+            )
             self._audit(
                 _AuditRecord(
                     role=role,
@@ -647,6 +667,14 @@ class LlmClient:
             )
             raise
         duration = time.monotonic() - started
+        logger.info(
+            "llm: role=%s model=%s ok in %.1fs (in=%s out=%s tokens)",
+            role,
+            binding.model,
+            duration,
+            response.input_tokens,
+            response.output_tokens,
+        )
 
         parsed: BaseModel | None = None
         if schema is not None:

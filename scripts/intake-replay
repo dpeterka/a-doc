@@ -1,0 +1,226 @@
+#!/usr/bin/env python3
+"""Replay a scripted intake conversation against a running local a-doc.
+
+Testing a change to the intake agent meant typing a full initial visit by
+hand — roughly an hour per iteration, and never quite the same twice, so a
+regression could hide behind a differently-worded answer. This drives the
+same HTTP surface the browser does (`POST /chat/send`), one patient message
+at a time, and prints what each turn cost and what it produced.
+
+The SCRIPT IS NOT PART OF THIS REPO. It is a real patient history in all
+but the names, so it lives in the data repo or any path outside the source
+tree, per CLAUDE.md rule 1. Pass it with `--script`.
+
+Script format: patient messages separated by blank lines. `#` at the start
+of a line is a comment. That is deliberately the same shape as a pasted
+chat transcript with the assistant's replies deleted.
+
+    ./scripts/intake-replay --script ~/intake-cases/andrea.txt --port 9001
+
+Useful flags:
+    --until-complete   stop as soon as intake flips to complete, and report
+                       which message it happened on (the wrap-up gate is the
+                       thing most likely to regress).
+    --then "question"  after the script, send one more message — this is how
+                       you exercise the FIRST post-intake turn, which routes
+                       to the diagnostic DAG and is by far the slowest.
+    --dry-run          parse and print the script without calling anything.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from http.cookiejar import CookieJar
+from pathlib import Path
+
+# A single diagnostic turn legitimately runs for minutes (each model call is
+# allowed up to 300s and a turn makes several in sequence), so the client
+# timeout has to be generous or the harness reports a failure the server
+# never had.
+TURN_TIMEOUT_SECONDS = 1800
+
+_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def parse_script(text: str) -> list[str]:
+    """Blank-line-separated messages; `#` lines are comments."""
+    blocks: list[str] = []
+    current: list[str] = []
+    for line in text.splitlines():
+        if line.lstrip().startswith("#"):
+            continue
+        if line.strip():
+            current.append(line.rstrip())
+        elif current:
+            blocks.append("\n".join(current))
+            current = []
+    if current:
+        blocks.append("\n".join(current))
+    return blocks
+
+
+def _strip_html(fragment: str) -> str:
+    """The assistant's reply, plain. `_chat_turn.html` renders the patient
+    bubble first and the assistant bubble second; we want the second."""
+    parts = fragment.split('class="chat-bubble chat-bubble-assistant')
+    body = parts[-1] if len(parts) > 1 else fragment
+    text = _TAG_RE.sub(" ", body)
+    text = (
+        text.replace("&#39;", "'").replace("&#34;", '"').replace("&amp;", "&").replace("&gt;", ">")
+    )
+    return " ".join(text.split())
+
+
+class Session:
+    def __init__(self, base: str) -> None:
+        self.base = base.rstrip("/")
+        self.opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(CookieJar()))
+
+    def _post(self, path: str, fields: dict[str, str], *, timeout: int) -> str:
+        data = urllib.parse.urlencode(fields).encode()
+        request = urllib.request.Request(f"{self.base}{path}", data=data, method="POST")
+        with self.opener.open(request, timeout=timeout) as response:
+            return response.read().decode("utf-8", "replace")
+
+    def login(self, username: str, password: str) -> None:
+        try:
+            self._post("/login", {"username": username, "password": password}, timeout=30)
+        except urllib.error.HTTPError as exc:
+            raise SystemExit(f"login failed: HTTP {exc.code}") from exc
+
+    def send(self, text: str) -> str:
+        return self._post("/chat/send", {"text": text}, timeout=TURN_TIMEOUT_SECONDS)
+
+
+def intake_is_complete(data_dir: Path) -> bool:
+    """Read the intake state directly rather than scraping the page — the
+    wrap-up gate writes it, and it is the thing under test."""
+    state = data_dir / "case" / "intake-state.yaml"
+    if not state.exists():
+        return False
+    return "intake_complete: true" in state.read_text(encoding="utf-8").lower()
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument(
+        "--script", required=True, type=Path, help="patient messages, blank-line separated"
+    )
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=9001)
+    parser.add_argument("--user", default="andrea")
+    parser.add_argument("--password", default="test")
+    parser.add_argument(
+        "--data-dir", type=Path, help="data repo, to read intake state after each turn"
+    )
+    parser.add_argument("--until-complete", action="store_true", help="stop once intake completes")
+    parser.add_argument("--then", help="one extra message to send after the script")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--out", type=Path, help="write a JSON record of the run here")
+    args = parser.parse_args(argv)
+
+    if not args.script.exists():
+        print(f"intake-replay: no such script: {args.script}", file=sys.stderr)
+        return 2
+    messages = parse_script(args.script.read_text(encoding="utf-8"))
+    if not messages:
+        print("intake-replay: script contained no messages", file=sys.stderr)
+        return 2
+
+    print(f"intake-replay: {len(messages)} message(s) from {args.script}")
+    if args.dry_run:
+        for i, message in enumerate(messages, 1):
+            print(f"  {i:2d}. {message[:100]}{'...' if len(message) > 100 else ''}")
+        return 0
+
+    session = Session(f"http://{args.host}:{args.port}")
+    session.login(args.user, args.password)
+
+    records: list[dict] = []
+    completed_on: int | None = None
+    run_clock = time.monotonic()
+
+    def run_turn(index: int, message: str, *, label: str) -> None:
+        nonlocal completed_on
+        preview = message if len(message) <= 70 else message[:67] + "..."
+        print(f"\n[{label}] -> {preview}")
+        started = time.monotonic()
+        try:
+            fragment = session.send(message)
+        except urllib.error.HTTPError as exc:
+            elapsed = time.monotonic() - started
+            print(f"  !! HTTP {exc.code} after {elapsed:.1f}s")
+            records.append({"n": index, "sent": message, "error": exc.code, "seconds": elapsed})
+            return
+        except TimeoutError:
+            elapsed = time.monotonic() - started
+            print(f"  !! no response after {elapsed:.1f}s (client timeout)")
+            records.append({"n": index, "sent": message, "error": "timeout", "seconds": elapsed})
+            return
+        elapsed = time.monotonic() - started
+        reply = _strip_html(fragment)
+        withheld = "Reply withheld by a safety check" in fragment
+        flag = " [WITHHELD]" if withheld else ""
+        print(f"  <- ({elapsed:.1f}s){flag} {reply[:400]}{'...' if len(reply) > 400 else ''}")
+        record = {
+            "n": index,
+            "sent": message,
+            "reply": reply,
+            "withheld": withheld,
+            "seconds": elapsed,
+        }
+        if args.data_dir:
+            done = intake_is_complete(args.data_dir)
+            record["intake_complete"] = done
+            if done and completed_on is None:
+                completed_on = index
+                print(f"  ** intake complete after message {index}")
+        records.append(record)
+
+    for index, message in enumerate(messages, 1):
+        run_turn(index, message, label=f"{index}/{len(messages)}")
+        if args.until_complete and completed_on is not None:
+            print(
+                f"\nintake-replay: stopping early — complete after "
+                f"{completed_on} of {len(messages)}"
+            )
+            break
+
+    if args.then:
+        # The first post-intake turn is the interesting one: it routes to the
+        # diagnostic DAG instead of the intake agent, and takes minutes.
+        run_turn(len(messages) + 1, args.then, label="post-intake")
+
+    total = time.monotonic() - run_clock
+    turns = [r for r in records if "seconds" in r]
+    slowest = max(turns, key=lambda r: r["seconds"], default=None)
+    withheld = [r for r in records if r.get("withheld")]
+    errors = [r for r in records if r.get("error")]
+
+    print(f"\nintake-replay: {len(records)} turn(s) in {total / 60:.1f} min")
+    if slowest:
+        print(f"  slowest turn: #{slowest['n']} at {slowest['seconds']:.1f}s")
+    withheld_note = f" -> {[r['n'] for r in withheld]}" if withheld else ""
+    print(f"  withheld replies: {len(withheld)}{withheld_note}")
+    print(f"  errors: {len(errors)}" + (f" -> {[r['n'] for r in errors]}" if errors else ""))
+    if args.data_dir:
+        print(f"  intake complete: {intake_is_complete(args.data_dir)}")
+
+    if args.out:
+        args.out.write_text(json.dumps(records, indent=2), encoding="utf-8")
+        print(f"  run record: {args.out}")
+
+    return 1 if errors else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

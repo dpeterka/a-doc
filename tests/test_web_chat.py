@@ -716,3 +716,23 @@ def test_error_turn_never_triggers_visit_capture(tmp_path: Path) -> None:
 
     assert response.status_code == 200
     assert capture_calls == []
+
+
+def test_chat_form_shows_a_pending_state_while_a_turn_is_in_flight(tmp_path: Path) -> None:
+    """A diagnostic turn runs the whole DAG — minutes of sequential model
+    calls. With no indicator and no disabled Send button the page did not
+    move at all while that ran, and htmx queues a repeat submit behind the
+    in-flight one, so pressing Send again did nothing either. It read as
+    "the Send button stopped working after intake"."""
+    app, _repo, _db, _calls = build_app(tmp_path)
+    client = TestClient(app)
+    login(client)
+
+    body = client.get("/chat").text
+
+    assert 'hx-indicator="#chat-pending"' in body
+    assert 'hx-disabled-elt="find button"' in body
+    assert 'id="chat-pending"' in body
+    # The wait is inherent, so the copy has to say so rather than imply
+    # something is about to appear any second.
+    assert "few minutes" in body
