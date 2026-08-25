@@ -72,9 +72,26 @@ Resources:
       HealthCheckEnabled: true
       HealthCheckProtocol: HTTP
       HealthCheckPath: /healthz
-      HealthCheckIntervalSeconds: 30
+      # 10s x 2 passes => a new task starts serving ~20s after it comes up,
+      # instead of ~60s at the previous 30s interval. Unhealthy stays at 3
+      # consecutive failures so a single blip never pulls the only task.
+      HealthCheckIntervalSeconds: 10
       HealthyThresholdCount: 2
       UnhealthyThresholdCount: 3
+      TargetGroupAttributes:
+        # THE dominant cost of a deploy here. Left unset, this is AWS's
+        # 300s default: the ALB drains the old task for five minutes before
+        # ECS may stop it, and because the service runs MaximumPercent 100 /
+        # MinimumHealthyPercent 0 (single writer for SQLite + git, see
+        # ecs.yaml), the replacement task cannot start until the old one is
+        # gone. So every deploy paid ~5 minutes of pure waiting.
+        #
+        # 30s is ample for this app: one user, no long-lived uploads, and
+        # the chat SSE stream sends a single event then closes. Anything
+        # still in flight after 30s gets reset, which for a single-user
+        # tool means at worst one retried request.
+        - Key: deregistration_delay.timeout_seconds
+          Value: "30"
       Tags:
         - Key: Name
           Value: a-doc-tg
