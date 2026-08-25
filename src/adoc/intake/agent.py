@@ -852,6 +852,10 @@ def run_intake_turn(client: LlmClient, repo: DataRepo, db: LabsDb, text: str) ->
     last_parsed: IntakeTurnResult | None = None
     applied = AppliedResult()
     retry_feedback: str | None = None
+    # A schema retry spends one of the same bounded attempts the ops retry
+    # uses, so a turn is never more than `_OPS_RETRY_ATTEMPTS` model calls
+    # however it fails.
+    schema_retry_used = False
 
     for _attempt in range(_OPS_RETRY_ATTEMPTS):
         if retry_feedback is not None:
@@ -870,6 +874,31 @@ def run_intake_turn(client: LlmClient, repo: DataRepo, db: LabsDb, text: str) ->
             )
         except LlmError as exc:
             if turn is None:
+                # A schema-validation failure on the FIRST attempt would
+                # otherwise cost the patient her whole message — observed
+                # live, when the model emitted an `add_fact` op's fields
+                # flat instead of nested and a turn of family history was
+                # lost. `facts.AddFact` now lifts that specific shape, but
+                # the general case still needs a second chance: retry once,
+                # feeding the validation error back so the model can
+                # re-emit. Only then give up.
+                if not schema_retry_used:
+                    schema_retry_used = True
+                    logger.warning("intake turn: schema validation failed, retrying once: %s", exc)
+                    messages = [
+                        *messages,
+                        Message(
+                            role="user",
+                            content=(
+                                "Your previous reply could not be parsed into the required "
+                                f"structure. The validation error was:\n\n{exc}\n\n"
+                                "Re-send the SAME turn, correcting only the structure. Each op "
+                                'must be shaped exactly as {"op": "add_fact", "fact": {...}} — '
+                                "the fact's own fields belong inside `fact`, never beside `op`."
+                            ),
+                        ),
+                    ]
+                    continue
                 return IntakeOutcome(kind="error", text=f"Sorry, I couldn't process that: {exc}")
             logger.warning("intake turn: ops-retry call failed, keeping first attempt: %s", exc)
             break
