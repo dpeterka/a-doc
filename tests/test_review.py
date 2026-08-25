@@ -23,12 +23,22 @@ from adoc.reason.context import build_context
 from adoc.reason.dag import ContractViolation
 from adoc.reason.dag import run as dag_run
 from adoc.reason.review import (
+    AdjudicationResult,
+    ChallengeSweepResult,
+    Divergence,
+    DivergenceDecisionPayload,
+    DivergenceSet,
     Marker,
+    OpsMetrics,
+    StalenessReport,
+    TestChooserItem,
+    TestChooserResult,
     build_review_dag,
     challenger_kill_rate,
     hypothesis_ages_days,
     ledger_churn,
     parse_audit_costs,
+    render_review_markdown,
     run_weekly_review,
     scan_staleness,
 )
@@ -694,3 +704,54 @@ def test_hypothesis_ages_days_only_counts_active() -> None:
     )
     ages = hypothesis_ages_days(ledger, today=date(2026, 1, 11))
     assert ages == {"h1": 10}
+
+
+# --- render_review_markdown gates model-written text (Violation 2 regression) -----------------
+#
+# `render_review_markdown` interpolates the Challenger/divergence
+# adjudicator's rationale and the Test-Chooser's items directly — none of
+# that text flows through the Composer's gated path, so nothing screened
+# it before this fix. `web/routes/reviews.py`'s `reviews_detail` gates the
+# read path too (`tests/test_web_reviews.py`); this test proves the write
+# path (this function) is clean at rest as well.
+
+
+def test_render_review_markdown_redacts_dosing_language() -> None:
+    empty_ledger = Ledger(version=1, updated=datetime(2026, 1, 1, tzinfo=UTC), hypotheses=[])
+    divergence = Divergence(
+        id="panel-only:lupus",
+        kind="panel_only",
+        name="Lupus",
+        panel_probability_bucket="moderate",
+        panel_cant_miss=False,
+    )
+    adjudication = AdjudicationResult(
+        decisions=[
+            DivergenceDecisionPayload(
+                divergence="panel-only:lupus",
+                decision="accept",
+                rationale="You should take 20 mg prednisone daily to confirm this diagnosis.",
+            )
+        ]
+    )
+    markdown = render_review_markdown(
+        review_date=date(2026, 1, 7),
+        trend_findings=[],
+        divergence_set=DivergenceSet(divergences=[divergence]),
+        adjudication=adjudication,
+        challenge_sweep=ChallengeSweepResult(notes=[]),
+        test_chooser=TestChooserResult(
+            items=[TestChooserItem(text="Start taking 500 mg metformin twice daily")]
+        ),
+        staleness=StalenessReport(),
+        metrics=OpsMetrics(),
+        ledger_before=empty_ledger,
+        ledger_after=empty_ledger,
+    )
+
+    assert "20 mg prednisone" not in markdown
+    assert "500 mg metformin" not in markdown
+    assert "withheld" in markdown.lower()
+    # Surrounding content survives.
+    assert "Lupus" in markdown
+    assert "to confirm this diagnosis" in markdown

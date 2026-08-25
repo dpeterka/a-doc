@@ -1,5 +1,12 @@
 """Weekly review surface (PLAN.md session loop (c)): list + render of
 `case/reviews/*.md`.
+
+`reviews_detail` re-gates the persisted markdown at render time
+(`reason.tools.redact_gated_text`, CLAUDE.md rule 5) in addition to
+`reason.review.render_review_markdown` gating it at generation time —
+reviews written before that fix (or by any future writer that forgets to
+gate) still get covered, since this is the one place every review is
+actually read.
 """
 
 from __future__ import annotations
@@ -10,6 +17,7 @@ from fastapi import APIRouter, Depends, Request
 from starlette.responses import Response
 
 from adoc.casefile.repo import DataRepo
+from adoc.reason.tools import redact_gated_text
 from adoc.web.deps import get_repo
 from adoc.web.templating import templates
 
@@ -52,7 +60,7 @@ def reviews_detail(request: Request, filename: str, repo: DataRepo = Depends(get
         return templates.TemplateResponse(
             request, "reviews_detail.html", {"filename": filename, "content": None}, status_code=404
         )
-    content = path.read_text(encoding="utf-8")
+    content = redact_gated_text(path.read_text(encoding="utf-8"))
     return templates.TemplateResponse(
         request, "reviews_detail.html", {"filename": filename, "content": content}
     )
