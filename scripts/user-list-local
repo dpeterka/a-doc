@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Thin wrapper: see `scripts/local-env.sh user-list --help`.
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+exec "$here/local-env.sh" user-list "$@"
