@@ -29,8 +29,22 @@ roles:
   # is already paid flat-rate for the blind panel, so this adds no
   # incremental per-token cost.
   entailment_verifier:
+    # DeepSeek V3, not R1. Judging "does this row say what this claim says"
+    # is a short factual comparison, not a reasoning problem, and a live
+    # comparison over the 20 labelled pairs in tests/fixtures/entailment/
+    # showed R1 was both slower AND less accurate: R1 78s / 17-of-20, V3
+    # 20s / 19-of-20, gpt-5.2 10s / 19-of-20. R1 also skewed toward
+    # not_entailed (10 vs 8), which is the over-flagging that cost a real
+    # diagnostic turn.
+    #
+    # V3 over gpt-5.2 despite gpt being marginally faster: V3 keeps this a
+    # THIRD model family, distinct from the Ledger-Maintainer (Anthropic)
+    # and the Challenger (OpenAI). ADR 0005's point is independent blind
+    # spots; putting the challenger and the verifier on one family would
+    # let a shared blind spot pass both. 10s of difference inside a
+    # multi-minute turn does not buy back that independence.
     provider: featherless
-    model: deepseek-ai/DeepSeek-R1-0528
+    model: deepseek-ai/DeepSeek-V3-0324
     params: {}
 
   blind_panel:
