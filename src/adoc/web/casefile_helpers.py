@@ -190,22 +190,40 @@ def page_images_dir(repo: DataRepo, sha: str) -> Path:
     return repo.root / "sources" / "pages" / sha
 
 
-def list_page_images(repo: DataRepo, sha: str) -> list[Path]:
+def list_page_images(
+    repo: DataRepo, sha: str, *, cache: dict[str, list[Path]] | None = None
+) -> list[Path]:
+    """`cache`, when given, memoizes this directory listing per `sha` -
+    a confirm-queue page or ledger view commonly calls this once per row/
+    evidence-ref, and several of those often share one document's `sha`.
+    Without a cache each call re-lists the same directory (a filesystem
+    `iterdir()`/stat) on every one of those calls; on the deployed app's
+    EFS/NFS-backed data repo that round trip costs real milliseconds, same
+    as a `labs.sqlite` query. Defaults to `None`, which lists fresh exactly
+    as before.
+    """
+    if cache is not None and sha in cache:
+        return cache[sha]
     if not _is_safe_sha(sha):
-        return []
-    directory = page_images_dir(repo, sha)
-    if not directory.is_dir():
-        return []
-    return sorted(p for p in directory.iterdir() if p.is_file())
+        result: list[Path] = []
+    else:
+        directory = page_images_dir(repo, sha)
+        result = sorted(p for p in directory.iterdir() if p.is_file()) if directory.is_dir() else []
+    if cache is not None:
+        cache[sha] = result
+    return result
 
 
-def page_image_url(repo: DataRepo, sha: str, page: int | None) -> str | None:
+def page_image_url(
+    repo: DataRepo, sha: str, page: int | None, *, cache: dict[str, list[Path]] | None = None
+) -> str | None:
     """The `/files/pages/<sha>/<filename>` URL for `page` (1-indexed), or
     `None` if the document has no rendered page images / the page is out
-    of range."""
+    of range. `cache` is forwarded to `list_page_images` unchanged - see
+    its docstring."""
     if page is None or page < 1:
         return None
-    images = list_page_images(repo, sha)
+    images = list_page_images(repo, sha, cache=cache)
     if page > len(images):
         return None
     filename = images[page - 1].name
@@ -272,8 +290,15 @@ def resolve_original_document_path(repo: DataRepo, sha: str) -> Path | None:
     return resolved
 
 
-def find_document_by_filename(db: LabsDb, filename: str) -> LabDocument | None:
-    for doc in db.list_documents():
+def find_document_by_filename(
+    db: LabsDb, filename: str, *, documents: list[LabDocument] | None = None
+) -> LabDocument | None:
+    """`documents`, when given, is searched instead of calling
+    `db.list_documents()` - the ledger view calls this once per `doc:`
+    evidence ref, and without a pre-fetched list each call re-runs the
+    same full-table `labs.sqlite` query. Defaults to `None`, which queries
+    fresh exactly as before."""
+    for doc in documents if documents is not None else db.list_documents():
         if doc.filename == filename:
             return doc
     return None
