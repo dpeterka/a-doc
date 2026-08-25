@@ -341,3 +341,51 @@ def test_facts_in_other_sections_never_block() -> None:
 
 def test_no_facts_means_no_blockers() -> None:
     assert section_completion_blockers([], "events") == []
+
+
+def test_add_fact_accepts_the_flat_shape_the_model_sometimes_emits() -> None:
+    """Observed live: the model wrote an `add_fact` op's fields flat beside
+    `op` instead of nested under `fact`, which failed structured-output
+    validation and cost the patient a whole message of family history.
+    The nested form is still what the prompt asks for; this only lifts an
+    unambiguous flat payload rather than losing the turn."""
+    flat = {
+        "op": "add_fact",
+        "id": "sister-hypertension",
+        "section": "family_history",
+        "kind": "relative",
+        "statement": "Half-sister (same father) had high blood pressure; died at 26.",
+        "fields": {"relation": "half-sister", "age_at_death": 26},
+    }
+    op = AddFact.model_validate(flat)
+    assert op.fact.id == "sister-hypertension"
+    assert op.fact.section == "family_history"
+    assert op.fact.fields["age_at_death"] == 26
+
+
+def test_add_fact_nested_shape_is_unchanged() -> None:
+    nested = {
+        "op": "add_fact",
+        "fact": {
+            "id": "f-1",
+            "section": "family_history",
+            "kind": "relative",
+            "statement": "Mother died when the patient was 11.",
+        },
+    }
+    assert AddFact.model_validate(nested).fact.id == "f-1"
+
+
+def test_add_fact_still_rejects_a_payload_that_is_malformed_after_lifting() -> None:
+    """Lifting must not turn a genuinely broken op into a silently accepted
+    one — an unknown section is still a validation error."""
+    with pytest.raises(Exception):  # noqa: B017 - pydantic ValidationError
+        AddFact.model_validate(
+            {
+                "op": "add_fact",
+                "id": "x",
+                "section": "not-a-topic",
+                "kind": "note",
+                "statement": "s",
+            }
+        )
