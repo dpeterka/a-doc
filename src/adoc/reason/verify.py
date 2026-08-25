@@ -28,6 +28,20 @@ every number in the Composer's patient-facing text that sits near a known
 analyte name must match a value actually stored for that analyte in
 `labs.sqlite` — arithmetic/number-matching is never delegated to a model
 (CLAUDE.md: "deterministic logic ... is plain code with unit tests").
+
+ADR 0016 revised (2026-08-25, "strip, don't reject"): a `not_entailed`
+claim no longer fails a diff outright. `strip_not_entailed_ops` removes
+just the offending evidence item(s) from a diff/verdict's ops (never
+`insufficient_source` ones — unresolvable is not the same as wrong), so
+the turn proceeds on the remaining, verified evidence instead of the whole
+turn being lost. The one entailment outcome still treated as a hard
+failure is `VerificationReport.all_not_entailed`: every claim in the
+checked ops judged `not_entailed`, with nothing — not even an
+`insufficient_source` claim — surviving. That is evidence the pipeline
+itself produced garbage, not merely an imprecise claim, so
+`reason.stages.entailment_check_contract` still raises a
+`ContractViolation` in that one case. See the ADR for the measured
+over-block rate this fixes and why the threshold is "all", not "any".
 """
 
 from __future__ import annotations
@@ -42,7 +56,7 @@ from pydantic import BaseModel, Field
 
 from adoc.casefile.encounters import read_encounter
 from adoc.casefile.repo import DataRepo
-from adoc.casefile.schema import AddEvidence, AddHypothesis, LedgerOp
+from adoc.casefile.schema import AddEvidence, AddHypothesis, Evidence, LedgerOp
 from adoc.labs.db import LabsDb
 from adoc.labs.models import LabResult
 from adoc.labs.validate import canonicalize
@@ -277,6 +291,7 @@ class ClaimVerification(BaseModel):
     claim: str
     judgment: EntailmentJudgment
     rationale: str = ""
+    hypothesis_id: str = ""
 
 
 class VerificationReport(BaseModel):
@@ -292,10 +307,25 @@ class VerificationReport(BaseModel):
 
     @property
     def failing(self) -> list[ClaimVerification]:
-        """Only `not_entailed` blocks a diff — `insufficient_source` is
-        deliberately excluded, same principle as the citation checker's
-        `unverifiable` (module docstring)."""
+        """Every `not_entailed` claim — the candidates `strip_not_entailed_
+        ops` will drop from a diff/verdict's ops, UNLESS `all_not_entailed`
+        (see that property) makes this a hard failure instead.
+        `insufficient_source` is deliberately excluded, same principle as
+        the citation checker's `unverifiable` (module docstring)."""
         return [c for c in self.checks if c.judgment == "not_entailed"]
+
+    @property
+    def all_not_entailed(self) -> bool:
+        """True when EVERY claim checked was judged `not_entailed` — nothing
+        survives, not even an `insufficient_source` claim. This is the one
+        entailment outcome `reason.stages.entailment_check_contract` still
+        treats as a hard failure (ADR 0016 revised, "strip, don't reject"):
+        a diff whose entire evidence set is not_entailed is evidence the
+        pipeline itself is broken, not merely imprecise — stripping it down
+        to nothing would silently hide that rather than surface it. `False`
+        when `checks` is empty (nothing to fail on, same as `failing`
+        being empty)."""
+        return bool(self.checks) and len(self.not_entailed) == len(self.checks)
 
     @property
     def counts(self) -> dict[str, int]:
@@ -354,6 +384,7 @@ def verify_claims(
                     claim=claim.claim,
                     judgment="insufficient_source",
                     rationale="no source text available to verify this ref yet",
+                    hypothesis_id=claim.hypothesis_id,
                 )
             )
             continue
@@ -395,6 +426,7 @@ def verify_claims(
                     claim=claim.claim,
                     judgment="not_entailed",
                     rationale="entailment verifier returned no judgment for this claim",
+                    hypothesis_id=claim.hypothesis_id,
                 )
             )
         else:
@@ -404,6 +436,7 @@ def verify_claims(
                     claim=claim.claim,
                     judgment=judged.judgment,
                     rationale=judged.rationale,
+                    hypothesis_id=claim.hypothesis_id,
                 )
             )
     return VerificationReport(checks=checks)
@@ -443,15 +476,172 @@ def log_verification_report(repo: DataRepo, report: VerificationReport, *, dag_n
 
 
 # --------------------------------------------------------------------------
+# Strip-don't-reject (ADR 0016 revised, 2026-08-25)
+# --------------------------------------------------------------------------
+
+STRIPPED_CLAIMS_LOG_RELPATH = "logs/entailment-stripped.jsonl"
+
+
+def strip_not_entailed_ops(
+    ops: Sequence[LedgerOp], report: VerificationReport
+) -> tuple[list[LedgerOp], list[ClaimVerification]]:
+    """Remove every evidence item `report` judged `not_entailed` from `ops`
+    (ADR 0016 revised, "strip, don't reject"): dropped from an
+    `AddHypothesis.hypothesis.evidence_for`/`evidence_against` list in
+    place, and an `AddEvidence` op whose own (single) evidence item was
+    `not_entailed` is dropped entirely. `entailed` and `insufficient_source`
+    items are kept unchanged — unresolvable is not the same as wrong, same
+    principle as the citation checker's `unverifiable`.
+
+    Callers decide WHETHER to call this at all: `report.all_not_entailed`
+    (nothing survives) is the one case this function should never be
+    applied to — see `reason.stages.ledger_maintainer_stage`/
+    `challenger_stage`, which leave `ops` untouched in that case so the
+    `entailment_check_*` DAG contract can raise instead.
+
+    Matches evidence to a judgment by `(source, claim)` text — the only
+    identity `VerificationReport` carries back from `verify_claims`. Two
+    evidence items with byte-identical claim text and source ref get the
+    same judgment applied to both, which is a reasonable de-facto behavior
+    given no finer-grained identity exists on either side.
+
+    Returns `(stripped_ops, removed)` — the corrected ops, plus exactly the
+    `ClaimVerification`s that were actually dropped, for the caller to pass
+    to `log_stripped_claims`."""
+    not_entailed_keys = {(c.source, c.claim) for c in report.not_entailed}
+    if not not_entailed_keys:
+        return list(ops), []
+
+    def _is_stripped(ev: Evidence) -> bool:
+        return (ev.source, ev.claim) in not_entailed_keys
+
+    stripped_ops: list[LedgerOp] = []
+    any_removed = False
+    for op in ops:
+        if isinstance(op, AddHypothesis):
+            hyp = op.hypothesis
+            kept_for = [e for e in hyp.evidence_for if not _is_stripped(e)]
+            kept_against = [e for e in hyp.evidence_against if not _is_stripped(e)]
+            if len(kept_for) != len(hyp.evidence_for) or len(kept_against) != len(
+                hyp.evidence_against
+            ):
+                any_removed = True
+                hyp = hyp.model_copy(
+                    update={"evidence_for": kept_for, "evidence_against": kept_against}
+                )
+                op = op.model_copy(update={"hypothesis": hyp})
+            stripped_ops.append(op)
+        elif isinstance(op, AddEvidence):
+            if _is_stripped(op.evidence):
+                any_removed = True
+                continue
+            stripped_ops.append(op)
+        else:
+            stripped_ops.append(op)
+
+    removed = list(report.not_entailed) if any_removed else []
+    return stripped_ops, removed
+
+
+def log_stripped_claims(
+    repo: DataRepo, stripped: Sequence[ClaimVerification], *, dag_node: str
+) -> None:
+    """Append one JSON line recording every evidence claim actually DROPPED
+    from a diff/verdict's ops by `strip_not_entailed_ops` (ADR 0016
+    revised, "strip, don't reject") to `logs/entailment-stripped.jsonl`.
+
+    Distinct from `log_verification_report`'s per-attempt raw judgment
+    counts (which include mid-retry failures the model then self-corrected
+    and which are never actually dropped): this file is the direct signal
+    for "how much evidence is being silently dropped from patient-facing
+    reasoning", so over-stripping is measurable without reconstructing it
+    from retry-attempt noise. A no-op when `stripped` is empty."""
+    if not stripped:
+        return
+    path = repo.root / STRIPPED_CLAIMS_LOG_RELPATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    record = {
+        "timestamp": datetime.now(UTC).isoformat(),
+        "dag_node": dag_node,
+        "count": len(stripped),
+        "stripped": [c.model_dump(mode="json") for c in stripped],
+    }
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(record) + "\n")
+
+
+# --------------------------------------------------------------------------
 # Composer quantitative (number-grounding) check — pure code, no LLM
 # --------------------------------------------------------------------------
 
 _DATE_IN_TEXT_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 _TITER_RE = re.compile(r"\d+\s*:\s*\d+")
+# Same pattern as `reason.citations._RANGE_RE` (reused rather than
+# reinvented, per the codebase's per-module-ownership convention for these
+# clause-cleaning regexes — see `_split_clauses`'s docstring): a range-shaped
+# mention ("reference range 0.0-5.0") is stripped before number extraction
+# so its two boundary numbers never masquerade as a quoted result value.
+_RANGE_RE = re.compile(r"\d+(?:\.\d+)?\s*-\s*\d+(?:\.\d+)?")
 _NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
 _CLAUSE_BOUNDARY_RE = re.compile(r"[.!?;\n]+")
 _DECIMAL_POINT_RE = re.compile(r"(?<=\d)\.(?=\d)")
 _DECIMAL_PLACEHOLDER = "\x00"
+
+# A number sitting next to a known analyte name is treated as that
+# analyte's VALUE by default (conservative-by-construction: this is what
+# lets the check catch a fabricated value with no unit at all). The one
+# thing that overrides that default is explicit positive evidence the
+# number is a COUNT of something instead — a frequency, a duration, a
+# number of occasions — never a result. `_COUNT_CONTEXT_FILLER_WORDS` are
+# short qualifiers skipped over when looking for that evidence ("3
+# SEPARATE panels").
+_VALUE_TOKEN_RE = re.compile(r"[A-Za-z]+")
+_COUNT_CONTEXT_WORDS = {
+    "panel",
+    "panels",
+    "occasion",
+    "occasions",
+    "time",
+    "times",
+    "week",
+    "weeks",
+    "month",
+    "months",
+    "year",
+    "years",
+    "day",
+    "days",
+    "visit",
+    "visits",
+    "test",
+    "tests",
+    "sample",
+    "samples",
+    "draw",
+    "draws",
+    "reading",
+    "readings",
+    "result",
+    "results",
+    "attempt",
+    "attempts",
+    "appointment",
+    "appointments",
+}
+_COUNT_CONTEXT_FILLER_WORDS = {
+    "separate",
+    "different",
+    "additional",
+    "more",
+    "other",
+    "various",
+    "total",
+    "multiple",
+    "prior",
+    "previous",
+    "recent",
+    "further",
+}
 
 
 def _split_clauses(text: str) -> list[str]:
@@ -489,6 +679,52 @@ def _analyte_value_index(db: LabsDb) -> dict[str, set[float]]:
     return index
 
 
+def _known_unit_tokens(db: LabsDb) -> set[str]:
+    """Every distinct `ucum_unit` actually recorded in `labs.sqlite`,
+    lowercased — the unit vocabulary `_quoted_number_looks_like_a_value`
+    treats as direct positive evidence a quoted number is a lab value
+    ("8.5 mg/L" is a value because "mg/L" is a unit this patient's own data
+    actually uses)."""
+    units: set[str] = set()
+    for row in db.all_non_rejected_rows():
+        if row.ucum_unit:
+            units.add(row.ucum_unit.strip().lower())
+    return units
+
+
+def _quoted_number_looks_like_a_value(tail: str, unit_tokens: set[str]) -> bool:
+    """Positive-evidence check for whether a quoted number sitting near a
+    known analyte name is plausibly THAT analyte's value, rather than an
+    unrelated count/frequency/duration — the false-positive over-block a
+    code review caught alongside the entailment-verifier one (ADR 0016
+    revised, 2026-08-25): "Your CRP has been elevated across 3 separate
+    panels" quotes "3", which sits in the same clause as "CRP", but "3" is
+    a COUNT OF PANELS, not a CRP value.
+
+    `tail` is the text immediately following the quoted number in its
+    (date/titer/range-stripped) clause. Deliberately NOT an exhaustive
+    non-value blacklist: a number immediately followed by one of this
+    patient's own recorded units ("8.5 mg/L") is a value by direct positive
+    evidence, and — because the genuine catch this check exists for (a
+    fabricated value with no unit at all, e.g. "12.0, notably elevated")
+    must never regress — a number with no recognizable count/frequency/
+    duration word immediately after it is ALSO still treated as a value
+    candidate by default. Only a number directly followed (skipping a
+    short qualifier like "separate" or "additional") by an explicit count/
+    frequency/duration word from `_COUNT_CONTEXT_WORDS` is excluded."""
+    stripped = tail.lstrip()
+    lowered = stripped.lower()
+    if any(unit and lowered.startswith(unit) for unit in unit_tokens):
+        return True
+    for word in _VALUE_TOKEN_RE.findall(stripped)[:2]:
+        word_l = word.lower()
+        if word_l in _COUNT_CONTEXT_FILLER_WORDS:
+            continue
+        singular = word_l[:-1] if word_l.endswith("s") else word_l
+        return word_l not in _COUNT_CONTEXT_WORDS and singular not in _COUNT_CONTEXT_WORDS
+    return True
+
+
 class ComposerNumberMismatch(BaseModel):
     """One patient-facing number that sits next to a known analyte name but
     does not match ANY stored value recorded for that analyte."""
@@ -519,12 +755,23 @@ def check_composer_numbers(text: str, db: LabsDb) -> ComposerNumberCheck:
     mention of an analyte name actually recorded in `labs.sqlite` for this
     patient — an unrelated number (a page count, a date fragment, a test
     kit catalog number) never trips this check because it never sits next
-    to a real analyte name. Dates and titer ratios (`1:640`) are stripped
-    before number extraction so their digits never masquerade as a quoted
-    result value (mirrors `reason.citations._extract_quoted_numbers`)."""
+    to a real analyte name. Dates, titer ratios (`1:640`), and range-shaped
+    mentions (`0.0-5.0`, e.g. a reference range restated in the reply) are
+    stripped before number extraction so their digits never masquerade as a
+    quoted result value (mirrors `reason.citations._extract_quoted_numbers`
+    exactly, including reusing its `_RANGE_RE`).
+
+    ADR 0016 revised (2026-08-25): sharing a clause with an analyte name is
+    NOT enough on its own — a number is also checked against
+    `_quoted_number_looks_like_a_value` so a COUNT sitting in the same
+    clause ("elevated across 3 separate panels") is never mistaken for that
+    analyte's value. A number that clears both gates and still fails to
+    match any stored value for the analyte it sits next to is exactly the
+    fabrication this check exists to catch."""
     index = _analyte_value_index(db)
     if not index:
         return ComposerNumberCheck()
+    unit_tokens = _known_unit_tokens(db)
 
     mismatches: list[ComposerNumberMismatch] = []
     for clause in _split_clauses(text):
@@ -537,13 +784,18 @@ def check_composer_numbers(text: str, db: LabsDb) -> ComposerNumberCheck:
 
         cleaned = _DATE_IN_TEXT_RE.sub(" ", clause)
         cleaned = _TITER_RE.sub(" ", cleaned)
-        numbers = [float(m) for m in _NUMBER_RE.findall(cleaned)]
-        if not numbers:
+        cleaned = _RANGE_RE.sub(" ", cleaned)
+        number_matches = list(_NUMBER_RE.finditer(cleaned))
+        if not number_matches:
             continue
 
         for label in matched_labels:
             stored = index[label]
-            for number in numbers:
+            for number_match in number_matches:
+                tail = cleaned[number_match.end() :]
+                if not _quoted_number_looks_like_a_value(tail, unit_tokens):
+                    continue
+                number = float(number_match.group())
                 if not any(abs(number - v) <= 1e-9 for v in stored):
                     mismatches.append(
                         ComposerNumberMismatch(
@@ -587,6 +839,8 @@ __all__ = [
     "build_entailment_retry_feedback",
     "check_composer_numbers",
     "claims_from_ops",
+    "log_stripped_claims",
     "log_verification_report",
+    "strip_not_entailed_ops",
     "verify_claims",
 ]

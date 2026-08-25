@@ -106,5 +106,17 @@
     "claim": "Your ferritin was 45, consistent with early iron deficiency.",
     "source_text": "Ferritin on 2026-05-02: 45; unit ng/mL; reference range 20.0-250.0",
     "expected": "not_entailed"
+  },
+  {
+    "id": "interpretation-esr-inflammatory-process-entailed",
+    "claim": "Your ESR was 42, elevated above the reference range, consistent with an ongoing inflammatory process.",
+    "source_text": "ESR on 2026-05-02: 42; unit mm/hr; reference range 0.0-20.0; flag H",
+    "expected": "entailed"
+  },
+  {
+    "id": "interpretation-crp-active-inflammation-entailed",
+    "claim": "Your CRP was 8.5, elevated above the reference range, suggesting an active inflammatory process worth discussing with your doctor.",
+    "source_text": "CRP on 2026-05-02: 8.5; unit mg/L; reference range 0.0-5.0; flag H",
+    "expected": "entailed"
   }
 ]

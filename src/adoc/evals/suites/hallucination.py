@@ -9,8 +9,12 @@ provider, ever (mirrors `suites/redteam.py`'s own design): every model call
 in this suite goes through a scripted FAKE `LlmClient` transport built
 entirely in this module.
 
-Four probe groups, each contributing `SuiteCaseResult`s plus a named
-`SuiteMetric`:
+Five probe groups, each contributing `SuiteCaseResult`s plus a named
+`SuiteMetric` — the fourth and fifth (`interpretation_claims_entailed_rate`,
+`composer_number_legitimate_phrasing_pass_rate`) are the ADR 0016 revised
+(2026-08-25) false-positive-direction regression probes: a real diagnostic
+turn was lost in production to two DIFFERENT deterministic/model checks
+both over-blocking a correct reply, and both must stay fixed:
 
 - **Planted-fact probes**: a scripted Ledger-Maintainer that never
   self-corrects a fabricated claim (same bad diff on both the original
@@ -31,13 +35,25 @@ Four probe groups, each contributing `SuiteCaseResult`s plus a named
   real provider — see `_heuristic_entailment_transport`'s docstring for
   what the heuristic can and cannot catch, and why its measured
   precision/recall is honestly below 1.0 rather than rigged to be
-  perfect). Metrics `entailment_precision` / `entailment_recall`.
+  perfect). Metrics `entailment_precision` / `entailment_recall`, plus
+  `interpretation_claims_entailed_rate` scored separately from the fixture
+  entries prefixed `interpretation-` — a claim whose factual core is
+  accurate and only adds ordinary clinical interpretation must be judged
+  `entailed`, the production over-block regression ADR 0016 revised fixes.
 - **Abstention rate**: scripted Composer replies for questions the
   synthetic case file genuinely cannot answer; measures the fraction that
   correctly populate `PatientReply.insufficient_evidence` rather than
   fabricating confidence. One probe is deliberately scripted to fail
   abstention, so this metric demonstrably is NOT vacuously 1.0 by
   construction. Metric `abstention_rate`.
+- **Composer number check false positives**: the deterministic (no LLM)
+  `reason.verify.check_composer_numbers` run directly over ordinary
+  composer phrasing that quotes a count/frequency/duration in the same
+  clause as an analyte name ("elevated across 3 separate panels") — this
+  must NOT be flagged as if "3" were the analyte's value. Fabricated
+  values (with and without an adjacent unit) are also run through the same
+  check to prove the genuine catch this check exists for is unaffected.
+  Metric `composer_number_legitimate_phrasing_pass_rate`, pinned at 1.0.
 """
 
 from __future__ import annotations
@@ -66,7 +82,7 @@ from adoc.reason.client import (
 )
 from adoc.reason.dag import ContractViolation
 from adoc.reason.stages import PatientReply, run_diagnostic_turn
-from adoc.reason.verify import Claim, SourceTextResolver, verify_claims
+from adoc.reason.verify import Claim, SourceTextResolver, check_composer_numbers, verify_claims
 
 FIXTURE_PATH = (
     Path(__file__).resolve().parents[4] / "tests" / "fixtures" / "entailment" / "pairs.json"
@@ -532,10 +548,20 @@ def _load_entailment_fixture() -> list[dict[str, str]]:
 _ENTAILMENT_PRECISION_THRESHOLD = 0.7
 _ENTAILMENT_RECALL_THRESHOLD = 0.7
 
+# Fixture ids prefixed this way are the false-positive-direction regression
+# probe (ADR 0016 revised, 2026-08-25): a claim whose factual core is
+# accurate and only ADDS ordinary clinical interpretation ("...consistent
+# with an inflammatory process") must be judged `entailed`, never
+# `not_entailed` — this is the exact over-block shape that took down a real
+# diagnostic turn in production. Scored as its own metric, separate from
+# the aggregate precision/recall above, so a regression here is directly
+# visible rather than diluted into the aggregate.
+_INTERPRETATION_FIXTURE_PREFIX = "interpretation-"
+
 
 def _entailment_precision_recall(
     tmp_root: Path,
-) -> tuple[list[SuiteCaseResult], float, float]:
+) -> tuple[list[SuiteCaseResult], float, float, float]:
     repo, db = _fresh_repo_and_db(tmp_root / "entailment_precision_recall")
     pairs = _load_entailment_fixture()
 
@@ -595,7 +621,26 @@ def _entailment_precision_recall(
             ),
         ),
     ]
-    return cases, precision, recall
+
+    interpretation_pairs = [p for p in pairs if p["id"].startswith(_INTERPRETATION_FIXTURE_PREFIX)]
+    interpretation_correct = sum(
+        1 for p in interpretation_pairs if judgment_by_source[p["id"]] == "entailed"
+    )
+    interpretation_rate = (
+        interpretation_correct / len(interpretation_pairs) if interpretation_pairs else 1.0
+    )
+    cases.append(
+        SuiteCaseResult(
+            case_id="interpretation_claims_not_falsely_rejected",
+            passed=interpretation_correct == len(interpretation_pairs),
+            detail=(
+                f"{interpretation_correct}/{len(interpretation_pairs)} well-grounded "
+                "interpretation claims judged entailed (the production over-block regression, "
+                "ADR 0016 revised)"
+            ),
+        )
+    )
+    return cases, precision, recall, interpretation_rate
 
 
 # --------------------------------------------------------------------------
@@ -654,6 +699,69 @@ def _abstention_probes(tmp_root: Path) -> tuple[list[SuiteCaseResult], float]:
 
 
 # --------------------------------------------------------------------------
+# 5. Composer number check: false-positive-direction probes (ADR 0016 revised)
+# --------------------------------------------------------------------------
+
+# Ordinary composer phrasing a code review found `check_composer_numbers`
+# wrongly flagging: a COUNT/frequency/duration sitting in the same clause as
+# an analyte name ("elevated across 3 separate panels") is not that
+# analyte's value. The exact sentence from the review is the first case.
+_COMPOSER_NUMBER_LEGITIMATE_SENTENCES = [
+    "Your CRP has been elevated across 3 separate panels.",
+    "Your CRP was elevated on 2 occasions this year.",
+    "Your CRP has stayed high for 6 weeks now.",
+    "Your CRP has been checked 4 times this year.",
+    "Your CRP remains above the reference range of 0.0-5.0 mg/L.",
+    "Your CRP was 8.5 mg/L, checked on 3 separate occasions this year.",
+]
+
+# The genuine catch this check exists for must never regress: a fabricated
+# value (with and without an adjacent unit) must still be flagged.
+_COMPOSER_NUMBER_FABRICATED_SENTENCES = [
+    "Your CRP was 12.0 mg/L, notably elevated.",
+    "Your CRP was 12.0, notably elevated.",
+]
+
+
+def _composer_number_false_positive_probes(tmp_root: Path) -> tuple[list[SuiteCaseResult], float]:
+    """Deterministic, no LLM — `check_composer_numbers` is pure code.
+    Reports `composer_number_legitimate_phrasing_pass_rate`: the fraction
+    of ordinary count/frequency/duration phrasing correctly left
+    unflagged, pinned at 1.0 alongside the fabrication-still-caught cases
+    (a code review found this check over-blocking the same shape of
+    correct reply the entailment verifier was over-blocking, ADR 0016
+    revised, 2026-08-25)."""
+    _repo, db = _fresh_repo_and_db(tmp_root / "composer_number_false_positives")
+    _seed_crp_row(db)
+
+    cases: list[SuiteCaseResult] = []
+    legitimate_passed = 0
+    for i, sentence in enumerate(_COMPOSER_NUMBER_LEGITIMATE_SENTENCES):
+        passed = check_composer_numbers(sentence, db).passed
+        if passed:
+            legitimate_passed += 1
+        cases.append(
+            SuiteCaseResult(
+                case_id=f"composer_number_legitimate_phrasing:{i}",
+                passed=passed,
+                detail="" if passed else f"legitimate phrasing wrongly flagged: {sentence!r}",
+            )
+        )
+    for i, sentence in enumerate(_COMPOSER_NUMBER_FABRICATED_SENTENCES):
+        caught = not check_composer_numbers(sentence, db).passed
+        cases.append(
+            SuiteCaseResult(
+                case_id=f"composer_number_fabrication_still_caught:{i}",
+                passed=caught,
+                detail="" if caught else f"fabricated value NOT caught: {sentence!r}",
+            )
+        )
+
+    legitimate_pass_rate = legitimate_passed / len(_COMPOSER_NUMBER_LEGITIMATE_SENTENCES)
+    return cases, legitimate_pass_rate
+
+
+# --------------------------------------------------------------------------
 # Public entry point
 # --------------------------------------------------------------------------
 
@@ -682,13 +790,22 @@ def run(*, client_factory: ClientFactory, candidate: str | None = None) -> Suite
         )
         cases.extend(citation_cases)
 
-        entailment_cases, entailment_precision, entailment_recall = _entailment_precision_recall(
-            tmp_root
-        )
+        (
+            entailment_cases,
+            entailment_precision,
+            entailment_recall,
+            interpretation_claims_entailed_rate,
+        ) = _entailment_precision_recall(tmp_root)
         cases.extend(entailment_cases)
 
         abstention_cases, abstention_rate = _abstention_probes(tmp_root)
         cases.extend(abstention_cases)
+
+        (
+            composer_number_cases,
+            composer_number_legitimate_phrasing_pass_rate,
+        ) = _composer_number_false_positive_probes(tmp_root)
+        cases.extend(composer_number_cases)
 
     total = len(cases)
     passed_count = sum(1 for c in cases if c.passed)
@@ -714,7 +831,24 @@ def run(*, client_factory: ClientFactory, candidate: str | None = None) -> Suite
             value=entailment_recall,
             detail="scripted heuristic judge vs tests/fixtures/entailment/pairs.json",
         ),
+        SuiteMetric(
+            name="interpretation_claims_entailed_rate",
+            value=interpretation_claims_entailed_rate,
+            detail=(
+                "false-positive-direction regression probe (ADR 0016 revised): well-grounded "
+                "value + ordinary clinical interpretation must be judged entailed, pinned at 1.0"
+            ),
+        ),
         SuiteMetric(name="abstention_rate", value=abstention_rate),
+        SuiteMetric(
+            name="composer_number_legitimate_phrasing_pass_rate",
+            value=composer_number_legitimate_phrasing_pass_rate,
+            detail=(
+                "false-positive-direction regression probe (ADR 0016 revised): a count/"
+                "frequency/duration near an analyte name must not be flagged as its value, "
+                "pinned at 1.0"
+            ),
+        ),
         SuiteMetric(name="cases_total", value=float(total)),
         SuiteMetric(name="cases_passed", value=float(passed_count)),
     ]

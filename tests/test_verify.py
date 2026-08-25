@@ -46,7 +46,9 @@ from adoc.reason.verify import (
     build_entailment_retry_feedback,
     check_composer_numbers,
     claims_from_ops,
+    log_stripped_claims,
     log_verification_report,
+    strip_not_entailed_ops,
     verify_claims,
 )
 
@@ -370,6 +372,216 @@ def test_build_entailment_retry_feedback_names_the_failed_claim() -> None:
     assert "source shows a normal value" in feedback
 
 
+def test_verify_claims_propagates_hypothesis_id_onto_each_check(db: LabsDb, repo: DataRepo) -> None:
+    _seed_lab_row(db, name="CRP", value=8.5)
+    claim = Claim(
+        hypothesis_id="h-01", for_or_against="for", claim="c", source="labs:crp:2026-05-02"
+    )
+    client = _build_verifier_client({})
+
+    report = verify_claims(client, [claim], db=db, repo=repo)
+
+    assert report.checks[0].hypothesis_id == "h-01"
+
+
+def test_verify_claims_propagates_hypothesis_id_for_insufficient_source(
+    db: LabsDb, repo: DataRepo
+) -> None:
+    def exploding(_request: TransportRequest) -> TransportResponse:
+        raise AssertionError("must not be called: no resolvable source text")
+
+    bindings: dict[str, list[ModelBinding]] = {
+        "entailment_verifier": [ModelBinding(provider="featherless", model="fake-verifier")]
+    }
+    client = LlmClient(bindings, {"featherless": OpenAIProvider(api_key=None, transport=exploding)})
+    claim = Claim(
+        hypothesis_id="h-02", for_or_against="for", claim="c", source="doc:missing.pdf#p1"
+    )
+
+    report = verify_claims(client, [claim], db=db, repo=repo)
+
+    assert report.checks[0].judgment == "insufficient_source"
+    assert report.checks[0].hypothesis_id == "h-02"
+
+
+# --- VerificationReport.all_not_entailed (ADR 0016 revised) -------------------------------------
+
+
+def test_all_not_entailed_true_when_every_claim_not_entailed() -> None:
+    report = VerificationReport(
+        checks=[
+            ClaimVerification(source="labs:a:2026-05-02", claim="a", judgment="not_entailed"),
+            ClaimVerification(source="labs:b:2026-05-02", claim="b", judgment="not_entailed"),
+        ]
+    )
+    assert report.all_not_entailed is True
+
+
+def test_all_not_entailed_false_when_an_insufficient_source_claim_survives() -> None:
+    """A mix of not_entailed and insufficient_source is NOT "nothing
+    survives" - insufficient_source is kept, so this must not be treated as
+    the pipeline-is-broken case."""
+    report = VerificationReport(
+        checks=[
+            ClaimVerification(source="labs:a:2026-05-02", claim="a", judgment="not_entailed"),
+            ClaimVerification(
+                source="doc:missing.pdf#p1", claim="b", judgment="insufficient_source"
+            ),
+        ]
+    )
+    assert report.all_not_entailed is False
+
+
+def test_all_not_entailed_false_when_an_entailed_claim_survives() -> None:
+    report = VerificationReport(
+        checks=[
+            ClaimVerification(source="labs:a:2026-05-02", claim="a", judgment="not_entailed"),
+            ClaimVerification(source="labs:b:2026-05-02", claim="b", judgment="entailed"),
+        ]
+    )
+    assert report.all_not_entailed is False
+
+
+def test_all_not_entailed_false_when_no_claims_at_all() -> None:
+    assert VerificationReport(checks=[]).all_not_entailed is False
+
+
+# --- strip_not_entailed_ops (ADR 0016 revised, "strip, don't reject") ---------------------------
+
+
+def _hyp_op(
+    *, evidence_for: list[Evidence] | None = None, evidence_against: list[Evidence] | None = None
+) -> AddHypothesis:
+    return AddHypothesis(
+        hypothesis=Hypothesis(
+            id="h-01",
+            name="Test",
+            tier="most-likely",
+            probability="moderate",
+            status="active",
+            origin="model",
+            first_proposed=date(2026, 1, 1),
+            evidence_for=evidence_for or [],
+            evidence_against=evidence_against or [],
+        )
+    )
+
+
+def test_strip_not_entailed_ops_drops_evidence_for_item_but_keeps_hypothesis() -> None:
+    good = Evidence(claim="good claim", source="labs:crp:2026-05-02", strength="strong")
+    bad = Evidence(claim="bad claim", source="labs:ana:2026-05-02", strength="strong")
+    op = _hyp_op(evidence_for=[good, bad])
+    report = VerificationReport(
+        checks=[
+            ClaimVerification(source=good.source, claim=good.claim, judgment="entailed"),
+            ClaimVerification(source=bad.source, claim=bad.claim, judgment="not_entailed"),
+        ]
+    )
+
+    stripped_ops, removed = strip_not_entailed_ops([op], report)
+
+    assert len(stripped_ops) == 1
+    stripped_hyp = stripped_ops[0]
+    assert isinstance(stripped_hyp, AddHypothesis)
+    assert [e.claim for e in stripped_hyp.hypothesis.evidence_for] == ["good claim"]
+    assert [c.claim for c in removed] == ["bad claim"]
+
+
+def test_strip_not_entailed_ops_drops_evidence_against_item() -> None:
+    bad = Evidence(claim="bad against", source="labs:ana:2026-05-02", strength="weak")
+    op = _hyp_op(evidence_against=[bad])
+    report = VerificationReport(
+        checks=[ClaimVerification(source=bad.source, claim=bad.claim, judgment="not_entailed")]
+    )
+
+    stripped_ops, removed = strip_not_entailed_ops([op], report)
+
+    stripped_hyp = stripped_ops[0]
+    assert isinstance(stripped_hyp, AddHypothesis)
+    assert stripped_hyp.hypothesis.evidence_against == []
+    assert len(removed) == 1
+
+
+def test_strip_not_entailed_ops_drops_add_evidence_op_entirely() -> None:
+    bad = Evidence(claim="bad claim", source="labs:ana:2026-05-02", strength="strong")
+    op = AddEvidence(id="h-01", for_or_against="for", evidence=bad)
+    report = VerificationReport(
+        checks=[ClaimVerification(source=bad.source, claim=bad.claim, judgment="not_entailed")]
+    )
+
+    stripped_ops, removed = strip_not_entailed_ops([op], report)
+
+    assert stripped_ops == []
+    assert len(removed) == 1
+
+
+def test_strip_not_entailed_ops_keeps_insufficient_source_and_entailed_unchanged() -> None:
+    entailed = Evidence(claim="entailed claim", source="labs:crp:2026-05-02", strength="strong")
+    insufficient = Evidence(
+        claim="insufficient claim", source="doc:missing.pdf#p1", strength="moderate"
+    )
+    op = _hyp_op(evidence_for=[entailed, insufficient])
+    report = VerificationReport(
+        checks=[
+            ClaimVerification(source=entailed.source, claim=entailed.claim, judgment="entailed"),
+            ClaimVerification(
+                source=insufficient.source,
+                claim=insufficient.claim,
+                judgment="insufficient_source",
+            ),
+        ]
+    )
+
+    stripped_ops, removed = strip_not_entailed_ops([op], report)
+
+    stripped_hyp = stripped_ops[0]
+    assert isinstance(stripped_hyp, AddHypothesis)
+    assert {e.claim for e in stripped_hyp.hypothesis.evidence_for} == {
+        "entailed claim",
+        "insufficient claim",
+    }
+    assert removed == []
+
+
+def test_strip_not_entailed_ops_no_not_entailed_claims_is_a_no_op() -> None:
+    good = Evidence(claim="good claim", source="labs:crp:2026-05-02", strength="strong")
+    op = _hyp_op(evidence_for=[good])
+    report = VerificationReport(
+        checks=[ClaimVerification(source=good.source, claim=good.claim, judgment="entailed")]
+    )
+
+    stripped_ops, removed = strip_not_entailed_ops([op], report)
+
+    assert stripped_ops == [op]
+    assert removed == []
+
+
+def test_log_stripped_claims_appends_jsonl(repo: DataRepo) -> None:
+    checks = [
+        ClaimVerification(
+            source="labs:ana:2026-05-02",
+            claim="bad claim",
+            judgment="not_entailed",
+            rationale="does not match",
+            hypothesis_id="h-01",
+        )
+    ]
+
+    log_stripped_claims(repo, checks, dag_node="ledger_maintainer")
+
+    log_path = repo.root / "logs" / "entailment-stripped.jsonl"
+    assert log_path.exists()
+    record = json.loads(log_path.read_text(encoding="utf-8").strip().splitlines()[-1])
+    assert record["dag_node"] == "ledger_maintainer"
+    assert record["count"] == 1
+    assert record["stripped"][0]["hypothesis_id"] == "h-01"
+
+
+def test_log_stripped_claims_no_op_when_nothing_stripped(repo: DataRepo) -> None:
+    log_stripped_claims(repo, [], dag_node="ledger_maintainer")
+    assert not (repo.root / "logs" / "entailment-stripped.jsonl").exists()
+
+
 def test_log_verification_report_appends_jsonl(db: LabsDb, repo: DataRepo) -> None:
     _seed_lab_row(db, name="CRP", value=8.5)
     claim = Claim(
@@ -431,3 +643,73 @@ def test_build_composer_number_retry_feedback_names_the_mismatch(db: LabsDb) -> 
     assert "12.0" in feedback
     assert "crp" in feedback.lower()
     assert "8.5" in feedback
+
+
+# --- check_composer_numbers: count/frequency/duration false-positive fix (ADR 0016 revised) ---
+
+
+def test_composer_numbers_ignores_a_count_of_panels(db: LabsDb) -> None:
+    """The exact false positive a code review caught: '3' here is a COUNT
+    OF PANELS, not a CRP value, even though it shares a clause with 'CRP'."""
+    _seed_lab_row(db, name="CRP", value=8.5)
+    check = check_composer_numbers("Your CRP has been elevated across 3 separate panels.", db)
+    assert check.passed
+
+
+def test_composer_numbers_ignores_a_count_of_occasions(db: LabsDb) -> None:
+    _seed_lab_row(db, name="CRP", value=8.5)
+    check = check_composer_numbers("Your CRP was elevated on 2 occasions this year.", db)
+    assert check.passed
+
+
+def test_composer_numbers_ignores_a_duration_in_weeks(db: LabsDb) -> None:
+    _seed_lab_row(db, name="CRP", value=8.5)
+    check = check_composer_numbers("Your CRP has stayed high for 6 weeks now.", db)
+    assert check.passed
+
+
+def test_composer_numbers_ignores_a_count_of_times(db: LabsDb) -> None:
+    _seed_lab_row(db, name="CRP", value=8.5)
+    check = check_composer_numbers("Your CRP has been checked 4 times this year.", db)
+    assert check.passed
+
+
+def test_composer_numbers_ignores_reference_range_restated_in_prose(db: LabsDb) -> None:
+    """A range-shaped mention ('0.0-5.0') must not be split into two
+    numbers that then get checked as if either were a quoted CRP value
+    (mirrors `reason.citations`'s own range-stripping, now reused here)."""
+    _seed_lab_row(db, name="CRP", value=8.5)
+    check = check_composer_numbers(
+        "Your CRP remains above the reference range of 0.0-5.0 mg/L.", db
+    )
+    assert check.passed
+
+
+def test_composer_numbers_still_catches_a_fabricated_value_with_no_unit(db: LabsDb) -> None:
+    """The genuine catch this check exists for must never regress: a
+    fabricated value with no unit and no count/frequency word after it is
+    still flagged, exactly as before the false-positive fix."""
+    _seed_lab_row(db, name="CRP", value=8.5)
+    check = check_composer_numbers("Your CRP was 12.0, notably elevated.", db)
+    assert not check.passed
+    assert check.mismatches[0].quoted_number == 12.0
+
+
+def test_composer_numbers_still_catches_a_fabricated_value_with_a_unit(db: LabsDb) -> None:
+    """A value directly followed by one of this patient's own recorded
+    units is positive evidence it's a value candidate, so a mismatch there
+    is still caught (unaffected by the count/frequency exclusion)."""
+    _seed_lab_row(db, name="CRP", value=8.5, ucum_unit="mg/L")
+    check = check_composer_numbers("Your CRP was 12.0 mg/L, notably elevated.", db)
+    assert not check.passed
+    assert check.mismatches[0].quoted_number == 12.0
+
+
+def test_composer_numbers_a_real_value_and_a_count_in_the_same_reply(db: LabsDb) -> None:
+    """A value and an unrelated count can appear in the same reply without
+    either one contaminating the other's check."""
+    _seed_lab_row(db, name="CRP", value=8.5)
+    check = check_composer_numbers(
+        "Your CRP was 8.5 mg/L, checked on 3 separate occasions this year.", db
+    )
+    assert check.passed
