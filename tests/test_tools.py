@@ -24,6 +24,7 @@ from adoc.reason.tools import (
     informational_llm_result,
     list_encounters,
     query_labs,
+    redact_gated_text,
     search_case,
     search_documents,
 )
@@ -236,6 +237,119 @@ def test_answer_informational_blocks_dosing_language(repo: DataRepo, db: LabsDb)
 
     assert "20 mg prednisone" not in answer
     assert "withholding" in answer.lower() or "can't share" in answer.lower()
+
+
+# --- informational_llm_result gates at the source (Violation 1 regression) --------------------
+#
+# Before this fix, `informational_llm_result` returned the model's raw text
+# with no `treatment_gate` call at all — the only gated caller
+# (`answer_informational`) was reachable from no production code, since
+# `reason.stages.run_informational_turn` (the real `web/routes/chat.py`
+# path) called `informational_llm_result` directly. These tests exercise
+# `informational_llm_result` itself, proving the gate now lives at the
+# source rather than depending on which entry point happens to call in.
+
+
+def test_informational_llm_result_gates_dosing_language_after_a_rewrite_attempt(
+    repo: DataRepo, db: LabsDb
+) -> None:
+    """A transport that keeps producing dosing language gets exactly one
+    rewrite attempt (mirroring `stages.composer_stage`), then the answer is
+    withheld rather than shown."""
+    calls: list[TransportRequest] = []
+
+    def transport(request: TransportRequest) -> TransportResponse:
+        calls.append(request)
+        return TransportResponse(
+            text="You should take 20 mg prednisone daily.",
+            tool_input=None,
+            input_tokens=5,
+            output_tokens=5,
+        )
+
+    client = _fake_client(transport)
+    result = informational_llm_result(client, repo, db, "What should I take for inflammation?")
+
+    assert "20 mg prednisone" not in result.text
+    assert "withholding" in result.text.lower()
+    assert len(calls) == 2  # first attempt + one gate-guided rewrite, then withheld
+
+
+def test_informational_llm_result_returns_the_clean_rewrite_when_the_retry_passes(
+    repo: DataRepo, db: LabsDb
+) -> None:
+    """When the model's rewrite actually fixes the dosing language, the
+    (now-passing) rewritten text is returned — the gate does not withhold
+    an answer that already complies."""
+    responses = iter(
+        [
+            "You should take 20 mg prednisone daily.",
+            "Discuss adjusting your current medication dose with your rheumatologist.",
+        ]
+    )
+    calls: list[TransportRequest] = []
+
+    def transport(request: TransportRequest) -> TransportResponse:
+        calls.append(request)
+        return TransportResponse(
+            text=next(responses), tool_input=None, input_tokens=5, output_tokens=5
+        )
+
+    client = _fake_client(transport)
+    result = informational_llm_result(client, repo, db, "What should I take for inflammation?")
+
+    assert result.text == "Discuss adjusting your current medication dose with your rheumatologist."
+    assert len(calls) == 2
+
+
+def test_informational_llm_result_single_call_when_answer_already_passes(
+    repo: DataRepo, db: LabsDb
+) -> None:
+    calls: list[TransportRequest] = []
+
+    def transport(request: TransportRequest) -> TransportResponse:
+        calls.append(request)
+        return TransportResponse(
+            text="Your potassium has been stable in recent labs.",
+            tool_input=None,
+            input_tokens=5,
+            output_tokens=5,
+        )
+
+    client = _fake_client(transport)
+    result = informational_llm_result(client, repo, db, "How has my potassium been?")
+
+    assert result.text == "Your potassium has been stable in recent labs."
+    assert len(calls) == 1
+
+
+# --- redact_gated_text (Violation 2 support) -----------------------------------------------
+
+
+def test_redact_gated_text_leaves_clean_text_untouched() -> None:
+    text = "Joint pain has been intermittent for six weeks."
+    assert redact_gated_text(text) == text
+
+
+def test_redact_gated_text_replaces_only_the_offending_span() -> None:
+    text = "Patient reports joint pain. Take 20 mg prednisone daily. Follow up in 2 weeks."
+    redacted = redact_gated_text(text)
+
+    assert "20 mg prednisone" not in redacted
+    assert "withheld" in redacted.lower()
+    # Surrounding, unrelated content survives untouched.
+    assert "Patient reports joint pain." in redacted
+    assert "Follow up in 2 weeks." in redacted
+
+
+def test_redact_gated_text_merges_overlapping_spans_into_one_marker() -> None:
+    """The dosage-pattern span ('20 mg') sits inside the wider imperative
+    span ('Take 20 mg prednisone') — the marker must appear once, not
+    twice back-to-back."""
+    text = "Take 20 mg prednisone daily."
+    redacted = redact_gated_text(text)
+
+    assert redacted.count("withheld") == 1
 
 
 # --- reason.stages.run_informational_turn delegation --------------------------------------------
