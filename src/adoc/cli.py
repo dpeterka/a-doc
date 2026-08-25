@@ -890,8 +890,21 @@ def _cmd_review(args: argparse.Namespace) -> int:
 def _run_uvicorn(app: FastAPI, *, host: str, port: int) -> None:  # pragma: no cover - real server
     """Real wiring for `serve`. Overridden by tests so a test run never
     actually binds a socket or blocks."""
+    import logging
+
     import uvicorn
 
+    # Without this the root logger has no handler, so `logging.lastResort`
+    # emits WARNING+ to stderr and drops every INFO line — including the
+    # per-node DAG progress and per-call model timings that explain why a
+    # turn is taking minutes. uvicorn's own dictConfig sets
+    # `disable_existing_loggers: False` and touches only the `uvicorn.*`
+    # loggers, so configuring the root here survives `uvicorn.run`.
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
     uvicorn.run(app, host=host, port=port)
 
 

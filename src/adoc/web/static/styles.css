@@ -444,6 +444,52 @@ button.button-danger {
   margin: 0 0 0.3rem;
 }
 
+/* Pending state for a chat turn. htmx adds `.htmx-request` to the element
+   named by `hx-indicator` for exactly as long as the request is in flight,
+   so visibility is driven entirely by that class — no JS of our own. A
+   diagnostic turn runs for minutes; this is the only thing on the page that
+   says so. */
+.chat-pending {
+  display: none;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.9rem;
+  color: var(--color-muted);
+}
+
+.chat-pending.htmx-request {
+  display: flex;
+}
+
+.chat-pending-dot {
+  width: 0.55rem;
+  height: 0.55rem;
+  flex: none;
+  border-radius: 50%;
+  background: var(--color-primary);
+  animation: chat-pending-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes chat-pending-pulse {
+  0%, 100% { opacity: 0.25; }
+  50% { opacity: 1; }
+}
+
+/* A disabled Send button must LOOK disabled — the point of the pending
+   state is that the patient can tell the difference between "working" and
+   "broken". */
+button:disabled {
+  opacity: 0.55;
+  cursor: progress;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .chat-pending-dot {
+    animation: none;
+    opacity: 0.8;
+  }
+}
+
 .confirm-row-body {
   display: flex;
   flex-direction: column;
