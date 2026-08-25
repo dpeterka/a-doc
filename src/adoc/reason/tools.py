@@ -1,7 +1,9 @@
 """Informational-turn tool support (PLAN.md "Session loops (b)", informational route).
 
-`query_labs`/`search_case`/`list_encounters` are deterministic, no-LLM
-retrieval helpers. `answer_informational` is the MVP tool loop: the
+`query_labs`/`search_case`/`search_documents`/`list_encounters` are
+deterministic, no-LLM retrieval helpers — `search_documents`
+(docs/adr/0015-document-text-corpus.md) is the document-TEXT-layer one,
+over `LabsDb.search_document_text`'s FTS5 index. `answer_informational` is the
 red-flag screen runs first (zero API calls on a match), then every
 deterministic retrieval helper runs unconditionally over the question
 text, and their results are folded into ONE LLM call alongside a full
@@ -35,6 +37,7 @@ from adoc.reason.safety import RedFlagResult, guarded_turn, treatment_gate
 
 _MAX_SERIES_POINTS = 8
 _MAX_GREP_HITS = 10
+_MAX_DOCUMENT_HITS = 5
 
 _TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9\-]*")
 
@@ -135,6 +138,23 @@ def search_case(repo: DataRepo, db: LabsDb, text: str) -> str:
     return "\n\n".join(sections)
 
 
+def search_documents(db: LabsDb, query: str) -> str:
+    """Full-text search over every ingested document's extracted text
+    (`LabsDb.search_document_text`, docs/adr/0015-document-text-corpus.md).
+    No LLM call. Snippets are returned VERBATIM with their `doc:<filename>
+    #p<page>`-style source ref — never paraphrased, so the model can quote
+    them and a later verifier can check them against the source.
+    """
+    hits = db.search_document_text(query, limit=_MAX_DOCUMENT_HITS)
+    if not hits:
+        return f"No document text matches found for {query!r}."
+    lines = [f"### Document text matching {query!r}"]
+    for hit in hits:
+        snippet = hit.snippet.strip()
+        lines.append(f"- {hit.source_ref}: {snippet}")
+    return "\n".join(lines)
+
+
 def list_encounters(repo: DataRepo, n: int) -> str:
     """The `n` most recent encounters, filename-descending — the same
     recency convention as `reason.context._recent_encounters_section`. No
@@ -182,6 +202,7 @@ def _deterministic_retrieval(repo: DataRepo, db: LabsDb, question: str) -> str:
         [
             f"### query_labs\n\n{query_labs(db, question)}",
             f"### search_case\n\n{search_case(repo, db, question)}",
+            f"### search_documents\n\n{search_documents(db, question)}",
             f"### list_encounters (last 5)\n\n{list_encounters(repo, 5)}",
         ]
     )
@@ -240,4 +261,5 @@ __all__ = [
     "list_encounters",
     "query_labs",
     "search_case",
+    "search_documents",
 ]

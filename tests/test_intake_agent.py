@@ -246,6 +246,63 @@ def test_short_message_gets_no_long_message_note(tmp_path: Path) -> None:
     assert "unusually long" not in sent_content
 
 
+# --- document excerpts (docs/adr/0015-document-text-corpus.md) ------------------------
+
+
+def _seed_document_text(db: LabsDb, sha: str, filename: str, text: str) -> None:
+    from adoc.labs.db import DocumentTextPage
+
+    db.upsert_document(
+        LabDocument(
+            sha256=sha,
+            filename=filename,
+            doc_type="clinical_note",
+            doc_date=date(2026, 3, 1),
+            page_count=1,
+            status=DocumentStatus.NEEDS_REVIEW,
+        )
+    )
+    db.replace_document_text(
+        sha, [DocumentTextPage(page=None, text=text)], extracted_at=datetime(2026, 3, 1, tzinfo=UTC)
+    )
+
+
+def test_intake_turn_context_includes_matching_document_excerpt(tmp_path: Path) -> None:
+    repo = DataRepo.init_at(tmp_path / "data")
+    db = LabsDb(":memory:")
+    _seed_document_text(
+        db,
+        "e" * 64,
+        "history.docx",
+        "Onset of joint pain in March 2026, worsening through the summer.",
+    )
+    client, transport = _make_client([_turn("Got it, noted.")])
+
+    run_intake_turn(client, repo, db, "How has my joint pain been?")
+
+    sent_content = transport.calls[0].messages[-1].content
+    assert "Relevant excerpts from her own prior documents" in sent_content
+    assert "joint pain" in sent_content.lower()
+    assert "doc:history.docx" in sent_content
+
+
+def test_intake_turn_context_excerpts_absent_when_nothing_matches(tmp_path: Path) -> None:
+    repo = DataRepo.init_at(tmp_path / "data")
+    db = LabsDb(":memory:")
+    _seed_document_text(db, "f" * 64, "history.docx", "Onset of joint pain in March 2026.")
+    client, transport = _make_client([_turn("Nice to meet you.")])
+
+    run_intake_turn(client, repo, db, "Hello there!")
+
+    sent_content = transport.calls[0].messages[-1].content
+    assert "Relevant excerpts from her own prior documents" in sent_content
+    assert "(none matched for this message)" in sent_content
+
+
+def test_intake_agent_prompt_version_bumped_for_document_excerpts() -> None:
+    assert INTAKE_AGENT_PROMPT_VERSION == "5"
+
+
 # --- topics_covered: vetoed by each blocker rule, honored once clear -------------------
 
 

@@ -12,10 +12,12 @@ from adoc.casefile.encounters import Encounter, EncounterFrontmatter, write_enco
 from adoc.casefile.ledger import apply_diff, save_ledger
 from adoc.casefile.repo import LEDGER_RELPATH, DataRepo
 from adoc.casefile.schema import AddHypothesis, Hypothesis, Ledger, LedgerDiff, Provenance
-from adoc.labs.db import LabsDb
+from adoc.labs.db import DocumentTextPage, LabsDb
 from adoc.labs.models import LabDocument, LabFlag, LabResult
 from adoc.reason.context import (
+    DOCUMENT_EXCERPTS_SECTION_KEY,
     LEDGER_SECTION_KEY,
+    MAX_DOCUMENT_EXCERPT_CHARS,
     PATIENT_THEORIES_SECTION_KEY,
     build_context,
 )
@@ -266,3 +268,86 @@ def test_genomics_inventory_section_absent_when_missing(repo: DataRepo, db: Labs
     pack = build_context(repo, db, include_ledger=False)
 
     assert "genomics_inventory" not in pack.keys
+
+
+# --------------------------------------------------------------------------
+# Document excerpts (docs/adr/0015-document-text-corpus.md)
+# --------------------------------------------------------------------------
+
+
+def test_document_excerpts_absent_when_no_query_given(repo: DataRepo, db: LabsDb) -> None:
+    db.replace_document_text(
+        SHA,
+        [DocumentTextPage(page=1, text="Impression: consistent with early arthritis.")],
+        extracted_at=datetime(2026, 5, 3, tzinfo=UTC),
+    )
+    pack = build_context(repo, db, include_ledger=True)
+    assert DOCUMENT_EXCERPTS_SECTION_KEY not in pack.keys
+    # Existing fixed-order assertion still holds unchanged - `query=None` is
+    # a fully backward-compatible default.
+    assert pack.keys == [
+        "case_summary",
+        "recent_encounters",
+        "labs",
+        "open_questions",
+        LEDGER_SECTION_KEY,
+    ]
+
+
+def test_document_excerpts_absent_when_nothing_matches(repo: DataRepo, db: LabsDb) -> None:
+    db.replace_document_text(
+        SHA,
+        [DocumentTextPage(page=1, text="Impression: consistent with early arthritis.")],
+        extracted_at=datetime(2026, 5, 3, tzinfo=UTC),
+    )
+    pack = build_context(repo, db, include_ledger=True, query="unrelated-token-xyz")
+    assert DOCUMENT_EXCERPTS_SECTION_KEY not in pack.keys
+
+
+def test_document_excerpts_included_and_last_when_query_matches(repo: DataRepo, db: LabsDb) -> None:
+    db.replace_document_text(
+        SHA,
+        [DocumentTextPage(page=1, text="Impression: consistent with early arthritis.")],
+        extracted_at=datetime(2026, 5, 3, tzinfo=UTC),
+    )
+    pack = build_context(repo, db, include_ledger=True, query="how is my arthritis doing")
+
+    assert pack.keys[-1] == DOCUMENT_EXCERPTS_SECTION_KEY
+    assert pack.keys[:-1] == [
+        "case_summary",
+        "recent_encounters",
+        "labs",
+        "open_questions",
+        LEDGER_SECTION_KEY,
+    ]
+    rendered = pack.render()
+    assert "Relevant Document Excerpts" in rendered
+    assert "arthritis" in rendered.lower()
+    assert "doc.pdf#p1" in rendered
+
+
+def test_document_excerpts_verbatim_not_paraphrased(repo: DataRepo, db: LabsDb) -> None:
+    exact_text = "The specific, exact wording of this passage must survive untouched."
+    db.replace_document_text(
+        SHA,
+        [DocumentTextPage(page=None, text=exact_text)],
+        extracted_at=datetime(2026, 5, 3, tzinfo=UTC),
+    )
+    pack = build_context(repo, db, include_ledger=False, query="specific exact wording")
+    section = next(s for s in pack.sections if s.key == DOCUMENT_EXCERPTS_SECTION_KEY)
+    # sqlite's snippet() brackets the matched terms but leaves the rest of
+    # the text verbatim - the underlying words are never paraphrased/rewritten.
+    assert "specific" in section.content
+    assert "exact" in section.content
+    assert "wording" in section.content
+
+
+def test_document_excerpts_respect_character_cap(repo: DataRepo, db: LabsDb) -> None:
+    long_pages = [
+        DocumentTextPage(page=i, text=f"finding number {i}: " + "lupus " * 200) for i in range(1, 6)
+    ]
+    db.replace_document_text(SHA, long_pages, extracted_at=datetime(2026, 5, 3, tzinfo=UTC))
+
+    pack = build_context(repo, db, include_ledger=False, query="lupus")
+    section = next(s for s in pack.sections if s.key == DOCUMENT_EXCERPTS_SECTION_KEY)
+    assert len(section.content) <= MAX_DOCUMENT_EXCERPT_CHARS + 200  # small slack for separators
