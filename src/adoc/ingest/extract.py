@@ -129,8 +129,8 @@ guessing a specific reading.
 """
 
 
-# Dense multi-page lab panels produce large JSON: the 4096-token default
-# silently truncated a real LabCorp panel to a single row. Sized for the
+# Dense multi-page lab panels produce large JSON output; a low token limit
+# can silently truncate a panel down to its first row or two. Sized for the
 # largest panels seen plus headroom; truncation is also detected hard in
 # vision.py via stop_reason.
 EXTRACTION_MAX_TOKENS = 16384

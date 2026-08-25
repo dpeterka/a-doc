@@ -23,13 +23,12 @@ Specimen = Literal[
     "serum", "plasma", "whole_blood", "urine", "stool", "csf", "saliva", "other", "unknown"
 ]
 """The bodily specimen a result was drawn from — mirrors the `labs.specimen`
-CHECK constraint (`db.py`). Added because one real report's urinalysis
-GLUCOSE ("NEGATIVE") and a serum glucose (mg/dL) reading were both being
-canonicalized to the same `name` ("glucose") and so shared one trend
-series — see `labs/queries.py`/`labs/validate.py` for how `specimen` scopes
-series/trend lookups apart again. `"unknown"` is the default: extraction
-never blocks or guesses a specimen it can't read from the report's section
-headers/labels."""
+CHECK constraint (`db.py`). Two analytes that canonicalize to the same
+`name` but come from different specimens (e.g. urinalysis glucose vs. serum
+glucose) must not share one trend series — see `labs/queries.py`/
+`labs/validate.py` for how `specimen` scopes series/trend lookups apart.
+`"unknown"` is the default: extraction never blocks or guesses a specimen
+it can't read from the report's section headers/labels."""
 
 
 class DocumentStatus(StrEnum):

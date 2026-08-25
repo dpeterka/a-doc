@@ -457,9 +457,9 @@ class VisionClient:
             )
             raise VisionError(f"role {role!r}: provider returned no structured output")
         if response.truncated:
-            # A truncated extraction is silent data loss (a real LabCorp
-            # panel came back as one row) — fail hard so it lands in the
-            # ingest report instead of the labs table.
+            # A truncated extraction is silent data loss (a large panel can
+            # come back as just its first row) — fail hard so it lands in
+            # the ingest report instead of the labs table.
             raise VisionError(
                 f"role {role!r}: output hit the token limit; extraction is "
                 "incomplete — raise max_tokens for this call"

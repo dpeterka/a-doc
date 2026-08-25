@@ -749,13 +749,12 @@ def render_review_markdown(
 # --------------------------------------------------------------------------
 
 
-# S4 remediation: both completeness postconditions below previously accepted
-# ANY non-empty string ("." satisfied them) as a covering note/rationale — a
-# model (or a bug) that stamps the same placeholder sentence across every
-# hypothesis/divergence sailed straight through. Both now require SUBSTANCE:
-# at least this many characters after stripping, AND not identical across
-# every item being covered (a single repeated sentence is not a substantive,
-# per-item review even if it happens to be long enough).
+# Both completeness postconditions below require SUBSTANCE in each covering
+# note/rationale, not just a non-empty string: at least this many characters
+# after stripping, AND not identical across every item being covered — a
+# model that stamps the same placeholder sentence across every
+# hypothesis/divergence must not pass ("." or one repeated sentence is not a
+# substantive, per-item review).
 MIN_SUBSTANTIVE_LENGTH = 20
 
 

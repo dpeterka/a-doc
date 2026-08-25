@@ -50,12 +50,11 @@ Both passes' raw extracted rows plus the computed reasons are serialized
 verbatim into `ReconciledRow.raw_json` for the confirm-queue UI and for
 audit (PLAN.md "Provenance").
 
-**RESCUE pass** (queue-ergonomics slice item 3b - root cause of the twin
-single-pass-row problem: the two extraction passes sometimes name the SAME
+**RESCUE pass** — the two extraction passes sometimes name the SAME
 measurement differently, e.g. "FRAX 10-year probability of hip fracture"
-vs. a sentence-fragment "10-year probability of hip fracture is" - so they
+vs. a sentence-fragment "10-year probability of hip fracture is", so they
 never land in the same `_match_key` group and never get a chance at
-`_pair_rows` in the first place). After the normal per-group pairing
+`_pair_rows` in the first place. After the normal per-group pairing
 above, every leftover single-pass `ExtractedResult` (across ALL groups) is
 run through one more greedy pairing pass, `_rescue_pair`, against a looser
 but still fully deterministic compatibility test: same page (+/-
@@ -175,16 +174,14 @@ def _normalize_str(value: str | None) -> str | None:
 
 
 # --------------------------------------------------------------------------
-# Semantic comparators (feature/semantic-compare): real-corpus reconcile
-# false-"disagreements" turned out to be the SAME printed reading, just
-# transcribed with cosmetic differences one pass's extractor happened to
-# introduce - a trailing unit token on a reference range, a unicode dash vs.
-# a hyphen, "None" vs. "" for an unflagged result. `_reconcile_matched_pair`
-# uses these in place of the old literal (`_normalize_str`-only) comparisons
-# for ref_range/unit/flag; value/value_text/specimen/confidence are
-# unchanged - those three fields never showed a false-mismatch pattern in
-# the real corpus, and loosening them would risk masking a genuine
-# extraction disagreement.
+# Semantic comparators: two extraction passes can print the SAME reading
+# with a cosmetic transcription difference - a trailing unit token on a
+# reference range, a unicode dash vs. a hyphen, "None" vs. "" for an
+# unflagged result. `_reconcile_matched_pair` uses these in place of literal
+# (`_normalize_str`-only) comparison for ref_range/unit/flag.
+# value/value_text/specimen/confidence stay literal on purpose: loosening
+# them risks masking a genuine extraction disagreement rather than a
+# cosmetic one.
 # --------------------------------------------------------------------------
 
 _UNIT_SYNONYM_MEMBERS: tuple[str, ...] = tuple(
@@ -360,8 +357,8 @@ def ref_ranges_equivalent(
 
 
 def units_equivalent(a_raw: str | None, b_raw: str | None) -> bool:
-    """Semantic equivalence of two printed units (feature/semantic-compare):
-    equal once casefold/whitespace-normalized, or both members of the same
+    """Semantic equivalence of two printed units: equal once
+    casefold/whitespace-normalized, or both members of the same
     `labs.validate.UNIT_SYNONYMS` spelling family (e.g. "Million/uL" vs.
     "M/uL", or the TSH "mIU/L"/"uIU/mL" family)."""
     a_norm = _normalize_str(a_raw)
