@@ -1056,6 +1056,128 @@ class ComposerNumberCheck(BaseModel):
         return not self.mismatches
 
 
+# --------------------------------------------------------------------------
+# Structural pairing (2026-08-25, third pass). The first two passes fixed
+# WHICH numbers count as candidate values (`_quoted_number_is_value_evidence`
+# above); this pass fixes something different and, in production, more
+# damaging: WHICH analyte a candidate number is checked against.
+#
+# The old code found every known analyte label that appeared ANYWHERE in a
+# clause, then checked every qualifying number against EVERY one of those
+# labels — not just the one it actually refers to. A live production run
+# ("FSH was 91.4 and LH 62.9…", "ALT 15, AST 22…") failed with 24
+# mismatches that turned out to be entirely this: 91.4 IS a real, correctly-
+# quoted FSH value, but it was also checked against LH's stored values (no
+# match, since it's FSH's number) and reported as a fabrication. The
+# Composer was quoting real values correctly; the checker was pairing them
+# with the wrong analyte. A second, distinct flavor of the same root cause:
+# "hs-CRP 1.8" matched the literal substring "crp" (word-bounded — a hyphen
+# is a non-word character, so `\bcrp\b` matches inside "hs-crp") and got
+# checked against plain CRP's stored values, a completely different assay.
+#
+# This guard had, by this point, failed three real diagnostic turns and
+# caught zero genuine fabrications. Given `check_composer_numbers` runs
+# AFTER the ledger is already committed (`composer_stage`/
+# `composer_number_check_contract` in `reason.stages`), a false positive
+# here does not just block a claim — it discards an already-correct,
+# already-grounded reply. That asymmetry is why the fix below is
+# deliberately conservative: a genuinely ambiguous pairing is left
+# unflagged (a missed check costs nothing — the citation checker and
+# `verify_claims` already ground the underlying evidence independently),
+# never guessed at. See `_resolve_governing_mention`'s docstring for the
+# structural pairing rule itself.
+# --------------------------------------------------------------------------
+
+
+def _mention_pattern(labels: Sequence[str]) -> re.Pattern[str] | None:
+    """One combined alternation regex matching any of `labels` at a
+    `\\b`-bounded position, tried LONGEST-label-first at every start
+    position so a shorter label can never win a match a longer, more
+    specific label also covers at the same spot — e.g. "hs-crp" must win
+    over "crp" when both are known analyte labels for this patient and the
+    text reads "hs-CRP"; otherwise "crp" matches the tail substring of
+    "hs-crp" (a hyphen is not a word character, so `\\bcrp\\b` matches
+    inside it) and a number gets judged against the WRONG analyte's stored
+    values. Mirrors the longest-alias-first precedence `labs.validate`
+    already applies for its own alias/suffix resolution
+    (`_SCORE_SUFFIX_TO_CANONICAL`'s length-sorted table, consulted by
+    `canonicalize`) — same idea, applied here to spotting mentions in free
+    text rather than resolving a canonical name. `None` when `labels` is
+    empty."""
+    if not labels:
+        return None
+    ordered = sorted(set(labels), key=len, reverse=True)
+    return re.compile(r"\b(?:" + "|".join(re.escape(label) for label in ordered) + r")\b")
+
+
+def _resolve_governing_mention(
+    number_match: re.Match[str],
+    mentions: Sequence[re.Match[str]],
+    text: str,
+    unit_index: dict[str, set[str]],
+) -> re.Match[str] | None:
+    """Which single analyte mention in `mentions` (if any) governs the
+    quoted number at `number_match` — the structural-pairing fix (module
+    design note above `check_composer_numbers`): a number is checked
+    against the ONE analyte mention that actually refers to it, never
+    against every analyte name that happens to share its clause.
+
+    A number is governed by the NEAREST mention immediately before it —
+    `ALT 15`, `ALT was 15`, `ALT of 15 U/L` — tied to it via
+    `_quoted_number_is_value_evidence`'s existing copula/unit evidence,
+    scoped to just the text between THAT mention and the number (so a
+    copula word belonging to some earlier, unrelated mention can never
+    leak in and manufacture false evidence) — or by the nearest mention
+    immediately AFTER it — `15 U/L ALT` — tied to it by a unit directly
+    attached to the number that belongs to that trailing mention. Because
+    both candidates are always the NEAREST mention on their respective
+    side, a number can never bind to a mention on the far side of another
+    mention sitting in between: there is no "other" mention within reach to
+    even consider skipping past.
+
+    Fails safe on ambiguity, per this module's asymmetry (a missed check
+    costs nothing; a false positive discards an already-committed, already-
+    correct reply): if a number has positive evidence tying it to BOTH a
+    different preceding and a different following mention, that pairing is
+    genuinely unclear and this returns `None` — no flag — rather than
+    guessing which one it meant. `None` too when neither side ties the
+    number to any mention at all."""
+    num_start, num_end = number_match.start(), number_match.end()
+    preceding: re.Match[str] | None = None
+    following: re.Match[str] | None = None
+    for mention in mentions:
+        if mention.end() <= num_start:
+            preceding = mention
+        elif mention.start() >= num_end and following is None:
+            following = mention
+
+    preceding_ok = False
+    if preceding is not None:
+        local_head = text[preceding.end() : num_start]
+        tail = text[num_end:]
+        preceding_units = unit_index.get(preceding.group(0), set())
+        preceding_ok = _quoted_number_is_value_evidence(
+            number_match.group(), local_head, tail, preceding_units
+        )
+
+    following_ok = False
+    if following is not None:
+        gap = text[num_end : following.start()].strip(" ,;:")
+        following_units = {u.lower() for u in unit_index.get(following.group(0), set())}
+        following_ok = bool(gap) and gap.lower() in following_units
+
+    if preceding_ok and following_ok:
+        # Both sides claim this number and disagree on who it belongs to —
+        # genuinely ambiguous unless they happen to name the same mention.
+        assert preceding is not None and following is not None  # narrows for mypy
+        return preceding if preceding.group(0) == following.group(0) else None
+    if preceding_ok:
+        return preceding
+    if following_ok:
+        return following
+    return None
+
+
 def check_composer_numbers(text: str, db: LabsDb) -> ComposerNumberCheck:
     """Deterministically check every number the Composer's `tiers_rendered`
     text quotes near a known analyte name against `labs.sqlite` (PLAN.md
@@ -1081,51 +1203,56 @@ def check_composer_numbers(text: str, db: LabsDb) -> ComposerNumberCheck:
     `_quoted_number_is_value_evidence` (see that function's module-level
     design comment for the full rationale and the false positives it
     fixes: a percent CHANGE and a bare YEAR both wrongly flagged as a
-    claimed analyte value under the first-pass exclusion-list design). A
-    number that clears that gate and still fails to match any stored value
-    for the analyte it sits next to is exactly the fabrication this check
-    exists to catch."""
+    claimed analyte value under the first-pass exclusion-list design).
+
+    ADR 0016 revised (2026-08-25, third pass): mentions are found via
+    LONGEST-label-first matching (`_mention_pattern`, so "hs-CRP" never
+    resolves as plain "CRP"), and each qualifying number is checked against
+    the ONE analyte mention that structurally governs it
+    (`_resolve_governing_mention`), never against every analyte name that
+    happens to share the clause — see the design note above
+    `ComposerNumberMismatch` for the production failure this fixes. A
+    number that clears both gates and still fails to match any stored
+    value for the analyte that actually governs it is exactly the
+    fabrication this check exists to catch."""
     index = _analyte_value_index(db)
     if not index:
         return ComposerNumberCheck()
     unit_index = _analyte_unit_index(db)
+    mention_pattern = _mention_pattern(list(index.keys()))
 
     mismatches: list[ComposerNumberMismatch] = []
     for clause in _split_clauses(text):
-        lowered = clause.lower()
-        matched_labels = [
-            label for label in index if re.search(rf"\b{re.escape(label)}\b", lowered)
-        ]
-        if not matched_labels:
-            continue
-
         cleaned = _DATE_IN_TEXT_RE.sub(" ", clause)
         cleaned = _TITER_RE.sub(" ", cleaned)
         cleaned = _RANGE_RE.sub(" ", cleaned)
-        number_matches = list(_NUMBER_RE.finditer(cleaned))
+        cleaned_lower = cleaned.lower()
+
+        mentions = list(mention_pattern.finditer(cleaned_lower)) if mention_pattern else []
+        if not mentions:
+            continue
+        number_matches = list(_NUMBER_RE.finditer(cleaned_lower))
         if not number_matches:
             continue
 
-        for label in matched_labels:
+        for number_match in number_matches:
+            governing = _resolve_governing_mention(
+                number_match, mentions, cleaned_lower, unit_index
+            )
+            if governing is None:
+                continue
+            label = governing.group(0)
             stored = index[label]
-            analyte_units = unit_index.get(label, set())
-            for number_match in number_matches:
-                head = cleaned[: number_match.start()]
-                tail = cleaned[number_match.end() :]
-                if not _quoted_number_is_value_evidence(
-                    number_match.group(), head, tail, analyte_units
-                ):
-                    continue
-                number = float(number_match.group())
-                if not any(abs(number - v) <= 1e-9 for v in stored):
-                    mismatches.append(
-                        ComposerNumberMismatch(
-                            clause=clause.strip(),
-                            analyte_label=label,
-                            quoted_number=number,
-                            stored_values=sorted(stored),
-                        )
+            number = float(number_match.group())
+            if not any(abs(number - v) <= 1e-9 for v in stored):
+                mismatches.append(
+                    ComposerNumberMismatch(
+                        clause=clause.strip(),
+                        analyte_label=label,
+                        quoted_number=number,
+                        stored_values=sorted(stored),
                     )
+                )
     return ComposerNumberCheck(mismatches=mismatches)
 
 

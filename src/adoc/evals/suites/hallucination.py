@@ -713,6 +713,14 @@ def _abstention_probes(tmp_root: Path) -> tuple[list[SuiteCaseResult], float]:
 # CHANGE) and "2024" (a YEAR) as claimed Ferritin values — see
 # `reason.verify._quoted_number_is_value_evidence`'s module-level design
 # comment for the full positive-evidence rationale this suite pins.
+#
+# The third pass (ADR 0016 revised, third pass, 2026-08-25) added the
+# multi-analyte pairing cases below after a live diagnostic run failed with
+# 24 mismatches that were entirely the checker pairing a correctly-quoted
+# number with the WRONG analyte in the same clause ("FSH was 91.4 and LH
+# was 62.9" flagged both, even though each number is that analyte's real
+# value) — see `reason.verify._resolve_governing_mention`'s module-level
+# design comment for the structural-pairing rationale this suite pins.
 _COMPOSER_NUMBER_LEGITIMATE_SENTENCES = [
     "Your CRP has been elevated across 3 separate panels.",
     "Your CRP was elevated on 2 occasions this year.",
@@ -727,6 +735,16 @@ _COMPOSER_NUMBER_LEGITIMATE_SENTENCES = [
     "Your Ferritin was drawn at 6 weeks.",
     # Common date phrasing can borrow a copula word with no unit attached.
     "Your Ferritin reading was 2024 this visit.",
+    # ADR 0016 revised, third pass: the exact production regression — each
+    # number is the OTHER analyte's real value if mis-paired, but each is
+    # actually correct for the analyte it is quoted next to.
+    "Your FSH was 91.4 and your LH was 62.9.",
+    "Your ALT was 15 U/L and your AST was 22 U/L.",
+    "Your femoral neck T-score was -1.1, and your lumbar spine BMD was 1.098.",
+    # "hs-CRP" must resolve as its own longest-match mention, never as
+    # plain "CRP" via the substring "crp" (a hyphen is not a word
+    # character, so `\bcrp\b` matches inside "hs-crp").
+    "Your hs-CRP was 1.8 mg/L, mildly elevated.",
 ]
 
 # The genuine catch this check exists for must never regress: a fabricated
@@ -738,6 +756,15 @@ _COMPOSER_NUMBER_FABRICATED_SENTENCES = [
     # still caught when a real unit is directly attached (the year veto
     # only guards copula-only evidence, not a unit-attached one).
     "Your B12 was 2024 pg/mL, dramatically high.",
+    # ADR 0016 revised, third pass: a fabricated value under CORRECT
+    # pairing must still be caught, with the correctly-quoted neighbor
+    # left alone.
+    "Your FSH was 91.4 and your LH was 999.0.",
+    # hs-CRP's fabricated value here happens to EQUAL plain CRP's real
+    # stored value (8.5) — proving the number is paired with hs-CRP's own
+    # stored values (1.8), not silently passed because it coincidentally
+    # matches a different analyte's number.
+    "Your hs-CRP was 8.5 mg/L, notably elevated.",
 ]
 
 # A percent-unit analyte (e.g. an iron saturation, a differential count) is
@@ -785,7 +812,9 @@ def _composer_number_false_positive_probes(tmp_root: Path) -> tuple[list[SuiteCa
     of ordinary non-value phrasing (counts/frequencies/durations, percent
     changes, bare years) correctly left unflagged, pinned at 1.0 alongside
     the fabrication-still-caught cases and the percent-unit-analyte
-    must-still-check case (ADR 0016 revised, both passes, 2026-08-25)."""
+    must-still-check case (ADR 0016 revised, both passes, 2026-08-25), plus
+    the multi-analyte structural-pairing cases (ADR 0016 revised, third
+    pass, 2026-08-25)."""
     _repo, db = _fresh_repo_and_db(tmp_root / "composer_number_false_positives")
     _seed_crp_row(db)
     _seed_analyte_row(db, sha="2" * 64, name="Ferritin", value=150.0, unit="ng/mL")
@@ -797,6 +826,18 @@ def _composer_number_false_positive_probes(tmp_root: Path) -> tuple[list[SuiteCa
         value=_COMPOSER_NUMBER_PERCENT_ANALYTE_STORED_VALUE,
         unit="%",
     )
+    # ADR 0016 revised, third pass: structural-pairing regression fixtures,
+    # built directly from the production evidence.
+    _seed_analyte_row(db, sha="5" * 64, name="FSH", value=91.4)
+    _seed_analyte_row(db, sha="6" * 64, name="LH", value=62.9)
+    _seed_analyte_row(db, sha="7" * 64, name="ALT", value=15.0, unit="U/L")
+    _seed_analyte_row(db, sha="8" * 64, name="AST", value=22.0, unit="U/L")
+    _seed_analyte_row(db, sha="9" * 64, name="Femoral Neck T-score", value=-1.1)
+    _seed_analyte_row(db, sha="a" * 64, name="Lumbar Spine BMD", value=1.098)
+    # hs-CRP's real value (1.8) deliberately differs from plain CRP's real
+    # value (8.5, seeded by `_seed_crp_row` above) so a mis-pairing onto
+    # plain CRP would be directly visible as a wrong pass/fail.
+    _seed_analyte_row(db, sha="b" * 64, name="hs-CRP", value=1.8, unit="mg/L")
 
     cases: list[SuiteCaseResult] = []
     legitimate_passed = 0
