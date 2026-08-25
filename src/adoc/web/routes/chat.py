@@ -155,10 +155,14 @@ def _handle_turn(text: str, *, client: LlmClient, repo: DataRepo, db: LabsDb) ->
         except LlmError as exc:
             return {"kind": "error", "text": str(exc), "tests_to_request": []}
         except ContractViolation as exc:
-            logger.warning("informational chat turn hit a ContractViolation: %s", exc)
+            logger.warning(
+                "informational chat turn hit a ContractViolation: node=%s contract=%s",
+                exc.node,
+                exc.contract_name,
+            )
             return {"kind": "withheld", "text": _CONTRACT_VIOLATION_MESSAGE, "tests_to_request": []}
-        except LedgerInvariantError as exc:
-            logger.warning("informational chat turn hit a LedgerInvariantError: %s", exc)
+        except LedgerInvariantError:
+            logger.warning("informational chat turn hit a LedgerInvariantError")
             return {"kind": "withheld", "text": _LEDGER_INVARIANT_MESSAGE, "tests_to_request": []}
         if isinstance(outcome, RedFlagResult):
             return {"kind": "urgent", "text": outcome.message or "", "tests_to_request": []}
@@ -178,10 +182,19 @@ def _handle_turn(text: str, *, client: LlmClient, repo: DataRepo, db: LabsDb) ->
         # postcondition: `apply` (which commits the ledger diff) always
         # runs before `composer` in build_diagnostic_dag, so this turn's
         # case-file update already happened.
-        logger.warning("diagnostic chat turn hit a ContractViolation: %s", exc)
+        #
+        # Log hygiene: only the structured, non-content fields (`node`,
+        # `contract_name`) go to the log — never `str(exc)`/`exc.message`,
+        # which `stages.treatment_gate_contract` builds from the offending
+        # span of the Composer's actual patient-facing reply text.
+        logger.warning(
+            "diagnostic chat turn hit a ContractViolation: node=%s contract=%s",
+            exc.node,
+            exc.contract_name,
+        )
         return {"kind": "withheld", "text": _CONTRACT_VIOLATION_MESSAGE, "tests_to_request": []}
-    except LedgerInvariantError as exc:
-        logger.warning("diagnostic chat turn hit a LedgerInvariantError: %s", exc)
+    except LedgerInvariantError:
+        logger.warning("diagnostic chat turn hit a LedgerInvariantError")
         return {"kind": "withheld", "text": _LEDGER_INVARIANT_MESSAGE, "tests_to_request": []}
     if isinstance(outcome, RedFlagResult):
         return {"kind": "urgent", "text": outcome.message or "", "tests_to_request": []}
