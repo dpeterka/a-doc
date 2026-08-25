@@ -17,6 +17,7 @@ back after `run()` returns without executing anything twice.
 
 from __future__ import annotations
 
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
@@ -36,6 +37,13 @@ from adoc.casefile.schema import (
 )
 from adoc.ingest.pipeline import IngestReport
 from adoc.labs.db import LabsDb
+from adoc.reason.citations import (
+    EutilsPmidVerifier,
+    PmidVerifier,
+    build_retry_feedback,
+    check_ops_citations,
+    log_citation_report,
+)
 from adoc.reason.client import LlmClient, LlmResult, Message
 from adoc.reason.context import ContextPack, build_context
 from adoc.reason.dag import Contract, Ctx, Dag, Node, require_prior_node, run
@@ -110,46 +118,115 @@ def _build_provenance(prompt: Prompt, model_id: str, dag_node: str) -> Provenanc
 # --------------------------------------------------------------------------
 
 
+# How many completions a stage may spend resolving its own evidence source
+# refs: the first attempt plus one objection-guided retry (PLAN.md Phase 2
+# citation checker, mirroring `composer_stage`'s gate-guided rewrite loop,
+# PR #94). Still failing after the retry -> return as-is and let the
+# `citation_check` DAG contract fire; the deterministic gate stays the
+# final, unbypassable authority (CLAUDE.md rules 2/3 pattern).
+_CITATION_RETRY_ATTEMPTS = 2
+
+
 def ledger_maintainer_stage(
-    client: LlmClient, ctx: ContextPack, patient_message: str
+    client: LlmClient,
+    ctx: ContextPack,
+    patient_message: str,
+    db: LabsDb,
+    repo: DataRepo,
+    *,
+    pmid_verifier: PmidVerifier | None = None,
 ) -> LedgerDiff:
     """Ledger-Maintainer stage (role `primary_reasoner`, schema `LedgerDiff`
     payload). Proposes a `LedgerDiff` from the context pack plus this turn's
-    raw patient message."""
+    raw patient message.
+
+    After the model returns a diff, the deterministic citation checker
+    (`reason.citations.check_ops_citations`) resolves every evidence source
+    ref; an `unresolved`/`mismatched` ref triggers ONE retry that feeds the
+    exact failed ref(s) and the reason back to the model, with an
+    instruction to cite only sources that exist or drop the claim. This is
+    a quality loop, not the enforcement point — the `citation_check`
+    contract on this node (`build_diagnostic_dag`) still re-checks whatever
+    this function returns and fails the run if it is still bad."""
     prompt = load_prompt("ledger_maintainer")
     user_content = f"{ctx.render()}\n\n## Patient Message\n\n{patient_message}\n"
+    messages = [Message(role="user", content=user_content)]
 
-    result = client.complete(
-        "primary_reasoner",
-        system=prompt.text,
-        messages=[Message(role="user", content=user_content)],
-        schema=_LedgerDiffPayload,
-    )
-    payload = result.parsed
-    assert isinstance(payload, _LedgerDiffPayload)
+    diff: LedgerDiff | None = None
+    for _attempt in range(_CITATION_RETRY_ATTEMPTS):
+        result = client.complete(
+            "primary_reasoner",
+            system=prompt.text,
+            messages=messages,
+            schema=_LedgerDiffPayload,
+        )
+        payload = result.parsed
+        assert isinstance(payload, _LedgerDiffPayload)
 
-    provenance = _build_provenance(prompt, result.model_id, "ledger_maintainer")
-    return LedgerDiff(provenance=provenance, rationale=payload.rationale, ops=payload.ops)
+        provenance = _build_provenance(prompt, result.model_id, "ledger_maintainer")
+        diff = LedgerDiff(provenance=provenance, rationale=payload.rationale, ops=payload.ops)
+
+        report = check_ops_citations(diff.ops, db, repo, pmid_verifier=pmid_verifier)
+        log_citation_report(repo, report, dag_node="ledger_maintainer")
+        if not report.failing:
+            break
+        messages = [
+            *messages,
+            Message(role="assistant", content=payload.model_dump_json()),
+            Message(role="user", content=build_retry_feedback(report)),
+        ]
+
+    assert diff is not None
+    return diff
 
 
 def challenger_stage(
-    client: LlmClient, proposed_diff: LedgerDiff, ctx: ContextPack
+    client: LlmClient,
+    proposed_diff: LedgerDiff,
+    ctx: ContextPack,
+    db: LabsDb,
+    repo: DataRepo,
+    *,
+    pmid_verifier: PmidVerifier | None = None,
 ) -> ChallengerVerdict:
     """Challenger stage (role `challenger` — cross-family per ADR-0005).
     Attacks `proposed_diff`; must produce >=1 substantive counter-argument
-    per most-likely hypothesis (enforced as a DAG postcondition, not here)."""
+    per most-likely hypothesis (enforced as a DAG postcondition, not here).
+
+    The Challenger's own `additional_ops` can carry evidence (e.g. a
+    `record_challenge`-adjacent `add_hypothesis`/`add_evidence`), so it gets
+    the same citation-checker retry loop as `ledger_maintainer_stage` — see
+    that function's docstring. On a clean verdict (no evidence in
+    `additional_ops`, the common case) this never spends a second
+    completion."""
     prompt = load_prompt("challenger")
     diff_json = proposed_diff.model_dump_json(indent=2)
     user_content = f"{ctx.render()}\n\n## Proposed Ledger Diff\n\n```json\n{diff_json}\n```\n"
+    messages = [Message(role="user", content=user_content)]
 
-    result = client.complete(
-        "challenger",
-        system=prompt.text,
-        messages=[Message(role="user", content=user_content)],
-        schema=ChallengerVerdict,
-    )
-    verdict = result.parsed
-    assert isinstance(verdict, ChallengerVerdict)
+    verdict: ChallengerVerdict | None = None
+    for _attempt in range(_CITATION_RETRY_ATTEMPTS):
+        result = client.complete(
+            "challenger",
+            system=prompt.text,
+            messages=messages,
+            schema=ChallengerVerdict,
+        )
+        parsed = result.parsed
+        assert isinstance(parsed, ChallengerVerdict)
+        verdict = parsed
+
+        report = check_ops_citations(verdict.additional_ops, db, repo, pmid_verifier=pmid_verifier)
+        log_citation_report(repo, report, dag_node="challenger")
+        if not report.failing:
+            break
+        messages = [
+            *messages,
+            Message(role="assistant", content=verdict.model_dump_json()),
+            Message(role="user", content=build_retry_feedback(report)),
+        ]
+
+    assert verdict is not None
     return verdict
 
 
@@ -321,6 +398,59 @@ def _apply_ledger_version_incremented_contract() -> Contract:
     return Contract(name="apply_ledger_version_incremented", predicate=predicate)
 
 
+def _maintainer_diff_ops(_ctx: Ctx, value: BaseModel | None) -> Sequence[LedgerOp]:
+    """Ops extractor for the ledger_maintainer node's `citation_check`
+    postcondition: just the diff this node itself produced."""
+    assert isinstance(value, LedgerDiff)
+    return value.ops
+
+
+def _merged_apply_ops(ctx: Ctx, value: BaseModel | None) -> Sequence[LedgerOp]:
+    """Ops extractor for the apply node's `citation_check` precondition:
+    the Ledger-Maintainer's diff ops PLUS the Challenger's `additional_ops`
+    — the exact merge `apply_stage` is about to hand to
+    `casefile.ledger.apply_and_save` (PLAN.md Phase 2: "cover the
+    challenger's additional_ops path too ... so NOTHING reaches apply
+    unchecked")."""
+    diff = ctx["ledger_maintainer"]
+    assert isinstance(diff, LedgerDiff)
+    assert isinstance(value, ChallengerVerdict)
+    return list(diff.ops) + list(value.additional_ops)
+
+
+def citation_check_contract(
+    name: str,
+    db: LabsDb,
+    repo: DataRepo,
+    ops_extractor: Callable[[Ctx, BaseModel | None], Sequence[LedgerOp]],
+    *,
+    pmid_verifier: PmidVerifier | None = None,
+) -> Contract:
+    """A DAG contract (pre- or postcondition, per `ops_extractor`) that runs
+    `reason.citations.check_ops_citations` over whatever `ops_extractor`
+    pulls out of `(ctx, value)` and fails closed on any `unresolved`/
+    `mismatched` evidence source ref (PLAN.md Phase 2 citation checker:
+    "Unresolvable or mismatched refs reject the ledger diff ... not just
+    warn"). `unverifiable` (PMID checks only, network unavailable) passes.
+
+    Used twice in `build_diagnostic_dag`: as the `ledger_maintainer` node's
+    postcondition (checks its own diff) and as the `apply` node's
+    precondition (checks the diff merged with the Challenger's
+    `additional_ops`) — between the two, nothing reaches
+    `casefile.ledger.apply_and_save` with an unresolved/mismatched ref."""
+
+    def predicate(ctx: Ctx, value: BaseModel | None) -> str | None:
+        ops = ops_extractor(ctx, value)
+        report = check_ops_citations(ops, db, repo, pmid_verifier=pmid_verifier)
+        log_citation_report(repo, report, dag_node=name)
+        if not report.failing:
+            return None
+        details = "; ".join(f"{c.source} [{c.outcome}]: {c.reason}" for c in report.failing)
+        return f"unresolved/mismatched evidence source ref(s): {details}"
+
+    return Contract(name=name, predicate=predicate)
+
+
 def treatment_gate_contract() -> Contract:
     """Postcondition: the Composer's rendered patient-facing text must pass
     `safety.treatment_gate`, or the run stops with a `ContractViolation`
@@ -347,16 +477,29 @@ def build_diagnostic_dag(
     client: LlmClient,
     repo: DataRepo,
     ledger_path: Path,
+    db: LabsDb,
     sink: dict[str, BaseModel] | None = None,
+    *,
+    pmid_verifier: PmidVerifier | None = None,
 ) -> Dag:
     """Assemble the chat-diagnostic-turn DAG (PLAN.md loop (b)):
     Ledger-Maintainer -> Challenger -> apply -> Composer.
 
-    Contracts: Challenger's postcondition requires a substantive
-    counter-argument for every most-likely hypothesis; the apply node's
-    postcondition requires the ledger version to have incremented;
-    Composer's precondition requires the Challenger node to have completed
-    this run, and its postcondition runs the treatment/dosing output gate.
+    Contracts: the ledger_maintainer node's postcondition runs the
+    deterministic citation checker (`reason.citations`) over its own diff;
+    Challenger's postcondition requires a substantive counter-argument for
+    every most-likely hypothesis; the apply node's PRECONDITION re-runs the
+    citation checker over the Ledger-Maintainer's diff merged with the
+    Challenger's `additional_ops` (so a bad ref introduced by the
+    Challenger can't reach `apply` either) and its postcondition requires
+    the ledger version to have incremented; Composer's precondition
+    requires the Challenger node to have completed this run, and its
+    postcondition runs the treatment/dosing output gate.
+
+    `pmid_verifier` defaults to a real `EutilsPmidVerifier` (NCBI
+    E-utilities, cached at `<repo>/work/pmid-cache.json`) when omitted —
+    tests should always inject a fake verifier explicitly so a test run
+    never touches the network.
 
     Expected `run()` initial context: `{"context_pack": ContextPack,
     "patient_turn": PatientTurn, "ledger": Ledger}` (the ledger state this
@@ -368,6 +511,9 @@ def build_diagnostic_dag(
     audit-only return value.
     """
     results: dict[str, BaseModel] = sink if sink is not None else {}
+    resolved_pmid_verifier = pmid_verifier or EutilsPmidVerifier(
+        repo.root / "work" / "pmid-cache.json"
+    )
 
     def _ledger_maintainer_fn(ctx: Ctx) -> BaseModel:
         context_pack = ctx["context_pack"]
@@ -375,7 +521,14 @@ def build_diagnostic_dag(
         patient_turn = ctx["patient_turn"]
         assert isinstance(patient_turn, PatientTurn)
 
-        diff = ledger_maintainer_stage(client, context_pack, patient_turn.text)
+        diff = ledger_maintainer_stage(
+            client,
+            context_pack,
+            patient_turn.text,
+            db,
+            repo,
+            pmid_verifier=resolved_pmid_verifier,
+        )
         results["ledger_maintainer"] = diff
         return diff
 
@@ -385,7 +538,9 @@ def build_diagnostic_dag(
         context_pack = ctx["context_pack"]
         assert isinstance(context_pack, ContextPack)
 
-        verdict = challenger_stage(client, proposed_diff, context_pack)
+        verdict = challenger_stage(
+            client, proposed_diff, context_pack, db, repo, pmid_verifier=resolved_pmid_verifier
+        )
         results["challenger"] = verdict
         return verdict
 
@@ -422,6 +577,15 @@ def build_diagnostic_dag(
         input_model=ContextPack,
         output_model=LedgerDiff,
         depends_on="context_pack",
+        postconditions=[
+            citation_check_contract(
+                "citation_check_ledger_maintainer",
+                db,
+                repo,
+                _maintainer_diff_ops,
+                pmid_verifier=resolved_pmid_verifier,
+            )
+        ],
     )
     challenger_node = Node(
         name="challenger",
@@ -437,7 +601,16 @@ def build_diagnostic_dag(
         input_model=ChallengerVerdict,
         output_model=Ledger,
         depends_on="challenger",
-        preconditions=[require_prior_node("challenger")],
+        preconditions=[
+            require_prior_node("challenger"),
+            citation_check_contract(
+                "citation_check_apply",
+                db,
+                repo,
+                _merged_apply_ops,
+                pmid_verifier=resolved_pmid_verifier,
+            ),
+        ],
         postconditions=[_apply_ledger_version_incremented_contract()],
     )
     composer_node = Node(
@@ -475,7 +648,7 @@ def run_diagnostic_turn(
         context_pack = build_context(repo, db, include_ledger=True)
         prior_ledger = load_ledger(ledger_path)
         sink: dict[str, BaseModel] = {}
-        dag = build_diagnostic_dag(client, repo, ledger_path, sink)
+        dag = build_diagnostic_dag(client, repo, ledger_path, db, sink)
 
         run(
             dag,
@@ -567,7 +740,7 @@ def run_post_ingest_dag(
     context_pack = build_context(repo, db, include_ledger=True)
     prior_ledger = load_ledger(ledger_path)
     sink: dict[str, BaseModel] = {}
-    dag = build_diagnostic_dag(client, repo, ledger_path, sink)
+    dag = build_diagnostic_dag(client, repo, ledger_path, db, sink)
 
     run(
         dag,
