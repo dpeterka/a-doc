@@ -637,6 +637,7 @@ cmd_restart() {
   local workdir="$DEFAULT_WORKDIR"
   local prev=""
   local arg
+  local saw_port=0
   for arg in "$@"; do
     if [ "$prev" = "--dir" ]; then
       workdir="$arg"
@@ -646,11 +647,33 @@ cmd_restart() {
     case "$arg" in
       --dir) prev="--dir" ;;
       --dir=*) workdir="${arg#*=}" ;;
+      --port | --port=*) saw_port=1 ;;
     esac
   done
 
+  # A restart must come back on the SAME port. Without this, restarting a
+  # server started with `--port 9001` silently fell back to the default and
+  # then refused to bind because something else already held it — so a
+  # plain `restart-local --dir X` stopped the server and never replaced it.
+  # The port is recorded per instance by cmd_start; read it BEFORE stopping,
+  # since cmd_stop removes the file.
+  local extra_args=()
+  if [ "$saw_port" -eq 0 ]; then
+    local restart_state_dir restart_port_file
+    restart_state_dir=$(instance_state_dir "$(abs_path "$workdir")")
+    restart_port_file="$restart_state_dir/adoc.port"
+    if [ -r "$restart_port_file" ]; then
+      local restart_port
+      restart_port=$(cat "$restart_port_file")
+      if [ -n "$restart_port" ]; then
+        out "restart: reusing port $restart_port"
+        extra_args=(--port "$restart_port")
+      fi
+    fi
+  fi
+
   cmd_stop --dir "$workdir"
-  cmd_start "$@"
+  cmd_start "$@" "${extra_args[@]+"${extra_args[@]}"}"
 }
 
 cmd_user_create() {
