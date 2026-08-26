@@ -15,12 +15,29 @@ Script format: patient messages separated by blank lines. `#` at the start
 of a line is a comment. That is deliberately the same shape as a pasted
 chat transcript with the assistant's replies deleted.
 
-    ./scripts/intake-replay --script ~/intake-cases/andrea.txt --port 9001
+Two modes:
+
+  --script FILE   fixed patient messages, replayed in order. Deterministic,
+                  no model calls, but BRITTLE: the intake agent rewords its
+                  questions and invents new ones, and a canned answer list
+                  silently drifts one question behind when it does.
+
+  --persona FILE  case notes for a simulated patient (the `patient_simulator`
+                  role in models.yaml) who answers whatever was actually
+                  asked, says "I don't remember" when the notes don't cover
+                  it, and never volunteers what it wasn't asked. Robust to
+                  the agent's prompts changing, which is the point.
+
+    ./scripts/intake-replay --persona ~/intake-cases/andrea.txt --port 9001 \
+        --user andrea --data-dir ~/scratch/a-doc-3
 
 Useful flags:
-    --until-complete   stop as soon as intake flips to complete, and report
-                       which message it happened on (the wrap-up gate is the
-                       thing most likely to regress).
+    --until-complete   script mode: stop as soon as intake flips to complete,
+                       and report which message it happened on (the wrap-up
+                       gate is the thing most likely to regress). Persona
+                       mode always stops there.
+    --max-turns N      persona mode: give up after N turns (default 60). An
+                       agent that never wraps up is itself a finding.
     --then "question"  after the script, send one more message — this is how
                        you exercise the FIRST post-intake turn, which routes
                        to the diagnostic DAG and is by far the slowest.
@@ -73,6 +90,12 @@ def _strip_html(fragment: str) -> str:
     bubble first and the assistant bubble second; we want the second."""
     parts = fragment.split('class="chat-bubble chat-bubble-assistant')
     body = parts[-1] if len(parts) > 1 else fragment
+    # The class list continues past the split point — the macro appends
+    # `chat-kind-<kind>` — so skip to the end of the opening tag. Without
+    # this every reply was printed with a leading `chat-kind-reply">`.
+    _, sep, remainder = body.partition(">")
+    if sep:
+        body = remainder
     text = _TAG_RE.sub(" ", body)
     text = (
         text.replace("&#39;", "'").replace("&#34;", '"').replace("&amp;", "&").replace("&gt;", ">")
@@ -113,9 +136,82 @@ class Session:
                     "failed sign-ins. Wait a few minutes and try again."
                 ) from exc
             raise SystemExit(f"login failed: HTTP {exc.code}") from exc
+        except urllib.error.URLError as exc:
+            raise SystemExit(
+                f"cannot reach {self.base}: {exc.reason}\n"
+                "  Start it with:  ./scripts/start-local --dir <dir> --port <port>"
+            ) from exc
 
     def send(self, text: str) -> str:
         return self._post("/chat/send", {"text": text}, timeout=TURN_TIMEOUT_SECONDS)
+
+    def opening_message(self) -> str:
+        """The last assistant bubble on `GET /chat` — the deterministic
+        intake opener on a fresh transcript. The simulated patient has to be
+        answering something, and on turn one that is the opener."""
+        request = urllib.request.Request(f"{self.base}/chat")
+        with self.opener.open(request, timeout=60) as response:
+            return response.read().decode("utf-8", "replace")
+
+
+PATIENT_SIMULATOR_SYSTEM = """\
+You are role-playing a PATIENT in a medical intake conversation, so that a \
+conversational intake agent can be tested without a human typing for an hour.
+
+Everything you know about yourself is in the case notes below. Rules:
+
+- Answer ONLY what was actually asked. Never volunteer the rest of your \
+history, and never answer a question that has not been put to you yet.
+- If the notes do not cover what you were asked, say so the way a person \
+would: "I don't remember", "I'm not sure", "I'd have to look that up". Do \
+NOT invent facts. A vague or forgetful answer is a legitimate test case.
+- Write the way a real person types into a chat box: one to three sentences, \
+plain, sometimes a typo, sometimes rambling a little. Not clinical prose, \
+not bullet points.
+- You are the patient. Never break character, never mention that you are \
+role-playing, never comment on the questions.
+- Output ONLY the patient's next message. No preamble, no quotation marks.
+
+--- YOUR CASE NOTES ---
+{persona}
+--- END CASE NOTES ---
+"""
+
+
+def simulate_patient_reply(client: object, persona: str, history: list[tuple[str, str]]) -> str:
+    """One patient message, answering whatever the agent just asked.
+
+    `history` is [(speaker, text)] with speaker in {"agent", "patient"}. The
+    simulator IS the patient, so its own past messages are the assistant
+    turns and the agent's questions are the user turns.
+    """
+    from adoc.reason.client import Message
+
+    messages = [
+        Message(role="assistant" if speaker == "patient" else "user", content=text)
+        for speaker, text in history
+    ]
+    result = client.complete(  # type: ignore[attr-defined]
+        "patient_simulator",
+        system=PATIENT_SIMULATOR_SYSTEM.format(persona=persona),
+        messages=messages,
+        max_tokens=1024,
+    )
+    return result.text.strip()
+
+
+def build_simulator_client(data_dir: Path | None) -> object:
+    """The app's own LlmClient, so the simulator obeys the same model
+    bindings and the same outbound identifier scrubbing as everything else.
+    Its role (`patient_simulator`) is test-only and in no DAG."""
+    if data_dir is not None:
+        os.environ.setdefault("ADOC_DATA_DIR", str(data_dir))
+    repo_models = Path(__file__).resolve().parent.parent / "models.yaml"
+    os.environ.setdefault("ADOC_MODELS_FILE", str(repo_models))
+    from adoc.config import Settings
+    from adoc.reason.client import LlmClient
+
+    return LlmClient.from_settings(Settings())
 
 
 def resolve_password(*, use_stdin: bool) -> str:
@@ -148,8 +244,15 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--script", type=Path, help="fixed patient messages, blank-line separated")
+    source.add_argument(
+        "--persona",
+        type=Path,
+        help="case notes for a simulated patient who answers whatever is asked",
+    )
     parser.add_argument(
-        "--script", required=True, type=Path, help="patient messages, blank-line separated"
+        "--max-turns", type=int, default=60, help="persona mode: turn cap (default 60)"
     )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=9001)
@@ -175,19 +278,29 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--out", type=Path, help="write a JSON record of the run here")
     args = parser.parse_args(argv)
 
-    if not args.script.exists():
-        print(f"intake-replay: no such script: {args.script}", file=sys.stderr)
-        return 2
-    messages = parse_script(args.script.read_text(encoding="utf-8"))
-    if not messages:
-        print("intake-replay: script contained no messages", file=sys.stderr)
+    source_path = args.script or args.persona
+    if not source_path.exists():
+        print(f"intake-replay: no such file: {source_path}", file=sys.stderr)
         return 2
 
-    print(f"intake-replay: {len(messages)} message(s) from {args.script}")
-    if args.dry_run:
-        for i, message in enumerate(messages, 1):
-            print(f"  {i:2d}. {message[:100]}{'...' if len(message) > 100 else ''}")
-        return 0
+    persona = ""
+    messages: list[str] = []
+    if args.persona:
+        persona = args.persona.read_text(encoding="utf-8")
+        print(f"intake-replay: simulated patient from {args.persona} (max {args.max_turns} turns)")
+        if args.dry_run:
+            print(persona)
+            return 0
+    else:
+        messages = parse_script(args.script.read_text(encoding="utf-8"))
+        if not messages:
+            print("intake-replay: script contained no messages", file=sys.stderr)
+            return 2
+        print(f"intake-replay: {len(messages)} message(s) from {args.script}")
+        if args.dry_run:
+            for i, message in enumerate(messages, 1):
+                print(f"  {i:2d}. {message[:100]}{'...' if len(message) > 100 else ''}")
+            return 0
 
     username = args.user or input("a-doc username: ").strip()
     if not username:
@@ -205,7 +318,9 @@ def main(argv: list[str] | None = None) -> int:
     completed_on: int | None = None
     run_clock = time.monotonic()
 
-    def run_turn(index: int, message: str, *, label: str) -> None:
+    def run_turn(index: int, message: str, *, label: str) -> str | None:
+        """Returns the agent's reply, or None if the turn failed — persona
+        mode needs the reply to know what it is answering next."""
         nonlocal completed_on
         preview = message if len(message) <= 70 else message[:67] + "..."
         print(f"\n[{label}] -> {preview}")
@@ -216,12 +331,25 @@ def main(argv: list[str] | None = None) -> int:
             elapsed = time.monotonic() - started
             print(f"  !! HTTP {exc.code} after {elapsed:.1f}s")
             records.append({"n": index, "sent": message, "error": exc.code, "seconds": elapsed})
-            return
+            return None
         except TimeoutError:
             elapsed = time.monotonic() - started
             print(f"  !! no response after {elapsed:.1f}s (client timeout)")
             records.append({"n": index, "sent": message, "error": "timeout", "seconds": elapsed})
-            return
+            return None
+        except urllib.error.URLError as exc:
+            # The server going away mid-run is ORDINARY here: a restart, a
+            # crash, someone stopping it. Twenty turns of work are already
+            # committed to the data repo at that point, so the run should
+            # end with a line saying what happened and where it stopped —
+            # not a socket traceback that buries the summary.
+            elapsed = time.monotonic() - started
+            print(f"  !! cannot reach {session.base} after {elapsed:.1f}s: {exc.reason}")
+            print("     (is the server still running? ./scripts/start-local --dir <dir> --port N)")
+            records.append(
+                {"n": index, "sent": message, "error": "unreachable", "seconds": elapsed}
+            )
+            return None
         elapsed = time.monotonic() - started
         reply = _strip_html(fragment)
         withheld = "Reply withheld by a safety check" in fragment
@@ -241,20 +369,47 @@ def main(argv: list[str] | None = None) -> int:
                 completed_on = index
                 print(f"  ** intake complete after message {index}")
         records.append(record)
+        return reply
 
-    for index, message in enumerate(messages, 1):
-        run_turn(index, message, label=f"{index}/{len(messages)}")
-        if args.until_complete and completed_on is not None:
-            print(
-                f"\nintake-replay: stopping early — complete after "
-                f"{completed_on} of {len(messages)}"
-            )
-            break
+    if args.persona:
+        simulator = build_simulator_client(args.data_dir)
+        history: list[tuple[str, str]] = []
+        opener = _strip_html(session.opening_message())
+        if opener:
+            history.append(("agent", opener))
+            print(f"\n[opener] <- {opener[:300]}{'...' if len(opener) > 300 else ''}")
+        for index in range(1, args.max_turns + 1):
+            patient = simulate_patient_reply(simulator, persona, history)
+            history.append(("patient", patient))
+            reply = run_turn(index, patient, label=f"{index}/{args.max_turns}")
+            if reply is None:
+                print("intake-replay: stopping — the previous turn failed")
+                break
+            history.append(("agent", reply))
+            if completed_on is not None:
+                print(f"\nintake-replay: intake complete after {completed_on} simulated turn(s)")
+                break
+        else:
+            print(f"\nintake-replay: hit the {args.max_turns}-turn cap without completing intake")
+    else:
+        for index, message in enumerate(messages, 1):
+            if run_turn(index, message, label=f"{index}/{len(messages)}") is None:
+                # Once a turn has failed the conversation is broken: the
+                # agent never saw that message, so every remaining scripted
+                # answer replies to a question it was never asked.
+                print(f"\nintake-replay: stopping at message {index} — the turn failed")
+                break
+            if args.until_complete and completed_on is not None:
+                print(
+                    f"\nintake-replay: stopping early — complete after "
+                    f"{completed_on} of {len(messages)}"
+                )
+                break
 
     if args.then:
         # The first post-intake turn is the interesting one: it routes to the
         # diagnostic DAG instead of the intake agent, and takes minutes.
-        run_turn(len(messages) + 1, args.then, label="post-intake")
+        run_turn(len(records) + 1, args.then, label="post-intake")
 
     total = time.monotonic() - run_clock
     turns = [r for r in records if "seconds" in r]
