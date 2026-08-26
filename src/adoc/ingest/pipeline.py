@@ -130,7 +130,13 @@ from adoc.ingest.genomics import (
     archive_genomic_file,
     regenerate_inventory,
 )
-from adoc.ingest.reconcile import ReconciledRow, parse_flag, parse_ref_range, reconcile
+from adoc.ingest.reconcile import (
+    ReconciledRow,
+    divert_narrative_extraction,
+    parse_flag,
+    parse_ref_range,
+    reconcile,
+)
 from adoc.ingest.schema import ClassifyResult, DocType, DocumentExtraction
 from adoc.ingest.vision import ImagePart, VisionClient, VisionError
 from adoc.labs.db import LabsDb
@@ -344,6 +350,14 @@ def _ingest_lab_report(
     page_count: int,
     doc_text: str | None = None,
 ) -> FileOutcome:
+    # ADR 0025: divert rows whose names read as sentences BEFORE reconciling,
+    # so the text lands in `narrative_findings` (where it stays retrievable
+    # and citable) instead of becoming a lab row whose analyte name is a
+    # sentence. Done here rather than inside `reconcile` because only this
+    # layer still has the extraction to put the findings back into.
+    pass_a = divert_narrative_extraction(pass_a)
+    pass_b = divert_narrative_extraction(pass_b)
+
     reconciled = reconcile(pass_a, pass_b, db)
 
     lab_rows: list[LabResult] = []
