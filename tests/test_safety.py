@@ -188,3 +188,34 @@ def test_default_gate_is_unchanged_and_still_blocks_dosing(text: str) -> None:
     """Diagnostic and informational replies keep the full gate — only the
     intake path opts into recording mode."""
     assert not treatment_gate(text).passed
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # Both of these opened a clause, so the advice-marker lookback was
+        # EMPTY and a gerund was read as a bare imperative. A live intake run
+        # withheld a reply that was doing nothing but asking which
+        # supplements the patient takes.
+        "Are those from Dr. Misgivens? Taking for those (iron, selenium) on your own?",
+        "You mentioned several: iron, selenium, biotin. taking for those (iron)?",
+    ],
+)
+def test_recording_mode_allows_a_gerund_that_opens_a_clause(text: str) -> None:
+    """English has no "-ing" imperative: "take iron" instructs, "taking
+    iron" cannot."""
+    assert treatment_gate(text, recording_only=True).passed
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Consider taking 5000 IU of vitamin D.",
+        "Try switching to levothyroxine.",
+        "I recommend tapering your prednisone.",
+    ],
+)
+def test_recording_mode_still_blocks_advised_gerunds(text: str) -> None:
+    """An advice marker in front of the gerund is what makes it advice, and
+    that is checked before the gerund exemption."""
+    assert not treatment_gate(text, recording_only=True).passed

@@ -414,6 +414,60 @@ def _unwrap_tool_input(tool_input: dict[str, Any]) -> dict[str, Any]:
     return tool_input
 
 
+def _decode_json_valued_strings(tool_input: dict[str, Any]) -> dict[str, Any]:
+    """Decode values that arrived as a JSON STRING instead of a structure.
+
+    Tool-use output occasionally serializes a list or object field into a
+    string — `{"ops": "[{\\"op\\": \\"update_fact\\", ...}]"}` instead of
+    `{"ops": [...]}`. Pydantic rejects it (`Input should be a valid list`),
+    the retry usually produces the same shape, and the turn dies. A live
+    33-turn intake run hit it 4 times, once surfacing a raw pydantic error
+    to the patient.
+
+    Only strings that already look like JSON (`[`/`{`) are touched, and only
+    when they parse; a field legitimately holding prose is never mangled.
+    """
+    repaired: dict[str, Any] = {}
+    changed = False
+    for key, value in tool_input.items():
+        if isinstance(value, str):
+            candidate = value.strip()
+            if candidate[:1] in ("[", "{"):
+                try:
+                    repaired[key] = json.loads(candidate)
+                    changed = True
+                    continue
+                except json.JSONDecodeError:
+                    pass
+        repaired[key] = value
+    return repaired if changed else tool_input
+
+
+def _validate_with_repairs(schema: type[BaseModel], tool_input: dict[str, Any]) -> BaseModel:
+    """Validate `tool_input` against `schema`, trying known tool-use
+    malformations in turn. Flat-first, so a payload that is already correct
+    is never reinterpreted; each repair is attempted only after the plainer
+    reading has failed. The LAST attempt's error is what propagates, so a
+    genuinely bad payload still reports a real validation message.
+    """
+    candidates = [
+        tool_input,
+        _unwrap_tool_input(tool_input),
+        _decode_json_valued_strings(tool_input),
+        _decode_json_valued_strings(_unwrap_tool_input(tool_input)),
+    ]
+    last_error: Exception | None = None
+    for index, candidate in enumerate(candidates):
+        if index and candidate is candidates[index - 1]:
+            continue  # repair was a no-op; do not re-validate the same dict
+        try:
+            return schema.model_validate(candidate)
+        except Exception as exc:  # noqa: PERF203 - each repair is a distinct attempt
+            last_error = exc
+    assert last_error is not None
+    raise last_error
+
+
 def _extract_json_object(text: str) -> str:
     """Return the first top-level JSON object in `text`.
 
@@ -694,15 +748,7 @@ class LlmClient:
                 )
                 raise LlmError(f"role {role!r}: provider returned no structured output")
             try:
-                try:
-                    parsed = schema.model_validate(response.tool_input)
-                except Exception:
-                    # Known Claude tool-use quirk: complex-schema input
-                    # occasionally arrives nested under a single wrapper key
-                    # (e.g. {"parameters": {...}}). Flat-first, unwrap-on-
-                    # failure so a legitimate single-field payload is never
-                    # misinterpreted.
-                    parsed = schema.model_validate(_unwrap_tool_input(response.tool_input))
+                parsed = _validate_with_repairs(schema, response.tool_input)
             except Exception as exc:
                 self._audit(
                     _AuditRecord(

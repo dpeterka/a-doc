@@ -290,6 +290,10 @@ _SUBJECT_TOKENS = frozenset(
 
 _ADVICE_LOOKBACK_TOKENS = 4
 
+# "taking", "tapering", "switching" — a participle/gerund, which English
+# never uses for an imperative.
+_GERUND_RE = re.compile(r"\w+ing$", re.IGNORECASE)
+
 
 def _is_advice_construction(tokens: list[re.Match[str]], verb_index: int) -> bool:
     """Does the imperative verb at `verb_index` actually INSTRUCT?
@@ -305,6 +309,16 @@ def _is_advice_construction(tokens: list[re.Match[str]], verb_index: int) -> boo
     words = [t.group(0).lower() for t in lookback]
     if any(w in _ADVICE_MARKERS for w in words):
         return True
+    # An "-ing" form is never an English imperative: "TAKE iron" instructs,
+    # "TAKING iron" cannot. Only an explicit advice marker makes a gerund
+    # into advice ("consider TAKING", "I recommend TAPERING"), and that is
+    # already handled above. Without this, a gerund that happened to open a
+    # sentence had an EMPTY lookback — no subject to find — and was read as
+    # a bare imperative: a live run withheld "...Taking for those (iron,
+    # selenium)?" while the agent was doing nothing but asking which
+    # supplements the patient takes.
+    if _GERUND_RE.match(tokens[verb_index].group(0)):
+        return False
     return not any(w in _SUBJECT_TOKENS for w in words)
 
 
