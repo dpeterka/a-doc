@@ -238,7 +238,91 @@ def _split_clauses(text: str) -> list[tuple[int, str]]:
     return clauses
 
 
-def _imperative_treatment_spans(text: str) -> list[GateSpan]:
+# Words that make a clause ADVICE regardless of who its subject is: "you
+# should take X", "I recommend tapering X", "consider taking X".
+_ADVICE_MARKERS = frozenset(
+    {
+        "should",
+        "recommend",
+        "recommended",
+        "recommending",
+        "suggest",
+        "suggested",
+        "suggesting",
+        "advise",
+        "advised",
+        "consider",
+        "must",
+        "ought",
+        "try",
+    }
+)
+
+# A subject immediately before the verb makes the clause a description or a
+# question about what the patient already takes ("ARE YOU still taking X",
+# "YOU take X", "SHE was on X") rather than an instruction to take it.
+_SUBJECT_TOKENS = frozenset(
+    {
+        "i",
+        "you",
+        "he",
+        "she",
+        "they",
+        "we",
+        "it",
+        "are",
+        "is",
+        "was",
+        "were",
+        "been",
+        "be",
+        "have",
+        "has",
+        "had",
+        "do",
+        "does",
+        "did",
+        "still",
+        "currently",
+        "your",
+    }
+)
+
+_ADVICE_LOOKBACK_TOKENS = 4
+
+# "taking", "tapering", "switching" — a participle/gerund, which English
+# never uses for an imperative.
+_GERUND_RE = re.compile(r"\w+ing$", re.IGNORECASE)
+
+
+def _is_advice_construction(tokens: list[re.Match[str]], verb_index: int) -> bool:
+    """Does the imperative verb at `verb_index` actually INSTRUCT?
+
+    Used only by `treatment_gate(recording_only=True)`. An explicit advice
+    marker anywhere before the verb makes it advice; otherwise a subject
+    directly before it ("are you still TAKING", "you TAKE") makes it a
+    question or a restatement, which a scribe is supposed to produce.
+    A bare clause-initial verb ("TAKE 50 mcg daily") has neither and is
+    treated as an instruction.
+    """
+    lookback = tokens[max(0, verb_index - _ADVICE_LOOKBACK_TOKENS) : verb_index]
+    words = [t.group(0).lower() for t in lookback]
+    if any(w in _ADVICE_MARKERS for w in words):
+        return True
+    # An "-ing" form is never an English imperative: "TAKE iron" instructs,
+    # "TAKING iron" cannot. Only an explicit advice marker makes a gerund
+    # into advice ("consider TAKING", "I recommend TAPERING"), and that is
+    # already handled above. Without this, a gerund that happened to open a
+    # sentence had an EMPTY lookback — no subject to find — and was read as
+    # a bare imperative: a live run withheld "...Taking for those (iron,
+    # selenium)?" while the agent was doing nothing but asking which
+    # supplements the patient takes.
+    if _GERUND_RE.match(tokens[verb_index].group(0)):
+        return False
+    return not any(w in _SUBJECT_TOKENS for w in words)
+
+
+def _imperative_treatment_spans(text: str, *, recording_only: bool = False) -> list[GateSpan]:
     """Scan each clause of `text` for an imperative/hortative treatment
     construction (start/stop/take/increase/decrease/taper/switch/resume/
     discontinue/add — including "you should take", "I recommend tapering",
@@ -257,6 +341,11 @@ def _imperative_treatment_spans(text: str) -> list[GateSpan]:
         tokens = list(_WORD_TOKEN_RE.finditer(clause_text))
         for i, token in enumerate(tokens):
             if token.group(0).lower() not in _IMPERATIVE_VERB_FORMS:
+                continue
+            if recording_only and not _is_advice_construction(tokens, i):
+                # Scribe mode: "are you still taking X", "you take X" are a
+                # question and a restatement. Only an actual instruction
+                # counts here — see `treatment_gate`'s `recording_only`.
                 continue
             window = tokens[i + 1 : i + 1 + _IMPERATIVE_WINDOW_TOKENS]
             drug_token = next((t for t in window if _is_drug_like(t.group(0))), None)
@@ -333,7 +422,7 @@ def _clause_containing(clauses: list[tuple[int, str]], pos: int) -> str:
     return current
 
 
-def treatment_gate(text: str) -> GateResult:
+def treatment_gate(text: str, *, recording_only: bool = False) -> GateResult:
     """Deterministic scan blocking dosing/prescriptive treatment instructions.
 
     Allowed (deliberately not flagged): naming a test to request, naming a
@@ -343,34 +432,47 @@ def treatment_gate(text: str) -> GateResult:
     urine volume in mL, a specimen mass in g, a lab value in ng/mL or
     mg/dL, a BMD in g/cm² — none of those trip any detector below (see
     ADR 0020, `_CONTEXT_DOSAGE_RE`).
+
+    `recording_only=True` drops the bare-dosage rule and keeps ONLY the
+    imperative-instruction rule. Use it where the assistant is acting as a
+    SCRIBE rather than an advisor — the intake conversation, whose job
+    explicitly includes asking "which medication, and what dose?" and
+    reading a medication list back for confirmation. Naming a drug and its
+    dose there is *recording what the patient takes*, which is the opposite
+    of prescribing it; blocking it made intake withhold its own reply to a
+    patient who had just said she could not remember her medication.
+    "Start taking 50 mcg daily" still trips the imperative rule, which is
+    the thing rule 5 actually exists to stop.
     """
     spans: list[GateSpan] = []
 
-    for match in _STRONG_DOSAGE_RE.finditer(text):
-        spans.append(
-            GateSpan(
-                start=match.start(),
-                end=match.end(),
-                text=match.group(0),
-                reason="dosage pattern",
+    if not recording_only:
+        for match in _STRONG_DOSAGE_RE.finditer(text):
+            spans.append(
+                GateSpan(
+                    start=match.start(),
+                    end=match.end(),
+                    text=match.group(0),
+                    reason="dosage pattern",
+                )
             )
-        )
 
-    clauses = _split_clauses(text)
-    for match in _CONTEXT_DOSAGE_RE.finditer(text):
-        clause_text = _clause_containing(clauses, match.start())
-        if not _has_dosing_context(clause_text):
-            continue
-        spans.append(
-            GateSpan(
-                start=match.start(),
-                end=match.end(),
-                text=match.group(0),
-                reason="dosage pattern",
+    if not recording_only:
+        clauses = _split_clauses(text)
+        for match in _CONTEXT_DOSAGE_RE.finditer(text):
+            clause_text = _clause_containing(clauses, match.start())
+            if not _has_dosing_context(clause_text):
+                continue
+            spans.append(
+                GateSpan(
+                    start=match.start(),
+                    end=match.end(),
+                    text=match.group(0),
+                    reason="dosage pattern",
+                )
             )
-        )
 
-    spans.extend(_imperative_treatment_spans(text))
+    spans.extend(_imperative_treatment_spans(text, recording_only=recording_only))
 
     if not spans:
         return GateResult(passed=True)

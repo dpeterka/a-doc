@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
+import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
@@ -147,6 +149,13 @@ def _hash_model(model: BaseModel) -> str:
     return hashlib.sha256(_canonical_json(model).encode("utf-8")).hexdigest()
 
 
+# A `DagRun` is only constructed once every node has finished, and it is
+# only written where a caller chooses to persist it — so while a run is in
+# flight it explains nothing. These log lines are the live view: which node
+# is executing, how long each took, and which contract stopped a run.
+logger = logging.getLogger(__name__)
+
+
 def _now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
@@ -197,9 +206,17 @@ def run(dag: Dag, initial: dict[str, BaseModel]) -> DagRun:
     ctx: dict[str, BaseModel] = dict(initial)
     node_records: list[NodeRecord] = []
     run_started = _now_iso()
+    # Generated up front rather than at `DagRun` construction so every log
+    # line below can be tied back to the run record this call returns.
+    run_id = uuid.uuid4().hex
+    total = len(dag.nodes)
+    logger.info("dag %s: starting, %d node(s): %s", run_id[:8], total, [n.name for n in dag.nodes])
+    run_clock = time.monotonic()
 
-    for node in dag.nodes:
+    for index, node in enumerate(dag.nodes, start=1):
         started = _now_iso()
+        node_clock = time.monotonic()
+        logger.info("dag %s: node %d/%d %r starting", run_id[:8], index, total, node.name)
 
         if node.depends_on not in ctx:
             raise KeyError(
@@ -213,6 +230,16 @@ def run(dag: Dag, initial: dict[str, BaseModel]) -> DagRun:
         for contract in node.preconditions:
             violation = contract.check(ctx, validated_input)
             if violation is not None:
+                # The contract NAME is logged, never `violation` — a
+                # violation message can quote the offending span of a
+                # patient-facing reply (see `web.routes.chat`'s note on the
+                # same rule).
+                logger.warning(
+                    "dag %s: node %r stopped by precondition %r",
+                    run_id[:8],
+                    node.name,
+                    contract.name,
+                )
                 raise ContractViolation(node.name, contract.name, violation)
 
         output = node.fn(ctx)
@@ -222,8 +249,23 @@ def run(dag: Dag, initial: dict[str, BaseModel]) -> DagRun:
         for contract in node.postconditions:
             violation = contract.check(ctx, validated_output)
             if violation is not None:
+                logger.warning(
+                    "dag %s: node %r stopped by postcondition %r after %.1fs",
+                    run_id[:8],
+                    node.name,
+                    contract.name,
+                    time.monotonic() - node_clock,
+                )
                 raise ContractViolation(node.name, contract.name, violation)
 
+        logger.info(
+            "dag %s: node %d/%d %r ok in %.1fs",
+            run_id[:8],
+            index,
+            total,
+            node.name,
+            time.monotonic() - node_clock,
+        )
         ctx[node.name] = validated_output
         node_records.append(
             NodeRecord(
@@ -237,8 +279,9 @@ def run(dag: Dag, initial: dict[str, BaseModel]) -> DagRun:
             )
         )
 
+    logger.info("dag %s: complete in %.1fs", run_id[:8], time.monotonic() - run_clock)
     return DagRun(
-        run_id=uuid.uuid4().hex,
+        run_id=run_id,
         started_at=run_started,
         finished_at=_now_iso(),
         nodes=node_records,

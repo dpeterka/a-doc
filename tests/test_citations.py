@@ -25,6 +25,7 @@ from adoc.labs.models import LabDocument, LabResult
 from adoc.reason.citations import (
     CITATION_LOG_RELPATH,
     EutilsPmidVerifier,
+    _extract_quoted_numbers,
     build_retry_feedback,
     check_diff_citations,
     check_ops_citations,
@@ -453,3 +454,93 @@ def test_eutils_verifier_network_failure_is_error_and_never_cached(tmp_path: Pat
     assert verifier.verify("444") == "error"
     assert verifier.verify("444") == "error"  # never cached; re-tried every time
     assert not cache_path.exists()
+
+
+def test_doc_ref_without_a_page_resolves_for_an_unpaginated_document(tmp_path: Path) -> None:
+    """`#p<int>` is optional. Requiring it assumed every citable document is
+    a paginated scan; the document-text corpus made `.docx`/`.txt` records
+    citable, and a real run died rejecting a ref to the patient's own
+    narrative history document because it has no pages."""
+    db = LabsDb(tmp_path / "labs.sqlite")
+    db.upsert_document(
+        LabDocument(
+            sha256="d" * 64,
+            filename="Longitudinal Health History.docx",
+            doc_type="clinical-note",
+            page_count=1,
+        )
+    )
+    repo = DataRepo.init_at(tmp_path / "data")
+
+    ok = check_ops_citations([_evidence_op("doc:Longitudinal Health History.docx")], db, repo)
+    assert not ok.failing
+
+    missing = check_ops_citations([_evidence_op("doc:Never Ingested.docx")], db, repo)
+    assert missing.failing
+
+
+# --- narrative-report rows whose "analyte name" is a prose lead-in --------------------
+#
+# A DEXA/FRAX summary yields rows named like a sentence with the value at the
+# end: "10-year probability of hip fracture IS". A model cites the sensible
+# slug and drops the dangling connective. That failed to resolve and cost a
+# real diagnostic turn 203 seconds at the ledger-maintainer's citation check,
+# for a row that was present and correctly cited.
+
+
+def test_labs_ref_resolves_when_the_stored_name_ends_in_a_connective(
+    db: LabsDb, repo: DataRepo
+) -> None:
+    _seed_lab_row(db, name="10-year probability of hip fracture is", value=0.7)
+    op = _evidence_op(
+        "labs:10-year-probability-of-hip-fracture:2026-05-02",
+        claim="10-year hip fracture probability is low",
+    )
+
+    report = check_ops_citations([op], db, repo)
+
+    assert report.checks[0].outcome == "resolved"
+    assert report.failing == []
+
+
+def test_shedding_a_connective_cannot_resolve_onto_a_different_analyte(
+    db: LabsDb, repo: DataRepo
+) -> None:
+    """Only trailing connectives are shed, and the remainder must still match
+    in full — so this narrowing cannot let a cited slug land on the wrong
+    row, which is the whole point of the citation check."""
+    _seed_lab_row(db, name="CRP", value=8.5)
+    op = _evidence_op("labs:crp-ratio:2026-05-02", claim="the CRP ratio is high")
+
+    report = check_ops_citations([op], db, repo)
+
+    assert report.checks[0].outcome == "unresolved"
+
+
+def test_an_exact_analyte_name_still_resolves(db: LabsDb, repo: DataRepo) -> None:
+    _seed_lab_row(db, name="CRP", value=8.5)
+    op = _evidence_op("labs:crp:2026-05-02", claim="CRP is elevated")
+
+    report = check_ops_citations([op], db, repo)
+
+    assert report.checks[0].outcome == "resolved"
+
+
+@pytest.mark.parametrize(
+    ("claim", "expected"),
+    [
+        # A number hyphenated to a word names something; it is not a reading.
+        ("10-year hip fracture probability is low", []),
+        ("6-minute walk test was abnormal", []),
+        # ... but a real value in the same claim is still extracted.
+        ("25-hydroxy vitamin D was 24.1 ng/mL", [24.1]),
+        ("CRP was 8.5 mg/L", [8.5]),
+        # A negative T-score is a genuine value, not a compound modifier.
+        ("T-score of -1.1", [-1.1]),
+    ],
+)
+def test_compound_modifiers_are_not_quoted_values(claim: str, expected: list[float]) -> None:
+    """ "10-year probability" against a stored 0.7 is a meaningless
+    comparison — the digits are part of a name. Same reason dates and titer
+    ratios are stripped."""
+    assert _extract_quoted_numbers(claim) == expected

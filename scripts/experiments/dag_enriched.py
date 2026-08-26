@@ -32,10 +32,10 @@ from adoc import __version__
 from adoc.casefile.repo import LEDGER_RELPATH, DataRepo
 from adoc.config import Settings
 from adoc.labs.db import LabsDb
+from adoc.logging_setup import configure_logging
 from adoc.privacy import Scrubber
 from adoc.reason.client import LlmClient
 from adoc.reason.dag import ContractViolation
-from adoc.reason.safety import RedFlagResult
 from adoc.reason.stages import run_diagnostic_turn
 
 PROMPT = (
@@ -69,6 +69,7 @@ def _build_llm_client(settings: Settings) -> LlmClient:
 
 
 def main() -> int:
+    configure_logging()
     settings = Settings()
     _refuse_if_safe_store(settings.data_dir)
     print(
@@ -108,10 +109,6 @@ def main() -> int:
         )
         return 2
     duration = time.monotonic() - start
-
-    if isinstance(outcome, RedFlagResult):
-        print(f"METADATA: profile=dag red-flagged (no DAG run) duration={duration:.0f}s")
-        return 0
 
     ledger_raw: dict[str, Any] = yaml.safe_load((repo.root / LEDGER_RELPATH).read_text()) or {}
     hyps = ledger_raw.get("hypotheses", [])

@@ -992,6 +992,49 @@ def _has_preceding_copula(head: str) -> bool:
     return False
 
 
+_COMPARATOR_WORDS = {
+    "below",
+    "above",
+    "under",
+    "over",
+    "beneath",
+    "beyond",
+    "exceeds",
+    "exceed",
+    "exceeding",
+    "less",
+    "fewer",
+    "greater",
+    "least",
+    "most",
+    "minimum",
+    "maximum",
+    "threshold",
+    "cutoff",
+    "than",
+}
+# "<", ">", "<=", ">=", "≤", "≥" immediately before the number.
+_COMPARATOR_SYMBOL_RE = re.compile(r"(?:[<>]=?|[≤≥])\s*$")
+
+
+def _has_preceding_comparator(head: str) -> bool:
+    """True iff the number is governed by a COMPARATOR rather than asserted
+    as a value — "below 30 ng/mL", "above 1.5", "< 0.08".
+
+    Only the closest non-filler word counts, matching
+    `_has_preceding_copula`'s rule, so "was 24.1, less than the 30
+    threshold" still treats 24.1 as a claimed value.
+    """
+    if _COMPARATOR_SYMBOL_RE.search(head):
+        return True
+    words = [w.lower() for w in _HEAD_WORD_RE.findall(head)]
+    for word in reversed(words[-3:]):
+        if word in _COPULA_SKIPPABLE_FILLERS:
+            continue
+        return word in _COMPARATOR_WORDS
+    return False
+
+
 def _looks_like_bare_year(number_text: str) -> bool:
     """True iff `number_text` is a plain integer (no decimal point) whose
     value falls in a plausible calendar-year range — "since 2024" is a
@@ -1018,6 +1061,16 @@ def _quoted_number_is_value_evidence(
     stripped_tail = tail.lstrip()
     lowered_tail = stripped_tail.lower()
     lowered_units = {u.lower() for u in analyte_units if u}
+
+    # A comparator-governed number is a THRESHOLD, not a claimed result, and
+    # this veto runs before the positive-evidence check because the usual
+    # phrasing attaches a real unit ("below 30 ng/mL") and so would sail
+    # through it. See the `_COMPARATOR_WORDS` rationale and ADR 0023: a live
+    # diagnostic turn was lost to six of these at once, including "Vitamin D
+    # insufficiency is defined as below 30 ng/mL", which asserts nothing
+    # about this patient at all.
+    if _has_preceding_comparator(head):
+        return False
 
     has_unit_evidence = any(lowered_tail.startswith(unit) for unit in lowered_units)
     has_copula_evidence = _has_preceding_copula(head)

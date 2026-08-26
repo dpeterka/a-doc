@@ -269,6 +269,16 @@ _MIGRATIONS: list[str] = [
         INSERT INTO document_text_fts(rowid, text) VALUES (new.id, new.text);
     END;
     """,
+    # ADR 0025: a result reported as a BOUND ("<20", ">150") is still a
+    # number. 183 real rows kept theirs in `value_text`, invisible to every
+    # numeric consumer. Purely additive - an existing row keeps
+    # `comparator IS NULL`, which reads as "point measurement", so nothing
+    # already stored changes meaning. `adoc labs-revalidate` is what
+    # backfills the rows whose number is still trapped in text.
+    """
+    ALTER TABLE labs ADD COLUMN comparator TEXT
+        CHECK(comparator IN ('<', '<=', '>', '>=') OR comparator IS NULL);
+    """,
 ]
 
 _CORRECTABLE_FIELDS = {
@@ -277,6 +287,7 @@ _CORRECTABLE_FIELDS = {
     "name",
     "name_raw",
     "value",
+    "comparator",
     "value_text",
     "ucum_unit",
     "ref_low",
@@ -315,6 +326,7 @@ def _lab_params(row: LabResult) -> tuple[Any, ...]:
         row.name,
         row.name_raw,
         row.value,
+        row.comparator,
         row.value_text,
         row.ucum_unit,
         row.ref_low,
@@ -668,10 +680,10 @@ class LabsDb:
         cur = self._conn.execute(
             """
             INSERT INTO labs (
-                date, loinc_code, name, name_raw, value, value_text, ucum_unit,
+                date, loinc_code, name, name_raw, value, comparator, value_text, ucum_unit,
                 ref_low, ref_high, ref_text, flag, specimen, source_doc, source_page,
                 extraction_status, raw_json, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(date, name, specimen, source_doc) DO NOTHING
             """,
             _lab_params(row),
@@ -694,7 +706,7 @@ class LabsDb:
         self._conn.execute(
             """
             UPDATE labs SET
-                date = ?, loinc_code = ?, name = ?, name_raw = ?, value = ?,
+                date = ?, loinc_code = ?, name = ?, name_raw = ?, value = ?, comparator = ?,
                 value_text = ?, ucum_unit = ?, ref_low = ?, ref_high = ?, ref_text = ?,
                 flag = ?, specimen = ?, source_page = ?, extraction_status = ?, raw_json = ?
             WHERE id = ?
@@ -705,6 +717,7 @@ class LabsDb:
                 new.name,
                 new.name_raw,
                 new.value,
+                new.comparator,
                 new.value_text,
                 new.ucum_unit,
                 new.ref_low,
@@ -1205,6 +1218,19 @@ class LabsDb:
         return [_row_to_lab(row) for row in rows]
 
     @_synchronized
+    def all_rows(self) -> list[LabResult]:
+        """Every lab row, REJECTED included, ordered by id.
+
+        `all_non_rejected_rows` is the working set for recanonicalization;
+        this is for `labs/review.py` (ADR 0026), where a rejection is itself
+        a human decision that a rebuild must carry forward — dropping it
+        would re-present a row a person already said was wrong as a fresh
+        one to review.
+        """
+        rows = self._conn.execute("SELECT * FROM labs ORDER BY id").fetchall()
+        return [_row_to_lab(row) for row in rows]
+
+    @_synchronized
     def rejected_row_keys(self) -> set[tuple[str, str, str, str]]:
         """The `(date, name, specimen, source_doc)` keys currently held by
         REJECTED rows. The table's UNIQUE constraint spans rejected rows
@@ -1509,10 +1535,10 @@ class LabsDb:
         self._conn.execute(
             """
             INSERT INTO labs (
-                id, date, loinc_code, name, name_raw, value, value_text, ucum_unit,
+                id, date, loinc_code, name, name_raw, value, comparator, value_text, ucum_unit,
                 ref_low, ref_high, ref_text, flag, specimen, source_doc, source_page,
                 extraction_status, raw_json, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (row.id, *_lab_params(row)),
         )

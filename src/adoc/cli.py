@@ -69,6 +69,7 @@ from adoc.labs.recanonicalize import recanonicalize_rows
 from adoc.labs.reclassify import reclassify_pending
 from adoc.labs.specimen import infer_unknown_specimens
 from adoc.labs.twins import sweep_twins, write_sweep_summary
+from adoc.logging_setup import configure_logging
 from adoc.privacy import (
     IDENTIFIER_FIELDS,
     IDENTIFIERS_RELPATH,
@@ -1174,6 +1175,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    # Every subcommand, not just `serve`: `review`, `ingest`, and the labs
+    # sweeps all make multi-minute model calls whose progress logging is
+    # dropped entirely without a root handler (see `adoc.logging_setup`).
+    configure_logging()
     parser = build_parser()
     args = parser.parse_args(argv)
     result: int = args.func(args)

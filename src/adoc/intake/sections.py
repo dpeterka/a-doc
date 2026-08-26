@@ -24,10 +24,19 @@ from pydantic import BaseModel, Field
 
 
 class BasicsSection(BaseModel):
-    age: int | None = None
+    age: str | None = None
+    """Free-form, like `MedicalEvent.date_approx` below — "42", "just
+    turned 40", or "mid-40s" all survive as the patient actually said them,
+    rather than being forced into an exact integer (a live crash: forcing
+    `Relative.age_at_onset` to `int` broke on "late 30s" — the same risk
+    applies here)."""
     sex_at_birth: str | None = None
-    height_cm: float | None = None
-    weight_kg: float | None = None
+    height_cm: str | None = None
+    """Free-form and NOT assumed to be centimeters despite the field name
+    (kept for backward compatibility with `intake.convert`'s fact-field
+    key) — "5'9\"", "175cm", or "about average" all survive verbatim."""
+    weight_kg: str | None = None
+    """Same free-form convention as `height_cm` above."""
     occupation: str | None = None
     exposures: list[str] = Field(default_factory=list)
 
@@ -68,8 +77,24 @@ DiagnosisStatus = Literal["confirmed", "suspected", "ruled-out"]
 class PriorDiagnosis(BaseModel):
     name: str
     by_whom: str | None = None
-    year: int | None = None
+    year: str | None = None
+    """Free-form, like `MedicalEvent.date_approx` — "2018", "a few years
+    ago", or "around 2015" all survive as the patient actually said them.
+    `status` below stays a closed vocabulary deliberately (see its own
+    note) — this field doesn't need to, since nothing downstream parses it
+    as a number; `intake.corroborate` already tolerates non-numeric text
+    here (`int(year)` wrapped in try/except)."""
     status: DiagnosisStatus = "suspected"
+    """Kept as a closed 3-value vocabulary (unlike the free-form fields in
+    this module) because it IS consumed as a controlled classification
+    downstream — `intake.wizard._write_patient_theories` and, later, the
+    first diagnostic run's Ledger-Maintainer pass, which reads
+    `case/patient-theories.md` as `origin: patient` hypotheses (module
+    docstring). A patient doesn't state this value verbatim; the intake
+    agent classifies it, so strictness here is still load-bearing —
+    `intake.convert._diagnosis_data` is responsible for clamping an
+    out-of-vocabulary value from the loosely-typed fact `fields` dict to
+    the schema default rather than letting model_validate raise."""
 
 
 class PatientSuspectedDiagnosis(BaseModel):
@@ -88,9 +113,15 @@ class PriorDiagnosesSection(BaseModel):
 class Relative(BaseModel):
     relation: str
     conditions: list[str] = Field(default_factory=list)
-    age_at_onset: int | None = None
+    age_at_onset: str | None = None
+    """Free-form, like `MedicalEvent.date_approx` — "late 30s", "as a
+    teenager", or "approx. 5 years old" all survive as the patient actually
+    said them, rather than being forced into an exact integer. THE live
+    crash this schema originally shipped with (`int | None` rejected "late
+    30s")."""
     deceased: bool = False
-    age_at_death: int | None = None
+    age_at_death: str | None = None
+    """Same free-form convention as `age_at_onset` above."""
 
 
 class FamilyHistorySection(BaseModel):
@@ -214,7 +245,10 @@ SECTIONS: list[SectionSpec] = [
             "Extract the patient's basic demographic and exposure information "
             "from their message into the given schema. Leave a field null/empty "
             "if the patient did not mention it — never guess or fabricate a "
-            "value. Never infer or add a diagnosis, treatment, or dosing advice."
+            "value. Capture age, height, and weight exactly as the patient stated "
+            "them (a number, a range like 'mid-40s', or a description, including "
+            "whichever unit they used) — never round, estimate, or convert units "
+            "yourself. Never infer or add a diagnosis, treatment, or dosing advice."
         ),
     ),
     SectionSpec(

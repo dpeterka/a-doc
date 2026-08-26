@@ -141,3 +141,81 @@ def test_treatment_gate_mg_mcg_iu_still_fire_without_context() -> None:
     assert treatment_gate("5000 IU").passed is False
     assert treatment_gate("50 mcg").passed is False
     assert treatment_gate("20 mg").passed is False
+
+
+# --- recording_only: intake is a scribe, not an advisor -------------------------------
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Are you still taking levothyroxine 50 mcg daily?",
+        "You take vitamin D 5000 IU and B12 1000 mcg — is that right?",
+        "I recorded it as thyroid replacement hormone, with the dose not remembered.",
+        "Were you on prednisone at the time?",
+    ],
+)
+def test_recording_mode_allows_asking_about_and_restating_medications(text: str) -> None:
+    """Intake's job includes asking "which medication, and what dose?" and
+    reading a list back. Blocking that made intake withhold its own reply to
+    a patient who had just said she could not remember her medication."""
+    assert treatment_gate(text, recording_only=True).passed
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Start taking 50 mcg of levothyroxine daily.",
+        "Take 20 mg prednisone every morning.",
+        "I recommend tapering your prednisone.",
+        "You should take 5000 IU of vitamin D.",
+    ],
+)
+def test_recording_mode_still_blocks_actual_instructions(text: str) -> None:
+    """The narrowing must not become a hole: an instruction is still an
+    instruction, with or without a subject in front of the verb."""
+    assert not treatment_gate(text, recording_only=True).passed
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Are you still taking levothyroxine 50 mcg daily?",
+        "Start taking 50 mcg of levothyroxine daily.",
+    ],
+)
+def test_default_gate_is_unchanged_and_still_blocks_dosing(text: str) -> None:
+    """Diagnostic and informational replies keep the full gate — only the
+    intake path opts into recording mode."""
+    assert not treatment_gate(text).passed
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # Both of these opened a clause, so the advice-marker lookback was
+        # EMPTY and a gerund was read as a bare imperative. A live intake run
+        # withheld a reply that was doing nothing but asking which
+        # supplements the patient takes.
+        "Are those from Dr. Misgivens? Taking for those (iron, selenium) on your own?",
+        "You mentioned several: iron, selenium, biotin. taking for those (iron)?",
+    ],
+)
+def test_recording_mode_allows_a_gerund_that_opens_a_clause(text: str) -> None:
+    """English has no "-ing" imperative: "take iron" instructs, "taking
+    iron" cannot."""
+    assert treatment_gate(text, recording_only=True).passed
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Consider taking 5000 IU of vitamin D.",
+        "Try switching to levothyroxine.",
+        "I recommend tapering your prednisone.",
+    ],
+)
+def test_recording_mode_still_blocks_advised_gerunds(text: str) -> None:
+    """An advice marker in front of the gerund is what makes it advice, and
+    that is checked before the gerund exemption."""
+    assert not treatment_gate(text, recording_only=True).passed

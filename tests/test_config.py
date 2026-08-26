@@ -91,6 +91,11 @@ def test_load_model_bindings_has_all_roles() -> None:
         "test_chooser",
         "intake_agent",
         "entailment_verifier",
+        # Test-harness only (`scripts/intake-replay --persona`); no DAG stage
+        # resolves it. Listed here rather than exempted so the set stays an
+        # exact equality check — a role appearing or vanishing unnoticed is
+        # what this test exists to catch.
+        "patient_simulator",
     }
     assert set(bindings.keys()) == expected_roles
 

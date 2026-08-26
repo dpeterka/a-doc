@@ -87,6 +87,7 @@ blocks the rescue outright.
 from __future__ import annotations
 
 import json
+import logging
 import re
 from collections import defaultdict
 from collections.abc import Sequence
@@ -97,6 +98,7 @@ from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, Field
 
+from adoc.ingest.rowkind import classify_extracted_row
 from adoc.ingest.schema import DocumentExtraction, ExtractedResult
 from adoc.labs.models import LabFlag, LabResult, Specimen
 from adoc.labs.validate import (
@@ -113,6 +115,8 @@ from adoc.labs.validate import (
 
 if TYPE_CHECKING:
     from adoc.labs.db import LabsDb
+
+logger = logging.getLogger(__name__)
 
 PAGE_TOLERANCE = 1
 _PLACEHOLDER_SHA = "0" * 64
@@ -487,6 +491,55 @@ def _clean_results(results: Sequence[ExtractedResult]) -> list[ExtractedResult]:
         name = clean_result_name(row.name_raw)
         cleaned.append(row if name == row.name_raw else row.model_copy(update={"name_raw": name}))
     return cleaned
+
+
+def divert_narrative_rows(
+    results: Sequence[ExtractedResult],
+) -> tuple[list[ExtractedResult], list[str]]:
+    """Split `results` into real measurements and diverted narrative text.
+
+    Applied AFTER `_clean_results`, so only names that cleaning cannot
+    rescue are diverted (ADR 0025). Returns `(kept, narrative_findings)`;
+    the narrative entries carry the page and the value so nothing the
+    extractor read is lost — "Left total hip: A statistically significant
+    decrease of 6.7%" survives as a finding rather than as a lab row whose
+    analyte name is a sentence.
+    """
+    kept: list[ExtractedResult] = []
+    findings: list[str] = []
+    for row in results:
+        kind = classify_extracted_row(row.name_raw, row.value, row.value_text)
+        if kind != "narrative":
+            kept.append(row)
+            continue
+        value = row.value if row.value is not None else (row.value_text or "")
+        unit = f" {row.unit_raw}" if row.unit_raw else ""
+        findings.append(f"(p{row.page}) {row.name_raw} {value}{unit}".strip())
+        logger.info(
+            "reconcile: diverted a narrative row to findings (not a measurement): %r",
+            row.name_raw,
+        )
+    return kept, findings
+
+
+def divert_narrative_extraction(extraction: DocumentExtraction) -> DocumentExtraction:
+    """`divert_narrative_rows` over a whole extraction, keeping the text.
+
+    Returns a copy whose `results` hold only real measurements and whose
+    `narrative_findings` have gained whatever was diverted. Runs in the
+    pipeline BEFORE `reconcile`, which is the only place that can preserve
+    the diverted text — `reconcile` returns rows, not an extraction.
+    """
+    cleaned = _clean_results(extraction.results)
+    kept, findings = divert_narrative_rows(cleaned)
+    if not findings:
+        return extraction
+    return extraction.model_copy(
+        update={
+            "results": kept,
+            "narrative_findings": [*extraction.narrative_findings, *findings],
+        }
+    )
 
 
 def _stored_name(*name_raws: str) -> str | None:
@@ -1091,6 +1144,16 @@ def reconcile(
     # see `clean_result_name`'s output.
     a_results = _clean_results(pass_a.results)
     b_results = _clean_results(pass_b.results)
+
+    # ADR 0025: a row whose name still reads as a SENTENCE after cleaning is
+    # not a measurement, and no cleaning rule can make it one. Normally
+    # already gone by now — `divert_narrative_extraction` runs in the
+    # pipeline, before this, so the diverted text can be kept in
+    # `narrative_findings`. Repeated here as a floor, because `reconcile` is
+    # also called directly (tests, the confirm queue) and a sentence must
+    # never become a lab row by that route either.
+    a_results, _ = divert_narrative_rows(a_results)
+    b_results, _ = divert_narrative_rows(b_results)
 
     groups_a = _group_by_key(a_results)
     groups_b = _group_by_key(b_results)

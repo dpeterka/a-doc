@@ -8,7 +8,7 @@ import types
 from pathlib import Path
 
 import pytest
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from adoc.config import ModelBinding, Settings
 from adoc.privacy import PatientIdentifiers, Scrubber
@@ -22,6 +22,7 @@ from adoc.reason.client import (
     TransientTransportError,
     TransportRequest,
     TransportResponse,
+    _validate_with_repairs,
 )
 
 
@@ -536,3 +537,47 @@ def test_openai_empty_structured_content_raises_clear_error() -> None:
     from adoc.reason.client import REASONING_MAX_TOKENS
 
     assert REASONING_MAX_TOKENS >= 32768
+
+
+# --- tool-use payload repairs ---------------------------------------------------------
+
+
+class _RepairTarget(BaseModel):
+    items: list[int]
+    note: str
+
+
+def test_list_field_arriving_as_a_json_string_is_repaired() -> None:
+    """Tool-use output sometimes serializes a list field into a STRING:
+    `{"ops": "[{...}]"}` instead of `{"ops": [...]}`. Pydantic rejects it,
+    the schema retry tends to repeat the same shape, and the turn dies — a
+    live 33-turn intake run hit this 4 times, once putting a raw pydantic
+    error in front of the patient."""
+    result = _validate_with_repairs(_RepairTarget, {"items": "[1, 2, 3]", "note": "fine"})
+
+    assert result.items == [1, 2, 3]
+
+
+def test_a_valid_payload_is_never_reinterpreted() -> None:
+    """Flat-first: each repair runs only after the plainer reading fails, so
+    a correct payload cannot be mangled by one — including a string field
+    whose contents merely look like the start of JSON."""
+    result = _validate_with_repairs(_RepairTarget, {"items": [1], "note": "[not json"})
+
+    assert result.items == [1]
+    assert result.note == "[not json"
+
+
+def test_wrapper_key_and_json_string_together_are_repaired() -> None:
+    """Both known malformations at once: nested under a single wrapper key
+    AND with the list serialized as a string."""
+    payload = {"parameters": {"items": "[7]", "note": "ok"}}
+
+    assert _validate_with_repairs(_RepairTarget, payload).items == [7]
+
+
+def test_a_genuinely_invalid_payload_still_raises() -> None:
+    """The repairs must not swallow real errors: a payload that no reading
+    can rescue still reports a validation failure."""
+    with pytest.raises(ValidationError):
+        _validate_with_repairs(_RepairTarget, {"items": "not a list at all", "note": 1})

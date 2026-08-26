@@ -91,6 +91,11 @@ def diff_with(ops: list[object], rationale: str = "seed", **prov_overrides: obje
         "labs:anti-dsdna:2026-07-10",
         "doc:smith-report.pdf#p1",
         "doc:smith-report.pdf#p12",
+        # Page-less: a .docx/.txt record has no pages, and the document-text
+        # corpus (ADR 0015) made those citable. Means "this document".
+        "doc:smith-report.pdf",
+        "doc:Comprehensive Clinical Context and Longitudinal Health History.docx",
+        "doc:My Labs 2024.pdf#p3",  # spaces are legal in real filenames
         "encounter:2026-08-20--rheum-visit.md",
         "pmid:38472910",
         "patient-report:2026-08-01",
@@ -107,8 +112,7 @@ def test_source_ref_grammar_accepts_valid_refs(ref: str) -> None:
         "labs:ana ana:2026-05-02",  # whitespace in slug still invalid
         "labs:ana:05-02-2026",  # wrong date format
         "labs:ana",  # missing date
-        "doc:smith-report.pdf",  # missing #p<int>
-        "doc:smith-report.pdf#page1",  # wrong page marker
+        "doc:smith-report.pdf#page1",  # wrong page marker (# is reserved)
         "pmid:abc123",  # non-digits
         "patient-report:2026/08/01",  # wrong date separator
         "just-some-text",

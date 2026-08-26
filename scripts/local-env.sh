@@ -235,7 +235,7 @@ run_experiment() {
 
 top_usage() {
   cat <<'EOF'
-usage: local-env.sh <start|stop|restart|user-create|user-list> [options]
+usage: local-env.sh <start|logs|stop|restart|user-create|user-list> [options]
 
 Shared implementation behind scripts/start-local, stop-local, restart-local,
 user-create-local, user-list-local. Run `local-env.sh <verb> --help` for a
@@ -358,6 +358,7 @@ cmd_start() {
   local workdir="$DEFAULT_WORKDIR"
   local port="$DEFAULT_PORT"
   local force=0 reindex=0 intake_reset=0 experiment="" no_wait=0 follow=0 no_start=0
+  local reset_users=0
 
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -380,6 +381,7 @@ cmd_start() {
       --force) force=1; shift ;;
       --re-index) reindex=1; shift ;;
       --intake) intake_reset=1; shift ;;
+      --reset-users) reset_users=1; shift ;;
       --experiment)
         [ $# -ge 2 ] || { err "start: --experiment requires a value"; exit 2; }
         experiment="$2"
@@ -447,16 +449,40 @@ cmd_start() {
   if [ -d "$workdir_abs" ]; then
     if [ "$force" -eq 1 ]; then
       guard_safe_to_delete "$workdir_abs" || exit 1
+      # `work/` is gitignored in the data repo, so `work/users.yaml` — the
+      # web login store — is never in a clone. Recreating the working dir
+      # therefore used to take the login with it, and `user-create-local`
+      # needs an interactive TTY, so a clean slate could not be scripted.
+      # Carry the credential across the recreate; --reset-users opts out.
+      local saved_users=""
+      if [ "$reset_users" -eq 0 ] && [ -f "$workdir_abs/work/users.yaml" ]; then
+        saved_users=$(mktemp)
+        cp -- "$workdir_abs/work/users.yaml" "$saved_users"
+        info "start: --force — preserving the existing login store (pass --reset-users to drop it)"
+      fi
       info "start: --force given; removing existing working dir '$workdir_abs'"
       rm -rf -- "$workdir_abs"
       clone_from_safe_store "$workdir_abs"
       cloned=1
+      if [ -n "$saved_users" ]; then
+        mkdir -p "$workdir_abs/work"
+        cp -- "$saved_users" "$workdir_abs/work/users.yaml"
+        rm -f -- "$saved_users"
+      fi
     else
       info "start: reusing existing working dir '$workdir_abs' as-is (pass --force to recreate from the safe store)"
     fi
   else
     clone_from_safe_store "$workdir_abs"
     cloned=1
+  fi
+
+  # A working dir with no login store is unusable: the app has no way to
+  # sign in and every page redirects to /login. Say so at start time rather
+  # than letting it surface as a mystery 401 later.
+  if [ ! -f "$workdir_abs/work/users.yaml" ]; then
+    info "start: no login store in '$workdir_abs' — create one with:"
+    info "start:      ./scripts/user-create-local <name> --dir '$workdir_abs'"
   fi
 
   if [ "$cloned" -eq 1 ] && [ "$reindex" -eq 0 ]; then
@@ -509,10 +535,63 @@ cmd_start() {
       exit 1
     fi
     out "start: up at http://127.0.0.1:$port/ (pid $server_pid, dir $workdir_abs)"
+    # Always name the log. The server runs detached, so without this a 500
+    # in the browser leaves no discoverable way to reach the traceback.
+    out "start: log  $log_file"
+    out "start:      ./scripts/logs-local --dir '$workdir_abs'          # last 200 lines"
+    out "start:      ./scripts/logs-local --dir '$workdir_abs' --follow  # tail -f"
+    out "start:      ./scripts/logs-local --dir '$workdir_abs' --errors  # tracebacks only"
   fi
 
   if [ "$follow" -eq 1 ]; then
     exec tail -f "$log_file"
+  fi
+}
+
+cmd_logs() {
+  local workdir="$DEFAULT_WORKDIR" lines=200 follow=0 errors=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dir) workdir="${2:-}"; [ -n "$workdir" ] || die "--dir needs a path"; shift 2 ;;
+      --lines|-n) lines="${2:-}"; [ -n "$lines" ] || die "--lines needs a count"; shift 2 ;;
+      --follow|-f) follow=1; shift ;;
+      --errors|-e) errors=1; shift ;;
+      -h|--help)
+        cat <<'USAGE'
+usage: logs-local [--dir PATH] [--lines N] [--follow] [--errors]
+
+Show the detached local server's log — where a browser 500's traceback
+lands, since the server does not run in your terminal.
+
+  --dir PATH     working data dir (default: the standard one)
+  --lines N      how many trailing lines (default 200)
+  --follow, -f   tail -f
+  --errors, -e   only tracebacks and error lines
+USAGE
+        exit 0 ;;
+      *) die "logs: unknown option '$1'" ;;
+    esac
+  done
+
+  local workdir_abs state_dir log_file
+  workdir_abs=$(abs_path "$workdir")
+  state_dir=$(instance_state_dir "$workdir_abs")
+  log_file="$state_dir/adoc.log"
+
+  if [ ! -f "$log_file" ]; then
+    err "logs: no log at $log_file — has a server run for '$workdir_abs'?"
+    exit 1
+  fi
+
+  out "logs: $log_file"
+  if [ "$errors" -eq 1 ]; then
+    # Show each traceback with its exception line, which is the part worth
+    # reading; -A keeps the frames after the header.
+    grep -n -A 40 "Traceback (most recent call last)" "$log_file" | tail -n "$lines"
+  elif [ "$follow" -eq 1 ]; then
+    tail -n "$lines" -f "$log_file"
+  else
+    tail -n "$lines" "$log_file"
   fi
 }
 
@@ -584,6 +663,7 @@ cmd_restart() {
   local workdir="$DEFAULT_WORKDIR"
   local prev=""
   local arg
+  local saw_port=0
   for arg in "$@"; do
     if [ "$prev" = "--dir" ]; then
       workdir="$arg"
@@ -593,11 +673,33 @@ cmd_restart() {
     case "$arg" in
       --dir) prev="--dir" ;;
       --dir=*) workdir="${arg#*=}" ;;
+      --port | --port=*) saw_port=1 ;;
     esac
   done
 
+  # A restart must come back on the SAME port. Without this, restarting a
+  # server started with `--port 9001` silently fell back to the default and
+  # then refused to bind because something else already held it — so a
+  # plain `restart-local --dir X` stopped the server and never replaced it.
+  # The port is recorded per instance by cmd_start; read it BEFORE stopping,
+  # since cmd_stop removes the file.
+  local extra_args=()
+  if [ "$saw_port" -eq 0 ]; then
+    local restart_state_dir restart_port_file
+    restart_state_dir=$(instance_state_dir "$(abs_path "$workdir")")
+    restart_port_file="$restart_state_dir/adoc.port"
+    if [ -r "$restart_port_file" ]; then
+      local restart_port
+      restart_port=$(cat "$restart_port_file")
+      if [ -n "$restart_port" ]; then
+        out "restart: reusing port $restart_port"
+        extra_args=(--port "$restart_port")
+      fi
+    fi
+  fi
+
   cmd_stop --dir "$workdir"
-  cmd_start "$@"
+  cmd_start "$@" "${extra_args[@]+"${extra_args[@]}"}"
 }
 
 cmd_user_create() {
@@ -726,6 +828,10 @@ main() {
     stop)
       shift
       cmd_stop "$@"
+      ;;
+    logs)
+      shift
+      cmd_logs "$@"
       ;;
     restart)
       shift
