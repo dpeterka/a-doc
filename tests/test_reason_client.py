@@ -581,3 +581,42 @@ def test_a_genuinely_invalid_payload_still_raises() -> None:
     can rescue still reports a validation failure."""
     with pytest.raises(ValidationError):
         _validate_with_repairs(_RepairTarget, {"items": "not a list at all", "note": 1})
+
+
+def test_a_placeholder_envelope_is_unwrapped() -> None:
+    """Observed live SIX times in one 115-document backfill: the model
+    echoed the tool's parameter scaffolding instead of filling it in —
+    `{"parameter_name": "DocumentExtraction", "parameter_value": {...}}`.
+    `_unwrap_tool_input` only unwraps a single-key dict, so this went to a
+    hard validation failure and cost the document."""
+    payload = {"items": [1, 2], "note": "ok"}
+
+    result = _validate_with_repairs(
+        _RepairTarget, {"parameter_name": "RepairTarget", "parameter_value": payload}
+    )
+
+    assert result.items == [1, 2]
+
+
+def test_an_uppercase_placeholder_envelope_is_unwrapped() -> None:
+    payload = {"items": [3], "note": "ok"}
+
+    result = _validate_with_repairs(
+        _RepairTarget, {"$PARAMETER_NAME": "repair_target", "parameter_value": payload}
+    )
+
+    assert result.items == [3]
+
+
+def test_a_legitimate_nested_object_is_not_unwrapped() -> None:
+    """The repair requires a placeholder NAME key alongside exactly one
+    dict value, so a real payload that merely contains a nested object is
+    never mistaken for an envelope."""
+
+    class Nested(BaseModel):
+        note: str
+        inner: dict[str, int]
+
+    result = _validate_with_repairs(Nested, {"note": "real", "inner": {"a": 1}})
+
+    assert result.inner == {"a": 1}

@@ -25,7 +25,7 @@ from __future__ import annotations
 import re
 from typing import Literal
 
-RowKind = Literal["quantitative", "qualitative", "narrative"]
+RowKind = Literal["quantitative", "qualitative", "narrative", "empty"]
 
 # A comparator-bearing result: "<20", ">= 150", "< 0.10". The numeric content
 # is real and belongs in `value`; the comparator says it is a BOUND rather
@@ -177,11 +177,19 @@ def classify_extracted_row(name: str, value: float | None, value_text: str | Non
     `doc:<file>#p<n>` and available for retrieval, rather than becoming a
     row whose analyte name is a sentence.
     """
+    text = (value_text or "").strip()
+    # A row with NEITHER a number nor result text is not a result at all —
+    # the extractor transcribed a label with nothing beside it (a section
+    # heading, a blank table cell). Classifying it `qualitative` and keeping
+    # it crashed a real 97-document backfill on document 100: `LabResult`
+    # requires one of value/value_text, and the unhandled ValidationError
+    # took every remaining document down with it.
+    if value is None and not text:
+        return "empty"
     if name_reads_as_prose(name):
         return "narrative"
     if value is not None:
         return "quantitative"
-    text = (value_text or "").strip()
-    if text and parse_comparator_value(text) is not None:
+    if parse_comparator_value(text) is not None:
         return "quantitative"
     return "qualitative"

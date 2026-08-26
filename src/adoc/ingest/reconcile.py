@@ -509,6 +509,12 @@ def divert_narrative_rows(
     findings: list[str] = []
     for row in results:
         kind = classify_extracted_row(row.name_raw, row.value, row.value_text)
+        if kind == "empty":
+            # Nothing was read for this label, so there is nothing to
+            # reconcile, validate or persist. Dropped rather than kept as a
+            # findings entry: an empty row carries no information at all.
+            logger.info("reconcile: dropped a row with no value at all: %r", row.name_raw)
+            continue
         if kind != "narrative":
             kept.append(row)
             continue
@@ -532,7 +538,11 @@ def divert_narrative_extraction(extraction: DocumentExtraction) -> DocumentExtra
     """
     cleaned = _clean_results(extraction.results)
     kept, findings = divert_narrative_rows(cleaned)
-    if not findings:
+    # Compare on KEPT, not on findings: an `empty` row is dropped without
+    # producing a finding, so a findings-only check would silently discard
+    # the drop and hand the empty row on to reconcile — which is the crash
+    # this exists to prevent.
+    if len(kept) == len(extraction.results) and not findings:
         return extraction
     return extraction.model_copy(
         update={
