@@ -137,6 +137,7 @@ from adoc.ingest.reconcile import (
     parse_ref_range,
     reconcile,
 )
+from adoc.ingest.rowkind import parse_comparator_value
 from adoc.ingest.schema import ClassifyResult, DocType, DocumentExtraction
 from adoc.ingest.vision import ImagePart, VisionClient, VisionError
 from adoc.labs.db import LabsDb
@@ -234,11 +235,22 @@ class IngestReport(BaseModel):
 def _to_lab_result(row: ReconciledRow, *, source_doc: str) -> LabResult:
     ref_low, ref_high = parse_ref_range(row.ref_range_raw)
     status = ExtractionStatus.AUTO if row.status == "auto" else ExtractionStatus.PENDING
+    # ADR 0025: "<20 Units" carries a real number. Lift it into `value` with
+    # the comparator recorded, so the result can be trended and
+    # range-checked; `value_text` keeps the printed form verbatim for audit
+    # and display. Only applied when the row has no numeric value already,
+    # so a reconciled numeric reading is never second-guessed.
+    value, comparator = row.value, None
+    if value is None and row.value_text:
+        parsed = parse_comparator_value(row.value_text)
+        if parsed is not None:
+            comparator, value, _ = parsed
     return LabResult(
         date=row.date,
         name=row.canonical_name or row.name_raw,
         name_raw=row.name_raw,
-        value=row.value,
+        value=value,
+        comparator=comparator,
         value_text=row.value_text,
         ucum_unit=row.unit_raw,
         ref_low=ref_low,
