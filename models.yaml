@@ -95,3 +95,22 @@ roles:
     model: claude-opus-5
     params:
       effort: high
+
+  # TEST HARNESS ONLY (`scripts/intake-replay --persona`). Role-plays the
+  # patient so a full initial visit can be replayed without a human typing
+  # for an hour. NOT part of any DAG, never reached from the app — nothing
+  # patient-facing depends on it, so rebinding it needs no eval report.
+  #
+  # A fixed script of patient answers cannot test a conversational agent:
+  # the intake agent rewords its questions and invents new ones (it started
+  # asking for a preferred name), and a canned answer list silently drifts
+  # one question behind, so the transcript stops being a test of anything.
+  # The simulator answers whatever was actually asked.
+  #
+  # Deliberately NOT the primary reasoner: the simulator should be a
+  # different mind from the agent under test, and a cheap one, since it
+  # speaks once per turn.
+  patient_simulator:
+    provider: anthropic
+    model: claude-sonnet-5
+    params: {}
