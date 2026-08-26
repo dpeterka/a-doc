@@ -32,6 +32,7 @@ from adoc import __version__
 from adoc.casefile.repo import LEDGER_RELPATH, DataRepo
 from adoc.config import Settings
 from adoc.labs.db import LabsDb
+from adoc.logging_setup import configure_logging
 from adoc.privacy import Scrubber
 from adoc.reason.client import LlmClient
 from adoc.reason.dag import ContractViolation
@@ -68,6 +69,7 @@ def _build_llm_client(settings: Settings) -> LlmClient:
 
 
 def main() -> int:
+    configure_logging()
     settings = Settings()
     _refuse_if_safe_store(settings.data_dir)
     print(

@@ -69,6 +69,7 @@ from adoc.labs.recanonicalize import recanonicalize_rows
 from adoc.labs.reclassify import reclassify_pending
 from adoc.labs.specimen import infer_unknown_specimens
 from adoc.labs.twins import sweep_twins, write_sweep_summary
+from adoc.logging_setup import configure_logging
 from adoc.privacy import (
     IDENTIFIER_FIELDS,
     IDENTIFIERS_RELPATH,
@@ -890,21 +891,8 @@ def _cmd_review(args: argparse.Namespace) -> int:
 def _run_uvicorn(app: FastAPI, *, host: str, port: int) -> None:  # pragma: no cover - real server
     """Real wiring for `serve`. Overridden by tests so a test run never
     actually binds a socket or blocks."""
-    import logging
-
     import uvicorn
 
-    # Without this the root logger has no handler, so `logging.lastResort`
-    # emits WARNING+ to stderr and drops every INFO line — including the
-    # per-node DAG progress and per-call model timings that explain why a
-    # turn is taking minutes. uvicorn's own dictConfig sets
-    # `disable_existing_loggers: False` and touches only the `uvicorn.*`
-    # loggers, so configuring the root here survives `uvicorn.run`.
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
     uvicorn.run(app, host=host, port=port)
 
 
@@ -1187,6 +1175,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    # Every subcommand, not just `serve`: `review`, `ingest`, and the labs
+    # sweeps all make multi-minute model calls whose progress logging is
+    # dropped entirely without a root handler (see `adoc.logging_setup`).
+    configure_logging()
     parser = build_parser()
     args = parser.parse_args(argv)
     result: int = args.func(args)
