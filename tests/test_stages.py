@@ -1284,9 +1284,24 @@ def test_composer_number_mismatch_is_rewritten_once_and_succeeds(
     assert "8.5" in feedback
 
 
-def test_composer_number_mismatch_persists_raises_contract_violation(
+def test_composer_number_mismatch_persists_is_recorded_not_raised(
     repo: DataRepo, db: LabsDb
 ) -> None:
+    """ADR 0024: a mismatch that survives the rewrite is RECORDED and the
+    reply delivered, not withheld.
+
+    ADR 0023 pre-committed this on a fifth false-positive class appearing,
+    and one did — a supplement dose ("your iron supplement is 25 mg") read
+    as a serum iron level, alongside IgE class boundaries described in
+    prose. Across four narrowings the check never caught a real
+    fabrication, while each firing cost a ~12-minute turn and the patient's
+    entire answer.
+
+    What still blocks is unchanged and is what actually enforces grounding:
+    `citation_check_*` (every evidence ref must resolve) and the entailment
+    verifier (every most-likely claim must be supported by its cited
+    source). The rewrite attempt is still spent, and still bounded.
+    """
     _seed_crp_row(db)
     calls: list[TransportRequest] = []
     primary_transport = _make_primary_transport_with_reply_sequence(
@@ -1303,12 +1318,11 @@ def test_composer_number_mismatch_persists_raises_contract_violation(
     )
     client = _build_client(primary_transport, challenger_transport)
 
-    with pytest.raises(ContractViolation) as excinfo:
-        run_diagnostic_turn(
-            client, repo, db, repo.root / LEDGER_RELPATH, "My joints ache and I'm exhausted."
-        )
+    reply = run_diagnostic_turn(
+        client, repo, db, repo.root / LEDGER_RELPATH, "My joints ache and I'm exhausted."
+    )
 
-    assert excinfo.value.contract_name == "composer_number_check"
+    assert reply.tiers_rendered  # delivered, not withheld
     assert len(calls) == 4  # exactly one rewrite attempt - never an unbounded loop
 
 

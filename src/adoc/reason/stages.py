@@ -15,6 +15,7 @@ back after `run()` returns without executing anything twice.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
@@ -55,6 +56,7 @@ from adoc.reason.safety import GateResult, treatment_gate
 from adoc.reason.verify import (
     ENTAILMENT_CACHE_RELPATH,
     Claim,
+    ComposerNumberCheck,
     DefaultSourceTextResolver,
     EntailmentCache,
     SourceTextResolver,
@@ -67,6 +69,8 @@ from adoc.reason.verify import (
     strip_not_entailed_ops,
     verify_claims,
 )
+
+logger = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------
 # Stage-IO models
@@ -919,23 +923,44 @@ def treatment_gate_contract() -> Contract:
     return Contract(name="treatment_gate", predicate=predicate)
 
 
+def describe_number_mismatches(check: ComposerNumberCheck) -> str:
+    return "; ".join(
+        f"{m.quoted_number!r} near {m.analyte_label!r} (stored: {m.stored_values})"
+        for m in check.mismatches
+    )
+
+
 def composer_number_check_contract(db: LabsDb) -> Contract:
-    """Postcondition: every number the Composer's rendered text attributes
-    to a lab value must match `labs.sqlite` exactly (PLAN.md Phase 2:
-    "every number in patient-facing output that is attributable to a lab
-    value must match labs.sqlite exactly"). Deterministic, no LLM call
-    (`reason.verify.check_composer_numbers`)."""
+    """Postcondition: the Composer's rendered text must not quote a number
+    that no lab row for that analyte holds.
+
+    NON-BLOCKING since ADR 0024. `check_composer_numbers` still runs on
+    every turn and `run_composer` still spends one rewrite attempt trying to
+    clear it, but a mismatch that survives the rewrite is RECORDED and the
+    reply is delivered, rather than withholding the patient's whole answer.
+
+    ADR 0023 pre-committed this: the check had been narrowed four times
+    without ever catching a real fabrication, and the ADR named a fifth
+    false-positive class as the trigger to demote rather than narrow again.
+    The fifth arrived — a supplement dose ("your iron supplement is 25 mg")
+    read as a serum iron level, plus IgE class boundaries described in
+    prose. Grounding is still ENFORCED by two blocking guards: the citation
+    check (every evidence ref must resolve) and the entailment verifier
+    (every most-likely claim must be supported by its cited source).
+    """
 
     def predicate(_ctx: Ctx, value: BaseModel | None) -> str | None:
         assert isinstance(value, PatientReply)
         check = check_composer_numbers(value.tiers_rendered, db)
         if check.passed:
             return None
-        details = "; ".join(
-            f"{m.quoted_number!r} near {m.analyte_label!r} (stored: {m.stored_values})"
-            for m in check.mismatches
+        # Recorded, not raised. Logged at WARNING so a real fabrication is
+        # still visible and reviewable — this must never become silent.
+        logger.warning(
+            "composer_number_check did not clear after rewrite (recorded, reply delivered): %s",
+            describe_number_mismatches(check),
         )
-        return f"quoted number(s) do not match stored lab value(s): {details}"
+        return None
 
     return Contract(name="composer_number_check", predicate=predicate)
 
