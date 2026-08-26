@@ -207,6 +207,15 @@ _RANGE_RE = re.compile(r"\d+(?:\.\d+)?\s*-\s*\d+(?:\.\d+)?")
 _NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
 
 
+# A number hyphenated to a word is a compound MODIFIER, not a value:
+# "10-year probability", "25-hydroxy vitamin D", "6-minute walk". Stripped
+# alongside dates and titers for exactly the same reason — the digits are
+# part of a name, and comparing them to a stored result is meaningless. The
+# hyphen is what distinguishes this from a real reading, which is never
+# glued to a following word.
+_COMPOUND_MODIFIER_RE = re.compile(r"\b\d+(?:\.\d+)?-[A-Za-z]\w*")
+
+
 def _extract_quoted_numbers(claim: str) -> list[float]:
     """Decimal literals a claim quotes, per PLAN.md's Phase-2 spec: dates
     (`YYYY-MM-DD`), titer ratios (`1:640`), and range-shaped mentions
@@ -215,6 +224,7 @@ def _extract_quoted_numbers(claim: str) -> list[float]:
     cleaned = _DATE_IN_TEXT_RE.sub(" ", claim)
     cleaned = _TITER_RE.sub(" ", cleaned)
     cleaned = _RANGE_RE.sub(" ", cleaned)
+    cleaned = _COMPOUND_MODIFIER_RE.sub(" ", cleaned)
     return [float(m) for m in _NUMBER_RE.findall(cleaned)]
 
 
@@ -233,19 +243,42 @@ def _normalize_slug(text: str) -> str:
     return _NON_ALNUM_RE.sub("", text.lower())
 
 
+# Narrative reports (a DEXA/FRAX summary, an imaging impression) yield rows
+# whose "analyte name" is really a prose lead-in with the value at the end of
+# the sentence: "10-year probability of hip fracture IS", "Left total hip: a
+# statistically significant decrease OF". A model citing that row writes the
+# sensible slug and drops the dangling connective, and the citation then
+# failed to resolve — costing a real diagnostic turn 203 seconds at the
+# ledger-maintainer's citation check, for a row that was present and correctly
+# cited. Only these trailing connectives are shed, and only from the END of a
+# stored name: the remainder must still match in full, so no cited slug can
+# resolve onto a DIFFERENT analyte.
+_TRAILING_CONNECTIVES = ("is", "of", "was", "are", "were", "shows", "at", "to")
+
+
+def _shed_trailing_connectives(name: str) -> str:
+    """Drop trailing connective words from a stored analyte name."""
+    words = name.split()
+    while words and words[-1].lower().strip(":,;") in _TRAILING_CONNECTIVES:
+        words.pop()
+    return " ".join(words)
+
+
 def _row_slug_candidates(row: LabResult) -> set[str]:
     """Every normalized slug a stored row could plausibly be cited under:
-    its own stored `name`/`name_raw`, plus whatever `labs.validate.
-    canonicalize` maps either of those onto (PLAN.md: "also accept via
+    its own stored `name`/`name_raw`, whatever `labs.validate.canonicalize`
+    maps either of those onto (PLAN.md: "also accept via
     labs.validate.canonicalize so a spec-canonical slug matches") — this
     lets a model cite an `ANALYTE_SPECS` canonical name even when the
-    stored row's own `name`/`name_raw` spelling differs slightly."""
+    stored row's own `name`/`name_raw` spelling differs slightly — and the
+    same names with any trailing connective shed (see above)."""
     candidates = {row.name, row.name_raw}
     for candidate in (row.name, row.name_raw):
         mapped = canonicalize(candidate)
         if mapped is not None:
             candidates.add(mapped)
-    return {_normalize_slug(c) for c in candidates}
+    candidates |= {_shed_trailing_connectives(c) for c in list(candidates) if c}
+    return {_normalize_slug(c) for c in candidates if c}
 
 
 def _check_labs_ref(source: str, claim: str, db: LabsDb) -> CitationCheck:
