@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.1] - 2026-08-26
+
+Found by rebuilding the real corpus from source. Every one of these cost data or visibility in a live 121-document run.
+
+### Fixed
+- **An empty row is not a result, and one bad row no longer kills a run.** A re-ingest died on document 100 of ~97 with an unhandled `ValidationError` — `LabResult requires at least one of value/value_text` — taking every remaining document with it. Two defects: the ADR 0025 gate classified a row with *neither* a number nor result text as `qualitative` and kept it (a label the extractor transcribed with nothing beside it is not a result), and the failure escaped to the top of `adoc backfill`, so the per-file `error` outcome that exists precisely for this never fired. A document that cannot be processed is now an error *for that document*; the run continues and reports it.
+- **Tool output nested under a placeholder envelope is rescued.** Six lab reports were lost to `{"parameter_name": "DocumentExtraction", "parameter_value": {...}}` — the model echoing the tool's scaffolding instead of filling it in. `_unwrap_tool_input` only unwraps a single-key dict, so a two-key envelope went straight to a hard failure: 5% of the corpus, silently, as six error lines nobody reads. Repaired in the same flat-first chain as the other known malformations; a legitimate payload containing a nested object is never unwrapped.
+- **A long command's progress is visible while it runs.** A healthy backfill went 25 minutes with two lines of output while archiving 300+ files, because Python block-buffers stdout when it isn't a TTY and the genomics phase makes no model calls at all (so the per-call logging that would otherwise show life has nothing to say). A healthy run looked exactly like a hung one. stdout is now line-buffered at every entrypoint.
+- Office lock files (`~$name.docx`) are skipped. They appear whenever a document is open in Word, are not documents, and one reached a real backfill and reported as an error.
+
 ## [0.11.0] - 2026-08-26
 
 ### Added
