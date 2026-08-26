@@ -909,8 +909,19 @@ def run_intake_turn(client: LlmClient, repo: DataRepo, db: LabsDb, text: str) ->
                 # context (and any human review) sees that she said
                 # something here, even though it couldn't be captured as
                 # structured facts.
+                # The patient must never be shown the raw exception. A live
+                # run put a pydantic traceback and an errors.pydantic.dev URL
+                # in the chat window ("Input should be a valid list ..."),
+                # which is meaningless to her and reads like the app broke.
+                # The detail belongs in the log, where it is actionable.
+                logger.warning("intake turn: giving up after schema retry: %s", exc)
                 error_outcome = IntakeOutcome(
-                    kind="error", text=f"Sorry, I couldn't process that: {exc}"
+                    kind="error",
+                    text=(
+                        "Sorry — I had trouble recording that one. Nothing is wrong with "
+                        "your case file. Could you say it again, or put it a little "
+                        "differently?"
+                    ),
                 )
                 _append_transcript_turn(repo, text, error_outcome)
                 return error_outcome

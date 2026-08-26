@@ -47,6 +47,7 @@ Useful flags:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import getpass
 import json
 import os
@@ -277,6 +278,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--out", type=Path, help="write a JSON record of the run here")
     args = parser.parse_args(argv)
+
+    # A full run takes tens of minutes, so it is normally started detached
+    # with its output redirected to a file — and Python block-buffers stdout
+    # when it is not a TTY, so that file stayed EMPTY until the run ended.
+    # Progress you cannot watch is not progress.
+    with contextlib.suppress(AttributeError, ValueError):
+        sys.stdout.reconfigure(line_buffering=True)
 
     source_path = args.script or args.persona
     if not source_path.exists():
