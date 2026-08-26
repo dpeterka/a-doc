@@ -1080,3 +1080,63 @@ def test_composer_numbers_ambiguous_pairing_is_not_flagged(db: LabsDb) -> None:
     _seed_lab_row(db, name="AST", value=999.0, ucum_unit="U/L")
     check = check_composer_numbers("ALT of 15 U/L AST.", db)
     assert check.passed
+
+
+# --- ADR 0023: a threshold is not a claimed value ---------------------------------------
+#
+# Six of these at once cost a real diagnostic turn 604 seconds of work and
+# withheld the patient's whole answer. Every one was a reference number —
+# an assay floor, a deficiency cutoff, an IgE class boundary — not a claim
+# about her.
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Your vitamin D is below 20 ng/mL, which is frank deficiency.",
+        "Vitamin D insufficiency is defined as below 30 ng/mL.",
+        "A vitamin D above 80 ng/mL would be excessive.",
+        "Vitamin D under 12 ng/mL risks osteomalacia.",
+        "Vitamin D < 20 ng/mL is deficient.",
+        "Vitamin D >= 30 ng/mL is the usual target.",
+        "Anything less than 20 ng/mL of vitamin D is treated.",
+        "The vitamin D threshold 30 ng/mL is where most labs flag low.",
+    ],
+)
+def test_composer_numbers_ignores_comparator_governed_thresholds(db: LabsDb, text: str) -> None:
+    """The usual threshold phrasing attaches a real unit, so ADR 0016's
+    positive-evidence rule accepted it as a value. Nothing looked at the
+    word GOVERNING the number."""
+    _seed_lab_row(db, name="VITAMIN D", value=24.1)
+
+    assert check_composer_numbers(text, db).passed
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Your vitamin D was 19.0 ng/mL.",
+        "Vitamin D came back at 19.0 ng/mL.",
+        "Vitamin D measured 19.0 ng/mL.",
+        "Your vitamin D reading of 19.0 ng/mL is the concern.",
+    ],
+)
+def test_composer_numbers_still_flags_an_asserted_value(db: LabsDb, text: str) -> None:
+    """Assertive phrasing is untouched — that is the shape a fabricated
+    value actually takes, and it must still block."""
+    _seed_lab_row(db, name="VITAMIN D", value=24.1)
+
+    assert not check_composer_numbers(text, db).passed
+
+
+def test_composer_numbers_flags_an_asserted_value_beside_a_threshold(db: LabsDb) -> None:
+    """Only the number the comparator governs is exempt. A fabricated value
+    in the same sentence as a legitimate threshold must still be caught."""
+    _seed_lab_row(db, name="VITAMIN D", value=24.1)
+
+    check = check_composer_numbers(
+        "Your vitamin D was 19.0 ng/mL, below the 30 ng/mL threshold.", db
+    )
+
+    assert not check.passed
+    assert [m.quoted_number for m in check.mismatches] == [19.0]
