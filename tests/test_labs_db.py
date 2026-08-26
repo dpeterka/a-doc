@@ -62,7 +62,7 @@ def db(tmp_path: Path) -> LabsDb:
 
 def test_schema_created_with_user_version(db: LabsDb) -> None:
     version = db._conn.execute("PRAGMA user_version").fetchone()[0]
-    assert version == 3
+    assert version == 4  # 4: labs.comparator (ADR 0025)
     tables = {
         row[0]
         for row in db._conn.execute(
@@ -312,7 +312,7 @@ def test_rebuild_from_jsonl_is_idempotent_and_replaces_existing_content(
 
 def test_migration_adds_specimen_column_with_unknown_default(db: LabsDb) -> None:
     version = db._conn.execute("PRAGMA user_version").fetchone()[0]
-    assert version == 3
+    assert version == 4  # 4: labs.comparator (ADR 0025)
     columns = {row[1] for row in db._conn.execute("PRAGMA table_info(labs)").fetchall()}
     assert "specimen" in columns
 
@@ -890,3 +890,44 @@ def test_search_document_text_respects_limit(db: LabsDb) -> None:
     db.replace_document_text(SHA_A, pages, extracted_at=datetime(2026, 5, 3, tzinfo=UTC))
     hits = db.search_document_text("biopsy", limit=3)
     assert len(hits) == 3
+
+
+def test_migration_adds_comparator_column_defaulting_to_null(db: LabsDb) -> None:
+    """ADR 0025. Purely additive: an existing row keeps `comparator IS
+    NULL`, which reads as "point measurement", so nothing already stored
+    changes meaning when the column appears."""
+    columns = {row[1] for row in db._conn.execute("PRAGMA table_info(labs)").fetchall()}
+
+    assert "comparator" in columns
+
+
+def test_a_bounded_result_round_trips_through_the_db(db: LabsDb) -> None:
+    """ "<20 Units" is stored as value=20.0 with comparator="<" rather than
+    as the string "<20", so it can be trended and range-checked at all."""
+    db.insert_results([_lab(name="rna-pol-iii-ab", value=20.0, comparator="<", ucum_unit="Units")])
+
+    row = db.series("rna-pol-iii-ab")[0]
+
+    assert (row.value, row.comparator) == (20.0, "<")
+
+
+def test_a_bounded_result_survives_a_jsonl_rebuild(db: LabsDb, tmp_path: Path) -> None:
+    """`labs.sqlite` is DERIVED — `labs-export.jsonl` is the committed
+    source of truth, so a comparator that did not survive the round trip
+    would be silently lost on the next rebuild."""
+    db.insert_results([_lab(name="estradiol", value=5.0, comparator="<", ucum_unit="pg/mL")])
+    export = tmp_path / "labs-export.jsonl"
+    db.export_jsonl(export)
+
+    db.rebuild_from_jsonl(export)
+
+    row = db.series("estradiol")[0]
+    assert (row.value, row.comparator) == (5.0, "<")
+
+
+def test_an_ordinary_result_keeps_a_null_comparator(db: LabsDb) -> None:
+    """`None` means "point measurement" — the overwhelmingly common case,
+    and what every pre-existing row migrates to."""
+    db.insert_results([_lab()])
+
+    assert db.series("potassium")[0].comparator is None

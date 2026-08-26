@@ -30,6 +30,13 @@ glucose) must not share one trend series — see `labs/queries.py`/
 `"unknown"` is the default: extraction never blocks or guesses a specimen
 it can't read from the report's section headers/labels."""
 
+Comparator = Literal["<", "<=", ">", ">="]
+"""A result reported as a BOUND rather than a point value (ADR 0025) —
+mirrors the `labs.comparator` CHECK constraint (`db.py`). Assay floors and
+ceilings are reported this way constantly (`<20`, `<0.10`, `>150`), and
+before this the number lived in `value_text` where nothing numeric could
+reach it. `None` means the value is a point measurement."""
+
 
 class DocumentStatus(StrEnum):
     """Lifecycle of an ingested source document (see `documents.status` CHECK)."""
@@ -97,6 +104,17 @@ class LabResult(BaseModel):
     name: str
     name_raw: str
     value: float | None = None
+    comparator: Comparator | None = None
+    """Set when the result is a BOUND rather than a point measurement:
+    `"<20 Units"` is stored as `value=20.0, comparator="<"` (ADR 0025).
+
+    183 real rows previously kept that number in `value_text`, where it
+    could be neither trended nor range-checked — `<20` on an RNA Polymerase
+    III antibody is a negative result, and a move from `<20` to `45` is
+    clinically meaningful. Every numeric consumer must treat a
+    comparator-bearing value as a bound: reading `value` alone would call
+    a "<20" a measurement of exactly 20.
+    """
     value_text: str | None = None
     ucum_unit: str | None = None
     ref_low: float | None = None
