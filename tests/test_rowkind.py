@@ -174,3 +174,25 @@ def test_existing_narrative_findings_are_preserved_when_diverting() -> None:
 
     assert result.narrative_findings[0].startswith("Impression:")
     assert len(result.narrative_findings) == 2
+
+
+def test_a_row_with_no_value_at_all_is_empty_not_qualitative() -> None:
+    """A label the extractor transcribed with nothing beside it — a section
+    heading, a blank table cell — is not a result. Classifying it
+    `qualitative` and keeping it crashed a real 97-document backfill on
+    document 100: `LabResult` requires one of value/value_text."""
+    assert classify_extracted_row("Comprehensive Metabolic Panel", None, None) == "empty"
+    assert classify_extracted_row("Some Analyte", None, "   ") == "empty"
+
+
+def test_an_empty_row_is_dropped_rather_than_reconciled() -> None:
+    extraction = DocumentExtraction(
+        doc_type="lab_report",
+        results=[_row("CRP", 8.5), _row("Comprehensive Metabolic Panel", None)],
+    )
+
+    result = divert_narrative_extraction(extraction)
+
+    assert [r.name_raw for r in result.results] == ["CRP"]
+    # nothing to preserve: an empty row carries no information at all
+    assert result.narrative_findings == []

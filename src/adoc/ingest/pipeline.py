@@ -972,16 +972,35 @@ def _ingest_one(
     # the time it's written. Only reached for a genuinely NEW document — a
     # duplicate already has its text stored from the first ingest (see the
     # `already_ingested` return above).
-    if archived.kind == "docx":
-        outcome = _ingest_docx(
-            path, repo=repo, db=db, client=vision.client, clock=clock, archived=archived
+    # One unparseable row must not destroy a whole backfill. A real
+    # 97-document run died on document 100 with an unhandled pydantic
+    # ValidationError from deep inside reconcile, taking every remaining
+    # document with it — and because the failure escaped to the top, the
+    # per-file `error` outcome that exists precisely for this never fired.
+    # A document that cannot be processed is an ERROR FOR THAT DOCUMENT;
+    # the run continues and reports it, exactly as an ArchiveError already
+    # does above.
+    try:
+        if archived.kind == "docx":
+            outcome = _ingest_docx(
+                path, repo=repo, db=db, client=vision.client, clock=clock, archived=archived
+            )
+        elif archived.kind == "text":
+            outcome = _ingest_text(
+                path, repo=repo, db=db, client=vision.client, clock=clock, archived=archived
+            )
+        else:
+            outcome = _ingest_pdf(
+                path, repo=repo, db=db, vision=vision, clock=clock, archived=archived
+            )
+    except Exception as exc:  # noqa: BLE001 - one bad document, not a dead run
+        logger.exception("ingest: %s failed and was skipped", path)
+        outcome = FileOutcome(
+            path=str(path),
+            sha256=archived.sha256,
+            outcome="error",
+            issues=[f"{type(exc).__name__}: {exc}"],
         )
-    elif archived.kind == "text":
-        outcome = _ingest_text(
-            path, repo=repo, db=db, client=vision.client, clock=clock, archived=archived
-        )
-    else:
-        outcome = _ingest_pdf(path, repo=repo, db=db, vision=vision, clock=clock, archived=archived)
 
     _apply_inbox_hygiene(path, outcome, repo=repo, inbox_root=inbox_root, clock=clock)
     return [outcome]
