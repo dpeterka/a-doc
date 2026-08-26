@@ -414,6 +414,34 @@ def _unwrap_tool_input(tool_input: dict[str, Any]) -> dict[str, Any]:
     return tool_input
 
 
+# Keys that are a tool-schema PLACEHOLDER leaking into the output rather
+# than a real field: the model echoed the parameter's name/value scaffolding
+# instead of filling it in.
+_PLACEHOLDER_NAME_KEYS = frozenset({"parameter_name", "$parameter_name", "parametername"})
+
+
+def _unwrap_placeholder_envelope(tool_input: dict[str, Any]) -> dict[str, Any]:
+    """Lift a payload nested under a placeholder envelope.
+
+    Observed live, six times in one 115-document backfill:
+
+        {"parameter_name": "DocumentExtraction",
+         "parameter_value": {...the real payload...}}
+
+    `_unwrap_tool_input` only unwraps a SINGLE-key dict, so a two-key
+    envelope like this went straight to a hard validation failure and cost
+    the document. Requires exactly one dict-valued entry and a placeholder
+    name key alongside it, so a legitimate payload that merely happens to
+    contain one nested object is never unwrapped.
+    """
+    if not any(key.lower() in _PLACEHOLDER_NAME_KEYS for key in tool_input):
+        return tool_input
+    dict_values = [value for value in tool_input.values() if isinstance(value, dict)]
+    if len(dict_values) != 1:
+        return tool_input
+    return dict_values[0]
+
+
 def _decode_json_valued_strings(tool_input: dict[str, Any]) -> dict[str, Any]:
     """Decode values that arrived as a JSON STRING instead of a structure.
 
@@ -453,8 +481,10 @@ def _validate_with_repairs(schema: type[BaseModel], tool_input: dict[str, Any]) 
     candidates = [
         tool_input,
         _unwrap_tool_input(tool_input),
+        _unwrap_placeholder_envelope(tool_input),
         _decode_json_valued_strings(tool_input),
         _decode_json_valued_strings(_unwrap_tool_input(tool_input)),
+        _decode_json_valued_strings(_unwrap_placeholder_envelope(tool_input)),
     ]
     last_error: Exception | None = None
     for index, candidate in enumerate(candidates):

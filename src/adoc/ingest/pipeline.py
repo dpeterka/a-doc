@@ -1050,12 +1050,17 @@ def _scan_files(root: Path) -> list[Path]:
 
     Recursive because Dropbox uploads (and `rclone move`) preserve
     subfolder structure inside the inbox. Hidden files and Windows
-    sync artifacts are skipped.
+    sync artifacts are skipped — including Office LOCK files (`~$name.docx`),
+    which appear whenever a document is open in Word and are not documents
+    at all. One reached a real backfill and reported as an error.
     """
     return sorted(
         p
         for p in root.rglob("*")
-        if p.is_file() and not p.name.startswith(".") and p.name.lower() != "desktop.ini"
+        if p.is_file()
+        and not p.name.startswith(".")
+        and not p.name.startswith("~$")
+        and p.name.lower() != "desktop.ini"
     )
 
 
