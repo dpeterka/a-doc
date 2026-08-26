@@ -1218,6 +1218,19 @@ class LabsDb:
         return [_row_to_lab(row) for row in rows]
 
     @_synchronized
+    def all_rows(self) -> list[LabResult]:
+        """Every lab row, REJECTED included, ordered by id.
+
+        `all_non_rejected_rows` is the working set for recanonicalization;
+        this is for `labs/review.py` (ADR 0026), where a rejection is itself
+        a human decision that a rebuild must carry forward — dropping it
+        would re-present a row a person already said was wrong as a fresh
+        one to review.
+        """
+        rows = self._conn.execute("SELECT * FROM labs ORDER BY id").fetchall()
+        return [_row_to_lab(row) for row in rows]
+
+    @_synchronized
     def rejected_row_keys(self) -> set[tuple[str, str, str, str]]:
         """The `(date, name, specimen, source_doc)` keys currently held by
         REJECTED rows. The table's UNIQUE constraint spans rejected rows
