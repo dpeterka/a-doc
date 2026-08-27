@@ -216,15 +216,45 @@ _NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
 _COMPOUND_MODIFIER_RE = re.compile(r"\b\d+(?:\.\d+)?-[A-Za-z]\w*")
 
 
+# The MIRROR of `_COMPOUND_MODIFIER_RE`: digits glued to the END of a name,
+# not the start. Analytes are full of them — CA-125, HLA-B27, IL-6, CD4, C3,
+# T4, B12, A1C — and `_NUMBER_RE`'s optional sign turns the hyphen into a
+# minus, so "CA-125 was normal" quoted `-125.0`. A live review dropped a
+# perfectly good citation of a real CA-125 row because -125.0 did not equal
+# the stored 27.7.
+#
+# The digits must be GLUED to the letters (optionally through one hyphen) for
+# this to fire, which is what separates a name from a reading: prose writes a
+# value with a space — "CRP 8.5", "FSH 91.4" — and those are untouched.
+_ANALYTE_NAME_DIGITS_RE = re.compile(r"\b[A-Za-z]+-?\d+(?:\.\d+)?\b")
+
+
+# A bare four-digit year introduced by a temporal preposition is a date, not
+# a result: "percent change vs 2024" quoted `2024.0`. Deliberately narrow —
+# an unqualified 4-digit number is stripped only with that lead-in, because
+# real analytes do live in this range (vitamin B12 in the 2000s pg/mL, a
+# platelet count, a ferritin), and silently discarding those would trade one
+# false positive for a worse false negative.
+_YEAR_IN_CONTEXT_RE = re.compile(
+    r"\b(?:since|vs\.?|versus|from|during|in|by|after|before)\s+(?:19|20)\d{2}\b",
+    re.IGNORECASE,
+)
+
+
 def _extract_quoted_numbers(claim: str) -> list[float]:
     """Decimal literals a claim quotes, per PLAN.md's Phase-2 spec: dates
     (`YYYY-MM-DD`), titer ratios (`1:640`), and range-shaped mentions
     (`3.5-5.1`, e.g. a reference range restated in the claim) are stripped
-    first so their digits never masquerade as a quoted result value."""
+    first so their digits never masquerade as a quoted result value — as are
+    digits belonging to an analyte's NAME (`CA-125`) and years introduced by
+    a temporal preposition (`vs 2024`), each of which cost a real citation on
+    a live review."""
     cleaned = _DATE_IN_TEXT_RE.sub(" ", claim)
     cleaned = _TITER_RE.sub(" ", cleaned)
     cleaned = _RANGE_RE.sub(" ", cleaned)
     cleaned = _COMPOUND_MODIFIER_RE.sub(" ", cleaned)
+    cleaned = _ANALYTE_NAME_DIGITS_RE.sub(" ", cleaned)
+    cleaned = _YEAR_IN_CONTEXT_RE.sub(" ", cleaned)
     return [float(m) for m in _NUMBER_RE.findall(cleaned)]
 
 

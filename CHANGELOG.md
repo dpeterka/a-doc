@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.7] — 2026-08-27
+
+### Fixed
+
+- **An analyte name's digits are no longer read as a quoted value.** The
+  citation checker extracted `-125` from the name "CA-125" (the optional sign
+  in its number pattern read the hyphen as a minus) and `2024` from "percent
+  change vs 2024", then dropped two well-formed citations of real rows for
+  disagreeing with the stored values. The digits-then-word direction was
+  already handled ("25-hydroxy", "10-year"); this adds the mirror, which
+  covers most of immunology (CA-125, HLA-B27, IL-6, CD4, C3, T4, B12, A1C).
+  Years are stripped only behind a temporal preposition, because real
+  analytes live in that range — vitamin B12 in the 2000s pg/mL still reads
+  as a value.
+
 ## [0.11.6] — 2026-08-27
 
 ### Fixed
