@@ -1939,11 +1939,49 @@ def _render_questions_open(payload: TestChooserPayload, ledger: Ledger | None = 
             "and some of them decide whether the tests below are needed._",
             "",
         ]
-        lines += render(mine)
+        lines += _prioritised(mine, render)
     if theirs:
         lines += ["## To raise with your doctor", ""]
-        lines += render(theirs)
+        lines += _prioritised(theirs, render)
     return "\n".join(lines).rstrip() + "\n"
+
+
+MAX_PRIORITY_ITEMS = 6
+"""How many items in one section are presented as the short actionable list.
+
+A real review produced 14 doctor items. None of them were junk — they were 14
+genuinely reasonable requests — but "no human doctor would be able to go
+through that list either" is a correct read of an appointment's capacity.
+Six is roughly what fits a consultation alongside whatever the doctor came to
+discuss.
+"""
+
+
+def _prioritised(
+    items: list[TestChooserItem], render: Callable[[list[TestChooserItem]], list[str]]
+) -> list[str]:
+    """The first `MAX_PRIORITY_ITEMS` prominently, the remainder below.
+
+    Nothing is dropped. Truncating a list of clinically reasonable requests
+    would silently discard real content and leave the page looking complete —
+    the "no silent caps" rule. The overflow keeps its own heading so the
+    reader knows the short list above is a prioritisation rather than the
+    whole of it, and the model is asked to order by yield so the split lands
+    somewhere meaningful.
+    """
+    if len(items) <= MAX_PRIORITY_ITEMS:
+        return render(items)
+    head, tail = items[:MAX_PRIORITY_ITEMS], items[MAX_PRIORITY_ITEMS:]
+    out = render(head)
+    out += [
+        f"### Also worth raising, lower priority ({len(tail)})",
+        "",
+        "_Ranked below the list above. Nothing here is unimportant; it is what "
+        "would not fit a single appointment._",
+        "",
+    ]
+    out += render(tail)
+    return out
 
 
 # --------------------------------------------------------------------------

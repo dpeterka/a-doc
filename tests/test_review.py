@@ -1683,3 +1683,39 @@ def test_each_related_hypothesis_gets_its_own_linked_line(repo: DataRepo) -> Non
 
     assert f"· [Systemic lupus erythematosus](/ledger#{SLE_ID})" in markdown
     assert f"· [Pulmonary embolism](/ledger#{PE_ID})" in markdown
+
+
+def test_a_long_list_is_prioritised_not_truncated(repo: DataRepo) -> None:
+    """14 doctor items is more than an appointment holds, but none of them
+    were junk. Dropping them would silently discard real clinical content and
+    leave the page looking complete — the "no silent caps" rule. The first six
+    lead; the rest keep their own heading."""
+    ledger = _seed_ledger(repo)
+    payload = TestChooserPayload(
+        items=[
+            TestChooserItem(
+                panel=f"Panel {n}", ask=f"Ask {n}.", audience="doctor", hypothesis_ids=[SLE_ID]
+            )
+            for n in range(1, 10)
+        ]
+    )
+
+    markdown = _render_questions_open(payload, ledger)
+
+    assert "Also worth raising, lower priority (3)" in markdown
+    # Every item survives; only prominence changes.
+    for n in range(1, 10):
+        assert f"**Panel {n}**" in markdown
+    # ...and the split lands after the sixth.
+    head, tail = markdown.split("Also worth raising")
+    assert "**Panel 6**" in head
+    assert "**Panel 7**" in tail
+
+
+def test_a_short_list_gets_no_overflow_heading(repo: DataRepo) -> None:
+    ledger = _seed_ledger(repo)
+    payload = TestChooserPayload(
+        items=[TestChooserItem(panel=f"Panel {n}", ask="x", audience="doctor") for n in range(1, 4)]
+    )
+
+    assert "Also worth raising" not in _render_questions_open(payload, ledger)
