@@ -53,18 +53,20 @@ import json
 import logging
 import re
 from collections import defaultdict
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from adoc import __version__
 from adoc.casefile.ledger import ACTIVE_STATUSES, load_ledger
 from adoc.casefile.repo import HISTORY_RELPATH, LEDGER_RELPATH, DataRepo
 from adoc.casefile.schema import (
     AddHypothesis,
+    Evidence,
+    EvidenceStrength,
     Hypothesis,
     Ledger,
     LedgerDiff,
@@ -74,10 +76,12 @@ from adoc.casefile.schema import (
     RecordChallenge,
     Tier,
     UpdateHypothesis,
+    validate_source_ref,
 )
 from adoc.labs.db import LabsDb
 from adoc.labs.queries import abnormal_summary
 from adoc.labs.validate import canonicalize, trend_outlier
+from adoc.reason.citations import check_evidence_citations
 from adoc.reason.client import LlmClient, Message
 from adoc.reason.context import ContextPack, build_context
 from adoc.reason.dag import (
@@ -129,6 +133,31 @@ class TrendScanResult(BaseModel):
     findings: list[TrendFinding] = Field(default_factory=list)
 
 
+class BlindEvidenceItem(BaseModel):
+    """One cited claim supporting a blind panel member's hypothesis.
+
+    Exists because the prompt has always asked the panel to cite source refs
+    and the schema gave it nowhere to put them. The result, measured on a
+    real review: 24 hypotheses reached the ledger with ZERO evidence items,
+    and zero refs even in the prose — the panel cited *values* densely
+    ("FSH 91.4 mIU/mL") but never a resolvable `labs:fsh:<date>`. Every
+    hypothesis card in the UI therefore rendered an empty evidence section.
+
+    `source` is validated against the same grammar as every other evidence
+    ref (`casefile.schema.validate_source_ref`), so a ref the panel invents
+    is rejected here rather than becoming an uncheckable ledger entry.
+    """
+
+    claim: str
+    source: str
+    strength: EvidenceStrength = "moderate"
+
+    @field_validator("source")
+    @classmethod
+    def _check_source(cls, value: str) -> str:
+        return validate_source_ref(value)
+
+
 class BlindDifferentialItem(BaseModel):
     """One hypothesis in a blind panel member's de novo differential —
     the schema `reason/prompts/blind_reviewer.md` describes."""
@@ -137,6 +166,11 @@ class BlindDifferentialItem(BaseModel):
     probability_bucket: ProbabilityBucket
     why: str
     cant_miss: bool = False
+    evidence: list[BlindEvidenceItem] = Field(default_factory=list)
+    """Cited support. Empty is tolerated rather than rejected: a panel member
+    that cites nothing should still contribute its hypothesis to the
+    divergence diff, and a missing citation is visible in the UI instead of
+    failing a 12-minute review."""
 
 
 class BlindDifferentialPayload(BaseModel):
@@ -171,10 +205,67 @@ class Divergence(BaseModel):
     panel_cant_miss: bool = False
     support_count: int = 1
     rationale_hint: str = ""
+    panel_evidence: list[BlindEvidenceItem] = Field(default_factory=list)
+    """Cited support pooled from every panel member that raised this
+    hypothesis, deduplicated by `(claim, source)`. Carried through so an
+    accepted divergence lands in the ledger WITH its citations instead of
+    prose alone (see `_merge_review_ops`)."""
 
 
 class DivergenceSet(BaseModel):
     divergences: list[Divergence] = Field(default_factory=list)
+
+
+def _resolvable_evidence(divergence: Divergence, db: LabsDb, repo: DataRepo) -> list[Evidence]:
+    """The divergence's pooled panel citations, keeping only refs that
+    actually resolve.
+
+    The review path has no citation-check DAG contract of its own (unlike a
+    diagnostic turn, where `citation_check` gates `apply`), so a ref that
+    resolves to nothing would otherwise become an uncheckable ledger entry —
+    exactly the fabrication Phase 2 exists to prevent. Filtering here rather
+    than failing the run follows ADR 0016's posture: strip the unsupported
+    claim and proceed, because destroying a 12-minute review over one bad
+    ref costs more than it protects.
+
+    An unresolvable ref is LOGGED, never silently dropped.
+    """
+    kept: list[Evidence] = []
+    for ev in divergence.panel_evidence:
+        report = check_evidence_citations(
+            [Evidence(claim=ev.claim, source=ev.source, strength=ev.strength)], db, repo
+        )
+        if report.failing:
+            logger.warning(
+                "review: dropped an unresolvable panel citation for %r: %s (%s)",
+                divergence.name,
+                ev.source,
+                report.failing[0].reason,
+            )
+            continue
+        kept.append(Evidence(claim=ev.claim, source=ev.source, strength=ev.strength))
+    return kept
+
+
+def _pool_evidence(items: Iterable[BlindDifferentialItem]) -> list[BlindEvidenceItem]:
+    """Every citation the panel members offered for one hypothesis, deduped
+    on `(claim, source)`.
+
+    Panel members work independently, so two of them citing the same lab row
+    for the same claim is agreement, not two pieces of evidence — pooling
+    without dedup would inflate a hypothesis's apparent support purely by
+    panel size.
+    """
+    seen: set[tuple[str, str]] = set()
+    pooled: list[BlindEvidenceItem] = []
+    for item in items:
+        for ev in item.evidence:
+            key = (ev.claim.strip().lower(), ev.source)
+            if key in seen:
+                continue
+            seen.add(key)
+            pooled.append(ev)
+    return pooled
 
 
 class DivergenceDecisionPayload(BaseModel):
@@ -451,6 +542,7 @@ def compute_divergences(ledger: Ledger, panels: list[BlindDifferential]) -> Dive
                     panel_cant_miss=cant_miss,
                     support_count=len(entries),
                     rationale_hint=why,
+                    panel_evidence=_pool_evidence(item for _, item in entries),
                 )
             )
         else:
@@ -468,6 +560,7 @@ def compute_divergences(ledger: Ledger, panels: list[BlindDifferential]) -> Dive
                         ledger_probability_bucket=hyp.probability,
                         support_count=len(mismatched),
                         rationale_hint=why,
+                        panel_evidence=_pool_evidence(mismatched),
                     )
                 )
 
@@ -506,6 +599,8 @@ def build_review_ledger_diff(
     challenge_sweep: ChallengeSweepResult,
     *,
     today: date,
+    db: LabsDb | None = None,
+    repo: DataRepo | None = None,
 ) -> LedgerDiff:
     """Merge accepted-divergence ops (`origin: challenger`) and the full
     challenge sweep's `RecordChallenge` ops into ONE `LedgerDiff` — see
@@ -532,6 +627,11 @@ def build_review_ledger_diff(
                         status="active",
                         origin="challenger",
                         first_proposed=today,
+                        evidence_for=(
+                            _resolvable_evidence(divergence, db, repo)
+                            if db is not None and repo is not None
+                            else []
+                        ),
                         challenger_notes=(
                             "Added from weekly blind-panel divergence adjudication: "
                             f"{decision.rationale}"
@@ -1259,7 +1359,13 @@ def build_review_dag(
         assert isinstance(sweep, ChallengeSweepResult)
 
         diff = build_review_ledger_diff(
-            current_ledger, divergence_set, adjudication, sweep, today=clock().date()
+            current_ledger,
+            divergence_set,
+            adjudication,
+            sweep,
+            today=clock().date(),
+            db=db,
+            repo=repo,
         )
         history_path = repo.root / HISTORY_RELPATH
         new_ledger = repo.apply_ledger_diff(ledger_path, history_path, diff)
