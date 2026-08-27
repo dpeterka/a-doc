@@ -64,6 +64,7 @@ from adoc import __version__
 from adoc.casefile.ledger import ACTIVE_STATUSES, load_ledger
 from adoc.casefile.repo import HISTORY_RELPATH, LEDGER_RELPATH, DataRepo
 from adoc.casefile.schema import (
+    AddEvidence,
     AddHypothesis,
     Evidence,
     EvidenceStrength,
@@ -221,6 +222,67 @@ class Divergence(BaseModel):
 class DivergenceSet(BaseModel):
     divergences: list[Divergence] = Field(default_factory=list)
 
+    panel_citations: dict[str, list[BlindEvidenceItem]] = Field(default_factory=dict)
+    """Panel citations for ledger hypotheses the panel NAMED, keyed by ledger
+    hypothesis id — including the ones it agreed with.
+
+    A divergence, by definition, exists only where the panel and the ledger
+    disagree. So citations used to survive exclusively on disagreement: an
+    accepted `panel_only` divergence became a new hypothesis carrying its
+    refs, and everything else dropped them. Where the panel *agreed* with a
+    ledger hypothesis, `compute_divergences` recorded the name in
+    `covered_norms` and discarded the evidence entirely — and a
+    `probability_mismatch` pooled only the *mismatched* members' citations,
+    throwing away those of members who happened to agree.
+
+    That inverted the intent. The hypotheses both the ledger and an
+    independent blind panel endorse are the best-supported ones in the case,
+    and they were precisely the ones left uncited — 24 of 25 hypotheses in
+    prod had an empty evidence list, which is what the patient's hypothesis
+    cards render. Citations are a fact about the data, not a verdict on a
+    probability, so they are collected for every named hypothesis and
+    attached independently of what the adjudicator decides.
+    """
+
+
+def _resolvable_items(
+    items: Iterable[BlindEvidenceItem], label: str, db: LabsDb, repo: DataRepo
+) -> list[Evidence]:
+    """`items`, keeping only citations whose refs are well-formed AND resolve.
+
+    Shared by both citation paths: the divergence path (a new hypothesis
+    carrying its refs) and the agreement path (`AddEvidence` onto a
+    hypothesis the ledger already holds). `label` names the hypothesis in the
+    log line only.
+    """
+    kept: list[Evidence] = []
+    for ev in items:
+        # Grammar first, and defensively: `Evidence.source` validates its ref
+        # and RAISES, which is right for the ledger's own type but means the
+        # citation check below cannot be reached with a malformed ref. The
+        # panel emitted `other:<analyte>:<date>` — well-formed in shape, bad
+        # in prefix — so this branch is a live path, not a theoretical one.
+        try:
+            validate_source_ref(ev.source)
+        except (ValueError, ValidationError) as exc:
+            logger.warning(
+                "review: dropped a malformed panel citation for %r: %s (%s)", label, ev.source, exc
+            )
+            continue
+        report = check_evidence_citations(
+            [Evidence(claim=ev.claim, source=ev.source, strength=ev.strength)], db, repo
+        )
+        if report.failing:
+            logger.warning(
+                "review: dropped an unresolvable panel citation for %r: %s (%s)",
+                label,
+                ev.source,
+                report.failing[0].reason,
+            )
+            continue
+        kept.append(Evidence(claim=ev.claim, source=ev.source, strength=ev.strength))
+    return kept
+
 
 def _resolvable_evidence(divergence: Divergence, db: LabsDb, repo: DataRepo) -> list[Evidence]:
     """The divergence's pooled panel citations, keeping only refs that
@@ -236,36 +298,7 @@ def _resolvable_evidence(divergence: Divergence, db: LabsDb, repo: DataRepo) -> 
 
     An unresolvable ref is LOGGED, never silently dropped.
     """
-    kept: list[Evidence] = []
-    for ev in divergence.panel_evidence:
-        # Grammar first, and defensively: `Evidence.source` validates its ref
-        # and RAISES, which is right for the ledger's own type but means the
-        # citation check below cannot be reached with a malformed ref. The
-        # panel emitted `other:<analyte>:<date>` — well-formed in shape, bad
-        # in prefix — so this branch is a live path, not a theoretical one.
-        try:
-            validate_source_ref(ev.source)
-        except (ValueError, ValidationError) as exc:
-            logger.warning(
-                "review: dropped a malformed panel citation for %r: %s (%s)",
-                divergence.name,
-                ev.source,
-                exc,
-            )
-            continue
-        report = check_evidence_citations(
-            [Evidence(claim=ev.claim, source=ev.source, strength=ev.strength)], db, repo
-        )
-        if report.failing:
-            logger.warning(
-                "review: dropped an unresolvable panel citation for %r: %s (%s)",
-                divergence.name,
-                ev.source,
-                report.failing[0].reason,
-            )
-            continue
-        kept.append(Evidence(claim=ev.claim, source=ev.source, strength=ev.strength))
-    return kept
+    return _resolvable_items(divergence.panel_evidence, divergence.name, db, repo)
 
 
 def _pool_evidence(items: Iterable[BlindDifferentialItem]) -> list[BlindEvidenceItem]:
@@ -547,6 +580,7 @@ def compute_divergences(ledger: Ledger, panels: list[BlindDifferential]) -> Dive
 
     divergences: list[Divergence] = []
     covered_norms: set[str] = set()
+    panel_citations: dict[str, list[BlindEvidenceItem]] = {}
 
     for norm in sorted(panel_by_norm):
         entries = panel_by_norm[norm]
@@ -568,6 +602,12 @@ def compute_divergences(ledger: Ledger, panels: list[BlindDifferential]) -> Dive
             )
         else:
             covered_norms.add(norm)
+            # Every citation from every member that named this hypothesis —
+            # including members who AGREED with the ledger's probability, whose
+            # refs the mismatch pooling below would otherwise discard.
+            pooled = _pool_evidence(item for _, item in entries)
+            if pooled:
+                panel_citations[hyp.id] = pooled
             mismatched = [item for _, item in entries if item.probability_bucket != hyp.probability]
             if mismatched:
                 why = "; ".join(f"panel: {item.why}" for item in mismatched)
@@ -599,7 +639,7 @@ def compute_divergences(ledger: Ledger, panels: list[BlindDifferential]) -> Dive
             )
         )
 
-    return DivergenceSet(divergences=divergences)
+    return DivergenceSet(divergences=divergences, panel_citations=panel_citations)
 
 
 def _slug_for_new_hypothesis(name: str, ledger: Ledger) -> str:
@@ -678,6 +718,32 @@ def build_review_ledger_diff(
                 )
             )
         accepted_summaries.append(f"{divergence.name} ({divergence.kind}): {decision.rationale}")
+
+    # Panel citations for hypotheses the ledger ALREADY holds. Not gated on
+    # the adjudicator's decision: a resolvable ref is a fact about the data,
+    # not a verdict on a probability, and it passes the citation checker by
+    # construction. Without this, a hypothesis could only ever be cited on the
+    # review that first created it — 24 of 25 in prod had an empty evidence
+    # list, which is exactly what the patient's hypothesis cards render.
+    if db is not None and repo is not None:
+        hypothesis_by_id = {h.id: h for h in current_ledger.hypotheses}
+        for hyp_id, items in sorted(divergence_set.panel_citations.items()):
+            hypothesis = hypothesis_by_id.get(hyp_id)
+            if hypothesis is None:
+                continue
+            # Dedup against what the hypothesis already carries: `apply_diff`
+            # appends AddEvidence blindly, so a weekly review would otherwise
+            # re-add the same citation every single week.
+            seen = {
+                (existing.claim.strip().lower(), existing.source)
+                for existing in hypothesis.evidence_for
+            }
+            for evidence in _resolvable_items(items, hypothesis.name, db, repo):
+                key = (evidence.claim.strip().lower(), evidence.source)
+                if key in seen:
+                    continue
+                seen.add(key)
+                ops.append(AddEvidence(id=hyp_id, for_or_against="for", evidence=evidence))
 
     active_ids = {h.id for h in current_ledger.hypotheses if h.status in ACTIVE_STATUSES}
     already_challenged = {op.id for op in ops if isinstance(op, RecordChallenge)}

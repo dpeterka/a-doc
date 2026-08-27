@@ -92,3 +92,45 @@ names the failure explicitly: a panel heading is not a ref prefix.
   panel's 31,232-token budget this is a few thousand characters — but it is
   the labs section, which is the section that grows with the corpus. If the
   budget is ever the binding constraint, this is a place to look.
+
+## Addendum (same day): citations must survive agreement
+
+Deploying the above fixed the crash — 14/14 nodes, 796s, **zero dropped
+refs**, every citation the panel produced was well-formed and resolved. Then
+measuring the result showed the user-visible symptom was still there: 25
+hypotheses in the ledger, **1** with any evidence.
+
+A `Divergence`, by definition, exists only where the panel and the ledger
+*disagree*. Citations therefore survived exclusively on disagreement. An
+accepted `panel_only` divergence became a new hypothesis carrying its refs —
+that is the 1. Everywhere else `compute_divergences` recorded the name in
+`covered_norms` and dropped the evidence on the floor, and a
+`probability_mismatch` pooled only the *mismatched* members' citations,
+discarding those of members who happened to agree.
+
+That inverts the intent. The hypotheses both the ledger and an independent
+blind panel endorse are the best-supported ones in the case, and they were
+precisely the ones rendering as uncited. A hypothesis could only ever be
+cited by the review that created it; the 21 added before citations existed
+could never gain one.
+
+**Decision.** `DivergenceSet.panel_citations` maps ledger hypothesis id to
+pooled citations for every hypothesis the panel *named*, agreement included.
+`build_review_ledger_diff` emits `AddEvidence` for each resolvable one,
+**not gated on the adjudicator's decision**: a resolvable ref is a fact about
+the data, not a verdict on a probability, and it passes the citation checker
+by construction. Dedup is against the hypothesis's existing evidence on
+`(normalized claim, source)`, because `apply_diff` appends `AddEvidence`
+blindly and a weekly review would otherwise re-add the same citation forever.
+
+**Consequences.**
+
+- Evidence accumulates across reviews instead of only at creation. The bound
+  on growth is the dedup key, so a panel rephrasing the same claim about the
+  same row *will* add a second item. Acceptable; watch it.
+- `confirmed-by-doctor` hypotheses are untouched — they are not in
+  `ACTIVE_STATUSES`, so `compute_divergences` never matches them and the
+  raised bar of invariant (d) is never approached.
+- Two properties are pinned: that agreement still yields citations (the test
+  asserts no divergence is produced for the agreeing hypothesis, so it cannot
+  pass for the wrong reason), and that a second review does not duplicate.
