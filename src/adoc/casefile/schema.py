@@ -122,6 +122,16 @@ class Hypothesis(BaseModel):
 
     id: str
     name: str
+    plain_language: str = ""
+    """One or two sentences saying what this condition IS, in words a patient
+    can read.
+
+    The name alone is not communication: "Primary ovarian insufficiency /
+    menopausal-range hypogonadism" is precise and tells the person whose case
+    file it is nothing at all. Defaulted so every existing ledger round-trips;
+    populated going forward by the challenge sweep, which visits every active
+    hypothesis on every review and so backfills the ones created before this
+    field existed."""
     mondo: str | None = None
     tier: Tier
     probability: ProbabilityBucket
@@ -175,6 +185,7 @@ class AddHypothesis(BaseModel):
 class UpdateHypothesis(BaseModel):
     op: Literal["update_hypothesis"] = "update_hypothesis"
     id: str
+    plain_language: str | None = None
     tier: Tier | None = None
     probability: ProbabilityBucket | None = None
     status: HypothesisStatus | None = None
