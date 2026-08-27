@@ -53,7 +53,12 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 from ruamel.yaml import YAML
 
-from adoc.casefile.encounters import Encounter, EncounterFrontmatter, write_encounter
+from adoc.casefile.encounters import (
+    DatePrecision,
+    Encounter,
+    EncounterFrontmatter,
+    write_encounter,
+)
 from adoc.casefile.repo import DataRepo
 from adoc.intake.sections import (
     SECTIONS,
@@ -233,17 +238,34 @@ def _parse_approx_date(text: str) -> date | None:
     1st). Returns None when no year can be found at all - undated events are
     legitimate (patients often cannot date a hospitalization).
     """
+    parsed = parse_approx_date_with_precision(text)
+    return parsed[0] if parsed else None
+
+
+def parse_approx_date_with_precision(text: str) -> tuple[date, DatePrecision] | None:
+    """`_parse_approx_date`, but reporting HOW precisely the date is known.
+
+    The date alone is not enough. "2021" and "early 2021" both parse to
+    `2021-01-01`, and "spring 2022" to `2022-01-01` — the wrong season,
+    asserted to the day. Downstream that is indistinguishable from a real
+    January 1st, so the precision travels with the date and the encounter
+    records it (`EncounterFrontmatter.date_precision`).
+    """
     stripped = text.strip()
     try:
-        return date.fromisoformat(stripped)
+        return date.fromisoformat(stripped), "day"
     except ValueError:
         pass
     match = re.fullmatch(r"(\d{4})-(\d{2})", stripped)
     if match:
-        return date(int(match.group(1)), int(match.group(2)), 1)
+        return date(int(match.group(1)), int(match.group(2)), 1), "month"
     match = re.search(r"\d{4}", stripped)
     if match:
-        return date(int(match.group(0)), 1, 1)
+        # A bare year is `year` precision; a year wrapped in qualifying words
+        # ("early 2021", "spring 2022") is weaker still — the month the
+        # fallback picks is an artefact, not a reading of the text.
+        precision: DatePrecision = "year" if stripped == match.group(0) else "approximate"
+        return date(int(match.group(0)), 1, 1), precision
     # No year anywhere ("recently", "<UNKNOWN>", "as a child"): the event is
     # real but undatable - callers record it as an undated event rather than
     # fabricating a date or failing the confirm (real onboarding crash).
@@ -337,17 +359,28 @@ UNDATED_EVENTS_RELPATH = "case/undated-events.md"
 
 
 def _write_events(repo: DataRepo, data: EventsSection) -> list[str]:
+    # The patient is telling us this NOW, whenever the event itself happened.
+    # `IntakeFact` already separates the two; the encounter kept only one
+    # date, losing the distinction at the point the record becomes durable.
+    reported_on = datetime.now(UTC).date()
     written: list[str] = []
     encounters_dir = repo.root / ENCOUNTERS_RELDIR
     undated: list[str] = []
     for event in data.events:
-        event_date = _parse_approx_date(event.date_approx) if event.date_approx else None
+        parsed = parse_approx_date_with_precision(event.date_approx) if event.date_approx else None
+        event_date = parsed[0] if parsed else None
+        precision: DatePrecision = parsed[1] if parsed else "approximate"
         summary = event.description.strip() or event.title
         if event_date is None:
             timing = f" (timing: {event.date_approx})" if event.date_approx else ""
             undated.append(f"- **{event.title}**{timing}: {summary}")
             continue
-        frontmatter = EncounterFrontmatter(date=event_date, type="patient-report")
+        frontmatter = EncounterFrontmatter(
+            date=event_date,
+            type="patient-report",
+            date_precision=precision,
+            reported_on=reported_on,
+        )
         encounter = Encounter(frontmatter=frontmatter, summary=summary)
         # `write_encounter` names the file deterministically from
         # `(date, slug(title))`, so re-confirming the same event (same date +

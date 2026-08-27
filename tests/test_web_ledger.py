@@ -23,6 +23,19 @@ from adoc.casefile.ledger import save_ledger
 from adoc.casefile.repo import LEDGER_RELPATH
 from adoc.casefile.schema import Evidence, Hypothesis, Ledger
 from adoc.labs.models import LabDocument
+from adoc.web.casefile_helpers import group_hypotheses
+
+
+def _hypothesis(hid: str, *, tier: str, probability: str) -> Hypothesis:
+    return Hypothesis(
+        id=hid,
+        name=f"Lead {hid}",
+        tier=tier,
+        probability=probability,
+        status="active",
+        origin="model",
+        first_proposed=date(2026, 8, 27),
+    )
 
 
 def test_ledger_view_empty_state_explains_instead_of_claiming_a_record(tmp_path: Path) -> None:
@@ -297,3 +310,47 @@ def test_reviews_index_redirect_still_reaches_the_review_list(tmp_path: Path) ->
     assert response.status_code == 200
     assert response.url.path == "/ledger"
     assert 'href="/reviews/2026-06-01-review.md"' in response.text
+
+
+# --- readability of a real-sized differential -------------------------------------------
+
+
+def test_a_large_ledger_leads_with_what_matters_and_folds_the_tail() -> None:
+    """Production carried 24 hypotheses rendered flat, in file order, with no
+    signal about which mattered. For a patient reading her own case file that
+    is not merely untidy — it reads as "you might have 24 things"."""
+    hyps = [
+        _hypothesis("h1", tier="expanded", probability="minimal"),
+        _hypothesis("h2", tier="cant-miss", probability="minimal"),
+        _hypothesis("h3", tier="expanded", probability="high"),
+        _hypothesis("h4", tier="most-likely", probability="moderate"),
+        _hypothesis("h5", tier="expanded", probability="low"),
+    ]
+
+    groups = group_hypotheses(hyps)
+
+    # most-likely first, then can't-miss at ANY probability, then high/moderate
+    assert [h.id for h in groups["leading"]] == ["h4", "h2", "h3"]
+    assert [h.id for h in groups["secondary"]] == ["h5", "h1"]
+
+
+def test_folding_never_drops_a_hypothesis() -> None:
+    """A lead stays on the list until evidence rules it out — folding is a
+    statement about prominence, not about what the record contains."""
+    hyps = [
+        _hypothesis(f"h{i}", tier="expanded", probability=p)
+        for i, p in enumerate(["high", "low", "minimal", "moderate", "low"])
+    ]
+
+    groups = group_hypotheses(hyps)
+
+    assert len(groups["leading"]) + len(groups["secondary"]) == len(hyps)
+
+
+def test_a_cant_miss_lead_is_never_folded_however_unlikely() -> None:
+    """Can't-miss is the tier that exists precisely because low probability
+    does not mean low consequence."""
+    groups = group_hypotheses([_hypothesis("cm", tier="cant-miss", probability="minimal")])
+
+    assert [h.id for h in groups["leading"]] == ["cm"]
+    assert groups["secondary"] == []

@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.3] - 2026-08-27
+
+Readability and temporal fidelity, all found by reading the real case file rather than fixtures.
+
+### Added
+- **The context pack shows trajectories, not just a snapshot** (ADR 0027). Its labs sections were "abnormal, most recent per analyte" and "latest panel" — a stage could see *movement* only by calling a tool, or by reading a document that narrated its own comparison (which is how the blind panel knew about the DEXA decline: the report did the arithmetic). The snapshot was hiding the ovarian-failure signature on the real corpus — LH rising 1330%, FSH rising 1119%, AMH falling 96% — none of it visible in any single row. Only readings sharing a unit are compared: a naive version reported `eosinophils rising 319,900%`, which was a unit change mid-history (×1000), not a clinical event.
+- **The blind panel must cite, so hypotheses arrive with evidence.** The ledger held 24 hypotheses and *zero* evidence items, so every card rendered an empty evidence section. The prompt had always asked for source refs; the schema gave it nowhere to put them, and 0 of 24 hypotheses carried a ref even in prose — the panel cited *values* densely and never the row they came from. An unresolvable ref is dropped and logged rather than failing a 12-minute review, because the review path has no citation-check contract of its own.
+
+### Fixed
+- **The differential has a spine.** 24 hypotheses rendered flat in file order, equal weight, no ranking — for a patient reading her own case file that reads as "you might have 24 things". Now ordered strongest-first and split into what to discuss now versus a folded tail. Nothing is dropped, and a can't-miss lead is never folded however unlikely.
+- **"What's new" no longer dumps model prose.** It rendered the full adjudication rationale verbatim — thousands of words in one paragraph. The diff's ops are typed, so the change set is now derived: "2 new leads, 1 updated, 2 re-challenged", with the reasoning behind a disclosure.
+- **Encounters no longer assert fabricated date precision.** `"2021"` parsed to `2021-01-01` and `"spring 2022"` to `2022-01-01` — the wrong season, stated to the day, indistinguishable downstream from a real January 1st. `date_precision` and `reported_on` are recorded and rendered (`2021`, `~2022`, `(reported …)`), both defaulting so existing encounter files round-trip unchanged.
+
 ## [0.11.2] - 2026-08-26
 
 A scheduled review failed in production; investigating it found two Phase-2 completeness gaps behind it.

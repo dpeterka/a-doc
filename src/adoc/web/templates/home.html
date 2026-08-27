@@ -22,11 +22,46 @@
   {% if whats_new %}
     <section class="card">
       <h2>What's new since your last visit</h2>
+      {# The diff's ops are typed, so what changed is DERIVED, not narrated.
+         This used to render `diff.rationale` verbatim: on a real review that
+         was thousands of words of clinical argument in one unbroken
+         paragraph, which buried the only thing this section is for. #}
       <ul class="whats-new-list">
         {% for entry in whats_new %}
-          <li>
-            <span class="muted">v{{ entry.resulting_version }}</span>
-            {{ entry.diff.rationale }}
+          {% set change = entry.diff | summarize_diff_ops %}
+          <li class="whats-new-item">
+            <p class="whats-new-headline">
+              <span class="chip chip-version">v{{ entry.resulting_version }}</span>
+              {% if change.added %}
+                {{ change.added | length }} new lead{{ '' if change.added | length == 1 else 's' }}
+              {% endif %}
+              {% if change.changed %}
+                {%- if change.added %}, {% endif -%}
+                {{ change.changed | length }} updated
+              {% endif %}
+              {% if change.challenged %}
+                {%- if change.added or change.changed %}, {% endif -%}
+                {{ change.challenged }} re-challenged
+              {% endif %}
+              {% if not change.added and not change.changed and not change.challenged %}
+                Review recorded, no change to your leads
+              {% endif %}
+            </p>
+            {% if change.added %}
+              <ul class="whats-new-names">
+                {% for name in change.added[:5] %}<li>{{ name }}</li>{% endfor %}
+                {% if change.added | length > 5 %}
+                  <li class="muted">and {{ change.added | length - 5 }} more —
+                    <a href="/ledger">see the full picture</a></li>
+                {% endif %}
+              </ul>
+            {% endif %}
+            {% if change.rationale %}
+              <details class="whats-new-why">
+                <summary>Why a-doc made these changes</summary>
+                <p class="reasoning-prose">{{ change.rationale }}</p>
+              </details>
+            {% endif %}
           </li>
         {% endfor %}
       </ul>

@@ -4,64 +4,39 @@
   <h1>The full picture</h1>
 
   {% if ledger.hypotheses %}
+    {% set groups = ledger.hypotheses | group_hypotheses %}
     <p class="muted">
-      Every lead a-doc has considered, version {{ ledger.version }}, last updated
-      {{ ledger.updated.date().isoformat() }}. This is the complete, unfiltered record — read-only.
+      Every lead a-doc has considered — {{ ledger.hypotheses | length }} in all, version
+      {{ ledger.version }}, last updated {{ ledger.updated.date().isoformat() }}. Ordered
+      strongest first. None of these is a diagnosis; they are things to raise with a doctor.
     </p>
-    {% for h in ledger.hypotheses %}
-      <article class="card hypothesis-full">
-        <h2>{{ h.name }}</h2>
-        <div class="chips">
-          <span class="chip chip-tier chip-tier-{{ h.tier }}">{{ h.tier | tier_label }}</span>
-          <span class="chip chip-status">{{ h.status | status_label }}</span>
-          <span class="chip chip-origin chip-origin-{{ h.origin }}" data-origin="{{ h.origin }}">
-            origin: {{ h.origin }}
-          </span>
-          <span class="chip chip-probability">confidence: {{ h.probability }}</span>
-        </div>
 
-        {% if h.evidence_for %}
-          <h3>Evidence for</h3>
-          <ul class="evidence-list">
-            {% for e in h.evidence_for %}
-              <li>
-                {{ e.claim }}
-                {% set href = source_ref_href(e.source) %}
-                {% if href %}
-                  <a href="{{ href }}" class="source-ref">({{ e.source }})</a>
-                {% else %}
-                  <span class="muted">({{ e.source }})</span>
-                {% endif %}
-              </li>
-            {% endfor %}
-          </ul>
-        {% endif %}
-
-        {% if h.evidence_against %}
-          <h3>Evidence against</h3>
-          <ul class="evidence-list">
-            {% for e in h.evidence_against %}
-              <li>
-                {{ e.claim }}
-                {% set href = source_ref_href(e.source) %}
-                {% if href %}
-                  <a href="{{ href }}" class="source-ref">({{ e.source }})</a>
-                {% else %}
-                  <span class="muted">({{ e.source }})</span>
-                {% endif %}
-              </li>
-            {% endfor %}
-          </ul>
-        {% endif %}
-
-        {% if h.discriminators %}
-          <p class="muted">Tests that would help tell this apart: {{ h.discriminators | join(", ") }}</p>
-        {% endif %}
-        {% if h.challenger_notes %}
-          <p class="muted">Challenge notes: {{ h.challenger_notes }}</p>
-        {% endif %}
-      </article>
+    {% if groups.leading %}
+      <h2 class="group-heading">
+        Worth discussing now <span class="muted">({{ groups.leading | length }})</span>
+      </h2>
+    {% endif %}
+    {% for h in groups.leading %}
+      {% include "_hypothesis_card.html" %}
     {% endfor %}
+
+    {% if groups.secondary %}
+      {# Kept, never dropped — but folded, so the page leads with what matters.
+         24 undifferentiated disease names reads as "you might have 24 things". #}
+      <details class="secondary-leads">
+        <summary>
+          Lower-likelihood leads still being tracked
+          <span class="muted">({{ groups.secondary | length }})</span>
+        </summary>
+        <p class="muted">
+          Carried so nothing is quietly dropped — not because they are expected. a-doc keeps
+          a lead on the list until there is evidence to rule it out.
+        </p>
+        {% for h in groups.secondary %}
+          {% include "_hypothesis_card.html" %}
+        {% endfor %}
+      </details>
+    {% endif %}
   {% else %}
     <p class="muted">
       Leads appear here once you've had a diagnostic conversation with a-doc — every
