@@ -1218,6 +1218,19 @@ class LabsDb:
         return [_row_to_lab(row) for row in rows]
 
     @_synchronized
+    def distinct_analyte_names(self) -> list[str]:
+        """Every analyte name with at least one non-rejected row, ordered.
+
+        For `reason.context`'s trajectory section, which needs to ask "what
+        is moving?" across the whole corpus rather than per-analyte.
+        """
+        rows = self._conn.execute(
+            "SELECT DISTINCT name FROM labs WHERE extraction_status != ? ORDER BY name",
+            (ExtractionStatus.REJECTED.value,),
+        ).fetchall()
+        return [row[0] for row in rows]
+
+    @_synchronized
     def all_rows(self) -> list[LabResult]:
         """Every lab row, REJECTED included, ordered by id.
 

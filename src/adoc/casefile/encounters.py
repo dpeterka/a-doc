@@ -27,12 +27,39 @@ _SLUG_INVALID = re.compile(r"[^a-z0-9-]+")
 _SLUG_DASHES = re.compile(r"-+")
 
 
+# How precisely `EncounterFrontmatter.date` is actually known.
+#
+# A patient says "my thyroid failed in 2021" and the parser returns
+# 2021-01-01 — indistinguishable downstream from "January 1st, 2021".
+# "spring 2022" becomes 2022-01-01, the wrong season asserted to the day.
+# For a diagnostic odyssey where sequence is the clinical signal that is
+# fabricated precision, so the encounter records what it really knows.
+DatePrecision = Literal["day", "month", "year", "approximate"]
+
+# `EncounterFrontmatter.date` shadows the `date` TYPE inside the class body,
+# so a second date-typed field cannot annotate itself as `date`. Alias it.
+CalendarDate = date
+
+
 class EncounterFrontmatter(BaseModel):
     date: date
     type: EncounterType
     provider: str | None = None
     sources: list[str] = Field(default_factory=list)
     symptoms: list[str] = Field(default_factory=list)
+    date_precision: DatePrecision = "day"
+    """Defaults to `day` so every encounter written before this field
+    existed round-trips unchanged — a document-sourced encounter genuinely
+    is day-precise, and those are the majority."""
+    reported_on: CalendarDate | None = None
+    """When the patient TOLD us, as distinct from when it happened.
+
+    `IntakeFact` already separates `date_approx` / `precision` /
+    `reported_on`, which is the right model — but the encounter written from
+    it kept only a single `date`, so the distinction was lost at exactly the
+    point the case file becomes the durable record. `None` for a
+    document-sourced encounter, where the document's own date is the fact.
+    """
 
 
 class Encounter(BaseModel):

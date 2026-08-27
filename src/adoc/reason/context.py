@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
-from adoc.casefile.encounters import read_encounter
+from adoc.casefile.encounters import EncounterFrontmatter, read_encounter
 from adoc.casefile.ledger import load_ledger
 from adoc.casefile.repo import LEDGER_RELPATH, DataRepo
 from adoc.casefile.schema import Ledger
@@ -25,6 +25,7 @@ from adoc.labs.db import LabsDb
 from adoc.labs.models import LabResult
 from adoc.labs.panels import derived_from_note, panel_sort_key
 from adoc.labs.queries import abnormal_summary
+from adoc.labs.validate import canonical_unit
 
 CASE_SUMMARY_RELPATH = "case/case-summary.md"
 PATIENT_THEORIES_RELPATH = "case/patient-theories.md"
@@ -111,11 +112,37 @@ def _recent_encounters_section(repo: DataRepo, limit: int) -> ContextSection:
         fm = encounter.frontmatter
         provider = f" ({fm.provider})" if fm.provider else ""
         summary = encounter.summary.strip() or "_no summary_"
-        lines.append(f"- **{fm.date.isoformat()}** [{fm.type}]{provider}: {summary}")
+        # A patient-reported date is often "2021" or "spring 2022", which the
+        # parser resolves to a January 1st. Rendering that bare invites a
+        # reasoning stage to treat fabricated precision as real, and to order
+        # events by a day nobody stated.
+        when = _render_encounter_date(fm)
+        lines.append(f"- **{when}** [{fm.type}]{provider}: {summary}")
 
     return ContextSection(
         key="recent_encounters", title="Recent Encounters", content="\n".join(lines)
     )
+
+
+def _render_encounter_date(fm: EncounterFrontmatter) -> str:
+    """The encounter's date, stated no more precisely than it is known.
+
+    `2021` parses to `2021-01-01` and `spring 2022` to `2022-01-01`; printing
+    those bare asserts a day the patient never gave. Precision qualifies the
+    date, and `reported_on` is shown when it differs from the event date so
+    a stage can tell recall from contemporaneous record.
+    """
+    if fm.date_precision == "year":
+        shown = str(fm.date.year)
+    elif fm.date_precision == "month":
+        shown = fm.date.strftime("%Y-%m")
+    elif fm.date_precision == "approximate":
+        shown = f"~{fm.date.year}"
+    else:
+        shown = fm.date.isoformat()
+    if fm.reported_on and fm.reported_on != fm.date:
+        shown = f"{shown} (reported {fm.reported_on.isoformat()})"
+    return shown
 
 
 def _labs_label(row: LabResult) -> str:
@@ -146,6 +173,112 @@ def _group_rows_by_panel(rows: list[LabResult]) -> list[tuple[str, list[LabResul
         else:
             groups.append((panel, [row]))
     return groups
+
+
+# A trajectory needs at least this many readings to be a direction rather
+# than a coincidence of two draws.
+MIN_TRAJECTORY_POINTS = 3
+
+# Only report movement that is unlikely to be assay noise. 20% is coarse on
+# purpose: this section exists to say "look here", not to quantify.
+TRAJECTORY_MIN_CHANGE = 0.20
+
+# Cap the section so it stays predictable for prompt caching and cannot grow
+# with the corpus. Ranked by magnitude, so the cap keeps the steepest moves.
+MAX_TRAJECTORIES = 12
+
+
+def _comparable_unit_key(unit: str | None) -> str:
+    """A key two readings must share before their values may be compared.
+
+    `labs.validate.canonical_unit` resolves cosmetic variants (`mcg/dL` and
+    `ug/dL` both to `mcg/dl`) but returns `None` for plenty of real units —
+    `IU/L`, `cells/uL`, `x10(9)/L`. Two `None`s must NOT be treated as
+    equal: `cells/uL` and `x10(9)/L` differ by a factor of a billion, and
+    26 of this patient's 461 analytes are stored under more than one unit.
+
+    So: the canonical form where one exists, otherwise the raw string,
+    case- and whitespace-normalized. Conservative by construction — an
+    unrecognized unit only ever matches itself.
+    """
+    canonical = canonical_unit(unit) if unit else None
+    if canonical:
+        return canonical
+    return (unit or "").strip().lower()
+
+
+def _comparable_series(rows: list[LabResult]) -> list[LabResult]:
+    """The readings that may legitimately be compared to each other: those
+    sharing the MOST RECENT unit.
+
+    Scoping to the latest unit rather than dropping a mixed-unit analyte
+    keeps the clinically current scale and still yields a trajectory — the
+    CBC absolutes moved from `x10E3/uL` to `cells/uL` mid-history, and
+    comparing across that boundary produced "eosinophils rising 319,900%".
+    """
+    numeric = [row for row in rows if row.value is not None]
+    if not numeric:
+        return []
+    latest_key = _comparable_unit_key(numeric[-1].ucum_unit)
+    return [row for row in numeric if _comparable_unit_key(row.ucum_unit) == latest_key]
+
+
+def _trajectories_section(db: LabsDb) -> ContextSection:
+    """Analytes that are MOVING, oldest-to-newest with the net change.
+
+    The rest of this pack is a snapshot — "abnormal, most recent per analyte"
+    and "latest panel". For a diagnostic odyssey the trajectory is often the
+    clinical signal, not the level: bone density falling 8% in a year matters
+    more than a T-score of −1.1, and a thyroid that failed and recovered is
+    invisible in a single row.
+
+    Before this, the only way a reasoning stage could see movement was to
+    call the `query_labs` tool, or to read it out of a document that
+    happened to narrate its own comparison (which is exactly how the blind
+    panel knew about the DEXA decline — the report did the arithmetic, not
+    a-doc). An analyte no document comments on had no visible slope at all.
+
+    Deterministic: no model call, no interpretation. Direction and percent
+    change only — whether a rise is good or bad is the reasoner's judgement,
+    not this function's.
+    """
+    moving: list[tuple[float, str]] = []
+    for name in db.distinct_analyte_names():
+        series = _comparable_series(db.series(name))
+        if len(series) < MIN_TRAJECTORY_POINTS:
+            continue
+        first, last = series[0], series[-1]
+        if first.value in (None, 0) or last.value is None:
+            continue
+        change = (last.value - first.value) / abs(first.value)
+        if abs(change) < TRAJECTORY_MIN_CHANGE:
+            continue
+        unit = f" {last.ucum_unit}" if last.ucum_unit else ""
+        direction = "rising" if change > 0 else "falling"
+        moving.append(
+            (
+                abs(change),
+                f"- {name}: {direction} {abs(change) * 100:.0f}% — "
+                f"{first.value}{unit} ({first.date.isoformat()}) → "
+                f"{last.value}{unit} ({last.date.isoformat()}), {len(series)} readings",
+            )
+        )
+
+    if not moving:
+        return ContextSection(
+            key="trajectories",
+            title="Trajectories (analytes that are moving)",
+            content="_No analyte has ≥3 readings with a net change over 20%._",
+        )
+    moving.sort(key=lambda item: item[0], reverse=True)
+    lines = [line for _, line in moving[:MAX_TRAJECTORIES]]
+    if len(moving) > MAX_TRAJECTORIES:
+        lines.append(f"- _…and {len(moving) - MAX_TRAJECTORIES} more moving less steeply._")
+    return ContextSection(
+        key="trajectories",
+        title="Trajectories (analytes that are moving)",
+        content="\n".join(lines),
+    )
 
 
 def _labs_section(db: LabsDb) -> ContextSection:
@@ -298,6 +431,9 @@ def build_context(
 
     sections.append(_recent_encounters_section(repo, recent_encounters_limit))
     sections.append(_labs_section(db))
+    # After the snapshot, deliberately: the reader needs to know what the
+    # current values ARE before being told which of them are moving.
+    sections.append(_trajectories_section(db))
 
     if (repo.root / GENOMICS_INVENTORY_RELPATH).exists():
         sections.append(

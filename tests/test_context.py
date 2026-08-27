@@ -19,6 +19,7 @@ from adoc.reason.context import (
     LEDGER_SECTION_KEY,
     MAX_DOCUMENT_EXCERPT_CHARS,
     PATIENT_THEORIES_SECTION_KEY,
+    _trajectories_section,
     build_context,
 )
 
@@ -76,6 +77,7 @@ def test_section_order_is_fixed_and_stable(repo: DataRepo, db: LabsDb) -> None:
         "case_summary",
         "recent_encounters",
         "labs",
+        "trajectories",
         "open_questions",
         LEDGER_SECTION_KEY,
     ]
@@ -289,6 +291,7 @@ def test_document_excerpts_absent_when_no_query_given(repo: DataRepo, db: LabsDb
         "case_summary",
         "recent_encounters",
         "labs",
+        "trajectories",
         "open_questions",
         LEDGER_SECTION_KEY,
     ]
@@ -317,6 +320,7 @@ def test_document_excerpts_included_and_last_when_query_matches(repo: DataRepo, 
         "case_summary",
         "recent_encounters",
         "labs",
+        "trajectories",
         "open_questions",
         LEDGER_SECTION_KEY,
     ]
@@ -351,3 +355,79 @@ def test_document_excerpts_respect_character_cap(repo: DataRepo, db: LabsDb) -> 
     pack = build_context(repo, db, include_ledger=False, query="lupus")
     section = next(s for s in pack.sections if s.key == DOCUMENT_EXCERPTS_SECTION_KEY)
     assert len(section.content) <= MAX_DOCUMENT_EXCERPT_CHARS + 200  # small slack for separators
+
+
+# --- trajectories: the snapshot hides direction -----------------------------------------
+
+
+def _row(name: str, value: float, day: str, unit: str = "mIU/mL") -> LabResult:
+    return LabResult(
+        date=date.fromisoformat(day),
+        name=name,
+        name_raw=name,
+        value=value,
+        ucum_unit=unit,
+        source_doc=SHA,
+        raw_json="{}",
+    )
+
+
+def test_a_moving_analyte_is_reported_with_direction_and_magnitude(db: LabsDb) -> None:
+    """The rest of the pack is a snapshot — "most recent per analyte" and
+    "latest panel". For a diagnostic odyssey the trajectory is often the
+    signal: AMH falling 96% over five readings is the ovarian-reserve story,
+    and no single row shows it."""
+    db.insert_results(
+        [
+            _row("AMH", 0.57, "2018-03-05", unit="ng/mL"),
+            _row("AMH", 0.18, "2021-05-01", unit="ng/mL"),
+            _row("AMH", 0.02, "2024-06-11", unit="ng/mL"),
+        ]
+    )
+
+    content = _trajectories_section(db).content
+
+    assert "AMH" in content
+    assert "falling" in content
+
+
+def test_a_unit_change_mid_history_never_becomes_a_fake_signal(db: LabsDb) -> None:
+    """The real corpus stores CBC absolutes under both `x10E3/uL` and
+    `cells/uL` — a factor of 1000. Comparing across that boundary reported
+    "eosinophils rising 319,900%", which would have gone straight to the
+    reasoner as a finding."""
+    db.insert_results(
+        [
+            _row("Eosinophils, Absolute", 0.1, "2017-02-27", unit="x10E3/uL"),
+            _row("Eosinophils, Absolute", 0.2, "2018-02-27", unit="x10E3/uL"),
+            _row("Eosinophils, Absolute", 92.0, "2019-06-08", unit="cells/uL"),
+            _row("Eosinophils, Absolute", 200.0, "2022-06-08", unit="cells/uL"),
+            _row("Eosinophils, Absolute", 320.0, "2026-08-14", unit="cells/uL"),
+        ]
+    )
+
+    content = _trajectories_section(db).content
+
+    # scoped to the most recent unit: 92 -> 320 is ~248%, not ~319,900%
+    assert "319900" not in content.replace(",", "")
+    assert "248%" in content
+
+
+def test_two_readings_are_not_a_trajectory(db: LabsDb) -> None:
+    """Two draws is a coincidence; a direction needs at least three."""
+    db.insert_results([_row("FSH", 7.5, "2019-06-08"), _row("FSH", 91.4, "2026-07-15")])
+
+    assert "FSH" not in _trajectories_section(db).content
+
+
+def test_a_flat_analyte_is_not_reported(db: LabsDb) -> None:
+    """The section exists to say "look here" — a stable analyte is noise."""
+    db.insert_results(
+        [
+            _row("Sodium", 140.0, "2019-06-08", unit="mmol/L"),
+            _row("Sodium", 141.0, "2022-06-08", unit="mmol/L"),
+            _row("Sodium", 140.0, "2026-07-15", unit="mmol/L"),
+        ]
+    )
+
+    assert "Sodium" not in _trajectories_section(db).content
