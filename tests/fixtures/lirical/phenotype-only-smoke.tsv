@@ -1,0 +1,22 @@
+! LIRICAL TSV Output (2.4.1)
+! Sample: subject
+! Observed HPO terms:
+!  Arachnodactyly <a href="https://hpo.jax.org/app/browse/term/HP:0001166">HP:0001166</a>
+!  Aortic root aneurysm <a href="https://hpo.jax.org/app/browse/term/HP:0002616">HP:0002616</a>
+!  Bicuspid aortic valve <a href="https://hpo.jax.org/app/browse/term/HP:0001647">HP:0001647</a>
+rank	diseaseName	diseaseCurie	pretestprob	posttestprob	compositeLR
+1	Contractural arachnodactyly, congenital	OMIM:121050	1/8621	99.829%	6.702
+2	Loeys-Dietz syndrome 2	OMIM:610168	1/8621	99.280%	6.075
+3	Loeys-Dietz syndrome 1	OMIM:609192	1/8621	99.159%	6.007
+4	Loeys-Dietz syndrome 6	OMIM:619656	1/8621	99.005%	5.933
+5	Loeys-Dietz syndrome 4	OMIM:614816	1/8621	98.50%	5.754
+6	Koolen-De Vries syndrome	OMIM:610443	1/8621	93.93%	5.125
+7	Marfan syndrome	OMIM:154700	1/8621	92.14%	5.005
+8	Loeys-Dietz syndrome 3	OMIM:613795	1/8621	71.80%	4.341
+9	Congenital disorder of glycosylation, type IICC	OMIM:621381	1/8621	37.62%	3.716
+10	Marfanoid habitus with situs inversus	OMIM:609008	1/8621	30.33%	3.574
+11	Marfan lipodystrophy syndrome	OMIM:616914	1/8621	30.33%	3.574
+12	Thrombocytopenia 11 with multiple congenital anomalies and dysmorphic facies	OMIM:620654	1/8621	22.08%	3.388
+13	Multiple joint dislocations, short stature, craniofacial dysmorphism, with or without congenital heart defects	OMIM:245600	1/8621	9.55%	2.959
+14	Aortic valve disease 3	OMIM:618496	1/8621	6.06%	2.745
+15	Cutis laxa, autosomal recessive, type IB	OMIM:614437	1/8621	5.87%	2.73
