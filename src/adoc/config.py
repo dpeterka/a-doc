@@ -92,6 +92,23 @@ class ModelBinding(BaseModel):
     provider: Literal["anthropic", "openai", "featherless"]
     model: str
     params: dict[str, Any] = Field(default_factory=dict)
+    context_window: int | None = None
+    """Total input+output tokens this binding accepts, DECLARED not guessed.
+
+    Declared per binding for the same reason model ids are (CLAUDE.md rule
+    4): the real limit depends on the model *and* the host — a model with a
+    128k native window can be served with less by a hosted provider, and
+    that is not discoverable from the model id.
+
+    Matters because a multi-bound role sends the SAME payload to every
+    binding: `blind_panel` renders one context pack and hands it to three
+    families. The usable budget for such a role is therefore the SMALLEST
+    window among its bindings — the weakest link — not the largest, and not
+    a per-model calculation. See `LlmClient.context_budget`.
+
+    `None` means undeclared, which disables the pre-flight check for that
+    role rather than inventing a number.
+    """
 
 
 def load_model_bindings(path: Path | None = None) -> dict[str, list[ModelBinding]]:

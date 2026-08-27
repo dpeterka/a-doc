@@ -1,5 +1,16 @@
 # Role -> model bindings (see PLAN.md "Model strategy & self-evaluation").
 #
+# `context_window` is the total input+output tokens a binding accepts, and is
+# DECLARED here rather than inferred from the model id, because the real
+# limit depends on the model *and* its host: a 128k-native model can be
+# served with less by a hosted provider, which no model id reveals.
+#
+# A MULTI-BOUND role sends the same payload to every binding — `blind_panel`
+# renders one context pack and hands it to three families — so its usable
+# budget is the SMALLEST window among them (see `LlmClient.context_budget`).
+# Raising a ceiling here is a data change, not a code change: moving to
+# million-token models is an edit to these numbers.
+#
 # Every role is loaded by `adoc.config.load_model_bindings()` as a *list* of
 # bindings, even when only one model fills the role — this keeps the loader's
 # return type uniform (`dict[str, list[ModelBinding]]`) regardless of whether
@@ -11,12 +22,14 @@ roles:
   primary_reasoner:
     provider: anthropic
     model: claude-opus-5
+    context_window: 200000
     params:
       effort: high
 
   challenger:
     provider: openai
     model: gpt-5.2
+    context_window: 400000
     params:
       effort: high
 
@@ -45,34 +58,41 @@ roles:
     # multi-minute turn does not buy back that independence.
     provider: featherless
     model: deepseek-ai/DeepSeek-V3-0324
+    context_window: 64000
     params: {}
 
   blind_panel:
     - provider: anthropic
       model: claude-opus-5
+      context_window: 200000
       params:
         effort: high
     - provider: openai
       model: gpt-5.2
+      context_window: 400000
       params:
         effort: high
     - provider: featherless
       model: deepseek-ai/DeepSeek-R1-0528
+      context_window: 64000
       params: {}
 
   extractor_pass_a:
     provider: anthropic
     model: claude-sonnet-5
+    context_window: 200000
     params: {}
 
   extractor_pass_b:
     provider: openai
     model: gpt-5.2
+    context_window: 400000
     params: {}
 
   classifier:
     provider: anthropic
     model: claude-haiku-4-5-20251001
+    context_window: 200000
     params: {}
 
   # Test-Chooser (PLAN.md "Session loops (c)"): rewrites case/questions-open.md
@@ -81,6 +101,7 @@ roles:
   test_chooser:
     provider: anthropic
     model: claude-opus-5
+    context_window: 200000
     params:
       effort: high
 
@@ -93,6 +114,7 @@ roles:
   intake_agent:
     provider: anthropic
     model: claude-opus-5
+    context_window: 200000
     params:
       effort: high
 
@@ -113,4 +135,5 @@ roles:
   patient_simulator:
     provider: anthropic
     model: claude-sonnet-5
+    context_window: 200000
     params: {}

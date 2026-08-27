@@ -13,6 +13,7 @@ from pydantic import BaseModel, ValidationError
 from adoc.config import ModelBinding, Settings
 from adoc.privacy import PatientIdentifiers, Scrubber
 from adoc.reason.client import (
+    CONTEXT_COMPLETION_RESERVE,
     FEATHERLESS_BASE_URL,
     AnthropicProvider,
     LlmClient,
@@ -661,3 +662,65 @@ def test_an_untruncated_free_text_reply_passes() -> None:
     )
 
     assert result.text == "Your ferritin trend suggests"
+
+
+# --- context window: the weakest bound model sets the budget ---------------------------
+
+
+def _panel_bindings(*windows: int | None) -> dict[str, list[ModelBinding]]:
+    return {
+        "blind_panel": [
+            ModelBinding(provider="anthropic", model=f"m{i}", params={}, context_window=w)
+            for i, w in enumerate(windows)
+        ]
+    }
+
+
+def test_the_budget_is_the_smallest_window_not_the_largest() -> None:
+    """A multi-bound role sends ONE payload to every binding — `blind_panel`
+    renders a single context pack for three families — so a context sized to
+    the largest window fails on the smallest."""
+    client = LlmClient(bindings=_panel_bindings(200_000, 400_000, 64_000), providers={})
+
+    assert client.context_budget("blind_panel") == 64_000 - CONTEXT_COMPLETION_RESERVE
+
+
+def test_an_undeclared_window_disables_the_check_rather_than_guessing() -> None:
+    """An unknown limit is not the same as no limit, and inventing a number
+    would be worse than not checking."""
+    client = LlmClient(bindings=_panel_bindings(200_000, None), providers={})
+
+    assert client.context_budget("blind_panel") is None
+
+
+def test_an_oversized_context_is_refused_naming_the_limiting_model() -> None:
+    """Refusing here names the role and which of three families was too
+    small; letting it through surfaces as an opaque provider error."""
+    bindings = _panel_bindings(64_000)
+    bindings["blind_panel"][0] = ModelBinding(
+        provider="anthropic", model="deepseek-ish", params={}, context_window=64_000
+    )
+    client = LlmClient(
+        bindings=bindings,
+        providers={"anthropic": AnthropicProvider(api_key="k", transport=lambda _r: None)},  # type: ignore[arg-type,return-value]
+    )
+    huge = "x" * (64_000 * 4)
+
+    with pytest.raises(LlmError, match="deepseek-ish"):
+        client.complete("blind_panel", system="s", messages=[Message(role="user", content=huge)])
+
+
+def test_a_context_inside_the_budget_is_allowed() -> None:
+    def transport(_req: TransportRequest) -> TransportResponse:
+        return TransportResponse(text="ok", tool_input=None, input_tokens=1, output_tokens=1)
+
+    client = LlmClient(
+        bindings=_panel_bindings(200_000),
+        providers={"anthropic": AnthropicProvider(api_key="k", transport=transport)},
+    )
+
+    result = client.complete(
+        "blind_panel", system="s", messages=[Message(role="user", content="short")]
+    )
+
+    assert result.text == "ok"
