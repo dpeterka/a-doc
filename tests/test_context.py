@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import UTC, date, datetime
 from pathlib import Path
 
@@ -11,9 +12,18 @@ import pytest
 from adoc.casefile.encounters import Encounter, EncounterFrontmatter, write_encounter
 from adoc.casefile.ledger import apply_diff, save_ledger
 from adoc.casefile.repo import LEDGER_RELPATH, DataRepo
-from adoc.casefile.schema import AddHypothesis, Hypothesis, Ledger, LedgerDiff, Provenance
+from adoc.casefile.schema import (
+    AddHypothesis,
+    Evidence,
+    Hypothesis,
+    Ledger,
+    LedgerDiff,
+    Provenance,
+    validate_source_ref,
+)
 from adoc.labs.db import DocumentTextPage, LabsDb
 from adoc.labs.models import LabDocument, LabFlag, LabResult
+from adoc.reason.citations import check_evidence_citations
 from adoc.reason.context import (
     DOCUMENT_EXCERPTS_SECTION_KEY,
     LEDGER_SECTION_KEY,
@@ -434,3 +444,76 @@ def test_a_flat_analyte_is_not_reported(db: LabsDb) -> None:
     )
 
     assert "Sodium" not in _trajectories_section(db).content
+
+
+def test_labs_rows_carry_a_ref_the_citation_checker_resolves(db: LabsDb, repo: DataRepo) -> None:
+    """Every lab row in the pack is rendered beside the ref that cites it,
+    and that ref must actually resolve.
+
+    Document excerpts always carried their own `doc:<file>#p<page>` ref, but
+    lab rows did not — so a model asked to cite a value had to construct
+    `labs:<slug>:<date>` by guessing the slug. A live blind panel guessed the
+    prefix from the visible section heading and emitted
+    `other:monospot_(heterophile)_screen:2026-03-17` (ADR 0028). Rendering
+    the ref makes citing a copy rather than an invention — but only if what
+    is rendered is what `citations` accepts, which is what this pins.
+    """
+    pack = build_context(repo, db, include_ledger=False)
+    labs_text = next(s.content for s in pack.sections if s.key == "labs")
+
+    refs = re.findall(r"`(labs:[^`]+)`", labs_text)
+    assert refs, f"no citable ref rendered in the labs section:\n{labs_text}"
+
+    for ref in refs:
+        report = check_evidence_citations(
+            [Evidence(claim="rendered ref resolves", source=ref, strength="moderate")],
+            db,
+            repo,
+        )
+        assert not report.failing, f"pack rendered a ref that does not resolve: {ref}"
+
+
+def test_a_lab_name_with_spaces_and_colons_still_renders_a_resolvable_ref(
+    tmp_path: Path, repo: DataRepo
+) -> None:
+    """Analyte names are display strings, not slugs, and the source-ref
+    grammar forbids whitespace and colons in a slug.
+
+    The first version of `_labs_ref` interpolated `row.name` directly. It
+    passed every synthetic test in this file because the fixtures happened to
+    use already-slugified names (`ana-titer`, `potassium`), and then failed on
+    the first real row it saw — `IGF-1 Z-Score`. 1178 of 2079 real rows have a
+    name that is not a legal slug. This fixture is deliberately hostile so
+    that gap cannot reopen.
+    """
+    db = LabsDb(tmp_path / "hostile.sqlite")
+    db.upsert_document(
+        LabDocument(sha256="a" * 64, filename="h.pdf", doc_type="lab-result", page_count=1)
+    )
+    db.insert_results(
+        [
+            LabResult(
+                date=date(2024, 9, 11),
+                name=name,
+                name_raw=name,
+                value=1.0,
+                source_doc="a" * 64,
+                raw_json=json.dumps({"name_raw": name}),
+            )
+            for name in ("IGF-1 Z-Score", "Free T4:T3 Ratio", "Monospot (Heterophile) Screen")
+        ]
+    )
+
+    pack = build_context(repo, db, include_ledger=False)
+    labs_text = next(s.content for s in pack.sections if s.key == "labs")
+    refs = re.findall(r"`(labs:[^`]+)`", labs_text)
+    assert len(refs) >= 3, f"expected a ref per row, got {refs}"
+
+    for ref in refs:
+        validate_source_ref(ref)  # raises if the slug is not grammar-legal
+        report = check_evidence_citations(
+            [Evidence(claim="hostile name resolves", source=ref, strength="moderate")],
+            db,
+            repo,
+        )
+        assert not report.failing, f"rendered ref does not resolve: {ref}"
