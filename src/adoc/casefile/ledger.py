@@ -242,6 +242,8 @@ def apply_diff(ledger: Ledger, diff: LedgerDiff) -> Ledger:
                 hyp.status = op.status
             if op.discriminators is not None:
                 hyp.discriminators = list(op.discriminators)
+            if op.plain_language is not None:
+                hyp.plain_language = op.plain_language.strip()
 
         elif isinstance(op, AddEvidence):
             hyp = _find(working, op.id)

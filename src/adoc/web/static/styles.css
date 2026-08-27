@@ -899,3 +899,12 @@ body.lightbox-active {
 .note-earlier[open] > summary {
   margin-bottom: 0.2rem;
 }
+
+.hypothesis-gloss {
+  /* The plain-language definition sits directly under the name and reads as
+     part of the title block, not as body copy. */
+  margin: 0.15rem 0 0.5rem;
+  font-size: 0.95rem;
+  color: var(--color-text);
+  max-width: 68ch;
+}
