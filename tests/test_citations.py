@@ -28,6 +28,7 @@ from adoc.reason.citations import (
     _extract_quoted_numbers,
     build_retry_feedback,
     check_diff_citations,
+    check_evidence_citations,
     check_ops_citations,
     log_citation_report,
 )
@@ -557,3 +558,65 @@ def test_compound_modifiers_are_not_quoted_values(claim: str, expected: list[flo
     comparison — the digits are part of a name. Same reason dates and titer
     ratios are stripped."""
     assert _extract_quoted_numbers(claim) == expected
+
+
+def _dxa_db(tmp_path: Path) -> LabsDb:
+    """A stored percent-change row, signed — the shape that broke three real
+    citations at once."""
+    db = LabsDb(tmp_path / "dxa.sqlite")
+    db.upsert_document(
+        LabDocument(sha256="d" * 64, filename="dxa.pdf", doc_type="lab-result", page_count=1)
+    )
+    db.insert_results(
+        [
+            LabResult(
+                date=date(2026, 8, 4),
+                name="lumbar-spine-percent-change-vs-2024",
+                name_raw="Lumbar Spine % Change vs 2024",
+                value=-8.0,
+                source_doc="d" * 64,
+                raw_json="{}",
+            )
+        ]
+    )
+    return db
+
+
+def test_a_decline_stated_in_words_matches_a_negative_stored_value(
+    tmp_path: Path, repo: DataRepo
+) -> None:
+    """The claim can carry the sign in prose while the row carries it as a
+    minus. Three real DXA citations were dropped for quoting 8.0, 6.7 and 7.0
+    against stored -8.0, -6.7 and -7.0."""
+    db = _dxa_db(tmp_path)
+    report = check_evidence_citations(
+        [
+            Evidence(
+                claim="Lumbar spine shows a decline of 8% versus the prior scan",
+                source="labs:lumbar-spine-percent-change-vs-2024:2026-08-04",
+                strength="moderate",
+            )
+        ],
+        db,
+        repo,
+    )
+    assert not report.failing
+
+
+def test_a_claimed_rise_still_fails_against_a_stored_fall(tmp_path: Path, repo: DataRepo) -> None:
+    """Magnitude is accepted only when the claim says the value fell. A claim
+    that it ROSE by 8% is a different assertion from a stored -8.0, and
+    must still be caught — otherwise the sign check buys nothing."""
+    db = _dxa_db(tmp_path)
+    report = check_evidence_citations(
+        [
+            Evidence(
+                claim="Lumbar spine density increased by 8% versus the prior scan",
+                source="labs:lumbar-spine-percent-change-vs-2024:2026-08-04",
+                strength="moderate",
+            )
+        ],
+        db,
+        repo,
+    )
+    assert report.failing

@@ -119,7 +119,12 @@ def _recent_encounters_section(repo: DataRepo, limit: int) -> ContextSection:
         # reasoning stage to treat fabricated precision as real, and to order
         # events by a day nobody stated.
         when = _render_encounter_date(fm)
-        lines.append(f"- **{when}** [{fm.type}]{provider}: {summary}")
+        # The citable ref, for the same reason lab rows carry theirs
+        # (ADR 0028): a model that is shown only a date invents
+        # `encounter:2026-08-04`, and encounter files are named
+        # `YYYY-MM-DD--<slug>.md`. That exact miss cost two citations on a
+        # live review.
+        lines.append(f"- **{when}** [{fm.type}]{provider}: {summary}  `encounter:{filename}`")
 
     return ContextSection(
         key="recent_encounters", title="Recent Encounters", content="\n".join(lines)
