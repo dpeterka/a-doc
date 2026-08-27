@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.2] - 2026-08-26
+
+A scheduled review failed in production; investigating it found two Phase-2 completeness gaps behind it.
+
+### Fixed
+- **Truncation is detected on every call, not only structured ones.** Both providers guarded with `if request.schema is not None`, so a free-text completion that hit the token budget was returned as if it had finished — and `run_informational_turn` passes no schema, meaning a patient-facing answer that stopped mid-sentence reached the patient undetected. The check also lived inside each provider's transport, which the injection seam bypasses, so no test could reach it. The transport now *reports* (`TransportResponse.truncated`) and `LlmClient.complete` *judges*: one provider-agnostic rule, audited as an error.
+- **A divergence no longer has to be echoed character-for-character.** The adjudication contract compared ids by exact string equality against a generated slug — for the review that failed, a 62-character unbroken run. The model *had* adjudicated the divergence and written a substantive rationale; the run died on spelling. Matching is now exact-first, then id and human-readable name with case and punctuation stripped, and an ambiguous key resolves to nothing rather than guessing — attaching a rationale to the wrong hypothesis is worse than failing the contract.
+
+### Added
+- **Context is sized to the weakest bound model** (`ModelBinding.context_window`, `LlmClient.context_budget`). Nothing previously modelled a context window at all. It matters because `blind_panel` renders one context pack and hands the identical payload to three model families: a pack sized to the largest window is only sometimes valid. Windows are *declared* in `models.yaml` rather than inferred from a model id, because the real limit depends on the model **and its host**; an undeclared window disables the check rather than inventing a number. Measured against the real store: the blind pack is ~9,580 tokens against a 31,232 budget.
+
 ## [0.11.1] - 2026-08-26
 
 Found by rebuilding the real corpus from source. Every one of these cost data or visibility in a live 121-document run.
