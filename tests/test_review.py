@@ -49,6 +49,7 @@ from adoc.reason.review import (
     ledger_churn,
     parse_audit_costs,
     render_review_markdown,
+    resolve_adjudication_decisions,
     run_review_tick,
     run_weekly_review,
     scan_staleness,
@@ -1205,3 +1206,60 @@ def test_run_review_tick_full_review_report_carries_the_trigger_summary_into_the
     markdown = (repo.root / result.full_review.markdown_path).read_text(encoding="utf-8")
     assert "Why this review ran" in markdown
     assert "ingest: 3 new document(s), 9 new lab row(s)" in markdown
+
+
+# --- adjudication ids: the contract checks coverage, not transcription ------------------
+
+
+def _div(did: str, name: str) -> Divergence:
+    return Divergence(id=did, kind="panel_only", name=name)
+
+
+def _decision(divergence: str) -> DivergenceDecisionPayload:
+    return DivergenceDecisionPayload(divergence=divergence, decision="accept", rationale="r" * 60)
+
+
+REAL_ID = "panel-only:prematureovarianinsufficiencymenopauseautoimmuneoophoritissubtype"
+REAL_NAME = "Premature ovarian insufficiency / menopause (autoimmune oophoritis subtype)"
+
+
+@pytest.mark.parametrize(
+    "echoed",
+    [
+        REAL_ID,
+        "panel-only:premature-ovarian-insufficiency-menopause-autoimmune-oophoritis-subtype",
+        REAL_NAME,
+        "premature ovarian insufficiency menopause autoimmune oophoritis subtype",
+    ],
+)
+def test_a_decision_resolves_however_the_model_spelled_the_id(echoed: str) -> None:
+    """A divergence id is a generated slug — a 62-character unbroken run for
+    this real case. Requiring the model to echo it character-for-character
+    cost a live scheduled review, which had adjudicated the divergence and
+    written a substantive rationale."""
+    divergences = [_div(REAL_ID, REAL_NAME), _div("panel-only:sle", "SLE")]
+
+    resolved = resolve_adjudication_decisions(divergences, [_decision(echoed)])
+
+    assert REAL_ID in resolved
+
+
+def test_an_unrelated_string_still_fails_to_resolve() -> None:
+    """The contract must keep its teeth: loose matching is for spelling, not
+    for letting an unadjudicated divergence through."""
+    divergences = [_div(REAL_ID, REAL_NAME)]
+
+    resolved = resolve_adjudication_decisions(divergences, [_decision("something else")])
+
+    assert resolved == {}
+
+
+def test_an_ambiguous_key_is_never_guessed() -> None:
+    """Two divergences whose names normalize identically must not have a
+    rationale silently attached to whichever came first — attaching a
+    human's reasoning to the wrong hypothesis is worse than failing."""
+    divergences = [_div("panel-only:a", "Sjogren's"), _div("panel-only:b", "Sjogrens")]
+
+    resolved = resolve_adjudication_decisions(divergences, [_decision("sjogrens")])
+
+    assert resolved == {}

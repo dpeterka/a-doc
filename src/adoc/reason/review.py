@@ -50,9 +50,10 @@ review; that is the entire point of a weekly full sweep.
 from __future__ import annotations
 
 import json
+import logging
 import re
 from collections import defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
@@ -180,6 +181,74 @@ class DivergenceDecisionPayload(BaseModel):
     divergence: str
     decision: Literal["accept", "reject"]
     rationale: str
+
+
+logger = logging.getLogger(__name__)
+
+_ADJUDICATION_KEY_RE = re.compile(r"[^a-z0-9]+")
+
+
+def _adjudication_key(text: str) -> str:
+    return _ADJUDICATION_KEY_RE.sub("", text.lower())
+
+
+def resolve_adjudication_decisions(
+    divergences: Sequence[Divergence],
+    decisions: Sequence[DivergenceDecisionPayload],
+) -> dict[str, DivergenceDecisionPayload]:
+    """Map each divergence id to the decision the model made about it.
+
+    A divergence id is a generated slug — `panel-only:` plus a
+    punctuation-stripped hypothesis name, e.g. a 62-character unbroken run
+    for "Premature ovarian insufficiency / menopause (autoimmune oophoritis
+    subtype)". Requiring the model to echo that CHARACTER-FOR-CHARACTER cost
+    a real scheduled review: it adjudicated the divergence, wrote a
+    substantive rationale, and the run still failed because the id it
+    returned did not match byte-for-byte.
+
+    The contract's intent is "every divergence was adjudicated", not "the
+    model can transcribe a slug". So an exact match wins; failing that, the
+    id and the divergence's human-readable NAME are compared with case and
+    punctuation removed. Ambiguity is never resolved by guessing — a key
+    that would match more than one divergence is dropped, so the contract
+    still fails rather than silently attaching a rationale to the wrong
+    hypothesis.
+    """
+    resolved: dict[str, DivergenceDecisionPayload] = {}
+    unclaimed = list(decisions)
+
+    for decision in list(unclaimed):
+        for div in divergences:
+            if decision.divergence == div.id:
+                resolved.setdefault(div.id, decision)
+                unclaimed.remove(decision)
+                break
+
+    # Build the loose index only over divergences still needing a decision,
+    # and only where the key is unambiguous across the whole set.
+    counts: dict[str, int] = {}
+    for div in divergences:
+        for key in {_adjudication_key(div.id), _adjudication_key(div.name)}:
+            counts[key] = counts.get(key, 0) + 1
+    loose: dict[str, Divergence] = {}
+    for div in divergences:
+        if div.id in resolved:
+            continue
+        for key in {_adjudication_key(div.id), _adjudication_key(div.name)}:
+            if key and counts.get(key) == 1:
+                loose[key] = div
+
+    for decision in unclaimed:
+        matched = loose.get(_adjudication_key(decision.divergence))
+        if matched is not None and matched.id not in resolved:
+            div = matched
+            logger.info(
+                "adjudication: matched decision %r to divergence %r on a normalized key",
+                decision.divergence,
+                div.id,
+            )
+            resolved[div.id] = decision
+    return resolved
 
 
 class AdjudicationPayload(BaseModel):
@@ -930,7 +999,7 @@ def _adjudication_completeness_contract() -> Contract:
             return "divergence_diff missing from context"
         assert isinstance(value, AdjudicationResult)
         expected = {d.id for d in divergence_set.divergences}
-        by_id = {d.divergence: d for d in value.decisions}
+        by_id = resolve_adjudication_decisions(divergence_set.divergences, value.decisions)
 
         missing = expected - set(by_id)
         if missing:
