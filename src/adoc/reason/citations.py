@@ -206,6 +206,15 @@ _TITER_RE = re.compile(r"\d+\s*:\s*\d+")
 _RANGE_RE = re.compile(r"\d+(?:\.\d+)?\s*-\s*\d+(?:\.\d+)?")
 _NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
 
+# Words that put the direction of a change in the prose rather than on the
+# number. A percent-change row stores -8.0; the panel writes "a decline of
+# 8%". Both say the same thing.
+_DECLINE_WORD_RE = re.compile(
+    r"\b(?:declin\w*|decreas\w*|drop\w*|fell|fall\w*|loss|lost|lower\w*|"
+    r"reduc\w*|down|negative)\b",
+    re.IGNORECASE,
+)
+
 
 # A number hyphenated to a word is a compound MODIFIER, not a value:
 # "10-year probability", "25-hydroxy vitamin D", "6-minute walk". Stripped
@@ -352,6 +361,7 @@ def _check_labs_ref(source: str, claim: str, db: LabsDb) -> CitationCheck:
             claim=claim,
         )
 
+    states_decline = bool(_DECLINE_WORD_RE.search(claim))
     for row in numeric_rows:
         assert row.value is not None
         for number in quoted_numbers:
@@ -360,6 +370,22 @@ def _check_labs_ref(source: str, claim: str, db: LabsDb) -> CitationCheck:
                     source=source,
                     outcome="resolved",
                     reason=f"claimed value {number} matches stored value {row.value}",
+                    claim=claim,
+                )
+            # A claim can carry the sign in WORDS while the row carries it as
+            # a minus: "a decline of 8%" against a stored -8.0. Three real
+            # citations of three real DXA rows were dropped for quoting 8.0,
+            # 6.7 and 7.0 against -8.0, -6.7 and -7.0. Magnitude is accepted
+            # only when the row is negative AND the claim says so lexically,
+            # so a claim that a value ROSE still fails against a fall.
+            if states_decline and row.value < 0 and abs(abs(row.value) - abs(number)) <= 1e-9:
+                return CitationCheck(
+                    source=source,
+                    outcome="resolved",
+                    reason=(
+                        f"claimed decline of {number} matches stored value {row.value} "
+                        "(direction stated in words, sign stored on the value)"
+                    ),
                     claim=claim,
                 )
 

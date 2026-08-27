@@ -134,3 +134,37 @@ blindly and a weekly review would otherwise re-add the same citation forever.
 - Two properties are pinned: that agreement still yields citations (the test
   asserts no divergence is produced for the agreeing hypothesis, so it cannot
   pass for the wrong reason), and that a second review does not duplicate.
+
+
+## Addendum 2: the pattern, stated once
+
+Four separate citation failures in one day, all the same defect:
+
+| what the model wrote | what it was never shown |
+|---|---|
+| `other:monospot_(heterophile)_screen:...` | the lab row's ref |
+| `encounter:2026-08-04` | the encounter's filename ref |
+| `strength: "supporting"` | the three words the enum allows |
+| `probability_bucket` (not yet hit) | the four words the enum allows |
+
+Two rules follow, and they are the general form of everything above.
+
+**1. If a model must reproduce an identifier, show it the identifier.** The
+pack now renders the citable ref beside every lab row and every encounter.
+This is the fourth instance of this defect in the system — intake fact IDs
+and divergence IDs were the earlier two — and it is worth stating as a
+standing rule rather than fixing a fifth time.
+
+**2. No single field of one item may fail a payload.** The schema exists to
+shape a hypothesis, not to referee an adjective. `strength` and
+`probability_bucket` map obvious synonyms and degrade unknown values with a
+warning. A `Literal` on a model-authored field is a landmine wherever the
+payload carries other, independent work.
+
+A third, smaller lesson from the same run: the citation checker's own
+comparison was wrong twice. It read `-125` out of the analyte name "CA-125",
+and it failed a claim of "a decline of 8%" against a stored `-8.0` because
+the claim carried the sign in words and the row carried it as a minus. Both
+are now handled, the second only when the claim states the direction
+lexically — a claimed *rise* still fails against a stored fall, which is
+pinned.
