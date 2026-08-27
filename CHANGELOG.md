@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.4] - 2026-08-27
+
+### Added
+- **Unit normalization.** 26 of this patient's 461 analytes were stored under more than one unit, in two categories. **Cosmetic** (21 of them) is the same quantity spelled differently by different labs — `IU/L`≡`U/L`≡`unit/L`, `mcg/dL`≡`ug/dL`, `uIU/mL`≡`mIU/L`, `Thousand/uL`≡`x10E3/uL`≡`x10(9)/L` — now grouped as synonyms, which changes no stored value. **Magnitude** is exactly the five CBC differential absolutes, which report `x10E3/uL` at some points and `cells/uL` at others, a factor of 1000; these get explicit conversion factors, and an unknown conversion returns nothing rather than a guess. Stored values are deliberately *not* rewritten — `citation_check` compares a claim's number against the stored value, so converting in place would break every existing citation and make the store disagree with its source document. Conversion happens at comparison time, where the ambiguity actually hurts.
+- The trajectory section now converts rather than scoping to the latest unit, recovering history it had been discarding: 23 comparable eosinophil readings instead of 17, and the 2017 value converts correctly for a real 220% rise across the decade.
+
 ## [0.11.3] - 2026-08-27
 
 Readability and temporal fidelity, all found by reading the real case file rather than fixtures.
