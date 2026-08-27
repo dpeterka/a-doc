@@ -12,13 +12,14 @@ from typing import Any
 
 import pytest
 from git import Repo
+from pydantic import ValidationError
 
 from adoc.casefile.ledger import apply_and_save
 from adoc.casefile.repo import HISTORY_RELPATH, LEDGER_RELPATH, DataRepo
 from adoc.casefile.schema import AddHypothesis, Hypothesis, Ledger, LedgerDiff, Provenance
 from adoc.config import ModelBinding
 from adoc.labs.db import LabsDb
-from adoc.labs.models import LabDocument, LabResult
+from adoc.labs.models import DocumentStatus, LabDocument, LabResult
 from adoc.reason.client import (
     AnthropicProvider,
     LlmClient,
@@ -33,6 +34,8 @@ from adoc.reason.review import (
     FULL_REVIEW_COOLDOWN,
     FULL_REVIEW_FLOOR,
     AdjudicationResult,
+    BlindDifferentialItem,
+    BlindEvidenceItem,
     ChallengeSweepResult,
     DeferredVerificationSweepResult,
     Divergence,
@@ -43,6 +46,8 @@ from adoc.reason.review import (
     StalenessReport,
     TestChooserItem,
     TestChooserResult,
+    _pool_evidence,
+    _resolvable_evidence,
     build_review_dag,
     challenger_kill_rate,
     hypothesis_ages_days,
@@ -1263,3 +1268,88 @@ def test_an_ambiguous_key_is_never_guessed() -> None:
     resolved = resolve_adjudication_decisions(divergences, [_decision("sjogrens")])
 
     assert resolved == {}
+
+
+# --- panel citations reach the ledger (or are dropped, never invented) ------------------
+
+
+def _panel_item(name: str, *, refs: list[str]) -> BlindDifferentialItem:
+    return BlindDifferentialItem(
+        name=name,
+        probability_bucket="moderate",
+        why="Short reasoning for the patient.",
+        evidence=[BlindEvidenceItem(claim=f"{name} support", source=r) for r in refs],
+    )
+
+
+def test_pooled_panel_evidence_is_deduped_across_members() -> None:
+    """Panel members work independently, so two of them citing the same row
+    for the same claim is AGREEMENT, not two pieces of evidence — pooling
+    without dedup would inflate support purely by panel size."""
+    a = _panel_item("Hashimoto thyroiditis", refs=["labs:tsh:2026-05-02"])
+    b = _panel_item("Hashimoto thyroiditis", refs=["labs:tsh:2026-05-02"])
+
+    pooled = _pool_evidence([a, b])
+
+    assert len(pooled) == 1
+
+
+def test_a_resolvable_citation_reaches_the_ledger(db: LabsDb, repo: DataRepo) -> None:
+    """Production carried 24 hypotheses with ZERO evidence items, so every
+    card in the UI rendered an empty evidence section."""
+    db.upsert_document(
+        LabDocument(
+            sha256="a" * 64,
+            filename="quest.pdf",
+            doc_type="lab-result",
+            page_count=1,
+            ingested_at=datetime(2026, 5, 3, 12, 0, 0, tzinfo=UTC),
+            status=DocumentStatus.COMPLETE,
+        )
+    )
+    db.insert_results(
+        [
+            LabResult(
+                date=date(2026, 5, 2),
+                name="CRP",
+                name_raw="CRP",
+                value=8.5,
+                ucum_unit="mg/L",
+                source_doc="a" * 64,
+                raw_json="{}",
+            )
+        ]
+    )
+    divergence = Divergence(
+        id="panel-only:x",
+        kind="panel_only",
+        name="Inflammatory process",
+        panel_evidence=[BlindEvidenceItem(claim="CRP is elevated", source="labs:crp:2026-05-02")],
+    )
+
+    kept = _resolvable_evidence(divergence, db, repo)
+
+    assert [e.source for e in kept] == ["labs:crp:2026-05-02"]
+
+
+def test_an_unresolvable_citation_is_dropped_not_written(db: LabsDb, repo: DataRepo) -> None:
+    """The review path has no citation-check DAG contract of its own, so a
+    ref resolving to nothing would become an uncheckable ledger entry —
+    exactly the fabrication Phase 2 exists to prevent. Dropped and logged,
+    rather than failing a 12-minute review (ADR 0016's posture)."""
+    divergence = Divergence(
+        id="panel-only:y",
+        kind="panel_only",
+        name="Invented finding",
+        panel_evidence=[
+            BlindEvidenceItem(claim="Never measured", source="labs:unicorn-factor:2026-05-02")
+        ],
+    )
+
+    assert _resolvable_evidence(divergence, db, repo) == []
+
+
+def test_a_malformed_ref_is_rejected_at_the_schema_boundary() -> None:
+    """A ref that isn't even in the grammar never gets as far as resolution."""
+    with pytest.raises(ValidationError):
+        BlindEvidenceItem(claim="c", source="not-a-ref")
