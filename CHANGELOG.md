@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.9] — 2026-08-27
+
+### Fixed
+
+- **Encounters carry their citable ref in the context pack.** Encounter files
+  are named `YYYY-MM-DD--<slug>.md` but the pack showed only the date, so a
+  panel wrote `encounter:2026-08-04` and the citations were dropped. Fourth
+  instance of one defect — a model asked to reproduce an identifier it was
+  never shown — now stated as a standing rule in ADR 0028.
+- **A decline stated in words matches a value stored with a minus.** Three
+  real DXA citations were dropped for claiming "a decline of 8%" against a
+  stored `-8.0`. Magnitude matches only when the row is negative and the
+  claim states direction lexically; a claimed rise still fails against a
+  stored fall.
+
 ## [0.11.8] — 2026-08-27
 
 ### Fixed
