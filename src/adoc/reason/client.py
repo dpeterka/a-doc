@@ -65,6 +65,26 @@ FEATHERLESS_BASE_URL = "https://api.featherless.ai/v1"
 # expect small outputs may pass less explicitly.
 REASONING_MAX_TOKENS = 32768
 
+# A context window covers input AND output, so the usable input budget is
+# the window minus whatever the completion may consume. Reserving the full
+# `REASONING_MAX_TOKENS` is deliberately pessimistic: a reasoning model can
+# spend the entire budget, and being wrong in this direction costs a little
+# context, while being wrong the other way costs the call.
+CONTEXT_COMPLETION_RESERVE = REASONING_MAX_TOKENS
+
+# Token estimate without a tokenizer round-trip. ~4 chars/token is the usual
+# English approximation; the divisor is deliberately low (3.5) so the
+# estimate errs HIGH — a pre-flight check that under-estimates lets through
+# exactly the call it exists to stop. Only ever used to decide whether to
+# refuse a call, never to trim content.
+_CHARS_PER_TOKEN = 3.5
+
+
+def estimate_tokens(text: str) -> int:
+    """Deliberately pessimistic character-based token estimate."""
+    return int(len(text) / _CHARS_PER_TOKEN) + 1
+
+
 # The app owns the only retry policy - `LlmClient._call_with_retry`'s bounded
 # backoff over a handful of attempts (default 3). Without these, each SDK
 # client retries its own transient failures internally (default
@@ -158,6 +178,15 @@ class TransportResponse:
     tool_input: dict[str, Any] | None
     input_tokens: int
     output_tokens: int
+    truncated: bool = False
+    """Generation stopped because it hit the completion budget, not because
+    the model finished (Anthropic `stop_reason == "max_tokens"`, OpenAI
+    `finish_reason == "length"`).
+
+    Reported by the transport, judged by `LlmClient.complete` — a provider
+    should say what happened, not decide what it means. Defaults to `False`
+    so existing fake transports keep working.
+    """
 
 
 TransportFn = Callable[[TransportRequest], TransportResponse]
@@ -244,12 +273,8 @@ class AnthropicProvider:
         if request.schema is not None and tool_input is None:
             raise LlmError("anthropic: expected an emit_result tool call, none returned")
 
-        if request.schema is not None and response.stop_reason == "max_tokens":
-            raise LlmError(
-                f"model {request.model!r}: output hit the token limit before "
-                "completing the structured result - raise max_tokens"
-            )
         return TransportResponse(
+            truncated=getattr(response, "stop_reason", None) == "max_tokens",
             text="".join(text_parts),
             tool_input=tool_input,
             input_tokens=response.usage.input_tokens,
@@ -348,7 +373,7 @@ class OpenAIProvider:
             raise LlmError("openai: response contained no choices")
         choice = response.choices[0]
         text = choice.message.content or ""
-        if request.schema is not None and (choice.finish_reason == "length" or not text.strip()):
+        if request.schema is not None and not text.strip():
             raise LlmError(
                 f"model {request.model!r}: no structured content returned "
                 f"(finish_reason={choice.finish_reason!r}) - reasoning tokens "
@@ -364,6 +389,7 @@ class OpenAIProvider:
 
         usage = response.usage
         return TransportResponse(
+            truncated=getattr(choice, "finish_reason", None) == "length",
             text=text,
             tool_input=tool_input,
             input_tokens=usage.prompt_tokens if usage else 0,
@@ -669,6 +695,26 @@ class LlmClient:
             )
         return bindings[binding_index]
 
+    def context_budget(self, role: str) -> int | None:
+        """Usable input budget for `role`: the SMALLEST declared window among
+        its bindings, minus the completion reserve.
+
+        The weakest link, deliberately — a multi-bound role sends one payload
+        to every binding (`blind_panel` renders a single context pack for
+        three model families), so a context that fits the largest window but
+        not the smallest fails on the smallest. Sizing to anything but the
+        minimum means the pack is only *sometimes* valid.
+
+        `None` when any binding leaves `context_window` undeclared: an
+        unknown limit is not the same as no limit, and guessing one would be
+        worse than not checking.
+        """
+        bindings = self._bindings.get(role) or []
+        windows = [b.context_window for b in bindings]
+        if not windows or any(w is None for w in windows):
+            return None
+        return min(w for w in windows if w is not None) - CONTEXT_COMPLETION_RESERVE
+
     def _call_with_retry(self, provider: Provider, request: TransportRequest) -> TransportResponse:
         last_exc: Exception | None = None
         for attempt in range(self._max_retries):
@@ -720,6 +766,29 @@ class LlmClient:
             max_tokens=max_tokens,
         )
 
+        # Pre-flight against the WEAKEST bound model's window (see
+        # `context_budget`). Refusing here names the role and the limiting
+        # model; letting it through surfaces as a provider error that says
+        # nothing about which of three families was too small, or — worse on
+        # some hosts — as a silently truncated input.
+        budget = self.context_budget(role)
+        if budget is not None:
+            estimated = estimate_tokens(scrubbed_system) + sum(
+                estimate_tokens(m.content) for m in scrubbed_messages
+            )
+            if estimated > budget:
+                smallest = min(
+                    (b for b in self._bindings.get(role, []) if b.context_window is not None),
+                    key=lambda b: b.context_window or 0,
+                )
+                raise LlmError(
+                    f"role {role!r}: context is ~{estimated:,} tokens but the budget is "
+                    f"{budget:,} — set by the smallest bound model "
+                    f"({smallest.model}, {smallest.context_window:,}-token window) minus a "
+                    f"{CONTEXT_COMPLETION_RESERVE:,}-token completion reserve. Every binding "
+                    "for this role receives the same payload, so it must fit the smallest."
+                )
+
         # Content is never logged — only the routing metadata (role, provider,
         # model) and, afterwards, timing/token counts. Same rule the audit log
         # follows.
@@ -751,6 +820,34 @@ class LlmClient:
             )
             raise
         duration = time.monotonic() - started
+
+        # Truncation is a failure for EVERY call, structured or not. A
+        # free-text reply that stopped mid-sentence at the budget is wrong,
+        # not merely short — and `run_informational_turn` passes no schema,
+        # so before this such a reply reached the patient undetected.
+        # Judged here rather than in each provider so the rule is one rule,
+        # and so it is reachable through the transport injection seam that
+        # every test uses.
+        if response.truncated:
+            self._audit(
+                _AuditRecord(
+                    role=role,
+                    model=binding.model,
+                    provider=binding.provider,
+                    input_tokens=response.input_tokens,
+                    output_tokens=response.output_tokens,
+                    cost_estimate=None,
+                    duration_s=duration,
+                    scrub_count=scrub_count,
+                    error=True,
+                )
+            )
+            raise LlmError(
+                f"role {role!r} ({binding.model}): output hit the {max_tokens}-token budget "
+                f"before completing ({response.output_tokens} tokens produced) - the response "
+                "is truncated, not merely short"
+            )
+
         logger.info(
             "llm: role=%s model=%s ok in %.1fs (in=%s out=%s tokens)",
             role,

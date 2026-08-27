@@ -247,6 +247,43 @@ other way around.
    re-ingesting anything already present in the restored history is a
    no-op rather than a duplicate.
 
+### Replacing a deployed store from a local rebuild
+
+When extraction improves enough to warrant rebuilding the corpus, rebuild
+**locally**, review it there, then replace the deployed store — rather than
+re-ingesting remotely and reviewing twice. Done for real on 2026-08-26.
+
+```
+# 1. snapshot the deployed backup — `adoc backup` overwrites latest/
+aws s3 cp s3://$BUCKET/latest/ s3://$BUCKET/prod-prewipe-$(date +%F)/ --recursive
+
+# 2. publish the local store as the new latest/
+ADOC_DATA_DIR=~/a-doc-data-local ADOC_BACKUP_BUCKET=$BUCKET adoc backup
+
+# 3. drain the service (single-writer discipline)
+aws ecs update-service --cluster a-doc --service a-doc-web --desired-count 0
+
+# 4. wipe + restore as a ONE-OFF TASK, then scale back to 1
+aws ecs run-task --cluster a-doc --task-definition a-doc-web --launch-type FARGATE \
+  --network-configuration '<same as the service>' --overrides file://overrides.json
+```
+
+Three things that will bite you, all learned the hard way:
+
+- **`work/` is gitignored, so the login store is not in the backup.** Restoring
+  replaces the data dir and leaves the deployment with no way to log in. Copy
+  `work/users.yaml` somewhere outside the data dir first and put it back after.
+  `case/identifiers.yaml` *is* tracked and does travel in the bundle — check
+  the local copy is populated before backing up, or you will restore an empty
+  scrubber over a working one.
+- **Do the destructive work as a one-off ECS task, not via `execute-command`.**
+  A backgrounded process started in an exec session dies when the session
+  closes. It fails *silently*: an empty log, an untouched store, and no error.
+  A task has its own lifecycle, CloudWatch logs, and an exit code you can read.
+- **Verify by row count, not by directory size.** A half-restored store and a
+  healthy one are both ~1.1G. Compare `wc -l labs-export.jsonl` against the
+  local original.
+
 ### Restore-from-backup drill (release gate)
 
 `PLAN.md`/`CLAUDE.md`/ADR 0004 call a tested restore a release gate — do
@@ -371,7 +408,7 @@ document is still current.
 | 0 | Project scaffold | complete |
 | 1 | MVP (onboarding, ingestion, DAG reasoning, web UI, AWS deploy) | complete |
 | 2 | Grounding & anti-hallucination hardening | complete |
-| 3 | Knowledge layer (HPO/LIRICAL/Monarch, ACR/EULAR criteria) + full eval | not started |
+| 3 | Knowledge layer (HPO/LIRICAL/Monarch, ACR/EULAR criteria) + full eval | **next** |
 | 4 | Extras (Apple Health import, specialist finder, notifications) | not started |
 
 See `PLAN.md` for phase acceptance criteria.
