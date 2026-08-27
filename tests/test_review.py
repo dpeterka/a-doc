@@ -51,12 +51,16 @@ from adoc.reason.review import (
     Divergence,
     DivergenceDecisionPayload,
     DivergenceSet,
+    HypothesisChallengeNote,
     Marker,
     OpsMetrics,
     StalenessReport,
     TestChooserItem,
+    TestChooserPayload,
     TestChooserResult,
+    UpdateHypothesis,
     _pool_evidence,
+    _render_questions_open,
     _resolvable_evidence,
     build_review_dag,
     build_review_ledger_diff,
@@ -1514,3 +1518,168 @@ def test_a_panel_citation_is_not_re_added_every_week(db: LabsDb, repo: DataRepo)
         repo=repo,
     )
     assert [op for op in diff.ops if isinstance(op, AddEvidence)] == []
+
+
+def test_questions_open_separates_what_the_patient_can_answer_herself() -> None:
+    """The list was telling the patient to ask her doctor which supplements
+    she takes and whether she has bloating.
+
+    Those are not appointment items — the system can simply ask her, which is
+    what the conversation exists for. Delegating them wastes the appointment
+    AND wastes the intake. They render in their own section, first, because
+    several of them decide whether the doctor items are needed at all.
+    """
+    ledger = None  # the renderer tolerates an absent ledger
+    payload = TestChooserPayload(
+        items=[
+            TestChooserItem(
+                panel="Supplement and medication review",
+                ask="Bring every supplement bottle to your next visit.",
+                audience="you",
+                hypothesis_ids=[SLE_ID],
+            ),
+            TestChooserItem(
+                panel="Celiac screen: tTG-IgA + total IgA",
+                ask="Ask for a coeliac blood screen.",
+                audience="doctor",
+                hypothesis_ids=[SLE_ID, PE_ID],
+            ),
+        ]
+    )
+
+    markdown = _render_questions_open(payload, ledger)
+
+    assert "Questions you can answer yourself" in markdown
+    assert "To raise with your doctor" in markdown
+    assert markdown.index("answer yourself") < markdown.index("raise with your doctor")
+    assert "**Supplement and medication review**" in markdown
+    assert "**Celiac screen: tTG-IgA + total IgA**" in markdown
+
+
+def test_an_item_lists_every_hypothesis_it_bears_on(repo: DataRepo) -> None:
+    """One test routinely serves several hypotheses; collapsing that to one
+    reference hides why the test is worth doing."""
+    ledger = _seed_ledger(repo)
+    payload = TestChooserPayload(
+        items=[
+            TestChooserItem(
+                panel="Complement C3/C4",
+                ask="Ask for a complement panel.",
+                audience="doctor",
+                hypothesis_ids=[SLE_ID, PE_ID],
+            )
+        ]
+    )
+
+    markdown = _render_questions_open(payload, ledger)
+
+    assert "Systemic lupus erythematosus" in markdown
+    assert "Pulmonary embolism" in markdown
+
+
+def test_a_legacy_free_text_item_still_parses(caplog: pytest.LogCaptureFixture) -> None:
+    """An in-flight review that predates the restructure must not fail.
+    ADR 0028's rule: no single field of one item may fail a payload."""
+    payload = TestChooserPayload.model_validate(
+        {"items": [{"text": "Ask about a coeliac screen. It ties several findings together."}]}
+    )
+    item = payload.items[0]
+
+    assert item.panel == "Ask about a coeliac screen"
+    assert item.ask.startswith("Ask about a coeliac screen")
+    assert item.audience == "doctor"
+
+
+def test_an_unknown_audience_degrades_to_doctor() -> None:
+    payload = TestChooserPayload.model_validate(
+        {"items": [{"panel": "X", "ask": "y", "audience": "nonsense"}]}
+    )
+
+    assert payload.items[0].audience == "doctor"
+    assert (
+        TestChooserPayload.model_validate(
+            {"items": [{"panel": "X", "ask": "y", "audience": "patient"}]}
+        )
+        .items[0]
+        .audience
+        == "you"
+    )
+
+
+def test_the_sweep_backfills_a_missing_plain_language_gloss(db: LabsDb, repo: DataRepo) -> None:
+    """A hypothesis name is not communication. The sweep is the one stage that
+    visits every active hypothesis, so it backfills glosses for hypotheses
+    created before the field existed — no separate command, no extra call."""
+    ledger = _seed_ledger(repo)
+    assert all(not h.plain_language for h in ledger.hypotheses)
+
+    diff = build_review_ledger_diff(
+        ledger,
+        DivergenceSet(divergences=[]),
+        AdjudicationResult(decisions=[]),
+        ChallengeSweepResult(
+            notes=[
+                HypothesisChallengeNote(
+                    id=SLE_ID,
+                    note="Reviewed again: no new contradicting evidence this week.",
+                    plain_language="An autoimmune condition in which the immune system "
+                    "attacks the body's own tissues, often affecting skin, joints and "
+                    "kidneys.",
+                )
+            ]
+        ),
+        today=date(2026, 8, 27),
+        db=db,
+        repo=repo,
+    )
+
+    updates = [op for op in diff.ops if isinstance(op, UpdateHypothesis)]
+    assert [(op.id, bool(op.plain_language)) for op in updates] == [(SLE_ID, True)]
+
+
+def test_an_existing_gloss_is_not_rewritten(db: LabsDb, repo: DataRepo) -> None:
+    """A definition does not need rewriting every week, and churning it would
+    make the ledger diff noisy for no gain."""
+    ledger = _seed_ledger(repo)
+    for hypothesis in ledger.hypotheses:
+        hypothesis.plain_language = "Already glossed."
+
+    diff = build_review_ledger_diff(
+        ledger,
+        DivergenceSet(divergences=[]),
+        AdjudicationResult(decisions=[]),
+        ChallengeSweepResult(
+            notes=[
+                HypothesisChallengeNote(
+                    id=SLE_ID, note="Reviewed again: stable.", plain_language="A new gloss."
+                )
+            ]
+        ),
+        today=date(2026, 8, 27),
+        db=db,
+        repo=repo,
+    )
+
+    assert not [op for op in diff.ops if isinstance(op, UpdateHypothesis) and op.plain_language]
+
+
+def test_each_related_hypothesis_gets_its_own_linked_line(repo: DataRepo) -> None:
+    """One test routinely serves several hypotheses. A comma-joined run of
+    links reads as one undifferentiated blob — which is the problem this page
+    has — so each gets its own line, linked to its ledger card."""
+    ledger = _seed_ledger(repo)
+    payload = TestChooserPayload(
+        items=[
+            TestChooserItem(
+                panel="Complement C3/C4",
+                ask="Ask for a complement panel.",
+                audience="doctor",
+                hypothesis_ids=[SLE_ID, PE_ID],
+            )
+        ]
+    )
+
+    markdown = _render_questions_open(payload, ledger)
+
+    assert f"· [Systemic lupus erythematosus](/ledger#{SLE_ID})" in markdown
+    assert f"· [Pulmonary embolism](/ledger#{PE_ID})" in markdown

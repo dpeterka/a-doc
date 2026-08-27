@@ -9,8 +9,17 @@
    a single unbroken paragraph, each opening with the same 60-character
    stem. Reviews write one entry per week and they only ever grow, so the
    most recent is shown and the rest are available behind a summary. #}
-      <article class="card hypothesis-full">
+      {# `id` is the anchor target for the next-appointment page's
+         "Relevant to:" links, so a test bullet can jump straight to the
+         hypothesis it answers. #}
+      <article class="card hypothesis-full" id="{{ h.id }}">
         <h3 class="hypothesis-name">{{ h.name }}</h3>
+        {% if h.plain_language %}
+          {# The name alone is not communication. "Primary ovarian
+             insufficiency / menopausal-range hypogonadism" is precise and
+             tells the person whose case file it is nothing at all. #}
+          <p class="hypothesis-gloss">{{ h.plain_language }}</p>
+        {% endif %}
         <div class="chips">
           <span class="chip chip-tier chip-tier-{{ h.tier }}">{{ h.tier | tier_label }}</span>
           <span class="chip chip-status">status: {{ h.status | status_label }}</span>
@@ -41,6 +50,16 @@
         {% if h.evidence_for %}
           <h4 class="card-section">Evidence for</h4>
           {{ evidence_list(h.evidence_for) }}
+        {% else %}
+          {# Silently omitting the section reads as "no evidence was looked
+             for". Saying why it is empty is the honest version: for a lead
+             the blind panel did not independently raise, there are no panel
+             citations to attach, which is itself informative. #}
+          <h4 class="card-section">Evidence for</h4>
+          <p class="note-text">
+            No citations recorded yet — the independent review panel did not
+            raise this lead on its own, so nothing has been cited for it.
+          </p>
         {% endif %}
 
         {% if h.evidence_against %}

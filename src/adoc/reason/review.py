@@ -58,7 +58,7 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, ValidationError, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 from adoc import __version__
 from adoc.casefile.ledger import ACTIVE_STATUSES, load_ledger
@@ -503,6 +503,15 @@ class AdjudicationResult(BaseModel):
 class HypothesisChallengeNote(BaseModel):
     id: str
     note: str
+    plain_language: str = ""
+    """One or two sentences saying what this condition IS, for a reader who
+    has never heard the name.
+
+    Sourced from the sweep because the sweep is the one stage that visits
+    EVERY active hypothesis on every review — so it backfills the glosses of
+    hypotheses created before the field existed, with no separate command and
+    no extra model call. Only written when the hypothesis does not already
+    have one; a gloss does not need rewriting every week."""
 
 
 class ChallengeSweepPayload(BaseModel):
@@ -518,8 +527,71 @@ class ChallengeSweepResult(BaseModel):
 
 
 class TestChooserItem(BaseModel):
-    text: str
+    """One next-appointment item, in named short fields rather than one
+    unbounded paragraph.
+
+    The previous shape was a single free-text `text`, and the renderer emitted
+    `- {text}` per item. A real review produced 22 items averaging a dense
+    paragraph each — a page the patient described as unreadable and which, as
+    she pointed out, no doctor could work through in an appointment either.
+    The structure to fix that already half-existed (`hypothesis_ids` was
+    always here); what was missing was anywhere to put a SHORT name, so the
+    model put everything in the only field it had.
+    """
+
+    panel: str = ""
+    """The test, referral or question itself, named in a few words — "Celiac
+    screen: tTG-IgA + total IgA". This is what gets bulleted."""
+    ask: str = ""
+    """One sentence: what to actually ask for."""
+    why: str = ""
+    """Short rationale, folded away in the UI."""
+    audience: Literal["doctor", "you"] = "doctor"
+    """Who can answer this.
+
+    `you` is the important one and it comes from a real observation: the list
+    was telling the patient to ask her doctor what her own pelvic ultrasound
+    showed, what supplements she takes, and whether she has bloating. Those
+    are not appointment items — the system either already holds the document
+    or can simply ask her. Delegating them to a fifteen-minute appointment
+    wastes the appointment AND wastes the intake conversation this system
+    exists to have.
+    """
     hypothesis_ids: list[str] = Field(default_factory=list)
+
+    text: str = ""
+    """Legacy free-text field, kept only so an in-flight review that predates
+    the restructure still parses. Folded into `ask` by the validator below."""
+
+    @model_validator(mode="after")
+    def _fill_from_legacy_text(self) -> TestChooserItem:
+        """Degrade rather than fail when only the old shape arrives.
+
+        ADR 0028's rule: no single field of one item may fail a payload. An
+        item with neither `panel` nor `text` keeps an empty panel and is
+        dropped by the renderer, which is visible; raising here would lose the
+        other twenty.
+        """
+        if not self.ask and self.text:
+            self.ask = self.text.strip()
+        if not self.panel and self.ask:
+            head = self.ask.split(".")[0].strip()
+            self.panel = head[:80] if head else ""
+        return self
+
+    @field_validator("audience", mode="before")
+    @classmethod
+    def _tolerate_unknown_audience(cls, value: object) -> object:
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"doctor", "you"}:
+                return normalized
+            if normalized in {"patient", "self", "andrea", "user"}:
+                return "you"
+            logger.warning(
+                "review: test chooser used an unknown audience %r; recording as 'doctor'", value
+            )
+        return "doctor"
 
 
 class TestChooserPayload(BaseModel):
@@ -836,6 +908,15 @@ def build_review_ledger_diff(
                     continue
                 seen.add(key)
                 ops.append(AddEvidence(id=hyp_id, for_or_against="for", evidence=evidence))
+
+    # Backfill the plain-language gloss for anything that still lacks one.
+    # A hypothesis name is not communication: "Primary ovarian insufficiency /
+    # menopausal-range hypogonadism" is precise and tells the person whose case
+    # file it is nothing at all.
+    needs_gloss = {h.id for h in current_ledger.hypotheses if not h.plain_language.strip()}
+    for note in challenge_sweep.notes:
+        if note.id in needs_gloss and note.plain_language.strip():
+            ops.append(UpdateHypothesis(id=note.id, plain_language=note.plain_language.strip()))
 
     active_ids = {h.id for h in current_ledger.hypotheses if h.status in ACTIVE_STATUSES}
     already_challenged = {op.id for op in ops if isinstance(op, RecordChallenge)}
@@ -1564,7 +1645,7 @@ def build_review_dag(
         )
         payload = result.parsed
         assert isinstance(payload, TestChooserPayload)
-        markdown = _render_questions_open(payload)
+        markdown = _render_questions_open(payload, ledger)
         repo.write("case/questions-open.md", markdown)
         tc_result = TestChooserResult(items=payload.items, questions_open_markdown=markdown)
         results["test_chooser"] = tc_result
@@ -1797,15 +1878,72 @@ def build_review_dag(
     return Dag(nodes)
 
 
-def _render_questions_open(payload: TestChooserPayload) -> str:
-    lines = ["# Open Questions for Next Appointment", ""]
+def _render_questions_open(payload: TestChooserPayload, ledger: Ledger | None = None) -> str:
+    """The next-appointment list, rendered deterministically from structure.
+
+    Written by code, not by the model, for the same reason ADR 0024 keeps
+    records rather than blocks: given one free-text field the model fills it,
+    and 22 paragraphs is what came back. Here the model supplies short named
+    parts and this function decides the shape, so length is bounded by design
+    rather than by asking nicely.
+
+    Items are split by who can actually answer them. The questions the patient
+    can answer herself are listed separately and FIRST, because they are free,
+    immediate, and several of them decide whether the doctor items are needed
+    at all.
+    """
+    names = {h.id: h.name for h in ledger.hypotheses} if ledger else {}
+
+    def render(items: list[TestChooserItem]) -> list[str]:
+        out: list[str] = []
+        for item in items:
+            if not item.panel.strip():
+                continue
+            out.append(f"- **{item.panel.strip()}**")
+            if item.ask.strip():
+                out.append(f"  {item.ask.strip()}")
+            # Every hypothesis the item bears on, not just the first: one test
+            # routinely serves several, and collapsing that to a single
+            # reference hides why the test is worth doing. Each is a link to
+            # its ledger card, so "why am I being asked this" is one click
+            # away rather than a scroll-and-search.
+            related = [
+                f"[{names[hid]}](/ledger#{hid})" if hid in names else hid
+                for hid in item.hypothesis_ids
+            ]
+            if related:
+                # One line per hypothesis rather than a comma-joined run: a
+                # single test routinely serves several, and the point of
+                # showing them is that the reader can see WHICH question each
+                # one answers and click into it. A run of links reads as one
+                # undifferentiated blob, which is the problem this page has.
+                out.append("  _Relevant to:_")
+                out += [f"  · {entry}" for entry in related]
+            if item.why.strip():
+                out.append(f"  _Why:_ {item.why.strip()}")
+            out.append("")
+        return out
+
+    mine = [i for i in payload.items if i.audience == "you"]
+    theirs = [i for i in payload.items if i.audience == "doctor"]
+
+    lines = ["# Next Appointment", ""]
     if not payload.items:
         lines.append("_None yet._")
-    else:
-        for item in payload.items:
-            tag = f" (re: {', '.join(item.hypothesis_ids)})" if item.hypothesis_ids else ""
-            lines.append(f"- {item.text}{tag}")
-    return "\n".join(lines) + "\n"
+        return "\n".join(lines) + "\n"
+
+    if mine:
+        lines += ["## Questions you can answer yourself", ""]
+        lines += [
+            "_Answering these here is faster than waiting for an appointment, "
+            "and some of them decide whether the tests below are needed._",
+            "",
+        ]
+        lines += render(mine)
+    if theirs:
+        lines += ["## To raise with your doctor", ""]
+        lines += render(theirs)
+    return "\n".join(lines).rstrip() + "\n"
 
 
 # --------------------------------------------------------------------------
