@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.8] — 2026-08-27
+
+### Fixed
+
+- **No single field of one evidence item can fail a review any more.** A
+  panel member wrote `strength: "supporting"`, the `Literal` refused it, and
+  all 14 nodes and 13 minutes went with it — the same death as the invalid
+  source ref two releases ago, one field over. `strength` and
+  `probability_bucket` now map obvious synonyms and degrade unknown values
+  with a warning rather than raising.
+- **Hypothesis cards are readable.** `challenger_notes` accumulates one entry
+  per review and the card dumped the whole accumulation into a single
+  paragraph, so three challenges from three different weeks arrived as one
+  unbroken block, each opening with the same 60-character stem. Entries are
+  now split and labelled, all but the newest folded. Source refs render in
+  words rather than slug syntax, with the exact ref kept in the link title.
+  Chips carry field labels instead of reading as a run-on.
+
+### Changed
+
+- `challenge_sweep.md` v2 and `divergence_adjudicator.md` v2 cap a note at
+  three sentences and a rationale at two or three. These strings are written
+  verbatim onto the hypothesis and stack up on the patient's case page; a
+  150-word argued paragraph is the same challenge as a 40-word one, only
+  harder to act on.
+
 ## [0.11.7] — 2026-08-27
 
 ### Fixed
