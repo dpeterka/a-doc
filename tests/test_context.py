@@ -517,3 +517,23 @@ def test_a_lab_name_with_spaces_and_colons_still_renders_a_resolvable_ref(
             repo,
         )
         assert not report.failing, f"rendered ref does not resolve: {ref}"
+
+
+def test_encounters_carry_a_ref_the_citation_checker_resolves(repo: DataRepo, db: LabsDb) -> None:
+    """Encounters are cited by FILENAME (`YYYY-MM-DD--<slug>.md`), but the
+    pack rendered only the date — so a panel wrote `encounter:2026-08-04` and
+    two citations were dropped. Same defect as the lab rows in ADR 0028, one
+    section up."""
+    _write_encounter(repo, date(2026, 8, 4), "dxa-scan", "DXA scan performed.")
+
+    pack = build_context(repo, db, include_ledger=False)
+    text = next(s.content for s in pack.sections if s.key == "recent_encounters")
+
+    refs = re.findall(r"`(encounter:[^`]+)`", text)
+    assert refs, f"no citable encounter ref rendered:\n{text}"
+    for ref in refs:
+        validate_source_ref(ref)
+        report = check_evidence_citations(
+            [Evidence(claim="encounter ref resolves", source=ref, strength="moderate")], db, repo
+        )
+        assert not report.failing, f"pack rendered an encounter ref that does not resolve: {ref}"
