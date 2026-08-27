@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.6] — 2026-08-27
+
+### Fixed
+
+- **Panel citations now survive agreement, not only disagreement.** A
+  divergence exists only where the blind panel and the ledger disagree, so
+  citations reached the ledger exclusively on disagreement: where the panel
+  *agreed* with a hypothesis its refs were dropped on the floor, and a
+  probability mismatch kept only the disagreeing members' refs. The result,
+  measured in production after the previous release fixed the crash: 25
+  hypotheses, 1 with any evidence. The best-supported hypotheses — endorsed
+  by both the ledger and an independent panel — were exactly the ones
+  rendering as uncited. Citations are now collected for every hypothesis the
+  panel named and attached with `AddEvidence`, deduped so a weekly review
+  does not re-add the same citation forever (ADR 0028 addendum).
+
 ## [0.11.5] — 2026-08-27
 
 ### Fixed
