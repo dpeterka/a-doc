@@ -1,56 +1,78 @@
 {# One hypothesis, rendered identically wherever it appears. Folding a
    lead away is a statement about PROMINENCE, never about which of its
    fields survive — a low-likelihood lead keeps its evidence, origin and
-   challenge notes. #}
+   challenge notes.
+
+   Every long piece of model prose on this card is either labelled or
+   folded. The card previously emitted the whole `challenger_notes`
+   accumulation as one `<p>`: several reviews' challenges run together into
+   a single unbroken paragraph, each opening with the same 60-character
+   stem. Reviews write one entry per week and they only ever grow, so the
+   most recent is shown and the rest are available behind a summary. #}
       <article class="card hypothesis-full">
         <h3 class="hypothesis-name">{{ h.name }}</h3>
         <div class="chips">
           <span class="chip chip-tier chip-tier-{{ h.tier }}">{{ h.tier | tier_label }}</span>
-          <span class="chip chip-status">{{ h.status | status_label }}</span>
-          <span class="chip chip-origin chip-origin-{{ h.origin }}" data-origin="{{ h.origin }}">
-            origin: {{ h.origin }}
-          </span>
+          <span class="chip chip-status">status: {{ h.status | status_label }}</span>
           <span class="chip chip-probability">confidence: {{ h.probability }}</span>
+          <span class="chip chip-origin chip-origin-{{ h.origin }}" data-origin="{{ h.origin }}">
+            raised by: {{ h.origin | origin_label }}
+          </span>
         </div>
 
-        {% if h.evidence_for %}
-          <h3>Evidence for</h3>
+        {% macro evidence_list(items) %}
           <ul class="evidence-list">
-            {% for e in h.evidence_for %}
+            {% for e in items %}
               <li>
-                {{ e.claim }}
+                <span class="evidence-claim">{{ e.claim }}</span>
                 {% set href = source_ref_href(e.source) %}
                 {% if href %}
-                  <a href="{{ href }}" class="source-ref">({{ e.source }})</a>
+                  <a href="{{ href }}" class="source-ref" title="{{ e.source }}"
+                    >{{ e.source | humanize_source_ref }}</a>
                 {% else %}
-                  <span class="muted">({{ e.source }})</span>
+                  <span class="source-ref muted" title="{{ e.source }}"
+                    >{{ e.source | humanize_source_ref }}</span>
                 {% endif %}
               </li>
             {% endfor %}
           </ul>
+        {% endmacro %}
+
+        {% if h.evidence_for %}
+          <h4 class="card-section">Evidence for</h4>
+          {{ evidence_list(h.evidence_for) }}
         {% endif %}
 
         {% if h.evidence_against %}
-          <h3>Evidence against</h3>
-          <ul class="evidence-list">
-            {% for e in h.evidence_against %}
-              <li>
-                {{ e.claim }}
-                {% set href = source_ref_href(e.source) %}
-                {% if href %}
-                  <a href="{{ href }}" class="source-ref">({{ e.source }})</a>
-                {% else %}
-                  <span class="muted">({{ e.source }})</span>
-                {% endif %}
-              </li>
-            {% endfor %}
-          </ul>
+          <h4 class="card-section">Evidence against</h4>
+          {{ evidence_list(h.evidence_against) }}
         {% endif %}
 
         {% if h.discriminators %}
-          <p class="muted">Tests that would help tell this apart: {{ h.discriminators | join(", ") }}</p>
+          <h4 class="card-section">Tests that would help tell this apart</h4>
+          <ul class="evidence-list">
+            {% for d in h.discriminators %}<li>{{ d }}</li>{% endfor %}
+          </ul>
         {% endif %}
-        {% if h.challenger_notes %}
-          <p class="muted">Challenge notes: {{ h.challenger_notes }}</p>
+
+        {% set notes = h.challenger_notes | split_challenge_notes %}
+        {% if notes %}
+          <h4 class="card-section">Review history</h4>
+          {% set latest = notes | last %}
+          <div class="note-entry">
+            <span class="chip chip-note">{{ latest.label }}</span>
+            <p class="note-text">{{ latest.text }}</p>
+          </div>
+          {% if notes | length > 1 %}
+            <details class="note-earlier">
+              <summary>{{ (notes | length) - 1 }} earlier note{{ "s" if notes | length > 2 }}</summary>
+              {% for n in notes[:-1] | reverse %}
+                <div class="note-entry">
+                  <span class="chip chip-note">{{ n.label }}</span>
+                  <p class="note-text">{{ n.text }}</p>
+                </div>
+              {% endfor %}
+            </details>
+          {% endif %}
         {% endif %}
       </article>
