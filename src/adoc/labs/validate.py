@@ -140,22 +140,69 @@ _TITER_PATTERN = re.compile(r"^1\s*:\s*\d+$")
 # interchangeable even though they look similar: "IU/mL" and "U/mL" stay
 # separate (different assay standardization), and "units"/"U" (a bare,
 # unit-less flag on some printed ranges) stays its own family too.
+# Each family is a set of spellings for the SAME quantity at the SAME
+# magnitude — grouping them changes no value. Members were taken from the
+# spellings this patient's own 461 analytes actually use across labs (26 of
+# them arrived under more than one), not from a general unit ontology: an
+# unrecognized spelling must stay unrecognized rather than be guessed at.
+#
+# Spellings that differ in MAGNITUDE never belong in one family — see
+# `UNIT_CONVERSIONS` for those.
 UNIT_SYNONYMS: tuple[tuple[str, ...], ...] = (
-    ("10*6/ul", "x10^6/ul", "m/ul", "million/ul", "x10e6/ul"),
-    ("10*3/ul", "x10^3/ul", "k/ul", "thousand/ul", "x10e3/ul"),
+    # 10^12/L == 10^6/µL, so these are all the same magnitude.
+    ("10*6/ul", "x10^6/ul", "m/ul", "million/ul", "x10e6/ul", "x10^12/l", "10*12/l"),
+    # 10^9/L == 10^3/µL, likewise.
+    ("10*3/ul", "x10^3/ul", "k/ul", "thousand/ul", "x10e3/ul", "x10(9)/l", "10*9/l", "x10^9/l"),
+    ("cells/ul",),  # deliberately its own family: 1000x smaller than 10*3/ul
     ("mg/dl",),
-    ("g/dl",),
+    ("g/dl", "g/dl(calc)"),  # "(calc)" annotates provenance, not magnitude
     ("mmol/l",),
     ("mcg/dl", "ug/dl", "µg/dl"),
+    ("mcg/l", "ug/l", "µg/l"),
+    ("mcg/g", "ug/g", "µg/g"),
     ("miu/l", "uiu/ml"),  # numerically equivalent for TSH reporting
     ("ng/ml",),
     ("pg/ml",),
-    ("%",),
+    ("%", "%oftotalhgb"),  # HbA1c is reported both ways, same number
     ("mm/hr", "mm/h"),
+    ("u/l", "iu/l", "unit/l"),  # enzyme activity: the same unit, three spellings
+    ("ml/min/1.73m2", "ml/min/1.73"),  # eGFR body-surface normalization
+    ("index",),
     ("iu/ml",),  # kept separate from U/mL - not assumed equal
     ("u/ml",),
     ("units", "u"),
 )
+
+# Spellings of the same quantity at DIFFERENT magnitudes, with the factor to
+# reach the family's base unit. Only entries that can be justified exactly
+# belong here — a wrong factor is worse than an unrecognized unit.
+#
+# The CBC differential absolutes are the real case: this patient's labs
+# report them as `x10E3/uL` at some points and `cells/uL` at others, a
+# factor of 1000. Comparing across that boundary without converting reported
+# "eosinophils rising 319,900%" (ADR 0027).
+UNIT_CONVERSIONS: dict[tuple[str, str], float] = {
+    ("10*3/ul", "cells/ul"): 1000.0,
+    ("cells/ul", "10*3/ul"): 0.001,
+    ("10*6/ul", "cells/ul"): 1_000_000.0,
+    ("cells/ul", "10*6/ul"): 0.000001,
+}
+
+
+def convert_value(value: float, from_unit: str | None, to_unit: str | None) -> float | None:
+    """`value` expressed in `to_unit`, or `None` when no exact factor is known.
+
+    Returns `value` unchanged when the two units are the same family (a
+    synonym change is not a conversion). `None` — never a guess — when the
+    units are unrelated or either is unrecognized, so a caller must decide
+    what to do rather than silently comparing incomparable numbers.
+    """
+    source = canonical_unit(from_unit) or _normalize_unit_text(from_unit or "")
+    target = canonical_unit(to_unit) or _normalize_unit_text(to_unit or "")
+    if source == target:
+        return value
+    factor = UNIT_CONVERSIONS.get((source, target))
+    return None if factor is None else value * factor
 
 
 def _normalize_unit_text(text: str) -> str:
