@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.1] — 2026-08-27
+
+### Fixed
+
+- **The context pack now states whether a hypothesis has a plain-language
+  gloss.** The first forced review on 0.12.0 produced zero glosses across 28
+  hypotheses: the challenge-sweep prompt says to write one "only when the
+  context pack shows it does not already have one", and the ledger section
+  never rendered that field. The model was asked to check a state it was
+  never shown. ADR 0028's rule one step out — if a model must act on a state,
+  show it the state.
+- **A long next-appointment list is prioritised, not truncated.** The same
+  review produced 14 doctor items. None were junk, so dropping them would
+  discard real clinical content while leaving the page looking complete; the
+  first six of each group now lead and the remainder sit under "Also worth
+  raising, lower priority (N)". `test_chooser.md` v3 asks for items ordered
+  by yield, since that ordering decides what one appointment covers.
+
 ## [0.12.0] — 2026-08-27
 
 ### Added
