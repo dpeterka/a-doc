@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -49,6 +50,92 @@ def write_last_seen(repo: DataRepo, when: datetime) -> None:
     path = repo.root / _LAST_SEEN_RELPATH
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(when.isoformat(), encoding="utf-8")
+
+
+# Reading order for a differential, strongest first. A 24-hypothesis ledger
+# rendered in file order is a list of disease names with no signal about
+# which matter — for a patient reading her own case file that is not merely
+# untidy, it reads as "you might have 24 things".
+_TIER_RANK = {"most-likely": 0, "cant-miss": 1, "expanded": 2}
+_PROBABILITY_RANK = {"high": 0, "moderate": 1, "low": 2, "minimal": 3}
+
+# Below this, a lead is real but not something to read on the way in. Kept,
+# never hidden — rendered behind a disclosure so the page leads with what
+# actually matters.
+SECONDARY_PROBABILITIES = frozenset({"low", "minimal"})
+
+
+def sort_hypotheses(hypotheses: Sequence[Any]) -> list[Any]:
+    """Tier first (most-likely, then can't-miss, then expanded), probability
+    within tier, then name so the order is stable between renders."""
+    return sorted(
+        hypotheses,
+        key=lambda h: (
+            _TIER_RANK.get(h.tier, 99),
+            _PROBABILITY_RANK.get(h.probability, 99),
+            h.name.lower(),
+        ),
+    )
+
+
+def group_hypotheses(hypotheses: Sequence[Any]) -> dict[str, list[Any]]:
+    """Split a sorted differential into what to lead with and what to fold
+    away: `leading` (can't-miss at any probability, plus anything high or
+    moderate) and `secondary` (the low/minimal tail)."""
+    ordered = sort_hypotheses(hypotheses)
+    leading = [
+        h for h in ordered if h.tier == "cant-miss" or h.probability not in SECONDARY_PROBABILITIES
+    ]
+    secondary = [h for h in ordered if h not in leading]
+    return {"leading": leading, "secondary": secondary}
+
+
+def summarize_diff_ops(diff: Any) -> dict[str, Any]:
+    """What a ledger diff actually DID, derived from its typed ops.
+
+    The home page used to render `diff.rationale` verbatim — the model's
+    full adjudication prose for every divergence, concatenated. On a real
+    review that was thousands of words of clinical argument in a single
+    unbroken paragraph, which is unreadable and buries the one thing the
+    page is for: what changed.
+
+    The ops are typed, so the change set is derivable rather than narrated.
+
+    `ledger-history.jsonl` is read back as plain JSON, so a diff arrives here
+    as a `dict`, not a `LedgerDiff`. Both shapes are handled: an
+    attribute-only reader silently returned empty for every real entry,
+    which is the failure mode this whole change exists to remove.
+    """
+
+    def field(obj: Any, name: str, default: Any = None) -> Any:
+        if isinstance(obj, dict):
+            return obj.get(name, default)
+        return getattr(obj, name, default)
+
+    added: list[str] = []
+    changed: list[str] = []
+    challenged = 0
+    evidence = 0
+    for op in field(diff, "ops", []) or []:
+        kind = field(op, "op", "")
+        if kind == "add_hypothesis":
+            hypothesis = field(op, "hypothesis", {}) or {}
+            name = field(hypothesis, "name", "") or ""
+            if name:
+                added.append(name)
+        elif kind == "update_hypothesis":
+            changed.append(str(field(op, "id", "") or ""))
+        elif kind == "record_challenge":
+            challenged += 1
+        elif kind == "add_evidence":
+            evidence += 1
+    return {
+        "added": added,
+        "changed": changed,
+        "challenged": challenged,
+        "evidence": evidence,
+        "rationale": field(diff, "rationale", "") or "",
+    }
 
 
 def ledger_history_since(repo: DataRepo, since: datetime | None) -> list[dict[str, Any]]:
