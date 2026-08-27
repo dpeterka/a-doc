@@ -436,3 +436,58 @@ def test_a_labs_ref_is_shown_in_words_not_slug_syntax(tmp_path: Path) -> None:
     # needs the exact identity; it is no longer body text.
     assert ">(labs:lumbar-spine-percent-change-vs-2024:2026-08-04)<" not in response.text
     assert 'title="labs:lumbar-spine-percent-change-vs-2024:2026-08-04"' in response.text
+
+
+def test_a_hypothesis_card_carries_an_anchor_id(tmp_path: Path) -> None:
+    """The next-appointment page links each test to the hypotheses it answers
+    via `/ledger#<id>`, so the card has to be a jump target."""
+    app, repo, _db, _calls = build_app(tmp_path)
+    hyp = Hypothesis(
+        id="poi-01",
+        name="Primary ovarian insufficiency",
+        plain_language="The ovaries stop releasing eggs earlier than expected.",
+        tier="expanded",
+        probability="high",
+        status="active",
+        origin="challenger",
+        first_proposed=date(2026, 1, 1),
+    )
+    save_ledger(
+        repo.root / LEDGER_RELPATH,
+        Ledger(version=1, updated=datetime.now(UTC), schema_version=1, hypotheses=[hyp]),
+    )
+
+    client = TestClient(app)
+    login(client)
+    response = client.get("/ledger")
+
+    assert 'id="poi-01"' in response.text
+    # And the plain-language gloss is rendered, since a name alone is not
+    # communication.
+    assert "The ovaries stop releasing eggs earlier than expected." in response.text
+
+
+def test_an_empty_evidence_section_says_why(tmp_path: Path) -> None:
+    """Silently omitting it reads as "no evidence was looked for"; the real
+    reason is that the blind panel never independently raised the lead."""
+    app, repo, _db, _calls = build_app(tmp_path)
+    hyp = Hypothesis(
+        id="x-01",
+        name="Some lead",
+        tier="expanded",
+        probability="low",
+        status="active",
+        origin="challenger",
+        first_proposed=date(2026, 1, 1),
+    )
+    save_ledger(
+        repo.root / LEDGER_RELPATH,
+        Ledger(version=1, updated=datetime.now(UTC), schema_version=1, hypotheses=[hyp]),
+    )
+
+    client = TestClient(app)
+    login(client)
+    response = client.get("/ledger")
+
+    assert "Evidence for" in response.text
+    assert "No citations recorded yet" in response.text

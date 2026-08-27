@@ -124,7 +124,17 @@ def summarize_diff_ops(diff: Any) -> dict[str, Any]:
             if name:
                 added.append(name)
         elif kind == "update_hypothesis":
-            changed.append(str(field(op, "id", "") or ""))
+            # A gloss-only update is not a change worth announcing. The
+            # challenge sweep backfills `plain_language` for every hypothesis
+            # that lacks one, so without this the first review after that
+            # field shipped would report all 26 hypotheses as "changed" on the
+            # home page — the precise noise this summary exists to avoid.
+            substantive = any(
+                field(op, name) is not None
+                for name in ("tier", "probability", "status", "discriminators")
+            )
+            if substantive:
+                changed.append(str(field(op, "id", "") or ""))
         elif kind == "record_challenge":
             challenged += 1
         elif kind == "add_evidence":

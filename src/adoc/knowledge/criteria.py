@@ -31,13 +31,27 @@ from dataclasses import dataclass, field
 from pydantic import BaseModel, Field
 
 from adoc.labs.models import LabResult
-from adoc.reason.citations import _normalize_slug
 
 CLASSIFICATION_DISCLAIMER = (
     "Classification criteria, not diagnostic criteria: they exist to define "
     "comparable groups for research, and a person can have the condition "
     "without meeting them."
 )
+
+
+_NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
+
+
+def _normalize_slug(text: str) -> str:
+    """Case/punctuation-insensitive key for analyte matching.
+
+    A deliberately local implementation, for the reason `reason.citations`
+    states about its own copy: a module should not reach into another
+    module's private helper. The first version of this file imported
+    `citations._normalize_slug` and so broke the very convention that
+    function's docstring exists to record.
+    """
+    return _NON_ALNUM_RE.sub("", text.lower())
 
 
 ItemState = str

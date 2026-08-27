@@ -394,6 +394,50 @@ still backed up: `adoc backup` syncs the whole `sources/` tree on disk to
 S3 regardless of what git tracks, so the bytes are safe even though
 they're not in git history. See ADR 0010.
 
+**What the archived data can actually support** (measured 2026-08-27, ADR
+0030). The 28 files are three different kinds and only one is usable for
+diagnostic reasoning:
+
+| Kind | Verdict |
+|---|---|
+| 23andMe v5 raw export (643,161 SNPs, GRCh37) | **Usable.** Directly measured genotypes; covers 12 of 14 curated autoimmune-relevant loci (HFE C282Y/H63D, coeliac DQ2.5/DQ8, both HLA-B27 tags, STAT4, TNFAIP3, SH2B3) |
+| 2 "phased" exports | **Excluded.** The vendor's own header says "not for medical or other use", and they cover only 6 of the 14 |
+| 25 imputed `.bcf` (431 MB) | **Excluded.** `FORMAT=HDS` dosages only — no hard calls and **no per-variant quality metric**, so a confidently imputed variant is indistinguishable from a coin flip. Also GRCh38 against the array's GRCh37 |
+
+Two consequences worth stating plainly: a derived artifact's job is to
+produce *confirmatory-test leads* ("the array suggests X; the clinical test
+is Y"), never findings — 23andMe validates only a subset of markers
+individually. And **absence of a call is not absence of the variant**: the
+FMR1 premutation on the ledger is a repeat expansion that neither an array
+nor imputation can see, so having genome data on file does not cover it.
+
+## Knowledge layer (Phase 3, in progress)
+
+`src/adoc/knowledge/` holds the deterministic, non-LLM half of the
+diagnostic reasoning — the third independent check alongside the
+cross-family Challenger and the ledger-blind panel.
+
+- **`criteria.py`** — hand-encoded classification-criteria scorers, computed
+  from stored labs. SLE 2019 EULAR/ACR is implemented; the framework (three
+  states per item, domain maxima, cited items, floor totals, entry criteria)
+  is shared by the ~9 still to come. Every item is `met` / `not_met` /
+  `not_assessed`, and totals are a **floor**: most items in these sets are
+  clinical and no lab row can answer them, so scoring an unseen item as
+  `not_met` would report a confident low total that is an artifact of missing
+  input.
+- **`lirical.py` + `deploy/lirical/`** — LIRICAL v2.4.1 as a sidecar
+  container (ADR 0029), phenotype-only. The Python side builds the
+  invocation and parses the TSV; it never computes a ranking.
+
+**Neither is wired into the review DAG yet, and the LIRICAL image is not
+deployable yet.** CI builds and pushes exactly one image (`a-doc`); the
+sidecar has no ECR repository, no CI build step and no ECS task definition.
+It is validated locally only — `docker build -t adoc-lirical deploy/lirical/`
+runs a build-time smoke test that fails the build if LIRICAL's data
+expectations change. The blocking dependency for both is an HPO phenotype
+profile, which does not exist: LIRICAL's input is a list of HPO terms, and
+the clinical items of every criteria scorer need the same thing.
+
 ## Currently deployed
 
 The deployed version is always the latest `v*` git tag on `main` — check
