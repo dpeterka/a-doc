@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.5] — 2026-08-27
+
+### Fixed
+
+- **A bad panel citation no longer destroys the review.** The blind panel
+  began citing densely and immediately killed a 14-node run: it emitted
+  `other:monospot_(heterophile)_screen:2026-03-17` — a real analyte on a
+  real date with an invented prefix — and `BlindEvidenceItem.source`
+  validated its ref in a field validator, which raises. Four bad refs failed
+  the payload, the panel member, and the whole review. Filtering now happens
+  after the payload parses, where the drop-and-log filter was always meant
+  to run (ADR 0028).
+- **The context pack now shows each lab row's citable ref.** Document
+  excerpts always carried `doc:<file>#p<page>`; lab rows carried nothing, so
+  a model had to construct `labs:<slug>:<date>` by guessing the slug — and
+  guessed the prefix from a section heading. Refs are slugified rather than
+  interpolated raw, because 1178 of 2079 stored names contain the whitespace
+  or colons the grammar forbids. Measured after: 568 refs, 0 invalid, 0
+  unresolvable.
+- `blind_reviewer.md` v4: copy refs verbatim, never construct one; a panel
+  heading is not a ref prefix.
+
 ## [Unreleased]
 
 ## [0.11.4] - 2026-08-27

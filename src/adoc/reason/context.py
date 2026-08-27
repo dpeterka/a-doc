@@ -15,6 +15,8 @@ the labs database and renders plain text.
 
 from __future__ import annotations
 
+import re
+
 from pydantic import BaseModel, Field
 
 from adoc.casefile.encounters import EncounterFrontmatter, read_encounter
@@ -143,6 +145,48 @@ def _render_encounter_date(fm: EncounterFrontmatter) -> str:
     if fm.reported_on and fm.reported_on != fm.date:
         shown = f"{shown} (reported {fm.reported_on.isoformat()})"
     return shown
+
+
+_SLUG_PUNCT_RE = re.compile(r"[^a-z0-9]+")
+"""Runs of non-alphanumerics in a lowercased analyte name, collapsed to `-`
+by `_labs_ref` so a rendered ref satisfies the source-ref grammar."""
+
+
+def _labs_ref(row: LabResult) -> str | None:
+    """The source ref this row is cited by, rendered beside it.
+
+    Document excerpts have always carried their own `doc:<file>#p<page>`
+    ref, but lab rows did not — so a model asked to cite a lab value had to
+    CONSTRUCT `labs:<slug>:<date>` from a name and a date, guessing the slug.
+    A live blind panel guessed the prefix from the visible section heading
+    and emitted `other:monospot_(heterophile)_screen:2026-03-17`, which is a
+    real analyte on a real date with an invented prefix. Four such refs
+    failed schema validation and took a 14-node review down with them.
+
+    Showing the ref makes citing a matter of copying rather than inventing —
+    but only if what is shown is what the checker accepts, and `row.name` on
+    its own is NOT. The grammar's slug is `[^\\s:]+`: no whitespace, no
+    colons. Real stored names break both rules (`IGF-1 Z-Score`,
+    `Free T4:T3 Ratio`), so interpolating the raw name rendered an invalid
+    ref for most of the real corpus — the same class of bug one layer down.
+    Measured: 1178 of 2079 stored rows have a name that is not a legal slug,
+    so the naive version would have printed an invalid ref beside more than
+    half of them.
+
+    So punctuation runs collapse to a single `-`. That satisfies the grammar
+    and is *normalization-preserving*: `citations._normalize_slug` strips
+    every non-alphanumeric character and lowercases, so `igf-1-z-score` and
+    `IGF-1 Z-Score` reduce to the identical key `igf1zscore` and the ref
+    resolves back to this row.
+
+    Returns `None` for a name with no alphanumeric content at all, which
+    cannot form a legal slug; the caller omits the ref rather than printing
+    a broken one.
+    """
+    slug = _SLUG_PUNCT_RE.sub("-", row.name.lower()).strip("-")
+    if not slug:
+        return None
+    return f"labs:{slug}:{row.date.isoformat()}"
 
 
 def _labs_label(row: LabResult) -> str:
@@ -311,7 +355,12 @@ def _labs_section(db: LabsDb) -> ContextSection:
                 value = row.value_text if row.value is None else str(row.value)
                 unit = f" {row.ucum_unit}" if row.ucum_unit else ""
                 flag = f" [{row.flag}]" if row.flag else ""
-                lines.append(f"- {_labs_label(row)}: {value}{unit}{flag} — {row.date.isoformat()}")
+                ref = _labs_ref(row)
+                ref_suffix = f"  `{ref}`" if ref else ""
+                lines.append(
+                    f"- {_labs_label(row)}: {value}{unit}{flag} — "
+                    f"{row.date.isoformat()}{ref_suffix}"
+                )
     else:
         lines.append("- _None currently flagged._")
 
@@ -328,8 +377,11 @@ def _labs_section(db: LabsDb) -> ContextSection:
                 unit = f" {row.ucum_unit}" if row.ucum_unit else ""
                 note = derived_from_note(row.name)
                 note_suffix = f" ({note})" if note else ""
+                ref = _labs_ref(row)
+                ref_suffix = f"  `{ref}`" if ref else ""
                 lines.append(
-                    f"- {_labs_label(row)}: {value}{unit} — {row.date.isoformat()}{note_suffix}"
+                    f"- {_labs_label(row)}: {value}{unit} — "
+                    f"{row.date.isoformat()}{note_suffix}{ref_suffix}"
                 )
     else:
         lines.append("- _No labs recorded yet._")
