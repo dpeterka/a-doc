@@ -5,6 +5,61 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.0] — 2026-08-27
+
+### Added
+
+- **Deterministic classification-criteria scorers** (`knowledge/criteria.py`),
+  with SLE 2019 EULAR/ACR as the first of ~10. Every item is `met`,
+  `not_met`, or `not_assessed`, and totals are an explicit **floor**: most
+  items in these sets are clinical and no lab row can answer them, so scoring
+  an unseen item as `not_met` would report a confident low total that is an
+  artifact of missing input. Domain maxima are respected (additive across
+  domains, single highest item within one) and every met item carries the
+  `labs:<slug>:<date>` ref it was decided from.
+- **LIRICAL v2.4.1 phenotype-only sidecar** (`deploy/lirical/`,
+  `knowledge/lirical.py`, ADR 0029) — a non-LLM differential engine, run as
+  its own container rather than reimplemented in Python. Validated locally;
+  **not yet in CI/CFN and not yet wired into the review DAG**, because its
+  input is a list of HPO terms and no phenotype profile exists.
+- `Hypothesis.plain_language`: one or two sentences saying what a condition
+  IS. A name alone is not communication — "Primary ovarian insufficiency /
+  menopausal-range hypogonadism" is precise and tells the person whose case
+  file it is nothing. Backfilled by the challenge sweep, which visits every
+  active hypothesis on every review.
+- ADR 0030 records which archived genomic data is admissible: the raw
+  23andMe array export only. The 25 imputed BCFs carry `HDS` dosages with no
+  per-variant quality metric, so a confidently imputed variant cannot be
+  distinguished from a coin flip; the two "phased" exports are labelled by
+  the vendor as not for medical use.
+
+### Changed
+
+- **The next-appointment page is assembled by code, not narrated by a model.**
+  It had become 22 dense paragraphs — unusable for the patient and for any
+  doctor in an appointment. `TestChooserItem` now carries short named parts
+  (`panel`, `ask`, `why`) instead of one unbounded text field, so length is
+  bounded by design. Each panel lists every hypothesis it bears on, one
+  linked line each.
+- **Items are split by who can answer them.** The list was telling the
+  patient to ask her doctor what her own ingested imaging reports say, which
+  supplements she takes, and whether she has bloating. Those are not
+  appointment items: the system either holds the document or can simply ask
+  her. `TestChooserItem.audience` separates them, patient-answerable first.
+- `markdown_lite` gains italics, internal-only links, and continuation lines
+  that stay inside their list item — without which the reformatted page
+  rendered as literal underscores and detached paragraphs.
+- An empty "Evidence for" section now says why it is empty instead of
+  vanishing; silence reads as "no evidence was looked for".
+- `test_chooser.md` v2 bans self-referential ranking and cost editorialising;
+  `challenge_sweep.md` v3 defines the plain-language gloss task.
+
+### Fixed
+
+- A gloss-only hypothesis update no longer counts as a "change" on the home
+  page, which would otherwise have announced all 26 hypotheses as changed on
+  the first review after `plain_language` shipped.
+
 ## [0.11.9] — 2026-08-27
 
 ### Fixed
