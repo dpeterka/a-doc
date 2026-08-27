@@ -537,6 +537,19 @@ def test_an_exact_analyte_name_still_resolves(db: LabsDb, repo: DataRepo) -> Non
         ("CRP was 8.5 mg/L", [8.5]),
         # A negative T-score is a genuine value, not a compound modifier.
         ("T-score of -1.1", [-1.1]),
+        # The MIRROR case: digits at the END of an analyte's name. `-?\d+`
+        # read the hyphen as a minus, so this quoted -125.0 and a real
+        # citation of a real CA-125 row was dropped on a live review.
+        ("CA-125 was normal at 27.7 U/mL", [27.7]),
+        ("HLA-B27 negative", []),
+        ("IL-6 and CD4 were unremarkable", []),
+        # A year introduced by a temporal preposition is a date, not a result.
+        ("lumbar spine percent change vs 2024 was -8.2%", [-8.2]),
+        ("stable since 2021", []),
+        # ...but an unqualified number in that range is still a value: real
+        # analytes live there (B12 in the 2000s pg/mL), and discarding those
+        # would trade one false positive for a worse false negative.
+        ("vitamin B12 measured 2024 pg/mL", [2024.0]),
     ],
 )
 def test_compound_modifiers_are_not_quoted_values(claim: str, expected: list[float]) -> None:
