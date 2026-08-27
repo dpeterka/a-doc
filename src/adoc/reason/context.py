@@ -449,6 +449,20 @@ def _render_ledger_section(ledger: Ledger) -> ContextSection:
                 f"- **{h.id}** ({h.name}) — tier={h.tier}, probability={h.probability}, "
                 f"status={h.status}, origin={h.origin}"
             )
+            # The plain-language gloss, and — when it is missing — the fact
+            # that it is missing.
+            #
+            # The challenge sweep is asked to write a gloss only for
+            # hypotheses that lack one, and the first review after that field
+            # shipped produced ZERO glosses across 28 hypotheses: the prompt
+            # told the model to check a state the pack never showed it, so it
+            # could not tell which needed one and wrote none. This is ADR
+            # 0028's rule one step out: if a model must act on a state, show
+            # it the state.
+            if h.plain_language.strip():
+                lines.append(f"  plain-language: {h.plain_language.strip()}")
+            else:
+                lines.append("  plain-language: MISSING — needs a one-or-two-sentence gloss")
         content = "\n".join(lines)
     return ContextSection(key=LEDGER_SECTION_KEY, title="Differential Ledger", content=content)
 

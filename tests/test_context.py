@@ -537,3 +537,42 @@ def test_encounters_carry_a_ref_the_citation_checker_resolves(repo: DataRepo, db
             [Evidence(claim="encounter ref resolves", source=ref, strength="moderate")], db, repo
         )
         assert not report.failing, f"pack rendered an encounter ref that does not resolve: {ref}"
+
+
+def test_the_ledger_section_states_whether_a_gloss_is_missing(repo: DataRepo, db: LabsDb) -> None:
+    """The challenge sweep writes a plain-language gloss only for hypotheses
+    that lack one, and the first review after that field shipped produced ZERO
+    across 28 hypotheses: the prompt told the model to check a state the pack
+    never showed it. ADR 0028's rule one step out — if a model must act on a
+    state, show it the state."""
+    hypotheses = [
+        Hypothesis(
+            id="with-01",
+            name="Has a gloss",
+            plain_language="A condition explained plainly.",
+            tier="expanded",
+            probability="low",
+            status="active",
+            origin="model",
+            first_proposed=date(2026, 1, 1),
+        ),
+        Hypothesis(
+            id="without-01",
+            name="Has none",
+            tier="expanded",
+            probability="low",
+            status="active",
+            origin="model",
+            first_proposed=date(2026, 1, 1),
+        ),
+    ]
+    save_ledger(
+        repo.root / LEDGER_RELPATH,
+        Ledger(version=1, updated=datetime.now(UTC), schema_version=1, hypotheses=hypotheses),
+    )
+
+    pack = build_context(repo, db, include_ledger=True)
+    text = next(s.content for s in pack.sections if s.key == "ledger")
+
+    assert "plain-language: A condition explained plainly." in text
+    assert "plain-language: MISSING" in text
