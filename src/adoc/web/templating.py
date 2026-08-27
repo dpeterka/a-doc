@@ -15,6 +15,7 @@ from starlette.requests import Request
 
 from adoc.casefile.repo import DataRepo
 from adoc.intake.facts import INTAKE_FACTS_RELPATH
+from adoc.web.casefile_helpers import group_hypotheses, sort_hypotheses, summarize_diff_ops
 from adoc.web.markdown_lite import render_markdown_lite
 
 TEMPLATES_DIR = Path(__file__).parent / "templates"
@@ -83,5 +84,8 @@ templates.env.globals["has_intake_facts"] = has_intake_facts
 templates.env.filters["markdown_lite"] = render_markdown_lite
 templates.env.filters["tier_label"] = tier_label
 templates.env.filters["status_label"] = status_label
+templates.env.filters["group_hypotheses"] = group_hypotheses
+templates.env.filters["sort_hypotheses"] = sort_hypotheses
+templates.env.filters["summarize_diff_ops"] = summarize_diff_ops
 templates.env.filters["origin_label"] = origin_label
 templates.env.filters["friendly_date"] = friendly_date

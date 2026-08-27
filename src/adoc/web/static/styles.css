@@ -760,3 +760,83 @@ body.lightbox-active {
     flex: 1;
   }
 }
+
+/* --- differential readability -------------------------------------------
+   A 24-hypothesis ledger rendered flat is a list of disease names with no
+   signal about which matter. For a patient reading her own case file that
+   is not merely untidy — it reads as "you might have 24 things". These
+   rules exist to give the page a spine: what to read now, and what is
+   merely being tracked. */
+
+.group-heading {
+  margin: 1.6rem 0 0.6rem;
+  font-size: 1.05rem;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  color: var(--color-muted);
+}
+
+.hypothesis-name {
+  margin: 0 0 0.5rem;
+  font-size: 1.15rem;
+  line-height: 1.3;
+}
+
+/* Folded, never dropped. `open` restores the full record in one click. */
+.secondary-leads {
+  margin-top: 1.5rem;
+  border-top: 1px solid var(--color-border);
+  padding-top: 0.75rem;
+}
+
+.secondary-leads > summary {
+  cursor: pointer;
+  font-weight: 600;
+  padding: 0.4rem 0;
+}
+
+.hypothesis-secondary {
+  border-left: 3px solid var(--color-border);
+  padding-left: 0.9rem;
+}
+
+/* Model prose is readable at a measure, not at full page width. */
+.reasoning-prose {
+  max-width: 68ch;
+  line-height: 1.6;
+  white-space: pre-wrap;
+}
+
+.whats-new-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.whats-new-item + .whats-new-item {
+  margin-top: 1rem;
+  border-top: 1px solid var(--color-border);
+  padding-top: 1rem;
+}
+
+.whats-new-headline {
+  margin: 0 0 0.4rem;
+  font-weight: 600;
+}
+
+.whats-new-names {
+  margin: 0.3rem 0 0.5rem 1.1rem;
+  padding: 0;
+}
+
+.whats-new-why > summary {
+  cursor: pointer;
+  color: var(--color-muted);
+  font-size: 0.9rem;
+}
+
+.chip-version {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  font-variant-numeric: tabular-nums;
+}
