@@ -400,3 +400,77 @@ def find_document_by_filename(
         if doc.filename == filename:
             return doc
     return None
+
+
+# --- rendering LLM prose so a person can read it --------------------------------------
+
+
+_CHALLENGE_NOTE_PREFIXES: tuple[tuple[str, str], ...] = (
+    ("Added from weekly blind-panel divergence adjudication:", "Added by review"),
+    ("Weekly blind panel did not independently surface this hypothesis:", "Not surfaced by panel"),
+    ("Reviewed again:", "Reviewed"),
+    ("Challenge:", "Challenge"),
+)
+"""Sentence stems the review path writes at the head of a note, mapped to a
+short label. The stem is redundant once the note is shown under that label,
+and it is the longest, least informative part of every entry."""
+
+
+def split_challenge_notes(notes: str | None) -> list[dict[str, str]]:
+    """One `challenger_notes` blob split back into the entries it was built
+    from, each labelled.
+
+    `apply_diff` appends every `RecordChallenge` with `"\\n"`, so the field
+    accumulates one entry per review — and the card rendered the whole
+    accumulation into a single `<p>`. Three challenges from three different
+    weeks arrived as one 200-word paragraph with no boundary between them,
+    each opening with the same 60-character bureaucratic stem. That is the
+    "barely readable blobs of text" the patient sees.
+
+    Splitting is on the newline the append uses. Where an entry opens with a
+    known stem, the stem becomes a label and is stripped from the body, which
+    removes the repetition and gives the reader a way to skim.
+    """
+    if not notes or not notes.strip():
+        return []
+    entries: list[dict[str, str]] = []
+    for raw in notes.splitlines():
+        text = raw.strip()
+        if not text:
+            continue
+        label = "Note"
+        for prefix, prefix_label in _CHALLENGE_NOTE_PREFIXES:
+            if text.startswith(prefix):
+                label = prefix_label
+                text = text[len(prefix) :].strip()
+                break
+        if text:
+            entries.append({"label": label, "text": text})
+    return entries
+
+
+def humanize_source_ref(source: str) -> str:
+    """A source ref as a person would read it.
+
+    The card printed the machine ref verbatim —
+    `(labs:lumbar-spine-percent-change-vs-2024:2026-08-04)` — beside every
+    claim. It is the citation's identity, not its presentation: the patient
+    and her doctors need to know WHICH row is being cited, and the slug's
+    hyphens and prefix are noise in the way of that.
+    """
+    if source.startswith("labs:"):
+        _, _, rest = source.partition(":")
+        slug, _, when = rest.rpartition(":")
+        name = (slug or rest).replace("-", " ").strip()
+        return f"{name} · {when}" if when else name
+    if source.startswith("doc:"):
+        body = source[len("doc:") :]
+        path, sep, page = body.partition("#p")
+        return f"{path} · p{page}" if sep else path
+    if source.startswith("encounter:"):
+        return source[len("encounter:") :]
+    if source.startswith("patient-report:"):
+        return f"you reported this · {source[len('patient-report:') :]}"
+    if source.startswith("pmid:"):
+        return f"PubMed {source[len('pmid:') :]}"
+    return source

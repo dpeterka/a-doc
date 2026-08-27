@@ -58,7 +58,7 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from adoc import __version__
 from adoc.casefile.ledger import ACTIVE_STATUSES, load_ledger
@@ -134,6 +134,41 @@ class TrendScanResult(BaseModel):
     findings: list[TrendFinding] = Field(default_factory=list)
 
 
+_EVIDENCE_STRENGTHS = frozenset({"strong", "moderate", "weak"})
+
+_EVIDENCE_STRENGTH_SYNONYMS = {
+    "supporting": "moderate",
+    "supportive": "moderate",
+    "suggestive": "weak",
+    "possible": "weak",
+    "definitive": "strong",
+    "conclusive": "strong",
+    "high": "strong",
+    "medium": "moderate",
+    "low": "weak",
+}
+"""Words panel members reach for instead of the three the schema allows.
+`supporting` is the one observed in production; the rest are the obvious
+neighbours, mapped so a near-miss keeps its meaning rather than flattening
+to the default."""
+
+
+_PROBABILITY_BUCKETS = frozenset({"high", "moderate", "low", "minimal"})
+
+_PROBABILITY_BUCKET_SYNONYMS = {
+    "possible": "low",
+    "likely": "high",
+    "probable": "high",
+    "very high": "high",
+    "very low": "minimal",
+    "unlikely": "minimal",
+    "remote": "minimal",
+    "medium": "moderate",
+    "intermediate": "moderate",
+}
+"""Words panel members reach for instead of the four the schema allows."""
+
+
 class BlindEvidenceItem(BaseModel):
     """One cited claim supporting a blind panel member's hypothesis.
 
@@ -164,6 +199,36 @@ class BlindEvidenceItem(BaseModel):
     source: str
     strength: EvidenceStrength = "moderate"
 
+    @field_validator("strength", mode="before")
+    @classmethod
+    def _tolerate_unknown_strength(cls, value: object) -> object:
+        """An unrecognised strength degrades to the default instead of failing
+        the payload.
+
+        The `source` fix above did not generalise, and the very next review
+        died the same death one field over: a panel member wrote
+        `strength: "supporting"` and the `Literal` rejected it, taking all 14
+        nodes and 13 minutes with it. The rule is not "validate refs late", it
+        is **no single field of one evidence item may fail the payload** —
+        the schema exists to shape a hypothesis, not to referee an adjective.
+
+        Synonyms map where the intent is unambiguous; anything else becomes
+        `moderate`, which is the field's default and the honest reading of a
+        vocabulary the model did not commit to.
+        """
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in _EVIDENCE_STRENGTHS:
+                return normalized
+            mapped = _EVIDENCE_STRENGTH_SYNONYMS.get(normalized)
+            if mapped is not None:
+                return mapped
+            logger.warning(
+                "review: panel used an unknown evidence strength %r; recording as 'moderate'",
+                value,
+            )
+        return "moderate"
+
 
 class BlindDifferentialItem(BaseModel):
     """One hypothesis in a blind panel member's de novo differential —
@@ -173,6 +238,33 @@ class BlindDifferentialItem(BaseModel):
     probability_bucket: ProbabilityBucket
     why: str
     cant_miss: bool = False
+
+    @field_validator("probability_bucket", mode="before")
+    @classmethod
+    def _tolerate_unknown_bucket(cls, value: object) -> object:
+        """Same posture as `BlindEvidenceItem.strength`, for the same reason.
+
+        This field is REQUIRED and a `Literal`, so an unrecognised word here
+        is even more destructive than a bad strength — it fails the item, the
+        payload, the panel member and the review. Two separate 13-minute runs
+        have already been lost to a `Literal` refusing a near-miss.
+
+        Unknown values fall to `low` rather than the middle: a bucket this
+        code did not understand is not evidence of a high-probability
+        hypothesis, and `cant_miss` carries urgency independently of it.
+        """
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in _PROBABILITY_BUCKETS:
+                return normalized
+            mapped = _PROBABILITY_BUCKET_SYNONYMS.get(normalized)
+            if mapped is not None:
+                return mapped
+            logger.warning(
+                "review: panel used an unknown probability bucket %r; recording as 'low'", value
+            )
+        return "low"
+
     evidence: list[BlindEvidenceItem] = Field(default_factory=list)
     """Cited support. Empty is tolerated rather than rejected: a panel member
     that cites nothing should still contribute its hypothesis to the
