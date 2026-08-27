@@ -6,13 +6,13 @@ Fake `LlmClient` transports throughout — no network, ever.
 from __future__ import annotations
 
 import json
+import logging
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import pytest
 from git import Repo
-from pydantic import ValidationError
 
 from adoc.casefile.ledger import apply_and_save
 from adoc.casefile.repo import HISTORY_RELPATH, LEDGER_RELPATH, DataRepo
@@ -35,6 +35,7 @@ from adoc.reason.review import (
     FULL_REVIEW_FLOOR,
     AdjudicationResult,
     BlindDifferentialItem,
+    BlindDifferentialPayload,
     BlindEvidenceItem,
     ChallengeSweepResult,
     DeferredVerificationSweepResult,
@@ -1349,7 +1350,46 @@ def test_an_unresolvable_citation_is_dropped_not_written(db: LabsDb, repo: DataR
     assert _resolvable_evidence(divergence, db, repo) == []
 
 
-def test_a_malformed_ref_is_rejected_at_the_schema_boundary() -> None:
-    """A ref that isn't even in the grammar never gets as far as resolution."""
-    with pytest.raises(ValidationError):
-        BlindEvidenceItem(claim="c", source="not-a-ref")
+def test_a_malformed_ref_costs_the_citation_not_the_review(
+    db: LabsDb, repo: DataRepo, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A malformed ref parses at the schema boundary and is dropped by the
+    filter — it must NEVER fail the payload (ADR 0028).
+
+    This pin is the inverse of the one it replaced. The earlier version
+    validated `BlindEvidenceItem.source` in a field validator, which raises;
+    on the first real review the panel guessed four prefixes wrong and the
+    resulting ValidationError destroyed a 14-node, 12-minute run. The
+    property worth pinning is not "bad refs are rejected early" but "bad refs
+    never reach the ledger AND never take the review down with them".
+    """
+    payload = BlindDifferentialPayload.model_validate(
+        {
+            "items": [
+                {
+                    "name": "Mononucleosis",
+                    "probability_bucket": "low",
+                    "why": "Cited with an invented prefix.",
+                    "evidence": [
+                        {
+                            "claim": "Monospot positive",
+                            # Verbatim from the failed prod run: well-formed in
+                            # shape, invented in prefix, real analyte and date.
+                            "source": "other:monospot_(heterophile)_screen:2026-03-17",
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+    assert payload.items[0].name == "Mononucleosis"
+
+    divergence = Divergence(
+        id="panel-only:mono",
+        kind="panel_only",
+        name="Mononucleosis",
+        panel_evidence=list(payload.items[0].evidence),
+    )
+    with caplog.at_level(logging.WARNING):
+        assert _resolvable_evidence(divergence, db, repo) == []
+    assert "malformed panel citation" in caplog.text

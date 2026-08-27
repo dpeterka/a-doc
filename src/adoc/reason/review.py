@@ -58,7 +58,7 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, ValidationError
 
 from adoc import __version__
 from adoc.casefile.ledger import ACTIVE_STATUSES, load_ledger
@@ -143,19 +143,25 @@ class BlindEvidenceItem(BaseModel):
     ("FSH 91.4 mIU/mL") but never a resolvable `labs:fsh:<date>`. Every
     hypothesis card in the UI therefore rendered an empty evidence section.
 
-    `source` is validated against the same grammar as every other evidence
-    ref (`casefile.schema.validate_source_ref`), so a ref the panel invents
-    is rejected here rather than becoming an uncheckable ledger entry.
+    `source` is deliberately an UNVALIDATED string. The first version of this
+    model validated it against `casefile.schema.validate_source_ref` in a
+    field validator, which raises — so a single invented ref failed the whole
+    `BlindDifferentialPayload`, which failed the panel member, which failed
+    the review. That is exactly what happened on the first real run: the
+    panel finally cited densely, guessed four prefixes wrong
+    (`other:monospot_(heterophile)_screen:2026-03-17` — a real analyte on a
+    real date), and took a 14-node, 12-minute review down with it.
+
+    A bad citation must cost the citation. Refs are filtered by
+    `_resolvable_evidence` after the payload parses, which drops and logs
+    what does not resolve — the strip-not-fail posture of ADR 0016. Nothing
+    unresolvable reaches the ledger either way; the difference is whether the
+    other 23 hypotheses survive.
     """
 
     claim: str
     source: str
     strength: EvidenceStrength = "moderate"
-
-    @field_validator("source")
-    @classmethod
-    def _check_source(cls, value: str) -> str:
-        return validate_source_ref(value)
 
 
 class BlindDifferentialItem(BaseModel):
@@ -232,6 +238,21 @@ def _resolvable_evidence(divergence: Divergence, db: LabsDb, repo: DataRepo) -> 
     """
     kept: list[Evidence] = []
     for ev in divergence.panel_evidence:
+        # Grammar first, and defensively: `Evidence.source` validates its ref
+        # and RAISES, which is right for the ledger's own type but means the
+        # citation check below cannot be reached with a malformed ref. The
+        # panel emitted `other:<analyte>:<date>` — well-formed in shape, bad
+        # in prefix — so this branch is a live path, not a theoretical one.
+        try:
+            validate_source_ref(ev.source)
+        except (ValueError, ValidationError) as exc:
+            logger.warning(
+                "review: dropped a malformed panel citation for %r: %s (%s)",
+                divergence.name,
+                ev.source,
+                exc,
+            )
+            continue
         report = check_evidence_citations(
             [Evidence(claim=ev.claim, source=ev.source, strength=ev.strength)], db, repo
         )
