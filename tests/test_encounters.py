@@ -19,6 +19,7 @@ from adoc.casefile.encounters import (
     slugify,
     write_encounter,
 )
+from adoc.intake.wizard import parse_approx_date_with_precision
 
 
 def make_encounter(**overrides: object) -> Encounter:
@@ -205,3 +206,60 @@ def test_slugify_keeps_long_titles_distinct_when_they_share_a_prefix() -> None:
 def test_slugify_is_unchanged_for_ordinary_titles() -> None:
     assert slugify("ER visit for chest pain") == "er-visit-for-chest-pain"
     assert slugify("   ") == "encounter"
+
+
+# --- ADR 0027: a date is stated no more precisely than it is known ---------------------
+
+
+@pytest.mark.parametrize(
+    ("text", "expected_precision"),
+    [
+        ("2021-03-15", "day"),
+        ("2021-03", "month"),
+        ("2021", "year"),
+        ("early 2021", "approximate"),
+        ("spring 2022", "approximate"),
+    ],
+)
+def test_precision_travels_with_a_parsed_date(text: str, expected_precision: str) -> None:
+    """ "2021" and "early 2021" both parse to 2021-01-01, and "spring 2022" to
+    2022-01-01 — the wrong season asserted to the day. Downstream that was
+    indistinguishable from a real January 1st."""
+    parsed = parse_approx_date_with_precision(text)
+
+    assert parsed is not None
+    assert parsed[1] == expected_precision
+
+
+def test_an_undatable_event_still_yields_nothing() -> None:
+    """Patients often cannot date a hospitalization; that stays an undated
+    event rather than a fabricated date."""
+    assert parse_approx_date_with_precision("about six years ago") is None
+
+
+def test_an_encounter_written_before_this_field_round_trips() -> None:
+    """Existing encounter files have no precision or reported_on; both
+    default so the committed format is unchanged."""
+    markdown = (
+        "---\ndate: 2025-03-26\ntype: imaging\n---\n\n"
+        "## Summary\n\nCT abdomen.\n\n## New findings\n\n\n\n## Plan / follow-ups\n\n\n"
+    )
+
+    encounter = parse_encounter(markdown)
+
+    assert encounter.frontmatter.date_precision == "day"
+    assert encounter.frontmatter.reported_on is None
+
+
+def test_precision_and_report_date_survive_a_round_trip() -> None:
+    fm = EncounterFrontmatter(
+        date=date(2021, 1, 1),
+        type="patient-report",
+        date_precision="year",
+        reported_on=date(2026, 8, 27),
+    )
+
+    parsed = parse_encounter(render_encounter(Encounter(frontmatter=fm, summary="Thyroid crisis")))
+
+    assert parsed.frontmatter.date_precision == "year"
+    assert parsed.frontmatter.reported_on == date(2026, 8, 27)
