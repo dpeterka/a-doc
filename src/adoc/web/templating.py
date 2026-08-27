@@ -15,7 +15,13 @@ from starlette.requests import Request
 
 from adoc.casefile.repo import DataRepo
 from adoc.intake.facts import INTAKE_FACTS_RELPATH
-from adoc.web.casefile_helpers import group_hypotheses, sort_hypotheses, summarize_diff_ops
+from adoc.web.casefile_helpers import (
+    group_hypotheses,
+    humanize_source_ref,
+    sort_hypotheses,
+    split_challenge_notes,
+    summarize_diff_ops,
+)
 from adoc.web.markdown_lite import render_markdown_lite
 
 TEMPLATES_DIR = Path(__file__).parent / "templates"
@@ -89,3 +95,5 @@ templates.env.filters["sort_hypotheses"] = sort_hypotheses
 templates.env.filters["summarize_diff_ops"] = summarize_diff_ops
 templates.env.filters["origin_label"] = origin_label
 templates.env.filters["friendly_date"] = friendly_date
+templates.env.filters["split_challenge_notes"] = split_challenge_notes
+templates.env.filters["humanize_source_ref"] = humanize_source_ref

@@ -126,7 +126,11 @@ def test_ledger_view_shows_origin_patient_chip(tmp_path: Path) -> None:
 
     assert response.status_code == 200
     assert 'data-origin="patient"' in response.text
-    assert "origin: patient" in response.text
+    # The chip is labelled "raised by:" rather than "origin:" — the machine
+    # word was in the patient's face. `data-origin` above is the stable hook;
+    # this asserts the human-readable label is present, not its exact phrasing.
+    assert "raised by:" in response.text
+    assert "you" in response.text.lower()
 
 
 def test_ledger_view_links_a_labs_source_ref(tmp_path: Path) -> None:
@@ -354,3 +358,81 @@ def test_a_cant_miss_lead_is_never_folded_however_unlikely() -> None:
 
     assert [h.id for h in groups["leading"]] == ["cm"]
     assert groups["secondary"] == []
+
+
+def test_challenge_notes_render_as_separate_labelled_blocks(tmp_path: Path) -> None:
+    """`challenger_notes` accumulates one entry per review, joined by "\\n",
+    and the card used to dump the whole accumulation into a single `<p>`.
+
+    Three challenges from three different weeks arrived as one unbroken
+    paragraph, each opening with the same 60-character stem — the "barely
+    readable blobs of text" the patient reported. Each entry now gets its own
+    labelled block, and only the most recent is unfolded.
+    """
+    app, repo, _db, _calls = build_app(tmp_path)
+    hyp = Hypothesis(
+        id="est-01",
+        name="Exogenous estrogen therapy",
+        tier="expanded",
+        probability="moderate",
+        status="active",
+        origin="challenger",
+        first_proposed=date(2026, 1, 1),
+        challenger_notes=(
+            "Added from weekly blind-panel divergence adjudication: high SHBG makes this plausible."
+            "\nChallenge: this is an inference without a medication history."
+            "\nChallenge: estradiol could reflect endogenous surges instead."
+        ),
+    )
+    ledger = Ledger(version=1, updated=datetime.now(UTC), schema_version=1, hypotheses=[hyp])
+    save_ledger(repo.root / LEDGER_RELPATH, ledger)
+
+    client = TestClient(app)
+    login(client)
+    response = client.get("/ledger")
+
+    assert response.status_code == 200
+    # One block per entry, not one paragraph for all three.
+    assert response.text.count('class="note-entry"') == 3
+    # The repeated bureaucratic stem is replaced by a short label.
+    assert "Added by review" in response.text
+    assert "Added from weekly blind-panel divergence adjudication:" not in response.text
+    # Older notes are folded; the newest is not.
+    assert "2 earlier notes" in response.text
+    assert "estradiol could reflect endogenous surges" in response.text
+
+
+def test_a_labs_ref_is_shown_in_words_not_slug_syntax(tmp_path: Path) -> None:
+    """The card printed the machine ref verbatim beside every claim —
+    `(labs:lumbar-spine-percent-change-vs-2024:2026-08-04)`. That is the
+    citation's identity, not its presentation."""
+    app, repo, _db, _calls = build_app(tmp_path)
+    hyp = Hypothesis(
+        id="dxa-01",
+        name="DXA measurement artifact",
+        tier="expanded",
+        probability="moderate",
+        status="active",
+        origin="challenger",
+        first_proposed=date(2026, 1, 1),
+        evidence_for=[
+            Evidence(
+                claim="Similar magnitude of decline at spine and both hips",
+                source="labs:lumbar-spine-percent-change-vs-2024:2026-08-04",
+                strength="moderate",
+            )
+        ],
+    )
+    ledger = Ledger(version=1, updated=datetime.now(UTC), schema_version=1, hypotheses=[hyp])
+    save_ledger(repo.root / LEDGER_RELPATH, ledger)
+
+    client = TestClient(app)
+    login(client)
+    response = client.get("/ledger")
+
+    assert response.status_code == 200
+    assert "lumbar spine percent change vs 2024 · 2026-08-04" in response.text
+    # The raw ref survives only as the link's title attribute, for anyone who
+    # needs the exact identity; it is no longer body text.
+    assert ">(labs:lumbar-spine-percent-change-vs-2024:2026-08-04)<" not in response.text
+    assert 'title="labs:lumbar-spine-percent-change-vs-2024:2026-08-04"' in response.text
