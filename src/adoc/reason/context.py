@@ -25,7 +25,7 @@ from adoc.labs.db import LabsDb
 from adoc.labs.models import LabResult
 from adoc.labs.panels import derived_from_note, panel_sort_key
 from adoc.labs.queries import abnormal_summary
-from adoc.labs.validate import canonical_unit
+from adoc.labs.validate import canonical_unit, convert_value
 
 CASE_SUMMARY_RELPATH = "case/case-summary.md"
 PATIENT_THEORIES_RELPATH = "case/patient-theories.md"
@@ -207,20 +207,37 @@ def _comparable_unit_key(unit: str | None) -> str:
     return (unit or "").strip().lower()
 
 
-def _comparable_series(rows: list[LabResult]) -> list[LabResult]:
-    """The readings that may legitimately be compared to each other: those
-    sharing the MOST RECENT unit.
+def _comparable_series(rows: list[LabResult]) -> list[tuple[LabResult, float]]:
+    """Readings paired with their value expressed in the MOST RECENT unit.
 
-    Scoping to the latest unit rather than dropping a mixed-unit analyte
-    keeps the clinically current scale and still yields a trajectory — the
-    CBC absolutes moved from `x10E3/uL` to `cells/uL` mid-history, and
-    comparing across that boundary produced "eosinophils rising 319,900%".
+    Two kinds of mixed-unit history exist in this corpus (ADR 0027). A
+    cosmetic difference (`IU/L` vs `U/L`) is resolved by
+    `labs.validate`'s synonym families and needs no conversion. A genuine
+    magnitude difference — the CBC absolutes report `x10E3/uL` at some
+    points and `cells/uL` at others, a factor of 1000 — is CONVERTED where
+    an exact factor is known.
+
+    A reading whose unit cannot be converted to the current one is dropped
+    rather than compared: `convert_value` returns `None` instead of guessing,
+    and comparing incomparable numbers is what produced "eosinophils rising
+    319,900%".
+
+    Converting rather than discarding matters: scoping to the latest unit
+    alone threw away five of this patient's readings per CBC absolute, which
+    is most of the early history.
     """
     numeric = [row for row in rows if row.value is not None]
     if not numeric:
         return []
-    latest_key = _comparable_unit_key(numeric[-1].ucum_unit)
-    return [row for row in numeric if _comparable_unit_key(row.ucum_unit) == latest_key]
+    target = numeric[-1].ucum_unit
+    converted: list[tuple[LabResult, float]] = []
+    for row in numeric:
+        assert row.value is not None
+        value = convert_value(row.value, row.ucum_unit, target)
+        if value is None:
+            continue
+        converted.append((row, value))
+    return converted
 
 
 def _trajectories_section(db: LabsDb) -> ContextSection:
@@ -247,20 +264,21 @@ def _trajectories_section(db: LabsDb) -> ContextSection:
         series = _comparable_series(db.series(name))
         if len(series) < MIN_TRAJECTORY_POINTS:
             continue
-        first, last = series[0], series[-1]
-        if first.value in (None, 0) or last.value is None:
+        (first_row, first_value), (last_row, last_value) = series[0], series[-1]
+        if first_value == 0:
             continue
-        change = (last.value - first.value) / abs(first.value)
+        change = (last_value - first_value) / abs(first_value)
         if abs(change) < TRAJECTORY_MIN_CHANGE:
             continue
-        unit = f" {last.ucum_unit}" if last.ucum_unit else ""
+        unit = f" {last_row.ucum_unit}" if last_row.ucum_unit else ""
         direction = "rising" if change > 0 else "falling"
         moving.append(
             (
                 abs(change),
                 f"- {name}: {direction} {abs(change) * 100:.0f}% — "
-                f"{first.value}{unit} ({first.date.isoformat()}) → "
-                f"{last.value}{unit} ({last.date.isoformat()}), {len(series)} readings",
+                f"{first_value:g}{unit} ({first_row.date.isoformat()}) → "
+                f"{last_value:g}{unit} ({last_row.date.isoformat()}), "
+                f"{len(series)} readings",
             )
         )
 

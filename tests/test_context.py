@@ -408,9 +408,12 @@ def test_a_unit_change_mid_history_never_becomes_a_fake_signal(db: LabsDb) -> No
 
     content = _trajectories_section(db).content
 
-    # scoped to the most recent unit: 92 -> 320 is ~248%, not ~319,900%
+    # The naive comparison reported ~319,900%. Converting (0.1 x10E3/uL ==
+    # 100 cells/uL) gives a real rise over the WHOLE history rather than the
+    # truncated span an earlier version produced by discarding the old unit.
     assert "319900" not in content.replace(",", "")
-    assert "248%" in content
+    assert "rising 220%" in content
+    assert "5 readings" in content  # nothing dropped: all five are comparable
 
 
 def test_two_readings_are_not_a_trajectory(db: LabsDb) -> None:

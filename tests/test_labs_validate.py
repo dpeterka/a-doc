@@ -14,7 +14,9 @@ from adoc.labs.validate import (
     ANALYTE_SPECS,
     IssueCode,
     canonical_rename_target,
+    canonical_unit,
     canonicalize,
+    convert_value,
     trend_outlier,
     validate_row,
 )
@@ -664,3 +666,69 @@ def test_canonical_rename_target_gives_egfr_stratifications_distinct_targets() -
     assert black == "eGFR (African American)"
     assert non_black == "eGFR (Non-African American)"
     assert black != non_black
+
+
+# --- unit normalization (ADR 0027 follow-up) --------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("a", "b"),
+    [
+        ("IU/L", "U/L"),  # enzyme activity, three spellings in this corpus
+        ("unit/L", "U/L"),
+        ("mcg/dL", "ug/dL"),
+        ("mcg/L", "ug/L"),
+        ("mm/h", "mm/hr"),
+        ("uIU/mL", "mIU/L"),  # numerically equal for TSH
+        ("Thousand/uL", "x10E3/uL"),
+        ("x10(9)/L", "x10E3/uL"),  # 10^9/L == 10^3/uL
+        ("Million/uL", "x10E6/uL"),
+        ("x10^12/L", "x10E6/uL"),  # 10^12/L == 10^6/uL
+        ("% of total Hgb", "%"),
+        ("g/dL (calc)", "g/dL"),
+        ("mL/min/1.73", "mL/min/1.73m2"),
+        ("INDEX", "index"),
+    ],
+)
+def test_cosmetic_spellings_canonicalize_together(a: str, b: str) -> None:
+    """26 of this patient's 461 analytes arrived under more than one unit.
+    These pairs are the same quantity at the same magnitude, so grouping them
+    changes no stored value."""
+    assert canonical_unit(a) == canonical_unit(b) is not None
+
+
+def test_a_magnitude_difference_is_never_a_synonym() -> None:
+    """`cells/uL` is 1000x smaller than `x10E3/uL`. Treating them as one
+    family would silently compare numbers a factor of 1000 apart — which is
+    what reported "eosinophils rising 319,900%"."""
+    assert canonical_unit("cells/uL") != canonical_unit("x10E3/uL")
+
+
+@pytest.mark.parametrize(
+    ("value", "from_unit", "to_unit", "expected"),
+    [
+        (0.1, "x10E3/uL", "cells/uL", 100.0),
+        (320.0, "cells/uL", "x10E3/uL", 0.32),
+        (0.1, "x10(9)/L", "cells/uL", 100.0),  # via the same family
+        (8.5, "U/L", "IU/L", 8.5),  # synonym: unchanged
+    ],
+)
+def test_a_known_factor_converts_exactly(
+    value: float, from_unit: str, to_unit: str, expected: float
+) -> None:
+    result = convert_value(value, from_unit, to_unit)
+    assert result is not None
+    assert result == pytest.approx(expected)
+
+
+@pytest.mark.parametrize(
+    ("from_unit", "to_unit"),
+    [("mg/dL", "cells/uL"), ("ng/mL", "pg/mL"), ("wibble", "cells/uL"), ("U/L", "mmol/L")],
+)
+def test_an_unknown_conversion_returns_none_rather_than_guessing(
+    from_unit: str, to_unit: str
+) -> None:
+    """A wrong factor is worse than an unrecognized unit — the caller must
+    decide, not receive a plausible-looking number. (ng/mL to pg/mL is a
+    real 1000x factor, but it is not in the table, so it is not asserted.)"""
+    assert convert_value(1.0, from_unit, to_unit) is None
