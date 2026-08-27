@@ -620,3 +620,44 @@ def test_a_legitimate_nested_object_is_not_unwrapped() -> None:
     result = _validate_with_repairs(Nested, {"note": "real", "inner": {"a": 1}})
 
     assert result.inner == {"a": 1}
+
+
+# --- truncation is a failure for free text too, not just structured output --------------
+
+
+def _truncating_client(truncated: bool) -> LlmClient:
+    def transport(_req: TransportRequest) -> TransportResponse:
+        return TransportResponse(
+            text="Your ferritin trend suggests",
+            tool_input=None,
+            input_tokens=10,
+            output_tokens=32768,
+            truncated=truncated,
+        )
+
+    return LlmClient(
+        bindings={"primary_reasoner": [ModelBinding(provider="anthropic", model="m", params={})]},
+        providers={"anthropic": AnthropicProvider(api_key="k", transport=transport)},
+    )
+
+
+def test_a_truncated_free_text_reply_is_an_error() -> None:
+    """`run_informational_turn` passes NO schema, so before this a reply that
+    stopped mid-sentence at the token budget went straight to the patient
+    with nothing detecting it. A truncated answer is wrong, not short."""
+    client = _truncating_client(truncated=True)
+
+    with pytest.raises(LlmError, match="truncated"):
+        client.complete(
+            "primary_reasoner", system="s", messages=[Message(role="user", content="q")]
+        )
+
+
+def test_an_untruncated_free_text_reply_passes() -> None:
+    client = _truncating_client(truncated=False)
+
+    result = client.complete(
+        "primary_reasoner", system="s", messages=[Message(role="user", content="q")]
+    )
+
+    assert result.text == "Your ferritin trend suggests"

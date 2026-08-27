@@ -158,6 +158,15 @@ class TransportResponse:
     tool_input: dict[str, Any] | None
     input_tokens: int
     output_tokens: int
+    truncated: bool = False
+    """Generation stopped because it hit the completion budget, not because
+    the model finished (Anthropic `stop_reason == "max_tokens"`, OpenAI
+    `finish_reason == "length"`).
+
+    Reported by the transport, judged by `LlmClient.complete` — a provider
+    should say what happened, not decide what it means. Defaults to `False`
+    so existing fake transports keep working.
+    """
 
 
 TransportFn = Callable[[TransportRequest], TransportResponse]
@@ -244,12 +253,8 @@ class AnthropicProvider:
         if request.schema is not None and tool_input is None:
             raise LlmError("anthropic: expected an emit_result tool call, none returned")
 
-        if request.schema is not None and response.stop_reason == "max_tokens":
-            raise LlmError(
-                f"model {request.model!r}: output hit the token limit before "
-                "completing the structured result - raise max_tokens"
-            )
         return TransportResponse(
+            truncated=getattr(response, "stop_reason", None) == "max_tokens",
             text="".join(text_parts),
             tool_input=tool_input,
             input_tokens=response.usage.input_tokens,
@@ -348,7 +353,7 @@ class OpenAIProvider:
             raise LlmError("openai: response contained no choices")
         choice = response.choices[0]
         text = choice.message.content or ""
-        if request.schema is not None and (choice.finish_reason == "length" or not text.strip()):
+        if request.schema is not None and not text.strip():
             raise LlmError(
                 f"model {request.model!r}: no structured content returned "
                 f"(finish_reason={choice.finish_reason!r}) - reasoning tokens "
@@ -364,6 +369,7 @@ class OpenAIProvider:
 
         usage = response.usage
         return TransportResponse(
+            truncated=getattr(choice, "finish_reason", None) == "length",
             text=text,
             tool_input=tool_input,
             input_tokens=usage.prompt_tokens if usage else 0,
@@ -751,6 +757,34 @@ class LlmClient:
             )
             raise
         duration = time.monotonic() - started
+
+        # Truncation is a failure for EVERY call, structured or not. A
+        # free-text reply that stopped mid-sentence at the budget is wrong,
+        # not merely short — and `run_informational_turn` passes no schema,
+        # so before this such a reply reached the patient undetected.
+        # Judged here rather than in each provider so the rule is one rule,
+        # and so it is reachable through the transport injection seam that
+        # every test uses.
+        if response.truncated:
+            self._audit(
+                _AuditRecord(
+                    role=role,
+                    model=binding.model,
+                    provider=binding.provider,
+                    input_tokens=response.input_tokens,
+                    output_tokens=response.output_tokens,
+                    cost_estimate=None,
+                    duration_s=duration,
+                    scrub_count=scrub_count,
+                    error=True,
+                )
+            )
+            raise LlmError(
+                f"role {role!r} ({binding.model}): output hit the {max_tokens}-token budget "
+                f"before completing ({response.output_tokens} tokens produced) - the response "
+                "is truncated, not merely short"
+            )
+
         logger.info(
             "llm: role=%s model=%s ok in %.1fs (in=%s out=%s tokens)",
             role,
