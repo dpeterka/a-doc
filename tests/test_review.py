@@ -16,7 +16,15 @@ from git import Repo
 
 from adoc.casefile.ledger import apply_and_save
 from adoc.casefile.repo import HISTORY_RELPATH, LEDGER_RELPATH, DataRepo
-from adoc.casefile.schema import AddHypothesis, Hypothesis, Ledger, LedgerDiff, Provenance
+from adoc.casefile.schema import (
+    AddEvidence,
+    AddHypothesis,
+    Evidence,
+    Hypothesis,
+    Ledger,
+    LedgerDiff,
+    Provenance,
+)
 from adoc.config import ModelBinding
 from adoc.labs.db import LabsDb
 from adoc.labs.models import DocumentStatus, LabDocument, LabResult
@@ -34,6 +42,7 @@ from adoc.reason.review import (
     FULL_REVIEW_COOLDOWN,
     FULL_REVIEW_FLOOR,
     AdjudicationResult,
+    BlindDifferential,
     BlindDifferentialItem,
     BlindDifferentialPayload,
     BlindEvidenceItem,
@@ -50,7 +59,9 @@ from adoc.reason.review import (
     _pool_evidence,
     _resolvable_evidence,
     build_review_dag,
+    build_review_ledger_diff,
     challenger_kill_rate,
+    compute_divergences,
     hypothesis_ages_days,
     ledger_churn,
     parse_audit_costs,
@@ -1393,3 +1404,113 @@ def test_a_malformed_ref_costs_the_citation_not_the_review(
     with caplog.at_level(logging.WARNING):
         assert _resolvable_evidence(divergence, db, repo) == []
     assert "malformed panel citation" in caplog.text
+
+
+def _seed_crp_row(db: LabsDb) -> None:
+    db.upsert_document(
+        LabDocument(
+            sha256="c" * 64,
+            filename="crp.pdf",
+            doc_type="lab-result",
+            page_count=1,
+            ingested_at=datetime(2026, 5, 3, 12, 0, 0, tzinfo=UTC),
+            status=DocumentStatus.COMPLETE,
+        )
+    )
+    db.insert_results(
+        [
+            LabResult(
+                date=date(2026, 5, 2),
+                name="CRP",
+                name_raw="CRP",
+                value=8.5,
+                ucum_unit="mg/L",
+                source_doc="c" * 64,
+                raw_json="{}",
+            )
+        ]
+    )
+
+
+def test_panel_citations_survive_agreement_with_the_ledger(db: LabsDb, repo: DataRepo) -> None:
+    """When the panel AGREES with a ledger hypothesis, its citations must
+    still reach that hypothesis.
+
+    A divergence exists only where panel and ledger disagree, so citations
+    used to survive exclusively on disagreement — which inverted the intent.
+    The hypotheses both the ledger and an independent blind panel endorse are
+    the best-supported in the case, and they were the ones left uncited: 24 of
+    25 in prod had an empty evidence list, which is what the patient's
+    hypothesis cards render.
+    """
+    _seed_crp_row(db)
+    ledger = _seed_ledger(repo)
+    # Same name AND same probability bucket as the seeded SLE hypothesis:
+    # deliberate agreement, so no divergence is produced for it at all.
+    panels = [
+        BlindDifferential(
+            panel_index=0,
+            items=[
+                BlindDifferentialItem(
+                    name="Systemic lupus erythematosus",
+                    probability_bucket="moderate",
+                    why="agrees with the ledger",
+                    evidence=[
+                        BlindEvidenceItem(claim="CRP is elevated", source="labs:crp:2026-05-02")
+                    ],
+                )
+            ],
+        )
+    ]
+
+    divergence_set = compute_divergences(ledger, panels)
+    assert not [d for d in divergence_set.divergences if d.ledger_hypothesis_id == SLE_ID], (
+        "agreement must not produce a divergence — that is the premise of this test"
+    )
+    assert divergence_set.panel_citations[SLE_ID][0].source == "labs:crp:2026-05-02"
+
+    diff = build_review_ledger_diff(
+        ledger,
+        divergence_set,
+        AdjudicationResult(decisions=[]),
+        ChallengeSweepResult(notes=[]),
+        today=date(2026, 8, 27),
+        db=db,
+        repo=repo,
+    )
+    added = [op for op in diff.ops if isinstance(op, AddEvidence)]
+    assert [(op.id, op.evidence.source) for op in added] == [(SLE_ID, "labs:crp:2026-05-02")]
+
+
+def test_a_panel_citation_is_not_re_added_every_week(db: LabsDb, repo: DataRepo) -> None:
+    """`apply_diff` appends AddEvidence blindly, so the diff builder must
+    dedup against what the hypothesis already carries — otherwise every
+    weekly review re-adds the same citation and the card grows without end."""
+    _seed_crp_row(db)
+    ledger = _seed_ledger(repo)
+    evidence = Evidence(claim="CRP is elevated", source="labs:crp:2026-05-02", strength="moderate")
+    for hypothesis in ledger.hypotheses:
+        if hypothesis.id == SLE_ID:
+            hypothesis.evidence_for.append(evidence)
+
+    divergence_set = DivergenceSet(
+        divergences=[],
+        panel_citations={
+            SLE_ID: [
+                # Same claim/source, differently cased and padded — dedup is on
+                # the normalized claim, not on bytes.
+                BlindEvidenceItem(claim="  crp is ELEVATED  ", source="labs:crp:2026-05-02")
+            ]
+        },
+    )
+
+    diff = build_review_ledger_diff(
+        ledger,
+        divergence_set,
+        AdjudicationResult(decisions=[]),
+        ChallengeSweepResult(notes=[]),
+        today=date(2026, 8, 27),
+        db=db,
+        repo=repo,
+    )
+    assert [op for op in diff.ops if isinstance(op, AddEvidence)] == []
