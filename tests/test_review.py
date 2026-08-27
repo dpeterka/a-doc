@@ -1661,3 +1661,25 @@ def test_an_existing_gloss_is_not_rewritten(db: LabsDb, repo: DataRepo) -> None:
     )
 
     assert not [op for op in diff.ops if isinstance(op, UpdateHypothesis) and op.plain_language]
+
+
+def test_each_related_hypothesis_gets_its_own_linked_line(repo: DataRepo) -> None:
+    """One test routinely serves several hypotheses. A comma-joined run of
+    links reads as one undifferentiated blob — which is the problem this page
+    has — so each gets its own line, linked to its ledger card."""
+    ledger = _seed_ledger(repo)
+    payload = TestChooserPayload(
+        items=[
+            TestChooserItem(
+                panel="Complement C3/C4",
+                ask="Ask for a complement panel.",
+                audience="doctor",
+                hypothesis_ids=[SLE_ID, PE_ID],
+            )
+        ]
+    )
+
+    markdown = _render_questions_open(payload, ledger)
+
+    assert f"· [Systemic lupus erythematosus](/ledger#{SLE_ID})" in markdown
+    assert f"· [Pulmonary embolism](/ledger#{PE_ID})" in markdown

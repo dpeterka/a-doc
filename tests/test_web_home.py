@@ -22,7 +22,7 @@ from adoc.casefile.repo import HISTORY_RELPATH, LEDGER_RELPATH
 from adoc.casefile.schema import Hypothesis, Ledger, Provenance
 from adoc.intake.facts import AddFact, IntakeFactsStore, NewFact
 from adoc.labs.models import ExtractionStatus, LabDocument, LabResult
-from adoc.web.casefile_helpers import append_chat_entry, write_last_seen
+from adoc.web.casefile_helpers import append_chat_entry, summarize_diff_ops, write_last_seen
 
 SHA = "c" * 64
 
@@ -400,3 +400,17 @@ def test_fresh_install_home_renders_without_error(tmp_path: Path) -> None:
     response = client.get("/")
 
     assert response.status_code == 200
+
+
+def test_a_gloss_only_update_is_not_announced_as_a_change() -> None:
+    """The challenge sweep backfills `plain_language` for every hypothesis
+    lacking one, so without this the first review after that field shipped
+    would report all 26 hypotheses as "changed" — the precise noise this
+    summary exists to avoid."""
+    gloss_only = {
+        "ops": [{"op": "update_hypothesis", "id": "sle-01", "plain_language": "A definition."}]
+    }
+    substantive = {"ops": [{"op": "update_hypothesis", "id": "sle-01", "probability": "high"}]}
+
+    assert summarize_diff_ops(gloss_only)["changed"] == []
+    assert summarize_diff_ops(substantive)["changed"] == ["sle-01"]

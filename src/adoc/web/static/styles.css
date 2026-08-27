@@ -908,3 +908,24 @@ body.lightbox-active {
   color: var(--color-text);
   max-width: 68ch;
 }
+
+.li-line {
+  /* Continuation lines inside one bullet on the next-appointment page: the
+     ask, the hypotheses the panel bears on, and the folded rationale each sit
+     on their own line rather than running together. */
+  margin-top: 0.15rem;
+  font-size: 0.92rem;
+  color: var(--color-muted);
+  max-width: 68ch;
+}
+
+.li-line a {
+  color: var(--color-primary);
+}
+
+.hypothesis-full:target {
+  /* Arriving from a "Relevant to:" link should make it obvious which card was
+     jumped to. */
+  outline: 2px solid var(--color-primary);
+  outline-offset: 3px;
+}

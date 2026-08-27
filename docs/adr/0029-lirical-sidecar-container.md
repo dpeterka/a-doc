@@ -98,7 +98,9 @@ duplicated as a unit test over the recorded fixture.
 - **Phenotype-only, always.** `--assembly` and `--vcf` are never passed.
   LIRICAL's genotype mode assumes rare-variant calls; this patient's genomic
   data is a genotyping array plus imputation carrying no per-variant quality
-  metric, which cannot support that reasoning (ADR 0030).
+  metric, so a missing call means "not measured" rather than "not
+  present" — which cannot support that reasoning. The deterministic genomics
+  engine will get its own ADR when it is built.
 - Negated phenotypes are passed (`-n`). Excluded findings are evidence, and a
   ranker that can only consume present findings discards them.
 - The engine is useless until a phenotype profile exists — LIRICAL's input is

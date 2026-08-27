@@ -95,7 +95,8 @@ def build_prioritize_args(
     "Leave unset to run in phenotype-only mode", and that is the only mode
     this system uses. The patient's genomic data is a genotyping array plus
     imputation with no per-variant quality metric, which cannot support the
-    rare-variant reasoning LIRICAL's genotype mode assumes (ADR 0030).
+    rare-variant reasoning LIRICAL's genotype mode assumes: a missing call
+    there means "not measured", not "not present".
     """
     observed, negated = request.validated_terms()
     if not observed:

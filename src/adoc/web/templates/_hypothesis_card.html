@@ -9,7 +9,10 @@
    a single unbroken paragraph, each opening with the same 60-character
    stem. Reviews write one entry per week and they only ever grow, so the
    most recent is shown and the rest are available behind a summary. #}
-      <article class="card hypothesis-full">
+      {# `id` is the anchor target for the next-appointment page's
+         "Relevant to:" links, so a test bullet can jump straight to the
+         hypothesis it answers. #}
+      <article class="card hypothesis-full" id="{{ h.id }}">
         <h3 class="hypothesis-name">{{ h.name }}</h3>
         {% if h.plain_language %}
           {# The name alone is not communication. "Primary ovarian

@@ -1902,12 +1902,23 @@ def _render_questions_open(payload: TestChooserPayload, ledger: Ledger | None = 
             out.append(f"- **{item.panel.strip()}**")
             if item.ask.strip():
                 out.append(f"  {item.ask.strip()}")
-            related = [names.get(hid, hid) for hid in item.hypothesis_ids]
+            # Every hypothesis the item bears on, not just the first: one test
+            # routinely serves several, and collapsing that to a single
+            # reference hides why the test is worth doing. Each is a link to
+            # its ledger card, so "why am I being asked this" is one click
+            # away rather than a scroll-and-search.
+            related = [
+                f"[{names[hid]}](/ledger#{hid})" if hid in names else hid
+                for hid in item.hypothesis_ids
+            ]
             if related:
-                # Every hypothesis the item bears on, not just the first: one
-                # test routinely serves several, and collapsing that to a
-                # single reference hides why the test is worth doing.
-                out.append(f"  _Relevant to: {', '.join(related)}_")
+                # One line per hypothesis rather than a comma-joined run: a
+                # single test routinely serves several, and the point of
+                # showing them is that the reader can see WHICH question each
+                # one answers and click into it. A run of links reads as one
+                # undifferentiated blob, which is the problem this page has.
+                out.append("  _Relevant to:_")
+                out += [f"  · {entry}" for entry in related]
             if item.why.strip():
                 out.append(f"  _Why:_ {item.why.strip()}")
             out.append("")
