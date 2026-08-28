@@ -90,12 +90,23 @@ every result and therefore on none.
 
 ## Consequences
 
-- The record must be *maintained*, not just seeded. It changes as the patient
-  talks — "I stopped selenium last month" — so the chat path has to propose
-  entries and deterministic code apply them, exactly as `IntakeFact` works
-  today. **That wiring is not in this ADR**; what is here is the record, the
-  merge semantics and the two reads. Until it lands, the record only reflects
-  what a backfill puts in it.
+- **The record is maintained from conversation** (`casefile/regimen_chat.py`).
+  The post-turn visit-capture pass already runs after every ordinary chat
+  turn, extracts typed facts and applies them deterministically, so the
+  regimen rides along in the same call rather than costing a new one. Two
+  deterministic guards stand between a chat turn and the case file: a
+  proposed substance name must actually appear in the patient's own message
+  (a model that invents one writes a fiction into a medical record, and no
+  prompt wording makes that impossible — a substring check does), and timing
+  comes from her own words parsed here, never a date the model computed.
+  Applied *before* the capture pass's `ops` early return, because "I stopped
+  the selenium last month" may warrant no fact op at all and gating on `ops`
+  would discard exactly the statements this path exists to capture.
+
+  What it does not solve: "should I take magnesium?" mentions magnesium, so
+  grounding passes and only the prompt separates a question from a statement.
+  That failure is visible in the record and correctable by a later turn,
+  which is why entries carry their source ref.
 - `intake.sections.Medication` / `Supplement` still exist and still carry
   `still_taking`. `RegimenEntry.still_taking` is a derived property over the
   interval so callers keep working, but it is a view, never the source of
