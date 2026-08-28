@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.1] — 2026-08-28
+
+### Added
+
+- **The regimen record is kept current from conversation.** It was a snapshot
+  of whatever the backfill found; the list changes as the patient talks. The
+  post-turn visit-capture pass now carries regimen statements alongside its
+  fact ops, so this costs no extra model call. Two deterministic guards: a
+  proposed substance name must actually appear in the patient's own message
+  (a model that invents one writes a fiction into a medical record), and
+  timing is parsed here from her own words rather than computed by the model,
+  so "last month" keeps its precision. A start with no stated date attests
+  today rather than claiming she began it during the conversation.
+
 ## [0.13.0] — 2026-08-28
 
 ### Added

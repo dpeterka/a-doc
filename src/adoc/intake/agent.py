@@ -39,6 +39,12 @@ from pydantic import BaseModel, Field
 
 from adoc import __version__
 from adoc.casefile.encounters import read_encounter
+from adoc.casefile.regimen import REGIMEN_RELPATH
+from adoc.casefile.regimen_chat import (
+    RegimenChange,
+    RegimenUpdateReport,
+    apply_regimen_changes,
+)
 from adoc.casefile.repo import DataRepo
 from adoc.casefile.schema import Provenance
 from adoc.ingest.genomics import GENOMIC_DOC_TYPE
@@ -1208,7 +1214,7 @@ def render_continuity_note(info: ContinuityInfo, *, now: datetime) -> str | None
 # (docs/adr/0013-fact-corroboration.md, "visits grow the record")
 # --------------------------------------------------------------------------
 
-VISIT_CAPTURE_PROMPT_VERSION = "2"
+VISIT_CAPTURE_PROMPT_VERSION = "3"
 
 _VISIT_CAPTURE_SYSTEM_PROMPT = f"""[visit-capture-v{VISIT_CAPTURE_PROMPT_VERSION}]
 You are a silent background process for a-doc, a single-patient longitudinal medical case-file
@@ -1242,8 +1248,22 @@ to clear the flag. You may also set `follow_up=true` on a new or updated fact yo
 something in THIS message is worth explicitly checking back on next time -- use it deliberately,
 not for everything you hear.
 
-Respond only with the structured result (`ops`) -- never free text, never anything addressed to
-the patient.
+MEDICATIONS AND SUPPLEMENTS -- the `regimen` field, separate from `ops`. When the patient states
+something about what she TAKES, also emit a `regimen` entry: `name`, `action`
+(`started`/`stopped`/`taking`), optional `dose`/`frequency`, and `when_text` -- HER OWN WORDS for
+the timing ("last month", "since the spring", "in 2021"), never a date you computed. Deterministic
+code parses the timing, so a phrase you pass through keeps its true precision while a date you
+invent silently claims a precision she never gave.
+
+Use `stopped` only when she says she stopped, `started` only when she says she began, and `taking`
+for a plain statement that she is on something. A QUESTION IS NOT A STATEMENT: "should I take
+magnesium?" or "does biotin affect my labs?" must produce no regimen entry at all. Neither does
+anything the assistant suggested -- only what she reports about herself. Never emit a name she did
+not say; deterministic code drops any name absent from her message, and that check is a backstop,
+not permission to guess.
+
+Respond only with the structured result (`ops`, `regimen`) -- never free text, never anything
+addressed to the patient.
 """
 
 
@@ -1254,11 +1274,23 @@ class VisitCaptureResult(BaseModel):
 
     ops: list[IntakeFactOp] = Field(default_factory=list)
 
+    regimen: list[RegimenChange] = Field(default_factory=list)
+    """Statements about what the patient takes, applied to
+    `case/regimen.yaml` by deterministic code.
+
+    Separate from `ops` on purpose. A medication fact is prose in the case
+    file; a regimen entry is a dated INTERVAL that gets compared against lab
+    collection dates (ADR 0031), and the two have different shapes and
+    different failure modes."""
+
 
 class CaptureResult(BaseModel):
     """What `run_visit_capture` did for one post-intake chat turn."""
 
     applied: AppliedResult = Field(default_factory=AppliedResult)
+    regimen: RegimenUpdateReport = Field(default_factory=RegimenUpdateReport)
+    """What the turn did to `case/regimen.yaml`, reported alongside the fact
+    ops so a caller — and a test — can see it."""
     error: str | None = None
 
 
@@ -1329,8 +1361,35 @@ def run_visit_capture(client: LlmClient, repo: DataRepo, db: LabsDb, text: str) 
 
     turn = result.parsed
     assert isinstance(turn, VisitCaptureResult)
+
+    # Applied BEFORE the `ops` early return below, deliberately. "I stopped
+    # the selenium last month" is a regimen change that may warrant no fact op
+    # at all, and gating it on `ops` would silently discard exactly the
+    # statements this path exists to capture.
+    regimen_report = RegimenUpdateReport()
+    try:
+        regimen_report = apply_regimen_changes(
+            repo, turn.regimen, message=text, today=datetime.now(UTC).date()
+        )
+    except Exception as exc:  # noqa: BLE001 - this pass must never break the turn
+        logger.warning("visit-capture: regimen update failed: %s", exc)
+    for name in regimen_report.dropped_ungrounded:
+        logger.warning(
+            "visit-capture: dropped regimen change for %r - not present in the patient's message",
+            name,
+        )
+    if regimen_report.applied:
+        logger.info("visit-capture: regimen updated: %s", ", ".join(regimen_report.applied))
+        try:
+            repo.commit(
+                f"casefile: regimen updated from a chat turn ({len(regimen_report.applied)})",
+                paths=[REGIMEN_RELPATH],
+            )
+        except Exception as exc:  # noqa: BLE001 - a commit failure must not break the turn
+            logger.warning("visit-capture: regimen commit failed: %s", exc)
+
     if not turn.ops:
-        return CaptureResult()
+        return CaptureResult(regimen=regimen_report)
 
     now = datetime.now(UTC)
     provenance = Provenance(
