@@ -43,6 +43,20 @@ Parameters:
       Full ECR image URI with tag, e.g.
       536726971394.dkr.ecr.us-east-2.amazonaws.com/a-doc:<git-sha>.
 
+  LiricalImageUri:
+    Type: String
+    Default: ""
+    Description: >
+      Full ECR image URI for the LIRICAL sidecar (ADR 0029), e.g.
+      536726971394.dkr.ecr.us-east-2.amazonaws.com/a-doc-lirical:latest.
+      Empty disables the sidecar task definition entirely, which is the
+      default: the image is built only when deploy/lirical/ changes, so a
+      stack deployed before that first build must not reference a tag that
+      does not exist yet.
+
+Conditions:
+  HasLiricalImage: !Not [!Equals [!Ref LiricalImageUri, ""]]
+
 Resources:
   # --------------------------------------------------------------------
   # Networking: a service SG (ALB -> tasks) and an EFS SG (tasks -> EFS).
@@ -451,6 +465,60 @@ Resources:
   # an EventBridge Scheduler role + one rule per job, each RunTask'ing
   # JobsTaskDefinition with a containerOverrides command.
   # --------------------------------------------------------------------
+
+  # --------------------------------------------------------------------
+  # LIRICAL sidecar (ADR 0029): a non-LLM differential engine, run as a
+  # one-off task with a containerOverrides command. Input and output are
+  # exchanged on the same EFS filesystem the app uses, so the caller writes
+  # a phenotype term list and reads the ranked TSV back from a shared path.
+  #
+  # Its own task definition rather than a container in the web task: LIRICAL
+  # is a Java program, the app image is python:3.12-slim, and this capability
+  # is used by the deep review a few times a day for about a second. Nothing
+  # is always-on.
+  # --------------------------------------------------------------------
+
+  LiricalTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Condition: HasLiricalImage
+    Properties:
+      Family: a-doc-lirical
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      # More memory than the jobs task: LIRICAL loads the HPO ontology and
+      # phenotype.hpoa into the JVM heap before it ranks anything.
+      Cpu: "1024"
+      Memory: "4096"
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      Volumes:
+        - Name: data
+          EFSVolumeConfiguration:
+            FilesystemId: !Ref Efs
+            TransitEncryption: ENABLED
+            AuthorizationConfig:
+              AccessPointId: !Ref EfsAccessPoint
+              IAM: ENABLED
+      ContainerDefinitions:
+        - Name: lirical
+          Image: !Ref LiricalImageUri
+          Essential: true
+          MountPoints:
+            - SourceVolume: data
+              ContainerPath: /data
+              ReadOnly: false
+          # No Secrets block, deliberately: this container never calls a
+          # model or any API. It reads HPO terms and writes a ranking, so it
+          # has no business holding an API key.
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: lirical
 
   EventsRole:
     Type: AWS::IAM::Role

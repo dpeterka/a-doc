@@ -48,6 +48,14 @@ class Settings(BaseSettings):
     # EFS mount and WAL is unsafe on NFS-family filesystems.
     sqlite_journal_mode: str = "WAL"
 
+    # The compact HPO label/synonym index (`scripts/build_hpo_index.py`),
+    # baked into the image at build time. A separate path rather than a file
+    # in the data repo: it is a build artifact of a public ontology, not
+    # patient data, and versioning it with the release is what makes a
+    # phenotype profile reproducible. Absent locally, phenotype matching
+    # switches itself off with a warning rather than failing.
+    hpo_index_path: Path = Path("/opt/hpo-index.json")
+
     # Upper bound on a single `/upload` file, in MB (see `web.routes.upload`):
     # rejected before any pipeline call (ingest/vision), with a warm
     # in-page message rather than an unbounded read into memory/disk.

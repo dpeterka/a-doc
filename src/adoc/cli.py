@@ -38,7 +38,7 @@ from __future__ import annotations
 import argparse
 import sys
 from collections.abc import Sequence
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -53,6 +53,8 @@ from adoc.backup import (
     run_backup,
 )
 from adoc.casefile.encounter_text import sync_encounter_text
+from adoc.casefile.phenotype import PHENOTYPE_RELPATH, load_phenotype, save_phenotype
+from adoc.casefile.phenotype_backfill import backfill_phenotype
 from adoc.casefile.regimen import REGIMEN_RELPATH, load_regimen, save_regimen
 from adoc.casefile.regimen_backfill import backfill_from_encounters
 from adoc.casefile.repo import LEDGER_RELPATH, DataRepo
@@ -67,6 +69,7 @@ from adoc.intake.cli import run_conversational_onboarding_session, run_onboardin
 from adoc.intake.corroborate import corroborate_facts
 from adoc.intake.facts import INTAKE_FACTS_RELPATH, IntakeFactsStore
 from adoc.intake.wizard import IntakeWizard
+from adoc.knowledge.hpo import HpoIndex
 from adoc.labs.db import LabsDb
 from adoc.labs.recanonicalize import recanonicalize_rows
 from adoc.labs.reclassify import reclassify_pending
@@ -843,6 +846,55 @@ def _cmd_backfill_doc_text(_args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_phenotype_backfill(_args: argparse.Namespace) -> int:
+    """Build `case/phenotype.yaml` from encounter bodies and case prose
+    (`casefile.phenotype_backfill`; NO LLM calls — `knowledge.hpo` matches
+    published HPO labels and synonyms).
+
+    The profile is the input LIRICAL's phenotype-only mode takes and the
+    missing half of every criteria scorer's clinical items.
+    """
+    try:
+        settings = Settings()
+    except Exception as exc:  # noqa: BLE001 - surface any config error to the user
+        print(f"phenotype-backfill: configuration error: {exc}", file=sys.stderr)
+        return 1
+
+    repo = DataRepo(settings.data_dir)
+    if not repo.is_initialized:
+        print(
+            f"phenotype-backfill: data repo not initialized at {settings.data_dir}",
+            file=sys.stderr,
+        )
+        return 1
+
+    index = HpoIndex.load(settings.hpo_index_path)
+    if index is None:
+        # Loud, not silent: without the index this command can only write an
+        # empty profile, which would look like "the patient has no phenotype".
+        print(
+            f"phenotype-backfill: no HPO index at {settings.hpo_index_path} - "
+            "cannot build a profile. Build it with scripts/build_hpo_index.py.",
+            file=sys.stderr,
+        )
+        return 1
+
+    path = repo.root / Path(PHENOTYPE_RELPATH)
+    profile, report = backfill_phenotype(repo, index, load_phenotype(path))
+    profile.updated = date.today()
+    save_phenotype(path, profile)
+    repo.commit(
+        f"casefile: phenotype profile ({len(profile.entries)} terms)",
+        paths=[PHENOTYPE_RELPATH],
+    )
+
+    print(f"phenotype-backfill: scanned {report.scanned} source(s)")
+    print(f"phenotype-backfill: {report.present} present, {report.excluded} excluded")
+    for name in report.skipped:
+        print(f"phenotype-backfill: skipped (unparseable): {name}", file=sys.stderr)
+    return 0
+
+
 def _cmd_regimen_backfill(_args: argparse.Namespace) -> int:
     """Seed `case/regimen.yaml` from the regimen encounters already on disk
     (`casefile.regimen_backfill`; NO LLM calls — the patient's supplement
@@ -1078,6 +1130,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="always run a full review, bypassing the marker/cooldown/floor gating",
     )
     review_parser.set_defaults(func=_cmd_review)
+    subparsers.add_parser(
+        "phenotype-backfill",
+        help=(
+            "build case/phenotype.yaml from encounters and case prose "
+            "(no LLM calls; HPO label/synonym matching)"
+        ),
+    ).set_defaults(func=_cmd_phenotype_backfill)
     subparsers.add_parser(
         "regimen-backfill",
         help=("seed case/regimen.yaml from regimen encounters on disk (no LLM calls; idempotent)"),

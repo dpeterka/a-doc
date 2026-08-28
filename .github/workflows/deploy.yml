@@ -72,6 +72,35 @@ jobs:
           docker push "$IMAGE_URI:${{ github.sha }}"
           docker push "$IMAGE_URI:latest"
 
+      # Built only when its inputs change. The sidecar is ~630MB and pins a
+      # LIRICAL version that moves a few times a year, so rebuilding it on
+      # every application deploy would add minutes to each one for nothing.
+      - name: Check whether the LIRICAL sidecar changed
+        id: lirical_changed
+        run: |
+          if git diff --quiet HEAD~1 HEAD -- deploy/lirical/ 2>/dev/null; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build and push the LIRICAL sidecar image
+        if: steps.lirical_changed.outputs.changed == 'true'
+        env:
+          IMAGE_URI: ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ vars.AWS_REGION }}.amazonaws.com/a-doc-lirical
+        run: |
+          # The image runs its own smoke test at build time (a fixed synthetic
+          # phenotype must still rank Loeys-Dietz/Marfan at the top), so a
+          # LIRICAL release that breaks the data assumptions fails HERE rather
+          # than in a deep review.
+          docker build \
+            --platform linux/amd64 \
+            -t "$IMAGE_URI:${{ github.sha }}" \
+            -t "$IMAGE_URI:latest" \
+            deploy/lirical/
+          docker push "$IMAGE_URI:${{ github.sha }}"
+          docker push "$IMAGE_URI:latest"
+
       - name: Deploy network stack
         run: |
           aws cloudformation deploy \
@@ -103,6 +132,23 @@ jobs:
 
       # Must come after network/backup/alb: ecs.yaml imports their exports
       # (VPC/subnets/SGs, backup bucket+key, the ALB target group).
+      # Resolved from ECR rather than assumed: the sidecar image is built only
+      # when deploy/lirical/ changes, so a stack deployed before that first
+      # build has no `latest` tag to point at. An empty value leaves the
+      # sidecar task definition out of the stack entirely (its Condition),
+      # which is the correct state until the image exists.
+      - name: Resolve the LIRICAL sidecar image
+        run: |
+          URI="${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ vars.AWS_REGION }}.amazonaws.com/a-doc-lirical"
+          if aws ecr describe-images \
+               --repository-name a-doc-lirical \
+               --image-ids imageTag=latest >/dev/null 2>&1; then
+            echo "LIRICAL_IMAGE_URI=$URI:latest" >> "$GITHUB_ENV"
+          else
+            echo "LIRICAL_IMAGE_URI=" >> "$GITHUB_ENV"
+            echo "no a-doc-lirical:latest in ECR yet - sidecar task definition skipped"
+          fi
+
       - name: Deploy ECS stack
         env:
           IMAGE_URI: ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ vars.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
@@ -115,5 +161,6 @@ jobs:
               BackupStackName=a-doc-backup \
               AlbStackName=a-doc-alb \
               ImageUri="$IMAGE_URI" \
+              LiricalImageUri="$LIRICAL_IMAGE_URI" \
             --capabilities CAPABILITY_NAMED_IAM \
             --no-fail-on-empty-changeset
