@@ -47,6 +47,7 @@ from adoc.reason.review import (
     BlindDifferentialPayload,
     BlindEvidenceItem,
     ChallengeSweepResult,
+    CriteriaScanResult,
     DeferredVerificationSweepResult,
     Divergence,
     DivergenceDecisionPayload,
@@ -1786,3 +1787,60 @@ def test_the_review_report_renders_structured_test_items() -> None:
     assert f"[Systemic lupus erythematosus](/ledger#{SLE_ID})" in section
     # No empty bullets: every "- " line carries text.
     assert not [line for line in section.splitlines() if line.strip() == "-"]
+
+
+def test_the_review_report_renders_criteria_itemised(repo: DataRepo, db: LabsDb) -> None:
+    """PLAN.md Phase 3 acceptance: "criteria render itemized (points,
+    threshold)". A bare score is the least useful part — what a doctor needs
+    is which items carry the total, and which are waiting on an attribution
+    judgement only they can make."""
+    from adoc.knowledge.criteria import score_all
+
+    scan = CriteriaScanResult(
+        results=score_all(
+            [],
+            phenotype={
+                "HP:0001250": ("Seizure", True, "seizure while taking wellbutrin"),
+            },
+        )
+    )
+    markdown = render_review_markdown(
+        review_date=date(2026, 8, 28),
+        trend_findings=[],
+        divergence_set=DivergenceSet(divergences=[]),
+        adjudication=AdjudicationResult(decisions=[]),
+        challenge_sweep=ChallengeSweepResult(notes=[]),
+        test_chooser=TestChooserResult(items=[]),
+        staleness=StalenessReport(),
+        deferred_verification=DeferredVerificationSweepResult(),
+        metrics=OpsMetrics(),
+        ledger_before=Ledger(version=1, updated=datetime(2026, 1, 1, tzinfo=UTC), hypotheses=[]),
+        ledger_after=Ledger(version=1, updated=datetime(2026, 1, 1, tzinfo=UTC), hypotheses=[]),
+        criteria=scan,
+    )
+    section = markdown.split("## Classification criteria")[1].split("## Metrics appendix")[0]
+
+    assert "of 10 points" in section
+    assert "| ? | Neuropsychiatric — Seizure | 5 |" in section
+    assert "wellbutrin" in section
+    # Always labelled, never presented as diagnostic.
+    assert "not diagnostic criteria" in section
+
+
+def test_criteria_are_absent_from_the_report_when_not_scored() -> None:
+    """A review run without the scan renders exactly as it did before."""
+    markdown = render_review_markdown(
+        review_date=date(2026, 8, 28),
+        trend_findings=[],
+        divergence_set=DivergenceSet(divergences=[]),
+        adjudication=AdjudicationResult(decisions=[]),
+        challenge_sweep=ChallengeSweepResult(notes=[]),
+        test_chooser=TestChooserResult(items=[]),
+        staleness=StalenessReport(),
+        deferred_verification=DeferredVerificationSweepResult(),
+        metrics=OpsMetrics(),
+        ledger_before=Ledger(version=1, updated=datetime(2026, 1, 1, tzinfo=UTC), hypotheses=[]),
+        ledger_after=Ledger(version=1, updated=datetime(2026, 1, 1, tzinfo=UTC), hypotheses=[]),
+    )
+
+    assert "## Classification criteria" not in markdown
