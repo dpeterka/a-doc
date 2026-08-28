@@ -13,6 +13,7 @@ from typing import Any
 import pytest
 
 import adoc.intake.agent as agent_module
+from adoc.casefile.regimen import REGIMEN_RELPATH, load_regimen
 from adoc.casefile.repo import DataRepo
 from adoc.config import ModelBinding
 from adoc.intake.agent import (
@@ -298,3 +299,59 @@ def test_duplicate_fact_id_op_is_rejected_not_an_error_and_persists_nothing(
     assert "duplicate fact id" in result.applied.rejected[0]
     after = (repo.root / INTAKE_FACTS_RELPATH).read_text(encoding="utf-8")
     assert before == after
+
+
+def _make_regimen_client(payload: dict[str, Any]) -> LlmClient:
+    """A transport returning both `ops` and `regimen`, so a turn can carry a
+    regimen change with no fact op at all."""
+
+    def transport(request: TransportRequest) -> TransportResponse:
+        assert request.schema is VisitCaptureResult
+        return TransportResponse(text="", tool_input=payload, input_tokens=5, output_tokens=5)
+
+    provider = AnthropicProvider(api_key=None, transport=transport)
+    return LlmClient(
+        {"intake_agent": [ModelBinding(provider="anthropic", model="claude-opus-5")]},
+        {"anthropic": provider},
+    )
+
+
+def test_a_regimen_change_survives_a_turn_with_no_fact_ops(tmp_path: Path) -> None:
+    """The trap this wiring had to avoid.
+
+    "I stopped the selenium last month" is a regimen change that may warrant
+    no fact op at all, and the pass returns early when `ops` is empty. Gating
+    the regimen update on `ops` would silently discard exactly the statements
+    this path exists to capture.
+    """
+    repo = DataRepo.init_at(tmp_path / "data")
+    db = LabsDb(":memory:")
+    client = _make_regimen_client(
+        {
+            "ops": [],
+            "regimen": [{"name": "selenium", "action": "stopped", "when_text": "last month"}],
+        }
+    )
+
+    result = run_visit_capture(client, repo, db, "I stopped the selenium last month.")
+
+    assert result.error is None
+    assert result.regimen.applied == ["selenium"]
+    entries = load_regimen(repo.root / Path(REGIMEN_RELPATH)).entries
+    assert [e.name for e in entries] == ["selenium"]
+    assert entries[0].stopped is not None
+
+
+def test_an_ungrounded_regimen_proposal_never_reaches_disk(tmp_path: Path) -> None:
+    """The deterministic backstop, exercised through the real pass."""
+    repo = DataRepo.init_at(tmp_path / "data")
+    db = LabsDb(":memory:")
+    client = _make_regimen_client(
+        {"ops": [], "regimen": [{"name": "Magnesium", "action": "taking"}]}
+    )
+
+    result = run_visit_capture(client, repo, db, "I'm feeling a bit better this week.")
+
+    assert result.regimen.applied == []
+    assert result.regimen.dropped_ungrounded == ["Magnesium"]
+    assert not (repo.root / Path(REGIMEN_RELPATH)).exists()
