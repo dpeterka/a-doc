@@ -551,6 +551,21 @@ def test_an_exact_analyte_name_still_resolves(db: LabsDb, repo: DataRepo) -> Non
         # analytes live there (B12 in the 2000s pg/mL), and discarding those
         # would trade one false positive for a worse false negative.
         ("vitamin B12 measured 2024 pg/mL", [2024.0]),
+        # A year qualifying a NOUN, which the first pass missed — a live
+        # review dropped a real TSAT citation for "quoting" 2025.
+        ("TSAT was 27% on the 2025 panel", [27.0]),
+        ("Iron studies from May 2025 showed TSAT 27", [27.0]),
+        ("CA-125 was 27.7 (2024)", [27.7]),
+        # A threshold inside a RATIO claim is the cut-off, not a value of
+        # either analyte. Two real citations were dropped for this.
+        ("FSH/LH ratio > 1.0 with FSH 91.4", [91.4]),
+        ("HbA1c 5.3% with an albumin/creatinine ratio below 1.0", [5.3]),
+        # ...but a comparator OUTSIDE a ratio claim still carries the value:
+        # labs genuinely report "<0.08", and that number IS the result.
+        ("ferritin reported as <0.08", [0.08]),
+        # A name whose digit is followed by a letter — the pattern was
+        # anchored on a word boundary and leaked a bare 1 from "HbA1c".
+        ("HbA1c was 5.3", [5.3]),
     ],
 )
 def test_compound_modifiers_are_not_quoted_values(claim: str, expected: list[float]) -> None:
