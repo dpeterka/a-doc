@@ -5,6 +5,65 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.1] — 2026-08-28
+
+### Fixed
+
+- **The 0.14.0 deploy failed and never shipped.** Adding the LIRICAL sidecar
+  gave the CI stack a second ECR repository to manage, and the deploy role had
+  never needed `ecr:CreateRepository` — the first repository came from the
+  one-time manual bootstrap. CloudFormation rolled back cleanly (the existing
+  repository, its images and the running service were untouched), but
+  production stayed on 0.13.1. The role now has the permission, scoped to the
+  two `a-doc` repositories, and the new repository `DependsOn` the role so the
+  policy update lands first rather than racing it.
+
+## [0.14.0] — 2026-08-28
+
+### Added
+
+- **Phenotype profile** (`case/phenotype.yaml`, `adoc phenotype-backfill`).
+  HPO terms matched deterministically from encounter bodies — no model, since
+  the ontology ships 26,237 synonyms so "joint pain" resolves to
+  `HP:0002829 Arthralgia` on its own. Restricted to descendants of
+  `HP:0000118`, because indexing every branch matched "Severe" and
+  "Frequency" as though they were symptoms. Negation is detected before and
+  after the phrase ("Coma: no") and cannot cross a sentence boundary — that
+  leak recorded "Headache: yes" as absent — and a *following* "denies"
+  negates the next finding rather than the previous one, which had been
+  marking "night sweats" excluded in "joint pain and night sweats, denies
+  fever". Built only from observed sources:
+  scanning the case summary added one term and broke the independence that
+  justifies an engine reading it.
+- **LIRICAL is deployable**: its own ECR repository, a CI build that runs only
+  when `deploy/lirical/` changes, and an ECS task definition behind a
+  Condition so a stack deployed before the first image build never references
+  a missing tag.
+- **Encounter bodies are searchable** (ADR 0015 extended). Every
+  patient-report encounter from chat previously contributed a title and
+  nothing else once it left the recent window.
+- **`case/reported-results.yaml`**: results the patient remembers but has no
+  document for. Held apart from the measured series permanently — a remembered
+  value must never sit in the series the citation checker guards — and checked
+  against measured rows within 45 days, where a contradiction is as valuable
+  an outcome as a match.
+- **`case/disputes.yaml`**: the patient can say the record is wrong. A dispute
+  never deletes; it marks the conflict wherever the item appears, stops it
+  being read as established, and waits for a human. Only a human resolves one
+  (ADR 0032).
+
+### Fixed
+
+- **The dates patients actually say now parse.** "two months ago", "last
+  month" and "a few weeks ago" all returned nothing, so a regimen statement
+  reached the record undated — losing exactly what decides whether she was
+  taking something when a specimen was drawn. Worse, "June 2026" parsed as
+  2026-01-01: five months off and stated as a date rather than the month it
+  names.
+- Three citation-extraction defects that were dropping real citations: a year
+  qualifying a noun ("the 2025 panel"), a threshold inside a ratio claim
+  ("FSH/LH ratio > 1.0"), and a bare `1` leaking out of "HbA1c".
+
 ## [0.13.1] — 2026-08-28
 
 ### Added

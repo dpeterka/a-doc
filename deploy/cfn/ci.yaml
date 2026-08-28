@@ -85,6 +85,11 @@ Resources:
   # pinned version changes, which is rare, and each one is ~630MB.
   LiricalEcrRepository:
     Type: AWS::ECR::Repository
+    # The role must gain ecr:CreateRepository BEFORE this is created, and
+    # CloudFormation orders by dependency, not by declaration. Without this
+    # the two are created concurrently and the repository loses the race —
+    # which is what happened on the 0.14.0 deploy.
+    DependsOn: DeployRole
     Properties:
       RepositoryName: a-doc-lirical
       ImageScanningConfiguration:
@@ -287,8 +292,18 @@ Resources:
                   - ecr:PutLifecyclePolicy
                   - ecr:GetLifecyclePolicy
                   - ecr:SetRepositoryPolicy
+                  # Repository CREATION, added when the LIRICAL sidecar
+                  # (ADR 0029) gave this stack a second repository to manage.
+                  # The first one was created by the one-time manual bootstrap
+                  # this file's description documents, so the role had never
+                  # needed it — and the 0.14.0 deploy failed on exactly that:
+                  #   not authorized to perform: ecr:CreateRepository
+                  #     on .../repository/a-doc-lirical
+                  - ecr:CreateRepository
+                  - ecr:DeleteRepository
                 Resource:
                   - !Sub "arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/a-doc"
+                  - !Sub "arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/a-doc-lirical"
               # deploy/cfn/ecs.yaml: cluster, service, task definitions,
               # scheduled-task RunTask wiring.
               - Sid: EcsDeployBroad
