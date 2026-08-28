@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.1] — 2026-08-28
+
+### Fixed
+
+- **The 0.14.0 deploy failed and never shipped.** Adding the LIRICAL sidecar
+  gave the CI stack a second ECR repository to manage, and the deploy role had
+  never needed `ecr:CreateRepository` — the first repository came from the
+  one-time manual bootstrap. CloudFormation rolled back cleanly (the existing
+  repository, its images and the running service were untouched), but
+  production stayed on 0.13.1. The role now has the permission, scoped to the
+  two `a-doc` repositories, and the new repository `DependsOn` the role so the
+  policy update lands first rather than racing it.
+
 ## [0.14.0] — 2026-08-28
 
 ### Added
