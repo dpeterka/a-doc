@@ -643,3 +643,43 @@ def test_an_empty_regimen_says_so_rather_than_vanishing(repo: DataRepo, db: Labs
     section = next(s.content for s in pack.sections if s.key == "regimen")
 
     assert "Nothing recorded yet" in section
+
+
+def test_a_combination_product_is_flagged_when_nothing_is_named_biotin(
+    repo: DataRepo, db: LabsDb
+) -> None:
+    """The case that matters, and the one the first implementation missed.
+
+    On the real regimen, biotin is named ZERO times while the patient's biotin
+    measured high — because biotin sits inside a B complex at doses well above
+    the interference threshold. The first version put this check behind an
+    early return that fired when no entry was named "biotin", making it
+    unreachable in precisely the situation it was written for.
+    """
+    save_regimen(
+        repo.root / Path(REGIMEN_RELPATH),
+        Regimen(entries=[RegimenEntry(name="B complex", attested_on=[date(2026, 5, 2)])]),
+    )
+
+    pack = build_context(repo, db, include_ledger=False)
+    section = next(s.content for s in pack.sections if s.key == "regimen")
+
+    assert "combination product" in section
+    assert "B complex" in section
+    # It says what would settle it, rather than asking for everything.
+    assert "label" in section
+
+
+def test_a_substance_named_outright_is_not_double_reported(repo: DataRepo, db: LabsDb) -> None:
+    """An entry actually named biotin gets the interval warning, not the
+    weaker "contents unknown" one."""
+    save_regimen(
+        repo.root / Path(REGIMEN_RELPATH),
+        Regimen(entries=[RegimenEntry(name="Biotin complex", started=date(2026, 1, 1))]),
+    )
+
+    pack = build_context(repo, db, include_ledger=False)
+    section = next(s.content for s in pack.sections if s.key == "regimen")
+
+    assert "combination product" not in section
+    assert "falsely shift" in section
