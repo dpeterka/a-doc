@@ -62,6 +62,7 @@ from pydantic import BaseModel, Field, ValidationError, field_validator, model_v
 
 from adoc import __version__
 from adoc.casefile.ledger import ACTIVE_STATUSES, load_ledger
+from adoc.casefile.phenotype import PHENOTYPE_RELPATH, load_phenotype
 from adoc.casefile.repo import HISTORY_RELPATH, LEDGER_RELPATH, DataRepo
 from adoc.casefile.schema import (
     AddEvidence,
@@ -79,6 +80,7 @@ from adoc.casefile.schema import (
     UpdateHypothesis,
     validate_source_ref,
 )
+from adoc.knowledge.criteria import CriteriaResult, score_all
 from adoc.labs.db import LabsDb
 from adoc.labs.queries import abnormal_summary
 from adoc.labs.validate import canonicalize, trend_outlier
@@ -601,6 +603,27 @@ class TestChooserPayload(BaseModel):
 class TestChooserResult(BaseModel):
     items: list[TestChooserItem] = Field(default_factory=list)
     questions_open_markdown: str = ""
+
+
+class CriteriaScanResult(BaseModel):
+    """Every registered classification-criteria scorer, run over the current
+    labs and phenotype record.
+
+    Deterministic and offline — no model call — so it sits with `trend_scan`
+    at the front of the review rather than among the LLM stages.
+    """
+
+    results: list[CriteriaResult] = Field(default_factory=list)
+
+    def applicable(self) -> list[CriteriaResult]:
+        """Sets whose entry criterion is not explicitly failed.
+
+        A set ruled out by its own entry criterion (this patient's ANA is
+        negative, so the 2019 SLE criteria do not apply) is still computed and
+        still reported — silently dropping it would hide the fact that it was
+        checked — but it is not what a reader should look at first.
+        """
+        return [r for r in self.results if r.entry_met is not False]
 
 
 class StaleArtifact(BaseModel):
@@ -1190,6 +1213,69 @@ def compute_ops_metrics(
     )
 
 
+def _render_criteria(scan: CriteriaScanResult) -> list[str]:
+    """Itemised: every criterion, its weight, and what the record says.
+
+    Shown item by item rather than as a score, because a score is the least
+    useful part. What a doctor needs is WHICH items are carrying the total and
+    which are merely unanswered — and, above all, which are `possible` and
+    waiting on an attribution judgement only they can make.
+    """
+    out: list[str] = []
+    for result in scan.results:
+        out.append(f"### {result.name}")
+        out.append("")
+        out.append(f"_{result.disclaimer}_")
+        out.append("")
+        if result.entry_met is False:
+            # Reported, not hidden: knowing a set was checked and ruled out is
+            # itself an answer.
+            out.append(f"**Does not apply.** {result.entry_note}")
+            out.append("")
+        elif result.entry_note:
+            out.append(result.entry_note)
+            out.append("")
+
+        out.append(
+            f"**{result.points} of {result.threshold} points**"
+            + (
+                f", plus {result.points_possible} more if the possible items below are"
+                " attributed to this condition by a clinician"
+                if result.points_possible
+                else ""
+            )
+            + (
+                f". {result.points_not_assessed} points sit in items nothing on file can answer."
+                if result.points_not_assessed
+                else "."
+            )
+        )
+        out.append("")
+
+        shown = [i for i in result.items if i.state in {"met", "possible", "not_met"}]
+        if shown:
+            out.append("| | Criterion | Points | Basis |")
+            out.append("|---|---|---|---|")
+            marks = {"met": "✓", "possible": "?", "not_met": "·"}
+            for item in shown:
+                basis = redact_gated_text(item.basis).replace("|", "\\|")
+                out.append(
+                    f"| {marks[item.state]} | {item.domain} — {item.name} "
+                    f"| {item.weight} | {basis} |"
+                )
+            out.append("")
+        unanswered = [i for i in result.items if i.state == "not_assessed"]
+        if unanswered:
+            out.append(
+                f"_{len(unanswered)} further criteria could not be assessed from the "
+                "record: "
+                + ", ".join(i.name for i in unanswered[:8])
+                + ("…_" if len(unanswered) > 8 else "._")
+            )
+            out.append("")
+    return out
+
+
 def render_review_markdown(
     *,
     review_date: date,
@@ -1203,6 +1289,7 @@ def render_review_markdown(
     metrics: OpsMetrics,
     ledger_before: Ledger,
     ledger_after: Ledger,
+    criteria: CriteriaScanResult | None = None,
     trigger_summary: str = "",
 ) -> str:
     """Render the review report: plain-language "what changed"/"what to
@@ -1315,6 +1402,12 @@ def render_review_markdown(
     else:
         lines.append("_Nothing new to bring to your next appointment this week._")
     lines.append("")
+
+    if criteria is not None and criteria.results:
+        lines.append("## Classification criteria")
+        lines.append("")
+        lines += _render_criteria(criteria)
+        lines.append("")
 
     lines.append("## Metrics appendix")
     lines.append("")
@@ -1532,6 +1625,23 @@ def build_review_dag(
         results["trend_scan"] = result
         return result
 
+    def _criteria_scan_fn(_ctx: Ctx) -> BaseModel:
+        """Score the hand-encoded classification criteria (ADR: knowledge
+        layer). No model call; pure code over stored labs and the phenotype
+        record."""
+        phenotype = load_phenotype(repo.root / Path(PHENOTYPE_RELPATH))
+        lookup = {
+            entry.term_id: (
+                entry.label,
+                entry.present,
+                entry.matched_text[0] if entry.matched_text else "",
+            )
+            for entry in phenotype.entries
+        }
+        result = CriteriaScanResult(results=score_all(db.all_non_rejected_rows(), phenotype=lookup))
+        results["criteria_scan"] = result
+        return result
+
     def _make_blind_panel_fn(index: int) -> Callable[[Ctx], BaseModel]:
         def fn(ctx: Ctx) -> BaseModel:
             context_pack = ctx["blind_context_pack"]
@@ -1728,6 +1838,7 @@ def build_review_dag(
         assert isinstance(metrics, OpsMetrics)
         trend_scan = ctx["trend_scan"]
         assert isinstance(trend_scan, TrendScanResult)
+        criteria = results.get("criteria_scan")
 
         markdown = render_review_markdown(
             review_date=review_date,
@@ -1742,6 +1853,7 @@ def build_review_dag(
             ledger_before=ledger_before,
             ledger_after=ledger_after,
             trigger_summary=trigger_summary,
+            criteria=criteria if isinstance(criteria, CriteriaScanResult) else None,
         )
         relpath, tag_name = _review_relpath_and_tag(repo, review_date, now=clock())
         repo.write(relpath, markdown)
@@ -1777,7 +1889,14 @@ def build_review_dag(
             input_model=Marker,
             output_model=TrendScanResult,
             depends_on="initial",
-        )
+        ),
+        Node(
+            name="criteria_scan",
+            fn=_criteria_scan_fn,
+            input_model=Marker,
+            output_model=CriteriaScanResult,
+            depends_on="initial",
+        ),
     ]
     prior_name = "trend_scan"
     for index in range(num_panel):

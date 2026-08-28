@@ -54,8 +54,32 @@ def _normalize_slug(text: str) -> str:
     return _NON_ALNUM_RE.sub("", text.lower())
 
 
+PhenotypeLookup = dict[str, tuple[str, bool, str]]
+"""`{term_id: (label, present, context)}` — the minimum a scorer needs from a
+phenotype profile, passed as a plain mapping so `knowledge` never imports
+`casefile` and the scorers stay unit-testable without a repo."""
+
+
 ItemState = str
-"""One of `met`, `not_met`, `not_assessed`."""
+"""One of `met`, `not_met`, `not_assessed`, `possible`.
+
+`possible` exists because of a specific near-miss. The phenotype profile is
+built by matching text, and text matching cannot know ATTRIBUTION. Two terms
+in this patient's profile would have scored as met SLE criteria:
+
+    Seizure   <- "clonic grand mal seizure while taking wellbutrin"
+    Arthritis <- "mitochondrial dysfunction psoriatic arthritis metabolic..."
+
+The first is a bupropion-induced seizure — a well-known adverse effect, not a
+neuropsychiatric manifestation of lupus. The second reads as an item in a list
+of conditions being CONSIDERED, not a confirmed finding. Together they are 11
+points against a threshold of 10.
+
+The 2019 criteria forbid exactly this in their own text: a criterion counts
+only if there is **no more likely explanation**. An automated matcher cannot
+make that judgement, so it must not claim the criterion. `possible` says what
+is true — something matching this item appears in the record — and leaves the
+attribution to a clinician."""
 
 
 class CriterionItem(BaseModel):
@@ -88,10 +112,19 @@ class CriteriaResult(BaseModel):
     items: list[CriterionItem] = Field(default_factory=list)
     threshold: int
     points: int
-    """Points from `met` items only — a FLOOR, not an estimate."""
+    """Points from `met` items only — a FLOOR, not an estimate. `possible`
+    items are deliberately excluded: they are unattributed."""
+    points_possible: int = 0
+    """What the `possible` items would add IF a clinician attributed them to
+    this condition. Reported separately so the reader can see that the total
+    is one confirmation away from crossing a threshold, without the scorer
+    ever claiming it has."""
     points_not_assessed: int
     """Weight sitting in items no stored data could answer."""
     meets_threshold: bool
+    """Computed from `points` alone. A `possible` item can never carry a
+    patient over a classification threshold — that is the whole reason the
+    state exists."""
     requires_clinical_item: bool = False
     clinical_item_met: bool = False
     disclaimer: str = CLASSIFICATION_DISCLAIMER
@@ -228,7 +261,67 @@ _SLE_APL_NAMES = (
 )
 
 
-def score_sle_2019(rows: Sequence[LabResult]) -> CriteriaResult:
+def _clinical_item(
+    domain: str, name: str, weight: int, phenotype: PhenotypeLookup | None
+) -> CriterionItem:
+    """A clinical criterion, raised to `possible` when the phenotype record
+    contains a matching term — never to `met`.
+
+    Attribution is the reason. The published criteria count an item only when
+    there is no more likely explanation, and a term matched out of narrative
+    text carries no such judgement: a seizure on bupropion and a seizure from
+    lupus produce the same HPO term.
+    """
+    term_ids = _SLE_CLINICAL_TERMS.get(name, ())
+    if phenotype is None or not term_ids:
+        return CriterionItem(
+            domain=domain,
+            name=name,
+            weight=weight,
+            state="not_assessed",
+            basis="Needs a symptom/phenotype record; not computable from labs.",
+        )
+
+    for term_id in term_ids:
+        found = phenotype.get(term_id)
+        if found is None:
+            continue
+        label, present, context = found
+        if not present:
+            return CriterionItem(
+                domain=domain,
+                name=name,
+                weight=weight,
+                state="not_met",
+                basis=f"Recorded as excluded ({label}).",
+                sources=[f"phenotype:{term_id}"],
+            )
+        excerpt = f' from "{context}"' if context else ""
+        return CriterionItem(
+            domain=domain,
+            name=name,
+            weight=weight,
+            state="possible",
+            basis=(
+                f"{label} appears in the record{excerpt}. NOT counted: these "
+                "criteria require that no more likely explanation exists, and "
+                "that judgement is a clinician's."
+            ),
+            sources=[f"phenotype:{term_id}"],
+        )
+
+    return CriterionItem(
+        domain=domain,
+        name=name,
+        weight=weight,
+        state="not_assessed",
+        basis="Nothing matching this appears in the phenotype record.",
+    )
+
+
+def score_sle_2019(
+    rows: Sequence[LabResult], phenotype: PhenotypeLookup | None = None
+) -> CriteriaResult:
     """2019 EULAR/ACR classification criteria for SLE.
 
     Structure of the published set, all of which this preserves: an **entry
@@ -263,17 +356,9 @@ def score_sle_2019(rows: Sequence[LabResult]) -> CriteriaResult:
             "the 2019 criteria do not apply without it."
         )
 
-    # --- clinical domains this system cannot yet see -------------------------
+    # --- clinical domains, answered from the phenotype profile when it can --
     for domain, name, weight in _SLE_CLINICAL_ITEMS:
-        items.append(
-            CriterionItem(
-                domain=domain,
-                name=name,
-                weight=weight,
-                state="not_assessed",
-                basis="Needs a symptom/phenotype record; not computable from labs.",
-            )
-        )
+        items.append(_clinical_item(domain, name, weight, phenotype))
 
     # --- haematologic --------------------------------------------------------
     items.append(
@@ -334,6 +419,24 @@ def score_sle_2019(rows: Sequence[LabResult]) -> CriteriaResult:
         clinical_domains=_SLE_CLINICAL_DOMAINS,
     )
 
+
+# HPO terms that would match each clinical item, used ONLY to raise it to
+# `possible`. Never to `met` — see `ItemState`.
+_SLE_CLINICAL_TERMS: dict[str, tuple[str, ...]] = {
+    "Fever": ("HP:0001945",),
+    "Delirium": ("HP:0031258",),
+    "Psychosis": ("HP:0000709",),
+    "Seizure": ("HP:0001250",),
+    "Non-scarring alopecia": ("HP:0002293", "HP:0001596"),
+    "Oral ulcers": ("HP:0000155",),
+    "Subacute cutaneous or discoid lupus": ("HP:0001056", "HP:0005306"),
+    "Acute cutaneous lupus": ("HP:0011110",),
+    "Pleural or pericardial effusion": ("HP:0002202", "HP:0001698"),
+    "Acute pericarditis": ("HP:0001701",),
+    "Joint involvement": ("HP:0001369",),
+    "Proteinuria >0.5 g/24 h": ("HP:0000093",),
+    "Autoimmune haemolysis": ("HP:0004854",),
+}
 
 _SLE_CLINICAL_ITEMS: tuple[tuple[str, str, int], ...] = (
     ("Constitutional", "Fever", 2),
@@ -554,6 +657,19 @@ def _finalize(
 
     points = sum(item.weight for item in best_by_domain.values())
 
+    # `possible` points, per-domain maxima like the met ones, and reduced by
+    # whatever that domain already scores — confirming a possible item only
+    # gains the difference, not its full weight.
+    best_possible: dict[str, int] = {}
+    for item in items:
+        if item.state != "possible":
+            continue
+        best_possible[item.domain] = max(best_possible.get(item.domain, 0), item.weight)
+    points_possible = sum(
+        max(0, weight - best_by_domain[domain].weight) if domain in best_by_domain else weight
+        for domain, weight in best_possible.items()
+    )
+
     # Unassessed weight is also counted per-domain: the most a domain could
     # still contribute is its single heaviest unanswered item, not their sum.
     not_assessed_by_domain: dict[str, int] = {}
@@ -583,6 +699,7 @@ def _finalize(
         items=items,
         threshold=threshold,
         points=points,
+        points_possible=points_possible,
         points_not_assessed=points_not_assessed,
         meets_threshold=meets,
         requires_clinical_item=requires_clinical_item,
@@ -590,7 +707,7 @@ def _finalize(
     )
 
 
-SCORERS: dict[str, Callable[[Sequence[LabResult]], CriteriaResult]] = {
+SCORERS: dict[str, Callable[..., CriteriaResult]] = {
     "sle-2019": score_sle_2019,
 }
 """Registry, keyed by criteria-set slug. PLAN.md Phase 3 calls for ~10 of
@@ -599,7 +716,11 @@ framework above — three states, domain maxima, cited items, floor totals —
 is shared by all of them."""
 
 
-def score_all(rows: Sequence[LabResult], keys: Iterable[str] | None = None) -> list[CriteriaResult]:
+def score_all(
+    rows: Sequence[LabResult],
+    keys: Iterable[str] | None = None,
+    phenotype: PhenotypeLookup | None = None,
+) -> list[CriteriaResult]:
     """Every registered scorer (or the named subset) against `rows`."""
     selected = list(SCORERS) if keys is None else [k for k in keys if k in SCORERS]
-    return [SCORERS[key](rows) for key in selected]
+    return [SCORERS[key](rows, phenotype) for key in selected]

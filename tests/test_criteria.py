@@ -228,3 +228,53 @@ def test_an_iga_isotype_does_not_score_the_antiphospholipid_item() -> None:
 
     assert apl.state == "not_assessed"
     assert result.points == 0
+
+
+def test_a_phenotype_match_is_possible_never_met() -> None:
+    """The near-miss this state exists for.
+
+    Two terms in this patient's real profile would have scored as met SLE
+    criteria: Seizure, from "clonic grand mal seizure while taking
+    wellbutrin", and Arthritis, from what reads as a list of conditions being
+    considered. Together they are 11 points against a threshold of 10.
+
+    The 2019 criteria count an item only if there is no more likely
+    explanation, and a bupropion-induced seizure has one. A text matcher
+    cannot make that judgement, so it must not claim the criterion.
+    """
+    phenotype = {
+        "HP:0001250": ("Seizure", True, "clonic grand mal seizure while taking wellbutrin"),
+        "HP:0001369": ("Arthritis", True, "psoriatic arthritis"),
+    }
+    result = score_sle_2019([_row("ANA", value_text="1:320")], phenotype)
+
+    seizure = next(i for i in result.items if i.name == "Seizure")
+    assert seizure.state == "possible"
+    assert "wellbutrin" in seizure.basis
+    assert "more likely explanation" in seizure.basis
+
+    assert result.points == 0
+    assert result.points_possible == 11
+    # ...and 11 possible points cannot carry her over a threshold of 10.
+    assert not result.meets_threshold
+
+
+def test_a_phenotype_term_recorded_as_excluded_reads_as_not_met() -> None:
+    """An explicitly denied finding is an answer, not an absence."""
+    phenotype = {"HP:0001945": ("Fever", False, "denies fever")}
+    result = score_sle_2019([_row("ANA", value_text="1:320")], phenotype)
+
+    fever = next(i for i in result.items if i.name == "Fever")
+    assert fever.state == "not_met"
+    assert result.points_possible == 0
+
+
+def test_without_a_phenotype_clinical_items_stay_unassessed() -> None:
+    """No phenotype record means unanswered, never absent."""
+    result = score_sle_2019([_row("ANA", value_text="1:320")])
+
+    assert all(
+        i.state == "not_assessed"
+        for i in result.items
+        if i.name in {"Fever", "Seizure", "Joint involvement"}
+    )
