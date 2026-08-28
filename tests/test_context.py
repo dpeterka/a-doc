@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from adoc.casefile.disputes import DISPUTES_RELPATH, Dispute, Disputes, save_disputes
 from adoc.casefile.encounters import Encounter, EncounterFrontmatter, write_encounter
 from adoc.casefile.ledger import apply_diff, save_ledger
 from adoc.casefile.regimen import (
@@ -18,6 +19,12 @@ from adoc.casefile.regimen import (
     save_regimen,
 )
 from adoc.casefile.repo import LEDGER_RELPATH, DataRepo
+from adoc.casefile.reported import (
+    REPORTED_RESULTS_RELPATH,
+    ReportedResult,
+    ReportedResults,
+    save_reported_results,
+)
 from adoc.casefile.schema import (
     AddHypothesis,
     Evidence,
@@ -683,3 +690,103 @@ def test_a_substance_named_outright_is_not_double_reported(repo: DataRepo, db: L
 
     assert "combination product" not in section
     assert "falsely shift" in section
+
+
+def test_a_disputed_encounter_is_shown_but_marked(repo: DataRepo, db: LabsDb) -> None:
+    """A dispute never deletes. The archived record is the source of truth and
+    the patient may be misremembering — but it must not be read as
+    established, because a phantom study shapes a differential exactly as a
+    real one does."""
+    path = write_encounter(
+        repo.root / "case" / "encounters",
+        Encounter(
+            frontmatter=EncounterFrontmatter(date=date(2026, 8, 23), type="imaging"),
+            summary="MRI pituitary.",
+        ),
+        "mripituitary",
+    )
+    save_disputes(
+        repo.root / Path(DISPUTES_RELPATH),
+        Disputes(
+            entries=[
+                Dispute(
+                    target=f"encounter:{path.name}",
+                    kind="did-not-occur",
+                    statement="This did not occur.",
+                    reported_on=date(2026, 8, 28),
+                )
+            ]
+        ),
+    )
+
+    pack = build_context(repo, db, include_ledger=False)
+    section = next(s.content for s in pack.sections if s.key == "recent_encounters")
+
+    # Still present...
+    assert "MRI pituitary." in section
+    # ...but never as established fact.
+    assert "DISPUTED BY THE PATIENT" in section
+
+
+def test_a_resolved_dispute_stops_marking_the_item(repo: DataRepo, db: LabsDb) -> None:
+    """Only an OPEN dispute marks an item; a dismissed one means the record
+    stands and the mark would be misleading."""
+    path = write_encounter(
+        repo.root / "case" / "encounters",
+        Encounter(
+            frontmatter=EncounterFrontmatter(date=date(2026, 8, 23), type="imaging"),
+            summary="MRI pituitary.",
+        ),
+        "mripituitary",
+    )
+    save_disputes(
+        repo.root / Path(DISPUTES_RELPATH),
+        Disputes(
+            entries=[
+                Dispute(
+                    target=f"encounter:{path.name}",
+                    statement="This did not occur.",
+                    reported_on=date(2026, 8, 28),
+                    status="dismissed",
+                )
+            ]
+        ),
+    )
+
+    pack = build_context(repo, db, include_ledger=False)
+    section = next(s.content for s in pack.sections if s.key == "recent_encounters")
+
+    assert "DISPUTED" not in section
+
+
+def test_reported_results_are_labelled_and_kept_out_of_the_labs_sections(
+    repo: DataRepo, db: LabsDb
+) -> None:
+    """A remembered value must never be read as a measured one — merging them
+    would put an uncitable number into the series the citation checker
+    guards."""
+    save_reported_results(
+        repo.root / Path(REPORTED_RESULTS_RELPATH),
+        ReportedResults(
+            entries=[
+                ReportedResult(
+                    analyte="Iron",
+                    direction="high",
+                    when=date(2024, 11, 1),
+                    when_precision="month",
+                    reported_on=date(2026, 8, 28),
+                )
+            ]
+        ),
+    )
+
+    pack = build_context(repo, db, include_ledger=False)
+    reported = next(s.content for s in pack.sections if s.key == "reported_results")
+    labs = next(s.content for s in pack.sections if s.key == "labs")
+
+    assert "Iron high" in reported
+    assert "2024-11" in reported
+    assert "no document on file" in reported
+    assert "NOT measured results" in reported
+    # ...and nowhere near the measured series.
+    assert "Iron" not in labs

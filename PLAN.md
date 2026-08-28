@@ -230,7 +230,7 @@ Numeric output has a deterministic pass too (`check_composer_numbers`), but it i
 
 *Acceptance:* zero unresolvable source refs can reach the committed ledger (enforced + tested); planted-fact and fabricated-citation probes pass at 100% in CI.
 
-**Phase 3 — Knowledge layer + full eval — IN PROGRESS (~45–65 h):** *Started 2026-08-27. **Landed:** the deterministic criteria-scorer framework (`knowledge/criteria.py`) with SLE 2019 EULAR/ACR; the LIRICAL v2.4.1 phenotype-only sidecar container and its parser (ADR 0029), validated locally but **not yet in CI/CFN and not yet wired into the review DAG**; a measured assessment of which archived genomic data is admissible (ADR 0030 — the raw array only; the imputed BCFs carry no per-variant quality metric and are excluded).*
+**Phase 3 — Knowledge layer + full eval — IN PROGRESS (~45–65 h):** *Started 2026-08-27. **Landed:** the deterministic criteria-scorer framework (`knowledge/criteria.py`) with SLE 2019 EULAR/ACR; the LIRICAL v2.4.1 phenotype-only sidecar container and its parser (ADR 0029), now built and pushed by CI into its own ECR repository with an ECS task definition, though **not yet wired into the review DAG**; a measured assessment of which archived genomic data is admissible (ADR 0030 — the raw array only; the imputed BCFs carry no per-variant quality metric and are excluded).*
 
 *Already present from earlier phases and reusable: `adoc eval --candidate` with its comparison report and suite registry (so the eval acceptance criterion needs two new suites, not a harness), and `EutilsPmidVerifier` (so PMID **verification** exists; PubMed **search** does not).*
 

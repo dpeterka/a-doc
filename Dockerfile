@@ -56,6 +56,20 @@ RUN chmod +x /usr/local/bin/docker-entrypoint.sh /usr/local/bin/run-ingest.sh
 RUN mkdir -p /data \
     && chown -R adoc:adoc /app /data /home/adoc
 
+# --- HPO index (ADR 0031's phenotype profile) -------------------------------
+# The compact label/synonym index the phenotype matcher needs, built from the
+# published ontology at image-build time. Baked in rather than downloaded at
+# start: a deploy stays reproducible and a running container has no network
+# dependency. ~3MB, down from hp.json's 22MB, because matching a patient's
+# words to a term needs labels and synonyms, not axioms or edges.
+#
+# One RUN so the 22MB source never lands in a layer of its own.
+COPY scripts/build_hpo_index.py /tmp/build_hpo_index.py
+RUN curl -sSL -o /tmp/hp.json \
+      https://github.com/obophenotype/human-phenotype-ontology/releases/latest/download/hp.json \
+    && python /tmp/build_hpo_index.py /tmp/hp.json /opt/hpo-index.json \
+    && rm -f /tmp/hp.json /tmp/build_hpo_index.py
+
 USER adoc
 
 EXPOSE 8080

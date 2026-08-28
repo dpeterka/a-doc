@@ -235,7 +235,11 @@ _COMPOUND_MODIFIER_RE = re.compile(r"\b\d+(?:\.\d+)?-[A-Za-z]\w*")
 # The digits must be GLUED to the letters (optionally through one hyphen) for
 # this to fire, which is what separates a name from a reading: prose writes a
 # value with a space — "CRP 8.5", "FSH 91.4" — and those are untouched.
-_ANALYTE_NAME_DIGITS_RE = re.compile(r"\b[A-Za-z]+-?\d+(?:\.\d+)?\b")
+# The trailing `[A-Za-z]*` matters: "HbA1c" has a letter AFTER its digit, so
+# a pattern anchored on a word boundary right after the digits misses it
+# and leaks a bare 1 into the quoted numbers. That cost a real HbA1c
+# citation on a live review.
+_ANALYTE_NAME_DIGITS_RE = re.compile(r"\b[A-Za-z]+-?\d+(?:\.\d+)?[A-Za-z]*\b")
 
 
 # A bare four-digit year introduced by a temporal preposition is a date, not
@@ -245,7 +249,30 @@ _ANALYTE_NAME_DIGITS_RE = re.compile(r"\b[A-Za-z]+-?\d+(?:\.\d+)?\b")
 # platelet count, a ferritin), and silently discarding those would trade one
 # false positive for a worse false negative.
 _YEAR_IN_CONTEXT_RE = re.compile(
-    r"\b(?:since|vs\.?|versus|from|during|in|by|after|before)\s+(?:19|20)\d{2}\b",
+    r"\b(?:since|vs\.?|versus|from|during|in|by|after|before)\s+(?:19|20)\d{2}\b"
+    # A month name in front of a year makes it a date, whatever follows.
+    r"|\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+(?:19|20)\d{2}\b"
+    # "the 2025 panel", "your 2024 results" — a determiner in front of a year
+    # is a date qualifying a noun, never a measurement. This is the case that
+    # survived the first pass: a live review dropped a real TSAT citation for
+    # "quoting" 2025.
+    r"|\b(?:the|that|your|her|his|our)\s+(?:19|20)\d{2}\b"
+    # A parenthesised year is a citation aside, e.g. "(2024)".
+    r"|\((?:19|20)\d{2}\)",
+    re.IGNORECASE,
+)
+
+# A threshold inside a RATIO claim. "FSH/LH ratio > 1.0" quotes 1.0 as the
+# cut-off being compared against, not as a value of either analyte — and a
+# live review dropped real FSH and HbA1c citations for exactly that.
+#
+# Scoped to claims containing "ratio" on purpose. Stripping every number after
+# a comparator would break the opposite case: labs genuinely report results as
+# "<0.08", and that number IS the value (`LabResult.comparator` exists for
+# it). Narrowing to ratios keeps both behaviours correct.
+_RATIO_THRESHOLD_RE = re.compile(
+    r"(?:[<>]=?|≥|≤|greater than|less than|above|below|over|under|at least|of)\s*"
+    r"-?\d+(?:\.\d+)?",
     re.IGNORECASE,
 )
 
@@ -264,6 +291,8 @@ def _extract_quoted_numbers(claim: str) -> list[float]:
     cleaned = _COMPOUND_MODIFIER_RE.sub(" ", cleaned)
     cleaned = _ANALYTE_NAME_DIGITS_RE.sub(" ", cleaned)
     cleaned = _YEAR_IN_CONTEXT_RE.sub(" ", cleaned)
+    if "ratio" in cleaned.lower():
+        cleaned = _RATIO_THRESHOLD_RE.sub(" ", cleaned)
     return [float(m) for m in _NUMBER_RE.findall(cleaned)]
 
 

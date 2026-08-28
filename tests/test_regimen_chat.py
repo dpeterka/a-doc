@@ -152,3 +152,26 @@ def test_every_proposal_ungrounded_writes_nothing(repo: DataRepo) -> None:
     assert report.applied == []
     assert report.dropped_ungrounded == ["Magnesium"]
     assert not path.exists()
+
+
+def test_relative_timing_survives_into_the_interference_answer(repo: DataRepo) -> None:
+    """Scenario: "I am also on Biotin which I started taking two months ago".
+
+    The whole value of that sentence is the two months. Before the parser
+    understood relative time it produced no date at all, and the record could
+    not say whether she was on biotin when a given specimen was drawn — which
+    is the question the top hypothesis on her ledger turns on.
+    """
+    apply_regimen_changes(
+        repo,
+        [RegimenChange(name="Biotin", action="started", when_text="two months ago")],
+        message="I am also on Biotin which I started taking two months ago",
+        today=date(2026, 8, 28),
+    )
+    entry = load_regimen(repo.root / Path(REGIMEN_RELPATH)).entries[0]
+
+    assert entry.started is not None
+    # A month-precision date, never presented as a day.
+    assert entry.started_precision == "month"
+    assert entry.overlaps(date(2026, 5, 2)) == "not-yet-started"
+    assert entry.overlaps(date(2026, 7, 15)) == "active"
