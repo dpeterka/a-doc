@@ -279,6 +279,45 @@ _MIGRATIONS: list[str] = [
     ALTER TABLE labs ADD COLUMN comparator TEXT
         CHECK(comparator IN ('<', '<=', '>', '>=') OR comparator IS NULL);
     """,
+    # ADR 0015 gave DOCUMENTS a full-text corpus; encounters never got one, so
+    # every encounter body — including every patient-report written from a
+    # chat turn — reached a reasoner as one summary line and nothing else.
+    # Measured on the real case file: a 110-line encounter contributed 107
+    # characters to the context pack.
+    #
+    # A separate table rather than rows in `document_text`: an encounter has
+    # no sha256 and no `documents` row, and inventing one to satisfy a join
+    # would put non-documents into the document inventory. It also cites
+    # differently — `encounter:<filename>`, not `doc:<file>#p<page>`.
+    """
+    CREATE TABLE encounter_text (
+        id INTEGER PRIMARY KEY,
+        filename TEXT NOT NULL UNIQUE,
+        encounter_date TEXT,
+        text TEXT NOT NULL
+    );
+
+    CREATE VIRTUAL TABLE encounter_text_fts USING fts5(
+        text,
+        content='encounter_text',
+        content_rowid='id'
+    );
+
+    CREATE TRIGGER encounter_text_ai AFTER INSERT ON encounter_text BEGIN
+        INSERT INTO encounter_text_fts(rowid, text) VALUES (new.id, new.text);
+    END;
+
+    CREATE TRIGGER encounter_text_ad AFTER DELETE ON encounter_text BEGIN
+        INSERT INTO encounter_text_fts(encounter_text_fts, rowid, text)
+        VALUES ('delete', old.id, old.text);
+    END;
+
+    CREATE TRIGGER encounter_text_au AFTER UPDATE ON encounter_text BEGIN
+        INSERT INTO encounter_text_fts(encounter_text_fts, rowid, text)
+        VALUES ('delete', old.id, old.text);
+        INSERT INTO encounter_text_fts(rowid, text) VALUES (new.id, new.text);
+    END;
+    """,
 ]
 
 _CORRECTABLE_FIELDS = {
@@ -1440,6 +1479,68 @@ class LabsDb:
             (source_doc, page),
         ).fetchone()
         return str(row[0]) if row is not None else None
+
+    @_synchronized
+    def upsert_encounter_text(self, filename: str, encounter_date: str | None, text: str) -> None:
+        """Index one encounter's body. Idempotent on `filename`."""
+        self._conn.execute(
+            """
+            INSERT INTO encounter_text (filename, encounter_date, text)
+            VALUES (?, ?, ?)
+            ON CONFLICT(filename) DO UPDATE SET
+                encounter_date = excluded.encounter_date,
+                text = excluded.text
+            """,
+            (filename, encounter_date, text),
+        )
+        self._conn.commit()
+
+    @_synchronized
+    def encounter_text_filenames(self) -> set[str]:
+        rows = self._conn.execute("SELECT filename FROM encounter_text").fetchall()
+        return {str(row["filename"]) for row in rows}
+
+    @_synchronized
+    def delete_encounter_text(self, filename: str) -> None:
+        """Drop an encounter that no longer exists on disk.
+
+        The repo is the source of truth and this index is derived, so a
+        renamed or deleted encounter must not keep answering searches.
+        """
+        self._conn.execute("DELETE FROM encounter_text WHERE filename = ?", (filename,))
+        self._conn.commit()
+
+    @_synchronized
+    def search_encounter_text(self, query: str, *, limit: int = 5) -> list[DocumentTextHit]:
+        """Ranked FTS5 snippet search over encounter bodies.
+
+        Returns the same hit type as `search_document_text` so the two can be
+        merged by a caller, but with an `encounter:<filename>` ref — the
+        grammar an encounter is actually cited under. `page` is always None:
+        an encounter is a markdown file, not a paginated scan.
+        """
+        rows = self._conn.execute(
+            """
+            SELECT encounter_text.filename AS filename,
+                   snippet(encounter_text_fts, 0, '[', ']', ' ... ', 12) AS snip
+            FROM encounter_text_fts
+            JOIN encounter_text ON encounter_text.id = encounter_text_fts.rowid
+            WHERE encounter_text_fts MATCH ?
+            ORDER BY rank
+            LIMIT ?
+            """,
+            (_fts_query_any(query), limit),
+        ).fetchall()
+        return [
+            DocumentTextHit(
+                source_doc="",
+                filename=row["filename"],
+                page=None,
+                snippet=row["snip"],
+                source_ref=f"encounter:{row['filename']}",
+            )
+            for row in rows
+        ]
 
     @_synchronized
     def search_document_text(self, query: str, *, limit: int = 5) -> list[DocumentTextHit]:
