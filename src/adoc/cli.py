@@ -52,6 +52,7 @@ from adoc.backup import (
     restore_from_bucket,
     run_backup,
 )
+from adoc.casefile.encounter_text import sync_encounter_text
 from adoc.casefile.regimen import REGIMEN_RELPATH, load_regimen, save_regimen
 from adoc.casefile.regimen_backfill import backfill_from_encounters
 from adoc.casefile.repo import LEDGER_RELPATH, DataRepo
@@ -827,6 +828,18 @@ def _cmd_backfill_doc_text(_args: argparse.Namespace) -> int:
     print(f"backfill-doc-text: extracted {report.extracted}")
     print(f"backfill-doc-text: skipped (no/unsupported source) {report.skipped_no_source}")
     print(f"backfill-doc-text: skipped (genomic) {report.skipped_genomic}")
+
+    # Encounters share this command because they share its purpose: making
+    # the searchable text corpus current. They are not documents and are
+    # indexed separately (ADR 0015's corpus covered documents only), but a
+    # user asking to backfill the text corpus means all of it.
+    with LabsDb(db_path, journal_mode=settings.sqlite_journal_mode) as db:
+        encounters = sync_encounter_text(repo, db)
+    print(f"backfill-doc-text: encounters indexed {encounters.indexed}")
+    if encounters.pruned:
+        print(f"backfill-doc-text: encounters pruned {encounters.pruned}")
+    for name in encounters.failed:
+        print(f"backfill-doc-text: encounter failed to parse, skipped: {name}", file=sys.stderr)
     return 0
 
 

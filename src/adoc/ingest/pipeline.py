@@ -448,7 +448,17 @@ def _ingest_non_lab(
         summary="(pending review)",
         extracted_text=extracted_text,
     )
-    write_encounter(repo.root / "case" / "encounters", encounter, slug=path.stem)
+    written = write_encounter(repo.root / "case" / "encounters", encounter, slug=path.stem)
+    # Index immediately: an encounter that is only searchable after the next
+    # backfill is invisible to the very turn that follows its ingestion.
+    try:
+        db.upsert_encounter_text(
+            written.name,
+            encounter.frontmatter.date.isoformat(),
+            written.read_text(encoding="utf-8"),
+        )
+    except Exception as exc:  # noqa: BLE001 - indexing must never fail an ingest
+        logger.warning("ingest: could not index encounter text for %s: %s", written.name, exc)
 
     db.upsert_document(
         LabDocument(

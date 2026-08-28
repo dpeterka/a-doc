@@ -62,7 +62,7 @@ def db(tmp_path: Path) -> LabsDb:
 
 def test_schema_created_with_user_version(db: LabsDb) -> None:
     version = db._conn.execute("PRAGMA user_version").fetchone()[0]
-    assert version == 4  # 4: labs.comparator (ADR 0025)
+    assert version == 5  # 5: encounter_text corpus (ADR 0015 extended to encounters)
     tables = {
         row[0]
         for row in db._conn.execute(
@@ -312,7 +312,7 @@ def test_rebuild_from_jsonl_is_idempotent_and_replaces_existing_content(
 
 def test_migration_adds_specimen_column_with_unknown_default(db: LabsDb) -> None:
     version = db._conn.execute("PRAGMA user_version").fetchone()[0]
-    assert version == 4  # 4: labs.comparator (ADR 0025)
+    assert version == 5  # 5: encounter_text corpus (ADR 0015 extended to encounters)
     columns = {row[1] for row in db._conn.execute("PRAGMA table_info(labs)").fetchall()}
     assert "specimen" in columns
 

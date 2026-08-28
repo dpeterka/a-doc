@@ -417,7 +417,13 @@ def _document_excerpts_section(db: LabsDb, query: str | None) -> ContextSection 
     """
     if not query or not query.strip():
         return None
+    # Documents AND encounters. An encounter body was previously unreachable
+    # once it fell outside the recent-encounters window, which meant anything
+    # the patient said in a chat turn stopped being retrievable — the same
+    # blindness that made a 110-line regimen document read as "on file but
+    # not yet reconciled".
     hits = db.search_document_text(query, limit=MAX_DOCUMENT_EXCERPTS)
+    hits += db.search_encounter_text(query, limit=MAX_DOCUMENT_EXCERPTS)
     if not hits:
         return None
 
