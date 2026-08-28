@@ -1294,8 +1294,24 @@ def render_review_markdown(
     lines.append("## What to ask your doctor")
     lines.append("")
     if test_chooser.items:
-        for item in test_chooser.items:
-            lines.append(f"- {redact_gated_text(item.text)}")
+        # The SAME renderer the case-file page uses. This section previously
+        # emitted `- {item.text}` and, once the item schema moved to named
+        # parts, produced one empty bullet per item — a row of bare dashes
+        # above the metrics appendix. `redact_gated_text` still runs over
+        # every piece of model-authored text, so the deterministic output gate
+        # is unchanged.
+        names = {h.id: h.name for h in ledger_after.hypotheses}
+        mine = [i for i in test_chooser.items if i.audience == "you"]
+        theirs = [i for i in test_chooser.items if i.audience == "doctor"]
+        if mine:
+            lines.append("**You can answer these yourself:**")
+            lines.append("")
+            lines += render_test_chooser_items(mine, names, transform=redact_gated_text)
+        if theirs:
+            if mine:
+                lines.append("**For your doctor:**")
+                lines.append("")
+            lines += render_test_chooser_items(theirs, names, transform=redact_gated_text)
     else:
         lines.append("_Nothing new to bring to your next appointment this week._")
     lines.append("")
@@ -1878,6 +1894,56 @@ def build_review_dag(
     return Dag(nodes)
 
 
+def render_test_chooser_items(
+    items: list[TestChooserItem],
+    names: dict[str, str],
+    *,
+    transform: Callable[[str], str] | None = None,
+) -> list[str]:
+    """One next-appointment item per bullet, in markdown.
+
+    Shared by the two surfaces that render these items — `questions-open.md`
+    and the weekly review report — because they drifted the moment they were
+    separate. When `TestChooserItem` moved from one free-text `text` field to
+    named parts, only this page was updated; the review report kept emitting
+    `- {item.text}` and so rendered 22 EMPTY bullets under "What to ask your
+    doctor", a row of bare dashes above the metrics appendix. One renderer
+    cannot drift from itself.
+
+    `transform` is applied to every piece of model-authored text. The review
+    report passes the deterministic output gate through it; the case file page
+    passes nothing, because its content is written straight to the repo and
+    gated where it is read.
+    """
+    apply = transform or (lambda text: text)
+    out: list[str] = []
+    for item in items:
+        panel = item.panel.strip()
+        if not panel:
+            continue
+        out.append(f"- **{apply(panel)}**")
+        if item.ask.strip():
+            out.append(f"  {apply(item.ask.strip())}")
+        # Every hypothesis the item bears on, not just the first: one test
+        # routinely serves several, and collapsing that to a single reference
+        # hides why the test is worth doing. Each is a link to its ledger
+        # card, so "why am I being asked this" is one click away rather than a
+        # scroll-and-search.
+        related = [
+            f"[{names[hid]}](/ledger#{hid})" if hid in names else hid for hid in item.hypothesis_ids
+        ]
+        if related:
+            # One line per hypothesis rather than a comma-joined run: a run of
+            # links reads as one undifferentiated blob, which is the problem
+            # this page has.
+            out.append("  _Relevant to:_")
+            out += [f"  · {entry}" for entry in related]
+        if item.why.strip():
+            out.append(f"  _Why:_ {apply(item.why.strip())}")
+        out.append("")
+    return out
+
+
 def _render_questions_open(payload: TestChooserPayload, ledger: Ledger | None = None) -> str:
     """The next-appointment list, rendered deterministically from structure.
 
@@ -1895,34 +1961,7 @@ def _render_questions_open(payload: TestChooserPayload, ledger: Ledger | None = 
     names = {h.id: h.name for h in ledger.hypotheses} if ledger else {}
 
     def render(items: list[TestChooserItem]) -> list[str]:
-        out: list[str] = []
-        for item in items:
-            if not item.panel.strip():
-                continue
-            out.append(f"- **{item.panel.strip()}**")
-            if item.ask.strip():
-                out.append(f"  {item.ask.strip()}")
-            # Every hypothesis the item bears on, not just the first: one test
-            # routinely serves several, and collapsing that to a single
-            # reference hides why the test is worth doing. Each is a link to
-            # its ledger card, so "why am I being asked this" is one click
-            # away rather than a scroll-and-search.
-            related = [
-                f"[{names[hid]}](/ledger#{hid})" if hid in names else hid
-                for hid in item.hypothesis_ids
-            ]
-            if related:
-                # One line per hypothesis rather than a comma-joined run: a
-                # single test routinely serves several, and the point of
-                # showing them is that the reader can see WHICH question each
-                # one answers and click into it. A run of links reads as one
-                # undifferentiated blob, which is the problem this page has.
-                out.append("  _Relevant to:_")
-                out += [f"  · {entry}" for entry in related]
-            if item.why.strip():
-                out.append(f"  _Why:_ {item.why.strip()}")
-            out.append("")
-        return out
+        return render_test_chooser_items(items, names)
 
     mine = [i for i in payload.items if i.audience == "you"]
     theirs = [i for i in payload.items if i.audience == "doctor"]

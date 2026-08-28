@@ -16,11 +16,14 @@ the labs database and renders plain text.
 from __future__ import annotations
 
 import re
+from datetime import date
+from pathlib import Path
 
 from pydantic import BaseModel, Field
 
-from adoc.casefile.encounters import EncounterFrontmatter, read_encounter
+from adoc.casefile.encounters import DatePrecision, EncounterFrontmatter, read_encounter
 from adoc.casefile.ledger import load_ledger
+from adoc.casefile.regimen import REGIMEN_RELPATH, Regimen, RegimenEntry, load_regimen
 from adoc.casefile.repo import LEDGER_RELPATH, DataRepo
 from adoc.casefile.schema import Ledger
 from adoc.labs.db import LabsDb
@@ -467,6 +470,158 @@ def _render_ledger_section(ledger: Ledger) -> ContextSection:
     return ContextSection(key=LEDGER_SECTION_KEY, title="Differential Ledger", content=content)
 
 
+REGIMEN_SECTION_KEY = "regimen"
+
+# Substances known to distort immunoassays badly enough that a result drawn
+# while they were active must be read differently. Deliberately short and
+# hand-curated: this drives an explicit warning next to lab values, and a
+# broad list would put a caveat on everything and so on nothing.
+_ASSAY_INTERFERING = {
+    "biotin": "can falsely shift many hormone and antibody immunoassays",
+}
+
+# Products whose NAME does not reveal what is inside them. Measured on the
+# real case: the regimen document names 24 items and mentions biotin zero
+# times, while the patient's biotin measured high — because biotin is
+# routinely inside a B-complex at doses well above the interference
+# threshold. Flagging the product is the honest move: the system cannot know
+# the contents from the name, and saying so is what turns a vague "bring your
+# bottles" into a specific question about one label.
+_COMPOUND_PRODUCTS = ("complex", "multivitamin", "multi-vitamin", "hair", "skin", "nail")
+
+
+def _regimen_section(repo: DataRepo, db: LabsDb) -> ContextSection:
+    """What the patient takes, WITH dates, and which lab draws it overlaps.
+
+    Exists because the reasoner could previously see that a supplement
+    document was on file and nothing more. Measured on the real case: a
+    110-line regimen encounter contributed 107 characters to the pack — its
+    title — and 3,446 characters never reached any model. The review then
+    reported the document as "on file but not yet reconciled", which was an
+    accurate description of its own blindness, and the top next-appointment
+    item asked the patient to bring supplement bottles so someone could
+    establish what she takes.
+
+    The alignment is the point. `still_taking` could never answer "was she
+    taking biotin when this assay ran", and that question decides whether a
+    hormone or antibody result is real or artefactual.
+    """
+    regimen = load_regimen(repo.root / Path(REGIMEN_RELPATH))
+    if not regimen.entries:
+        return ContextSection(
+            key=REGIMEN_SECTION_KEY,
+            title="Medications & Supplements",
+            content="_Nothing recorded yet._",
+        )
+
+    lines: list[str] = []
+    current = [e for e in regimen.entries if e.stopped is None]
+    stopped = [e for e in regimen.entries if e.stopped is not None]
+
+    if current:
+        lines.append("**Currently taking**")
+        lines += [f"- {_regimen_line(e)}" for e in current]
+    if stopped:
+        lines.append("")
+        lines.append("**Stopped**")
+        lines += [f"- {_regimen_line(e)}" for e in stopped]
+
+    undated = regimen.undated()
+    if undated:
+        # Stated, not hidden: these are what make the overlap answers below
+        # incomplete, and a reader deserves to know before relying on them.
+        lines.append("")
+        lines.append(
+            f"_{len(undated)} entr{'y has' if len(undated) == 1 else 'ies have'} no "
+            "start or stop date, so overlap with a lab draw cannot be determined "
+            "for them._"
+        )
+
+    overlaps = _interference_warnings(regimen, db)
+    if overlaps:
+        lines.append("")
+        lines.append("**Possible assay interference**")
+        lines += overlaps
+
+    return ContextSection(
+        key=REGIMEN_SECTION_KEY,
+        title="Medications & Supplements",
+        content="\n".join(lines),
+    )
+
+
+def _regimen_line(entry: RegimenEntry) -> str:
+    dose = f" {entry.dose}" if entry.dose else ""
+    freq = f" {entry.frequency}" if entry.frequency else ""
+    span = _regimen_span(entry)
+    attribution = "" if entry.attribution == "unknown" else f" [{entry.attribution}]"
+    return f"{entry.name}{dose}{freq}{attribution}{span}"
+
+
+def _regimen_span(entry: RegimenEntry) -> str:
+    """The interval, stated no more precisely than it is known — the same
+    rule `_render_encounter_date` applies to encounters (ADR 0027)."""
+    started = _precise(entry.started, entry.started_precision)
+    stopped = _precise(entry.stopped, entry.stopped_precision)
+    if started and stopped:
+        return f" — {started} to {stopped}"
+    if started:
+        return f" — since {started}"
+    if stopped:
+        return f" — until {stopped}"
+    return " — dates unknown"
+
+
+def _precise(when: date | None, precision: DatePrecision | None) -> str:
+    if when is None:
+        return ""
+    if precision == "year":
+        return str(when.year)
+    if precision == "month":
+        return when.strftime("%Y-%m")
+    if precision == "approximate":
+        return f"~{when.year}"
+    return when.isoformat()
+
+
+def _interference_warnings(regimen: Regimen, db: LabsDb) -> list[str]:
+    """Lab dates that fall inside an interfering substance's interval.
+
+    Reported per DATE rather than per row: the point is that everything drawn
+    that day is suspect, and listing hundreds of individual analytes would
+    bury that.
+    """
+    intervals = [
+        (entry, note)
+        for entry in regimen.entries
+        for key, note in _ASSAY_INTERFERING.items()
+        if key in entry.name.lower()
+    ]
+    dates = sorted({row.date for row in db.all_non_rejected_rows()}, reverse=True)
+    out: list[str] = []
+    # Deliberately NOT behind an "is anything named biotin" early return: the
+    # combination-product case exists precisely because nothing is. On the
+    # real regimen, biotin is named zero times while the patient's biotin
+    # measured high — it is inside a B complex.
+    for entry in regimen.entries:
+        lowered = entry.name.lower()
+        if any(hint in lowered for hint in _COMPOUND_PRODUCTS) and not any(
+            key in lowered for key in _ASSAY_INTERFERING
+        ):
+            out.append(
+                f"- {entry.name} — a combination product; its contents are not known from "
+                "the name. If it contains biotin, results drawn while taking it may be "
+                "affected. The label settles it."
+            )
+    for entry, note in intervals:
+        hits = [d for d in dates if entry.overlaps(d) == "active"]
+        if hits:
+            shown = ", ".join(d.isoformat() for d in hits[:8])
+            more = f" (+{len(hits) - 8} more)" if len(hits) > 8 else ""
+            out.append(f"- {entry.name} — {note}. Draws while active: {shown}{more}")
+    return out
+
+
 def build_context(
     repo: DataRepo,
     db: LabsDb,
@@ -523,6 +678,7 @@ def build_context(
     # After the snapshot, deliberately: the reader needs to know what the
     # current values ARE before being told which of them are moving.
     sections.append(_trajectories_section(db))
+    sections.append(_regimen_section(repo, db))
 
     if (repo.root / GENOMICS_INVENTORY_RELPATH).exists():
         sections.append(
