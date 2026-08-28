@@ -5,6 +5,39 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.0] — 2026-08-28
+
+### Added
+
+- **`case/regimen.yaml`: what the patient takes, and when** (ADR 0031).
+  Medications and supplements were modelled as `still_taking: bool`, and that
+  boolean cannot answer the question this case turns on — was she taking
+  biotin when the 2026-07-15 assay ran? High-dose biotin distorts many hormone
+  and antibody immunoassays, so whether a result is real depends on an
+  interval overlapping a specimen date. Entries now carry `started`/`stopped`
+  with per-endpoint precision, `attested_on` dates, attribution, `reported_on`
+  and source refs. A restart is a new interval, never a widened one; an
+  undated entry reports `unknown`, never absent.
+- A `regimen` section in the fixed context order, so the chat turn and the
+  deep review read the same record. It aligns the regimen to lab collection
+  dates and flags possible assay interference.
+- `adoc regimen-backfill` seeds the record from regimen encounters already on
+  disk — deterministic and offline, so the supplement list never leaves the
+  machine. Run against the real case file it produced 23 entries, taking the
+  regimen context a reasoner sees from 107 characters to 1,817.
+- **Combination products are flagged when their name hides their contents.**
+  Biotin appears zero times in the patient's regimen document while her biotin
+  measured high — it is inside a B complex. The pack now says so, and names
+  the label that would settle it, instead of asking her to bring every bottle
+  she owns.
+
+### Fixed
+
+- The review report's "What to ask your doctor" section rendered one empty
+  bullet per item — a row of bare dashes above the metrics appendix — because
+  it still read the free-text field the item schema had moved away from. Both
+  surfaces now share one renderer.
+
 ## [0.12.1] — 2026-08-27
 
 ### Fixed
