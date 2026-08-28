@@ -65,13 +65,19 @@ _NEGATION_WINDOW = 4
 "she has no history of joint pain", narrow enough that a cue from an earlier
 clause does not leak forward."""
 
-_TRAILING_NEGATION_CUES = frozenset({"no", "none", "negative", "denied", "denies", "absent", "nil"})
-_TRAILING_WINDOW = 2
-"""Review-of-systems prose puts the denial AFTER the finding — "Coma: no",
-"Chest pain - denied". A backward-only window reads those as positives, and
-on the first real run that recorded `HP:0001259 Coma` five times from
-checklist rows. Kept narrow: two words is enough for a colon and a "no",
-short enough that the next sentence's "no" cannot reach back."""
+_TRAILING_NEGATION_CUES = frozenset({"no", "none", "negative", "denied", "nil", "absent"})
+"""Words that TERMINATE a finding, in review-of-systems prose that puts the
+denial after it: "Coma: no", "Chest pain - denied".
+
+"denies" is deliberately absent, and only backward. It INTRODUCES a negated
+item rather than closing the previous one, so treating it as a trailing cue
+negates the wrong term: "joint pain and night sweats, denies fever" marked
+night sweats as excluded — caught by running the built image, not by the
+unit tests, which never put two findings either side of one cue."""
+
+_TRAILING_WINDOW = 1
+"""Exactly one word. Two was enough to reach past a comma into the next
+clause's cue, which is how the bug above happened."""
 
 
 @dataclass(frozen=True)

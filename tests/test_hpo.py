@@ -129,3 +129,27 @@ def test_round_trips_from_disk(tmp_path: Path) -> None:
     assert loaded.size == len(TERMS)
     assert loaded.is_valid("HP:0002829")
     assert not loaded.is_valid("HP:9999999")
+
+
+def test_a_following_denial_negates_the_next_finding_not_the_previous_one(
+    index: HpoIndex,
+) -> None:
+    """ "joint pain and night sweats, denies fever" marked NIGHT SWEATS as
+    excluded.
+
+    "denies" introduces a negated item rather than closing the previous one,
+    and a two-word trailing window reached past the comma to find it. Caught
+    by running the built image — the unit tests never put two findings either
+    side of a single cue, which is exactly the shape that breaks.
+    """
+    by_id = {m.term_id: m for m in index.find_terms("joint pain and night sweats, denies fever")}
+
+    assert by_id["HP:0002829"].present is True
+    assert by_id["HP:0030166"].present is True
+    assert by_id["HP:0001945"].present is False
+
+
+def test_a_terminal_denial_still_negates_its_own_finding(index: HpoIndex) -> None:
+    """Review-of-systems shorthand puts the denial after the finding, and
+    that must keep working — it is why the trailing window exists."""
+    assert index.find_terms("Coma: no")[0].present is False

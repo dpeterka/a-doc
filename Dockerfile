@@ -56,10 +56,6 @@ RUN chmod +x /usr/local/bin/docker-entrypoint.sh /usr/local/bin/run-ingest.sh
 RUN mkdir -p /data \
     && chown -R adoc:adoc /app /data /home/adoc
 
-USER adoc
-
-EXPOSE 8080
-
 # --- HPO index (ADR 0031's phenotype profile) -------------------------------
 # The compact label/synonym index the phenotype matcher needs, built from the
 # published ontology at image-build time. Baked in rather than downloaded at
@@ -73,6 +69,10 @@ RUN curl -sSL -o /tmp/hp.json \
       https://github.com/obophenotype/human-phenotype-ontology/releases/latest/download/hp.json \
     && python /tmp/build_hpo_index.py /tmp/hp.json /opt/hpo-index.json \
     && rm -f /tmp/hp.json /tmp/build_hpo_index.py
+
+USER adoc
+
+EXPOSE 8080
 
 ENTRYPOINT ["docker-entrypoint.sh"]
 CMD ["adoc", "serve", "--host", "0.0.0.0", "--port", "8080"]
