@@ -480,6 +480,15 @@ _ASSAY_INTERFERING = {
     "biotin": "can falsely shift many hormone and antibody immunoassays",
 }
 
+# Products whose NAME does not reveal what is inside them. Measured on the
+# real case: the regimen document names 24 items and mentions biotin zero
+# times, while the patient's biotin measured high — because biotin is
+# routinely inside a B-complex at doses well above the interference
+# threshold. Flagging the product is the honest move: the system cannot know
+# the contents from the name, and saying so is what turns a vague "bring your
+# bottles" into a specific question about one label.
+_COMPOUND_PRODUCTS = ("complex", "multivitamin", "multi-vitamin", "hair", "skin", "nail")
+
 
 def _regimen_section(repo: DataRepo, db: LabsDb) -> ContextSection:
     """What the patient takes, WITH dates, and which lab draws it overlaps.
@@ -531,7 +540,7 @@ def _regimen_section(repo: DataRepo, db: LabsDb) -> ContextSection:
     overlaps = _interference_warnings(regimen, db)
     if overlaps:
         lines.append("")
-        lines.append("**Lab draws taken while an interfering substance was active**")
+        lines.append("**Possible assay interference**")
         lines += overlaps
 
     return ContextSection(
@@ -588,10 +597,22 @@ def _interference_warnings(regimen: Regimen, db: LabsDb) -> list[str]:
         for key, note in _ASSAY_INTERFERING.items()
         if key in entry.name.lower()
     ]
-    if not intervals:
-        return []
     dates = sorted({row.date for row in db.all_non_rejected_rows()}, reverse=True)
     out: list[str] = []
+    # Deliberately NOT behind an "is anything named biotin" early return: the
+    # combination-product case exists precisely because nothing is. On the
+    # real regimen, biotin is named zero times while the patient's biotin
+    # measured high — it is inside a B complex.
+    for entry in regimen.entries:
+        lowered = entry.name.lower()
+        if any(hint in lowered for hint in _COMPOUND_PRODUCTS) and not any(
+            key in lowered for key in _ASSAY_INTERFERING
+        ):
+            out.append(
+                f"- {entry.name} — a combination product; its contents are not known from "
+                "the name. If it contains biotin, results drawn while taking it may be "
+                "affected. The label settles it."
+            )
     for entry, note in intervals:
         hits = [d for d in dates if entry.overlaps(d) == "active"]
         if hits:

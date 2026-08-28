@@ -81,6 +81,20 @@ class RegimenEntry(BaseModel):
     legitimate combination — a patient often knows when she stopped something
     far better than when she began."""
 
+    attested_on: list[date] = Field(default_factory=list)
+    """Dates on which this entry was explicitly reported as in use.
+
+    A regimen document dated 2026-08-01 says what she was taking THAT DAY. It
+    does not say when she started, and inventing a start date to make the
+    interval work would be fabricating exactly the kind of temporal claim this
+    module exists to prevent. Recording the attestation keeps the fact without
+    the fiction: `overlaps` answers "active" for an attested date and stays
+    `unknown` elsewhere.
+
+    Deliberately NOT widened into a window. A monthly regimen titled "August
+    2026" is arguably evidence about the whole month, but "arguably" is not a
+    basis for telling a doctor she was on biotin when a specimen was drawn.
+    """
     attribution: Attribution = "unknown"
     reported_on: date | None = None
     """When the patient said this, as distinct from when it was true. The
@@ -106,6 +120,10 @@ class RegimenEntry(BaseModel):
         confident wrong answer here would directly mislead the assay-
         interference question this record exists to settle.
         """
+        if when in self.attested_on:
+            # Directly reported as in use on this date — the strongest
+            # statement available, and it outranks interval inference.
+            return "active"
         if self.started is None and self.stopped is None:
             return "unknown"
         if self.started is not None and when < self.started:
@@ -129,13 +147,19 @@ class Regimen(BaseModel):
         """Entries in force on `when` — the alignment a lab row needs."""
         return [e for e in self.entries if e.overlaps(when) == "active"]
 
+    def attested_dates(self) -> list[date]:
+        """Every date any entry is attested on, oldest first."""
+        return sorted({d for e in self.entries for d in e.attested_on})
+
     def undated(self) -> list[RegimenEntry]:
         """Entries that cannot be placed in time at all.
 
         Surfaced deliberately rather than hidden: these are the ones that make
         an `active_on` answer incomplete, and a reader deserves to know the
         list is partial before relying on it."""
-        return [e for e in self.entries if e.overlaps(date.today()) == "unknown"]
+        return [
+            e for e in self.entries if e.started is None and e.stopped is None and not e.attested_on
+        ]
 
     def by_name(self, name: str) -> list[RegimenEntry]:
         """Every interval recorded for one substance, oldest first — a restart
@@ -206,4 +230,8 @@ def merge_entries(regimen: Regimen, proposed: Iterable[RegimenEntry]) -> Regimen
         for source in entry.sources:
             if source not in open_match.sources:
                 open_match.sources.append(source)
+        for attested in entry.attested_on:
+            if attested not in open_match.attested_on:
+                open_match.attested_on.append(attested)
+        open_match.attested_on.sort()
     return Regimen(entries=merged, updated=regimen.updated)

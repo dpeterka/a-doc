@@ -52,6 +52,8 @@ from adoc.backup import (
     restore_from_bucket,
     run_backup,
 )
+from adoc.casefile.regimen import REGIMEN_RELPATH, load_regimen, save_regimen
+from adoc.casefile.regimen_backfill import backfill_from_encounters
 from adoc.casefile.repo import LEDGER_RELPATH, DataRepo
 from adoc.config import Settings, load_model_bindings
 from adoc.evals.report import write_comparison_report, write_report
@@ -828,6 +830,55 @@ def _cmd_backfill_doc_text(_args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_regimen_backfill(_args: argparse.Namespace) -> int:
+    """Seed `case/regimen.yaml` from the regimen encounters already on disk
+    (`casefile.regimen_backfill`; NO LLM calls — the patient's supplement
+    list never leaves the machine).
+
+    Idempotent: `merge_entries` updates an open interval rather than
+    appending a duplicate, so re-running after a new regimen document only
+    adds what is new.
+    """
+    try:
+        settings = Settings()
+    except Exception as exc:  # noqa: BLE001 - surface any config error to the user
+        print(f"regimen-backfill: configuration error: {exc}", file=sys.stderr)
+        return 1
+
+    repo = DataRepo(settings.data_dir)
+    if not repo.is_initialized:
+        print(
+            f"regimen-backfill: data repo not initialized at {settings.data_dir} "
+            "- run `adoc init` first",
+            file=sys.stderr,
+        )
+        return 1
+
+    path = repo.root / Path(REGIMEN_RELPATH)
+    before = load_regimen(path)
+    after, counts = backfill_from_encounters(repo.root, before)
+
+    if not counts:
+        # Stated rather than exiting 0 in silence: an empty record with a
+        # successful exit code is indistinguishable from a working one.
+        print("regimen-backfill: no regimen encounters found - nothing to do")
+        return 0
+
+    save_regimen(path, after)
+    repo.commit(
+        f"casefile: backfilled regimen ({len(after.entries)} entries)",
+        paths=[REGIMEN_RELPATH],
+    )
+
+    for name, count in counts.items():
+        print(f"regimen-backfill: {name}: {count} entr{'y' if count == 1 else 'ies'}")
+    print(f"regimen-backfill: total entries {len(before.entries)} -> {len(after.entries)}")
+    dated = sum(1 for e in after.entries if e.attested_on or e.started or e.stopped)
+    print(f"regimen-backfill: placeable in time {dated}/{len(after.entries)}")
+    print(f"regimen-backfill: with a dose {sum(1 for e in after.entries if e.dose)}")
+    return 0
+
+
 def _cmd_review(args: argparse.Namespace) -> int:
     """The entry point both the frequent scheduled tick
     (`deploy/cfn/ecs.yaml`'s `ReviewRule`) and a human at a terminal call —
@@ -1014,6 +1065,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="always run a full review, bypassing the marker/cooldown/floor gating",
     )
     review_parser.set_defaults(func=_cmd_review)
+    subparsers.add_parser(
+        "regimen-backfill",
+        help=("seed case/regimen.yaml from regimen encounters on disk (no LLM calls; idempotent)"),
+    ).set_defaults(func=_cmd_regimen_backfill)
     subparsers.add_parser(
         "backfill-doc-text",
         help=(
