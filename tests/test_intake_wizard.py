@@ -7,7 +7,7 @@ returns canned structured-output dicts keyed by section schema name, so
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +24,7 @@ from adoc.intake.wizard import (
     IntakeWizard,
     SectionState,
     load_intake_state,
+    parse_approx_date_with_precision,
     save_intake_state,
 )
 from adoc.reason.client import (
@@ -657,7 +658,10 @@ def test_undated_events_are_recorded_without_fabricating_dates(tmp_path: Path) -
     for events the patient couldn't date; confirm must record them in
     case/undated-events.md instead of raising."""
     from adoc.intake.sections import EventsSection, MedicalEvent
-    from adoc.intake.wizard import UNDATED_EVENTS_RELPATH, _write_events
+    from adoc.intake.wizard import (
+        UNDATED_EVENTS_RELPATH,
+        _write_events,
+    )
 
     repo = DataRepo.init_at(tmp_path / "data")
     data = EventsSection(
@@ -694,3 +698,34 @@ def test_undated_events_are_recorded_without_fabricating_dates(tmp_path: Path) -
     assert "Appendectomy" in undated
     dated = [w for w in written if w.startswith("case/encounters/")]
     assert len(dated) == 1 and "2023" in dated[0]
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        # How a patient actually states timing in conversation. None of these
+        # parsed before, so "I started biotin two months ago" reached the
+        # regimen record with no date — losing exactly the fact that decides
+        # whether she was taking it when a lab was drawn.
+        ("two months ago", (date(2026, 6, 29), "month")),
+        ("2 months ago", (date(2026, 6, 29), "month")),
+        ("last month", (date(2026, 7, 29), "month")),
+        ("last year", (date(2025, 8, 28), "year")),
+        # Vaguer word forms report `approximate` even though they resolve to a
+        # count: "a few weeks" is not "3 weeks".
+        ("a few weeks ago", (date(2026, 8, 7), "approximate")),
+        # A month name used to be thrown away entirely: "June 2026" parsed as
+        # 2026-01-01, five months off and stated as a date rather than a month.
+        ("June 2026", (date(2026, 6, 1), "month")),
+        ("Nov 2024", (date(2024, 11, 1), "month")),
+        ("15 March 2021", (date(2021, 3, 15), "day")),
+        # Unchanged behaviour.
+        ("2026-07-15", (date(2026, 7, 15), "day")),
+        ("in 2021", (date(2021, 1, 1), "approximate")),
+        ("as a child", None),
+    ],
+)
+def test_relative_and_named_dates_parse_with_honest_precision(
+    text: str, expected: tuple[date, str] | None
+) -> None:
+    assert parse_approx_date_with_precision(text, today=date(2026, 8, 28)) == expected
