@@ -31,6 +31,20 @@ logger = logging.getLogger(__name__)
 
 _NON_ALNUM = re.compile(r"[^a-z0-9]+")
 
+# Multi-word clinical entities HPO has no term for, where matching the tail
+# word alone MISREPRESENTS the finding. Applied before ordinary matching, so
+# the compound claims its span and the misleading sub-match cannot fire.
+#
+# "Myxedema coma" is the case that forced this: HPO has no `myxedema` term at
+# all, so only "coma" matched — recording a primary neurological finding for
+# what is decompensated hypothyroidism. The name is a misnomer in the
+# literature too: most patients have altered mental status rather than true
+# coma, so `Coma` is not merely imprecise here, it is usually wrong.
+_COMPOUND_OVERRIDES: dict[str, str | None] = {
+    "myxedema coma": "HP:0000821",  # Hypothyroidism — the actual substance
+    "myxoedema coma": "HP:0000821",
+}
+
 _CLAUSE_SPLIT_RE = re.compile(r"[.;\n]+")
 """Sentence-ish boundaries a negation cue must not cross. Commas and colons
 are deliberately excluded — a list ("no fever, chills, or night sweats") and
@@ -162,6 +176,31 @@ class HpoIndex:
         words = _NON_ALNUM.sub(" ", text.lower()).split()
         claimed: set[int] = set()
         matches: list[HpoMatch] = []
+
+        # Compound overrides first: they must claim their span before a
+        # shorter, misleading match can take the tail word.
+        for phrase, override_id in _COMPOUND_OVERRIDES.items():
+            parts = phrase.split()
+            for start in range(len(words) - len(parts) + 1):
+                if words[start : start + len(parts)] != parts:
+                    continue
+                span = range(start, start + len(parts))
+                if any(i in claimed for i in span):
+                    continue
+                claimed.update(span)
+                if override_id is None:
+                    continue
+                matches.append(
+                    HpoMatch(
+                        term_id=override_id,
+                        label=self._terms.get(override_id, phrase),
+                        matched_text=phrase,
+                        context=" ".join(
+                            words[max(0, start - 3) : min(len(words), start + len(parts) + 3)]
+                        ),
+                        present=not _is_negated(words, start, start + len(parts)),
+                    )
+                )
 
         for length in range(MAX_PHRASE_WORDS, 0, -1):
             for start in range(len(words) - length + 1):

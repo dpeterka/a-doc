@@ -15,6 +15,7 @@ from adoc.casefile.phenotype import (
     load_phenotype,
     merge_terms,
     save_phenotype,
+    select_for_engine,
 )
 from adoc.casefile.phenotype_backfill import backfill_phenotype
 from adoc.casefile.repo import DataRepo
@@ -126,3 +127,45 @@ def test_round_trips_through_yaml(repo: DataRepo) -> None:
 
     assert path.read_bytes() == first
     assert reloaded.entries[0].matched_text == ["reports joint pain most mornings"]
+
+
+def test_engine_selection_caps_and_prefers_current_corroborated_terms(
+    repo: DataRepo, index: HpoIndex
+) -> None:
+    """The full profile is the RECORD; the engine input is a QUERY.
+
+    Conflating them produced an unusable ranking: at 82 terms LIRICAL's top
+    composite LR was -25.97, against +4.82 at eight terms. Terms no single
+    disease explains subtract without bound.
+    """
+    _encounter(repo, "old", "Reports joint pain.", date(2019, 1, 1))
+    _encounter(repo, "recent-a", "Reports fatigue.", date(2026, 8, 1))
+    _encounter(repo, "recent-b", "Still fatigued, and a fever.", date(2026, 8, 20))
+
+    profile, _ = backfill_phenotype(repo, index, PhenotypeProfile())
+    observed, excluded = select_for_engine(profile, today=date(2026, 8, 28), limit=2)
+
+    assert len(observed) == 2
+    # Fatigue is both current and twice-corroborated; the 2019 joint pain is
+    # neither, and a differential about today should not be asked to explain
+    # an episode that never recurred.
+    assert "HP:0012378" in observed
+    assert "HP:0002829" not in observed
+    assert excluded == []
+
+
+def test_excluded_terms_are_not_capped_with_the_observed_ones(repo: DataRepo) -> None:
+    """LIRICAL takes a negated phenotype as evidence in its own right, there
+    are typically few of them, and each is a deliberate clinical statement
+    rather than an incidental mention."""
+    profile = PhenotypeProfile(
+        entries=[
+            PhenotypeTerm(term_id=f"HP:000000{n}", label=f"t{n}", present=False)
+            for n in range(1, 6)
+        ]
+    )
+
+    observed, excluded = select_for_engine(profile, today=date(2026, 8, 28), limit=2)
+
+    assert observed == []
+    assert len(excluded) == 5
