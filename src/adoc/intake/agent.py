@@ -38,7 +38,14 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from adoc import __version__
+from adoc.casefile.disputes import DISPUTES_RELPATH
 from adoc.casefile.encounters import read_encounter
+from adoc.casefile.patient_updates import (
+    DisputeClaim,
+    PatientUpdateReport,
+    ReportedResultClaim,
+    apply_patient_updates,
+)
 from adoc.casefile.regimen import REGIMEN_RELPATH
 from adoc.casefile.regimen_chat import (
     RegimenChange,
@@ -46,6 +53,7 @@ from adoc.casefile.regimen_chat import (
     apply_regimen_changes,
 )
 from adoc.casefile.repo import DataRepo
+from adoc.casefile.reported import REPORTED_RESULTS_RELPATH
 from adoc.casefile.schema import Provenance
 from adoc.ingest.genomics import GENOMIC_DOC_TYPE
 from adoc.intake.convert import facts_to_section_data
@@ -1214,7 +1222,7 @@ def render_continuity_note(info: ContinuityInfo, *, now: datetime) -> str | None
 # (docs/adr/0013-fact-corroboration.md, "visits grow the record")
 # --------------------------------------------------------------------------
 
-VISIT_CAPTURE_PROMPT_VERSION = "3"
+VISIT_CAPTURE_PROMPT_VERSION = "4"
 
 _VISIT_CAPTURE_SYSTEM_PROMPT = f"""[visit-capture-v{VISIT_CAPTURE_PROMPT_VERSION}]
 You are a silent background process for a-doc, a single-patient longitudinal medical case-file
@@ -1262,8 +1270,22 @@ anything the assistant suggested -- only what she reports about herself. Never e
 not say; deterministic code drops any name absent from her message, and that check is a backstop,
 not permission to guess.
 
-Respond only with the structured result (`ops`, `regimen`) -- never free text, never anything
-addressed to the patient.
+RESULTS SHE REMEMBERS BUT HAS NO DOCUMENT FOR -- the `reported_results` field. When she reports a
+past lab result that is not on file ("I had a lab in November 2024, my iron was high"), emit
+`analyte` (her word for it), `direction` (high/low/normal/positive/negative), `value`/`unit` if she
+gives a number, and `when_text` -- HER OWN WORDS for the timing, never a date you computed. This
+never enters the measured lab series; it is recorded as a claim she made, and deterministic code
+checks it against any document that turns up later. Do NOT emit one for a result already on file.
+
+CORRECTIONS TO THE RECORD -- the `disputes` field. When she says something on file is WRONG ("you
+reported a pituitary scan in 2026, that did not occur"), emit `target` -- COPIED VERBATIM from a
+ref shown in the context above, never constructed -- plus `kind` (`did-not-occur`, `wrong-date`,
+`wrong-detail`, `not-mine`) and `statement` in her own words. Nothing is deleted: a dispute records
+the conflict for a human to resolve. Emit one ONLY for a genuine objection to existing content, not
+for a correction to something she said earlier in this same conversation.
+
+Respond only with the structured result (`ops`, `regimen`, `reported_results`, `disputes`) -- never
+free text, never anything addressed to the patient.
 """
 
 
@@ -1273,6 +1295,15 @@ class VisitCaptureResult(BaseModel):
     it (see module docstring)."""
 
     ops: list[IntakeFactOp] = Field(default_factory=list)
+
+    reported_results: list[ReportedResultClaim] = Field(default_factory=list)
+    """Results the patient remembers but has no document for. Applied to
+    `case/reported-results.yaml`, never to the measured lab series."""
+
+    disputes: list[DisputeClaim] = Field(default_factory=list)
+    """Objections to something already on file. Recorded, never acted on
+    automatically — a dispute marks a conflict for a human, it does not
+    delete a document."""
 
     regimen: list[RegimenChange] = Field(default_factory=list)
     """Statements about what the patient takes, applied to
@@ -1289,6 +1320,8 @@ class CaptureResult(BaseModel):
 
     applied: AppliedResult = Field(default_factory=AppliedResult)
     regimen: RegimenUpdateReport = Field(default_factory=RegimenUpdateReport)
+    updates: PatientUpdateReport = Field(default_factory=PatientUpdateReport)
+    """Reported results and disputes recorded by this turn."""
     """What the turn did to `case/regimen.yaml`, reported alongside the fact
     ops so a caller — and a test — can see it."""
     error: str | None = None
@@ -1388,8 +1421,36 @@ def run_visit_capture(client: LlmClient, repo: DataRepo, db: LabsDb, text: str) 
         except Exception as exc:  # noqa: BLE001 - a commit failure must not break the turn
             logger.warning("visit-capture: regimen commit failed: %s", exc)
 
+    # Same reasoning as the regimen block above: a reported result or a
+    # dispute may warrant no fact op at all, and gating them on `ops` would
+    # discard the statements they exist to capture.
+    updates = PatientUpdateReport()
+    try:
+        updates = apply_patient_updates(
+            repo,
+            reported=turn.reported_results,
+            disputes=turn.disputes,
+            message=text,
+            today=datetime.now(UTC).date(),
+        )
+    except Exception as exc:  # noqa: BLE001 - this pass must never break the turn
+        logger.warning("visit-capture: patient updates failed: %s", exc)
+    if updates.reported or updates.disputes:
+        logger.info(
+            "visit-capture: reported results %s, disputes %s",
+            updates.reported,
+            updates.disputes,
+        )
+        try:
+            repo.commit(
+                "casefile: patient-reported results / disputes from a chat turn",
+                paths=[REPORTED_RESULTS_RELPATH, DISPUTES_RELPATH],
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("visit-capture: patient-update commit failed: %s", exc)
+
     if not turn.ops:
-        return CaptureResult(regimen=regimen_report)
+        return CaptureResult(regimen=regimen_report, updates=updates)
 
     now = datetime.now(UTC)
     provenance = Provenance(

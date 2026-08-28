@@ -21,10 +21,12 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
+from adoc.casefile.disputes import DISPUTES_RELPATH, load_disputes
 from adoc.casefile.encounters import DatePrecision, EncounterFrontmatter, read_encounter
 from adoc.casefile.ledger import load_ledger
 from adoc.casefile.regimen import REGIMEN_RELPATH, Regimen, RegimenEntry, load_regimen
 from adoc.casefile.repo import LEDGER_RELPATH, DataRepo
+from adoc.casefile.reported import REPORTED_RESULTS_RELPATH, load_reported_results
 from adoc.casefile.schema import Ledger
 from adoc.labs.db import LabsDb
 from adoc.labs.models import LabResult
@@ -95,6 +97,7 @@ def _read_or_placeholder(repo: DataRepo, relpath: str, placeholder: str) -> str:
 
 
 def _recent_encounters_section(repo: DataRepo, limit: int) -> ContextSection:
+    disputed_targets = load_disputes(repo.root / Path(DISPUTES_RELPATH)).open_targets()
     encounters_dir = repo.root / ENCOUNTERS_RELDIR
     if not encounters_dir.is_dir():
         return ContextSection(
@@ -127,7 +130,13 @@ def _recent_encounters_section(repo: DataRepo, limit: int) -> ContextSection:
         # `encounter:2026-08-04`, and encounter files are named
         # `YYYY-MM-DD--<slug>.md`. That exact miss cost two citations on a
         # live review.
-        lines.append(f"- **{when}** [{fm.type}]{provider}: {summary}  `encounter:{filename}`")
+        # A disputed item is still shown — the archived record is the source
+        # of truth and she may be misremembering — but it must never be read
+        # as established fact. Marking it here is what stops a phantom study
+        # shaping a differential exactly as a real one would.
+        disputed = f"encounter:{filename}" in disputed_targets
+        mark = "  ⚠ DISPUTED BY THE PATIENT — do not treat as established" if disputed else ""
+        lines.append(f"- **{when}** [{fm.type}]{provider}: {summary}  `encounter:{filename}`{mark}")
 
     return ContextSection(
         key="recent_encounters", title="Recent Encounters", content="\n".join(lines)
@@ -628,6 +637,54 @@ def _interference_warnings(regimen: Regimen, db: LabsDb) -> list[str]:
     return out
 
 
+REPORTED_RESULTS_SECTION_KEY = "reported_results"
+
+
+def _reported_results_section(repo: DataRepo) -> ContextSection | None:
+    """Results the patient remembers but has no document for.
+
+    Rendered in its own section, never mixed into the labs sections, and
+    labelled on every line. The whole reason this record exists separately is
+    that a remembered value must not be read as a measured one — merging them
+    would put an uncitable number into the series the citation checker
+    guards.
+
+    Returns `None` when there are none, so a case with nothing reported looks
+    exactly as it did before the feature existed.
+    """
+    results = load_reported_results(repo.root / Path(REPORTED_RESULTS_RELPATH))
+    if not results.entries:
+        return None
+
+    lines = [
+        "_The patient reports these from memory; no document is on file for them. "
+        "They are NOT measured results and must be described as reported, not as findings._",
+        "",
+    ]
+    for entry in results.entries:
+        when = _precise(entry.when, entry.when_precision) or "date unknown"
+        value = ""
+        if entry.value is not None:
+            value = f" {entry.value}{(' ' + entry.unit) if entry.unit else ''}"
+        elif entry.direction != "unknown":
+            value = f" {entry.direction}"
+        status = {
+            "unverified": "no document on file",
+            "corroborated": "matches a measured result",
+            "contradicted": "DISAGREES with the measured result",
+        }[entry.verification]
+        ref = f" ({entry.corroborating_source})" if entry.corroborating_source else ""
+        lines.append(f"- {entry.analyte}{value} — {when} · {status}{ref}")
+        if entry.note.strip():
+            lines.append(f"  {entry.note.strip()}")
+
+    return ContextSection(
+        key=REPORTED_RESULTS_SECTION_KEY,
+        title="Results the patient reports (unverified)",
+        content="\n".join(lines),
+    )
+
+
 def build_context(
     repo: DataRepo,
     db: LabsDb,
@@ -685,6 +742,9 @@ def build_context(
     # current values ARE before being told which of them are moving.
     sections.append(_trajectories_section(db))
     sections.append(_regimen_section(repo, db))
+    reported_section = _reported_results_section(repo)
+    if reported_section is not None:
+        sections.append(reported_section)
 
     if (repo.root / GENOMICS_INVENTORY_RELPATH).exists():
         sections.append(
