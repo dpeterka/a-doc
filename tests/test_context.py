@@ -11,6 +11,12 @@ import pytest
 
 from adoc.casefile.encounters import Encounter, EncounterFrontmatter, write_encounter
 from adoc.casefile.ledger import apply_diff, save_ledger
+from adoc.casefile.regimen import (
+    REGIMEN_RELPATH,
+    Regimen,
+    RegimenEntry,
+    save_regimen,
+)
 from adoc.casefile.repo import LEDGER_RELPATH, DataRepo
 from adoc.casefile.schema import (
     AddHypothesis,
@@ -88,6 +94,7 @@ def test_section_order_is_fixed_and_stable(repo: DataRepo, db: LabsDb) -> None:
         "recent_encounters",
         "labs",
         "trajectories",
+        "regimen",
         "open_questions",
         LEDGER_SECTION_KEY,
     ]
@@ -302,6 +309,7 @@ def test_document_excerpts_absent_when_no_query_given(repo: DataRepo, db: LabsDb
         "recent_encounters",
         "labs",
         "trajectories",
+        "regimen",
         "open_questions",
         LEDGER_SECTION_KEY,
     ]
@@ -331,6 +339,7 @@ def test_document_excerpts_included_and_last_when_query_matches(repo: DataRepo, 
         "recent_encounters",
         "labs",
         "trajectories",
+        "regimen",
         "open_questions",
         LEDGER_SECTION_KEY,
     ]
@@ -576,3 +585,61 @@ def test_the_ledger_section_states_whether_a_gloss_is_missing(repo: DataRepo, db
 
     assert "plain-language: A condition explained plainly." in text
     assert "plain-language: MISSING" in text
+
+
+def test_the_regimen_section_flags_lab_draws_taken_during_interference(
+    repo: DataRepo, db: LabsDb
+) -> None:
+    """The clinically decisive alignment: high-dose biotin distorts many
+    hormone and antibody immunoassays, so a result drawn while it was active
+    must be read differently.
+
+    The reasoner previously could not answer this at all — the regimen was a
+    110-line encounter contributing 107 characters to the pack, and
+    `still_taking` is a boolean.
+    """
+    save_regimen(
+        repo.root / Path(REGIMEN_RELPATH),
+        Regimen(
+            entries=[
+                RegimenEntry(
+                    name="Biotin",
+                    dose="10000 mcg",
+                    started=date(2026, 1, 1),
+                    started_precision="day",
+                )
+            ]
+        ),
+    )
+
+    pack = build_context(repo, db, include_ledger=False)
+    section = next(s.content for s in pack.sections if s.key == "regimen")
+
+    assert "Biotin 10000 mcg" in section
+    assert "since 2026-01-01" in section
+    # The db fixture's rows are dated 2026-05-02, inside the interval.
+    assert "Draws while active" in section
+    assert "2026-05-02" in section
+
+
+def test_the_regimen_section_states_how_many_entries_cannot_be_placed(
+    repo: DataRepo, db: LabsDb
+) -> None:
+    """Undated entries are what make an overlap answer incomplete. Saying so
+    is the difference between a partial answer and a misleading one."""
+    save_regimen(
+        repo.root / Path(REGIMEN_RELPATH),
+        Regimen(entries=[RegimenEntry(name="Selenium"), RegimenEntry(name="Zinc")]),
+    )
+
+    pack = build_context(repo, db, include_ledger=False)
+    section = next(s.content for s in pack.sections if s.key == "regimen")
+
+    assert "2 entries have no start or stop date" in section
+
+
+def test_an_empty_regimen_says_so_rather_than_vanishing(repo: DataRepo, db: LabsDb) -> None:
+    pack = build_context(repo, db, include_ledger=False)
+    section = next(s.content for s in pack.sections if s.key == "regimen")
+
+    assert "Nothing recorded yet" in section
