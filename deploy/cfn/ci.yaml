@@ -76,6 +76,36 @@ Resources:
             ]
           }
 
+  # The LIRICAL sidecar (ADR 0029) is a separate image because it is a Java
+  # program and the application image is python:3.12-slim. A JRE in the app
+  # image would add ~200MB and a second runtime to every always-on web task,
+  # for a capability only the deep review uses.
+  #
+  # Only 3 images retained rather than 10: this image changes when LIRICAL's
+  # pinned version changes, which is rare, and each one is ~630MB.
+  LiricalEcrRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: a-doc-lirical
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep only the last 3 images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 3
+                },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+
   GitHubOidcProvider:
     Type: AWS::IAM::OIDCProvider
     Condition: CreateOidcProvider

@@ -103,10 +103,28 @@ duplicated as a unit test over the recorded fixture.
   engine will get its own ADR when it is built.
 - Negated phenotypes are passed (`-n`). Excluded findings are evidence, and a
   ranker that can only consume present findings discards them.
-- The engine is useless until a phenotype profile exists — LIRICAL's input is
-  a list of HPO terms and this system has none yet. That profile is the next
-  piece of work, and it is largely a one-off backfill over intake facts,
-  encounters and document text already on disk.
+- The phenotype profile now exists (`case/phenotype.yaml`, built by
+  `adoc phenotype-backfill` from `knowledge.hpo`'s deterministic label and
+  synonym matching). Run against the real case file it produced 82 terms from
+  30 encounters, and the full chain has been exercised end to end: profile →
+  `lirical prioritize` → ranked diseases.
+
+  **It is built only from OBSERVED sources.** The first version also scanned
+  `case-summary.md` and `patient-theories.md`. That added one term and was a
+  mistake of principle: those files discuss the ledger's own hypotheses, and
+  an engine fed them is no longer independent of the ledger — which is the
+  entire reason it is here.
+
+- **83 terms is a diffuse profile, and LIRICAL is built for a focused one.**
+  Run against the real profile, every posttest probability came back 0.00%
+  and the ranking was dominated by rare Mendelian syndromes, with only
+  "Autoinflammatory disease, systemic, with vasculitis" and "Celiac disease,
+  susceptibility to, 1" landing anywhere near the case. A decade-wide scrape
+  of every phenotype ever mentioned is not the input this tool expects, which
+  is a real limitation of the current backfill rather than of the engine.
+  Narrowing to current, active findings is the obvious next lever — and the
+  honest measure remains the divergence rate against the panel, not a
+  conviction that the engine must be useful.
 - LIRICAL's disease corpus is dominated by rare Mendelian disease, and this
   patient's picture reads autoimmune. Its value here is genuinely uncertain,
   and the honest measure is the divergence rate once it runs against a real
