@@ -1719,3 +1719,70 @@ def test_a_short_list_gets_no_overflow_heading(repo: DataRepo) -> None:
     )
 
     assert "Also worth raising" not in _render_questions_open(payload, ledger)
+
+
+def test_the_review_report_renders_structured_test_items() -> None:
+    """The report's "What to ask your doctor" section must contain the items,
+    not one empty bullet each.
+
+    It emitted `- {item.text}` and, once `TestChooserItem` moved to named
+    parts, `text` was empty for every item — so the live report showed a row
+    of bare dashes above the metrics appendix. Two renderers of the same data
+    drifted the moment they were separate; they now share one, and this pins
+    the section's CONTENT rather than its presence.
+    """
+    ledger = Ledger(
+        version=1,
+        updated=datetime(2026, 1, 1, tzinfo=UTC),
+        hypotheses=[
+            Hypothesis(
+                id=SLE_ID,
+                name="Systemic lupus erythematosus",
+                tier="expanded",
+                probability="moderate",
+                status="active",
+                origin="model",
+                first_proposed=date(2026, 1, 1),
+            )
+        ],
+    )
+    markdown = render_review_markdown(
+        review_date=date(2026, 8, 28),
+        trend_findings=[],
+        divergence_set=DivergenceSet(divergences=[]),
+        adjudication=AdjudicationResult(decisions=[]),
+        challenge_sweep=ChallengeSweepResult(notes=[]),
+        test_chooser=TestChooserResult(
+            items=[
+                TestChooserItem(
+                    panel="Celiac screen: tTG-IgA plus total IgA",
+                    ask="Ask for a coeliac blood screen.",
+                    audience="doctor",
+                    hypothesis_ids=[SLE_ID],
+                ),
+                TestChooserItem(
+                    panel="Your supplement labels",
+                    ask="Bring every bottle to the appointment.",
+                    audience="you",
+                ),
+            ]
+        ),
+        staleness=StalenessReport(),
+        deferred_verification=DeferredVerificationSweepResult(),
+        metrics=OpsMetrics(),
+        ledger_before=ledger,
+        ledger_after=ledger,
+    )
+
+    section = markdown.split("## What to ask your doctor")[1].split("## Metrics appendix")[0]
+
+    assert "Celiac screen: tTG-IgA plus total IgA" in section
+    assert "Ask for a coeliac blood screen." in section
+    assert "Your supplement labels" in section
+    # The audience split survives into the report...
+    assert "You can answer these yourself" in section
+    assert "For your doctor" in section
+    # ...and the hypothesis is named and linked, not left as a bare id.
+    assert f"[Systemic lupus erythematosus](/ledger#{SLE_ID})" in section
+    # No empty bullets: every "- " line carries text.
+    assert not [line for line in section.splitlines() if line.strip() == "-"]
