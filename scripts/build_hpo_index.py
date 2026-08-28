@@ -87,7 +87,10 @@ def build(hp_json: Path) -> dict[str, object]:
     graph = data["graphs"][0]
     nodes = graph["nodes"]
     allowed = _descendants(graph.get("edges", []), PHENOTYPIC_ABNORMALITY)
-    print(f"build_hpo_index: {len(allowed):,} terms under {PHENOTYPIC_ABNORMALITY}", file=sys.stderr)
+    print(
+        f"build_hpo_index: {len(allowed):,} terms under {PHENOTYPIC_ABNORMALITY}",
+        file=sys.stderr,
+    )
 
     terms: dict[str, str] = {}
     phrase_to_ids: dict[str, set[str]] = defaultdict(set)
@@ -126,4 +129,5 @@ if __name__ == "__main__":
     source, destination = Path(sys.argv[1]), Path(sys.argv[2])
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(json.dumps(build(source), separators=(",", ":"), sort_keys=True))
-    print(f"build_hpo_index: wrote {destination} ({destination.stat().st_size/1e6:.1f} MB)", file=sys.stderr)
+    size_mb = destination.stat().st_size / 1e6
+    print(f"build_hpo_index: wrote {destination} ({size_mb:.1f} MB)", file=sys.stderr)
