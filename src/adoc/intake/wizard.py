@@ -46,7 +46,7 @@ to repeat.
 from __future__ import annotations
 
 import re
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
 
@@ -242,7 +242,128 @@ def _parse_approx_date(text: str) -> date | None:
     return parsed[0] if parsed else None
 
 
-def parse_approx_date_with_precision(text: str) -> tuple[date, DatePrecision] | None:
+_MONTH_NAMES = {
+    name: number
+    for number, names in enumerate(
+        [
+            ("january", "jan"),
+            ("february", "feb"),
+            ("march", "mar"),
+            ("april", "apr"),
+            ("may",),
+            ("june", "jun"),
+            ("july", "jul"),
+            ("august", "aug"),
+            ("september", "sep", "sept"),
+            ("october", "oct"),
+            ("november", "nov"),
+            ("december", "dec"),
+        ],
+        start=1,
+    )
+    for name in names
+}
+
+_WORD_NUMBERS = {
+    "a": 1,
+    "an": 1,
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+    "eleven": 11,
+    "twelve": 12,
+    "eighteen": 18,
+    "couple": 2,
+    "few": 3,
+    "several": 4,
+}
+
+_RELATIVE_RE = re.compile(
+    r"\b(?:(?P<count>\d+|[a-z]+)\s+)?(?P<unit>day|week|month|year)s?\s+ago\b",
+    re.IGNORECASE,
+)
+_LAST_UNIT_RE = re.compile(r"\blast\s+(?P<unit>week|month|year)\b", re.IGNORECASE)
+
+_DAYS_PER_UNIT = {"day": 1, "week": 7, "month": 30, "year": 365}
+_UNIT_PRECISION: dict[str, DatePrecision] = {
+    "day": "day",
+    "week": "approximate",
+    "month": "month",
+    "year": "year",
+}
+
+
+def _parse_relative(text: str, today: date) -> tuple[date, DatePrecision] | None:
+    """ "two months ago", "last month", "a few weeks ago".
+
+    These are how a patient actually states timing in conversation, and the
+    parser understood none of them — so "I started biotin two months ago"
+    reached the regimen record with no date at all, losing precisely the fact
+    that decides whether she was taking it when a lab was drawn.
+
+    Months are approximated as 30 days and years as 365. The precision
+    reported alongside is what keeps that honest: a "month"-precision date is
+    never presented as a day, so the approximation cannot masquerade as
+    exactness downstream (ADR 0027).
+    """
+    match = _LAST_UNIT_RE.search(text)
+    if match:
+        unit = match.group("unit").lower()
+        return today - timedelta(days=_DAYS_PER_UNIT[unit]), _UNIT_PRECISION[unit]
+
+    match = _RELATIVE_RE.search(text)
+    if match:
+        raw = (match.group("count") or "1").lower()
+        count = int(raw) if raw.isdigit() else _WORD_NUMBERS.get(raw)
+        if count is None:
+            return None
+        unit = match.group("unit").lower()
+        # "a few weeks ago" is vaguer than "2 weeks ago" even though both
+        # resolve to a week count; the word forms report `approximate`.
+        precision = _UNIT_PRECISION[unit]
+        if raw in {"few", "several", "couple"}:
+            precision = "approximate"
+        return today - timedelta(days=count * _DAYS_PER_UNIT[unit]), precision
+    return None
+
+
+def _parse_month_name(text: str) -> tuple[date, DatePrecision] | None:
+    """ "June 2026", "Nov 2024", "15 March 2021".
+
+    The year-only fallback below reads "June 2026" as 2026-01-01 with
+    `approximate` precision — five months off, and stated as a date rather
+    than as the month it actually names.
+    """
+    lowered = text.lower()
+    year_match = re.search(r"\b(19|20)\d{2}\b", lowered)
+    if not year_match:
+        return None
+    for name, number in _MONTH_NAMES.items():
+        if not re.search(rf"\b{name}\b", lowered):
+            continue
+        year = int(year_match.group(0))
+        day_match = re.search(r"\b(\d{1,2})\b(?!\d)", lowered.replace(year_match.group(0), ""))
+        if day_match:
+            day = int(day_match.group(1))
+            if 1 <= day <= 31:
+                try:
+                    return date(year, number, day), "day"
+                except ValueError:
+                    pass
+        return date(year, number, 1), "month"
+    return None
+
+
+def parse_approx_date_with_precision(
+    text: str, *, today: date | None = None
+) -> tuple[date, DatePrecision] | None:
     """`_parse_approx_date`, but reporting HOW precisely the date is known.
 
     The date alone is not enough. "2021" and "early 2021" both parse to
@@ -256,6 +377,12 @@ def parse_approx_date_with_precision(text: str) -> tuple[date, DatePrecision] | 
         return date.fromisoformat(stripped), "day"
     except ValueError:
         pass
+    relative = _parse_relative(stripped, today or date.today())
+    if relative is not None:
+        return relative
+    named = _parse_month_name(stripped)
+    if named is not None:
+        return named
     match = re.fullmatch(r"(\d{4})-(\d{2})", stripped)
     if match:
         return date(int(match.group(1)), int(match.group(2)), 1), "month"

@@ -233,8 +233,26 @@ def test_precision_travels_with_a_parsed_date(text: str, expected_precision: str
 
 def test_an_undatable_event_still_yields_nothing() -> None:
     """Patients often cannot date a hospitalization; that stays an undated
-    event rather than a fabricated date."""
-    assert parse_approx_date_with_precision("about six years ago") is None
+    event rather than a fabricated date.
+
+    The example changed, not the property. "about six years ago" was used
+    here and is now genuinely datable — to a year, with `year` precision —
+    since the parser learned relative time. Keeping it would have pinned a
+    capability gap as though it were a design choice. These phrases carry no
+    temporal information at all.
+    """
+    assert parse_approx_date_with_precision("as a child") is None
+    assert parse_approx_date_with_precision("when I was younger") is None
+    assert parse_approx_date_with_precision("recently") is None
+
+
+def test_a_relative_phrase_is_datable_to_its_unit() -> None:
+    """ "about six years ago" is not undatable — it is datable to a year, and
+    the precision says so rather than implying a day."""
+    parsed = parse_approx_date_with_precision("about six years ago", today=date(2026, 8, 28))
+
+    assert parsed is not None
+    assert parsed[1] == "year"
 
 
 def test_an_encounter_written_before_this_field_round_trips() -> None:
