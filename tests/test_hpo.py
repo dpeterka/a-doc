@@ -90,14 +90,37 @@ def test_negation_reaches_across_commas_in_a_list(index: HpoIndex) -> None:
     assert all(m.present is False for m in matches)
 
 
-def test_context_is_recorded_so_a_match_can_be_audited(index: HpoIndex) -> None:
-    """ "Myxedema coma" is a real entity with no HPO term for the compound, so
-    only "coma" matches and the modifier is lost. The mitigation is to make
-    that visible rather than silent."""
-    match = index.find_terms("history of myxedema coma in 2021")[0]
+def test_a_compound_hpo_cannot_express_maps_to_its_substance(index: HpoIndex) -> None:
+    """ "Myxedema coma" has no HPO term — not for the compound and not for
+    "myxedema" at all — so only "coma" matched, recording a primary
+    neurological finding for what is decompensated hypothyroidism.
 
-    assert match.matched_text == "coma"
-    assert "myxedema" in match.context
+    The name is a misnomer in the literature too: most patients have altered
+    mental status rather than true coma, so `Coma` was not merely imprecise
+    here, it was usually wrong. The override claims the whole span before the
+    misleading sub-match can fire.
+    """
+    matches = index.find_terms("history of myxedema coma in 2021")
+
+    assert [m.term_id for m in matches] == ["HP:0000821"]
+    assert matches[0].matched_text == "myxedema coma"
+
+
+def test_a_genuine_coma_still_matches(index: HpoIndex) -> None:
+    """The override is scoped to the compound, not a blanket suppression."""
+    assert index.find_terms("patient was in a coma")[0].term_id == "HP:0001259"
+
+
+def test_context_is_recorded_so_a_match_can_be_audited(index: HpoIndex) -> None:
+    """Phrase matching against a fixed vocabulary loses modifiers it has no
+    term for, and there is no override for every case. Recording the
+    surrounding words is what lets a reader see where a term came from and
+    judge it, rather than finding a bare term with no way back to the text.
+    """
+    match = index.find_terms("worsening chronic fatigue since spring")[0]
+
+    assert match.term_id == "HP:0012378"
+    assert "worsening" in match.context
 
 
 def test_an_unmatched_phrase_yields_nothing(index: HpoIndex) -> None:
