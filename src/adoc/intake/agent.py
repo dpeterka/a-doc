@@ -46,7 +46,7 @@ from adoc.casefile.patient_updates import (
     ReportedResultClaim,
     apply_patient_updates,
 )
-from adoc.casefile.regimen import REGIMEN_RELPATH
+from adoc.casefile.regimen import REGIMEN_RELPATH, load_regimen, save_regimen
 from adoc.casefile.regimen_chat import (
     RegimenChange,
     RegimenUpdateReport,
@@ -76,6 +76,7 @@ from adoc.intake.facts import (
     section_completion_blockers,
 )
 from adoc.intake.sections import SECTIONS, SectionSpec
+from adoc.intake.to_regimen import merge_intake_medications
 from adoc.intake.wizard import write_section
 from adoc.labs.db import LabsDb
 from adoc.reason.client import LlmClient, LlmError, Message
@@ -762,6 +763,36 @@ def _write_section_from_facts(
     return write_section(repo, section_key, section_data)
 
 
+def _sync_regimen_from_facts(repo: DataRepo, facts_store: IntakeFactsStore) -> None:
+    """Fold medication/supplement facts into `case/regimen.yaml`.
+
+    Same posture as `_write_section_from_facts_safe`: the facts are the source
+    of truth and this artifact is derived, so a failure here logs and skips
+    rather than costing the patient her turn.
+
+    Why the regimen and not just `medications.md`: a prose list cannot answer
+    whether she was taking something when a specimen was drawn, and that is
+    the question the biotin/assay-interference thread turns on. The regimen
+    record carries intervals and is already rendered against lab collection
+    dates (ADR 0031).
+    """
+    try:
+        path = repo.root / Path(REGIMEN_RELPATH)
+        before = load_regimen(path)
+        after = merge_intake_medications(
+            before, facts_store.active_facts(), reported_on=datetime.now(UTC).date()
+        )
+        if len(after.entries) == len(before.entries) and after == before:
+            return
+        after.updated = datetime.now(UTC).date()
+        save_regimen(path, after)
+    except Exception:
+        logger.exception(
+            "intake turn: syncing medications into the regimen failed; skipping this "
+            "turn (the facts are persisted and the regimen can be rebuilt later)"
+        )
+
+
 def _write_section_from_facts_safe(
     repo: DataRepo, facts_store: IntakeFactsStore, section_key: str
 ) -> list[str]:
@@ -1006,6 +1037,7 @@ def run_intake_turn(client: LlmClient, repo: DataRepo, db: LabsDb, text: str) ->
     for topic_key in touched_topics:
         if _is_covered(coverage, topic_key):
             artifacts.extend(_write_section_from_facts_safe(repo, facts_store, topic_key))
+    _sync_regimen_from_facts(repo, facts_store)
 
     # --- deterministic topic-coverage veto: code, not the model, decides ---
     for topic_key in turn.topics_covered:
@@ -1496,6 +1528,9 @@ def run_visit_capture(client: LlmClient, repo: DataRepo, db: LabsDb, text: str) 
     for topic_key in touched_topics:
         if _is_covered(coverage, topic_key):
             artifacts.extend(_write_section_from_facts_safe(repo, facts_store, topic_key))
+    # Post-intake turns keep changing what she takes, so the regimen is kept
+    # in step here too, not only during the initial visit.
+    _sync_regimen_from_facts(repo, facts_store)
 
     # Everything past this point (corroboration, the final save, the
     # commit) touches the filesystem/db in ways this pass cannot fully
