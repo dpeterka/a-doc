@@ -68,6 +68,7 @@ from adoc.ingest.vision import VisionClient
 from adoc.intake.cli import run_conversational_onboarding_session, run_onboarding_session
 from adoc.intake.corroborate import corroborate_facts
 from adoc.intake.facts import INTAKE_FACTS_RELPATH, IntakeFactsStore
+from adoc.intake.replay import find_dropped_turns, replay_dropped_turns
 from adoc.intake.wizard import IntakeWizard
 from adoc.knowledge.hpo import HpoIndex
 from adoc.labs.db import LabsDb
@@ -846,6 +847,49 @@ def _cmd_backfill_doc_text(_args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_intake_replay(args: argparse.Namespace) -> int:
+    """Re-run patient turns whose facts never reached the case file
+    (`intake.replay`).
+
+    A turn can fail after the patient has already spoken: the structured
+    output fails validation, the retry fails the same way, and the turn is
+    abandoned. Her words survive — the transcript is written first — but the
+    facts derived from them do not, and nothing re-derives them.
+
+    `--dry-run` lists what would be replayed without calling a model.
+    """
+    try:
+        settings = Settings()
+    except Exception as exc:  # noqa: BLE001 - surface any config error to the user
+        print(f"intake-replay: configuration error: {exc}", file=sys.stderr)
+        return 1
+
+    repo = DataRepo(settings.data_dir)
+    if not repo.is_initialized:
+        print(f"intake-replay: data repo not initialized at {settings.data_dir}", file=sys.stderr)
+        return 1
+
+    dropped = find_dropped_turns(repo)
+    if not dropped:
+        print("intake-replay: no dropped turns found")
+        return 0
+
+    for turn in dropped:
+        print(f"intake-replay: {turn.timestamp}  {turn.preview}")
+    if args.dry_run:
+        print(f"intake-replay: {len(dropped)} turn(s) would be replayed (--dry-run)")
+        return 0
+
+    client = LlmClient.from_settings(settings)
+    with LabsDb(settings.data_dir / "labs.sqlite", journal_mode=settings.sqlite_journal_mode) as db:
+        report = replay_dropped_turns(client, repo, db, dropped)
+
+    print(f"intake-replay: replayed {len(report.replayed)}, failed {len(report.failed)}")
+    for stamp in report.failed:
+        print(f"intake-replay: still failing: {stamp}", file=sys.stderr)
+    return 0 if not report.failed else 1
+
+
 def _cmd_phenotype_backfill(_args: argparse.Namespace) -> int:
     """Build `case/phenotype.yaml` from encounter bodies and case prose
     (`casefile.phenotype_backfill`; NO LLM calls — `knowledge.hpo` matches
@@ -1130,6 +1174,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="always run a full review, bypassing the marker/cooldown/floor gating",
     )
     review_parser.set_defaults(func=_cmd_review)
+    replay_parser = subparsers.add_parser(
+        "intake-replay",
+        help=(
+            "re-run patient turns whose facts were lost to a failed turn "
+            "(reads the saved transcript; nothing is invented)"
+        ),
+    )
+    replay_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="list the dropped turns without calling a model",
+    )
+    replay_parser.set_defaults(func=_cmd_intake_replay)
     subparsers.add_parser(
         "phenotype-backfill",
         help=(

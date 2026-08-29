@@ -44,7 +44,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 from adoc.config import ModelBinding, Settings, load_model_bindings
 from adoc.privacy import IDENTIFIERS_RELPATH, Scrubber
@@ -512,16 +512,27 @@ def _validate_with_repairs(schema: type[BaseModel], tool_input: dict[str, Any]) 
         _decode_json_valued_strings(_unwrap_tool_input(tool_input)),
         _decode_json_valued_strings(_unwrap_placeholder_envelope(tool_input)),
     ]
-    last_error: Exception | None = None
+    best_error: Exception | None = None
+    best_count = -1
     for index, candidate in enumerate(candidates):
         if index and candidate is candidates[index - 1]:
             continue  # repair was a no-op; do not re-validate the same dict
         try:
             return schema.model_validate(candidate)
         except Exception as exc:  # noqa: PERF203 - each repair is a distinct attempt
-            last_error = exc
-    assert last_error is not None
-    raise last_error
+            # Report the error from the candidate that got FURTHEST, not the
+            # last one tried. The last candidate is the most heavily rewritten
+            # and therefore the least informative: a live intake turn died
+            # reporting "Input should be a valid list" for `ops` even though a
+            # repair had already turned `ops` into a list, because a later
+            # candidate re-raised the shallow error and masked whatever
+            # actually failed. Two retries and a lost patient turn later, the
+            # log still did not say what was wrong.
+            count = len(exc.errors()) if isinstance(exc, ValidationError) else 1
+            if best_error is None or count < best_count:
+                best_error, best_count = exc, count
+    assert best_error is not None
+    raise best_error
 
 
 def _extract_json_object(text: str) -> str:
@@ -875,7 +886,25 @@ class LlmClient:
                 )
                 raise LlmError(f"role {role!r}: provider returned no structured output")
             try:
-                parsed = _validate_with_repairs(schema, response.tool_input)
+                try:
+                    parsed = _validate_with_repairs(schema, response.tool_input)
+                except ValidationError:
+                    # Shape only — keys and types, never values. A payload
+                    # that defeats every repair is undiagnosable from the
+                    # error alone, and the values are the patient's.
+                    logger.warning(
+                        "llm: role=%s payload failed every repair; shape=%s",
+                        role,
+                        {
+                            key: (
+                                f"{type(value).__name__}[{len(value)}]"
+                                if isinstance(value, (list, str, dict))
+                                else type(value).__name__
+                            )
+                            for key, value in sorted(response.tool_input.items())
+                        },
+                    )
+                    raise
             except Exception as exc:
                 self._audit(
                     _AuditRecord(

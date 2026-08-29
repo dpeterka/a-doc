@@ -929,12 +929,23 @@ def run_intake_turn(client: LlmClient, repo: DataRepo, db: LabsDb, text: str) ->
                 # which is meaningless to her and reads like the app broke.
                 # The detail belongs in the log, where it is actionable.
                 logger.warning("intake turn: giving up after schema retry: %s", exc)
+                # Do NOT ask her to rephrase. The failure is ours — the
+                # model returned a shape our schema refused — and in the live
+                # case her message was 6,775 characters of medical history.
+                # Asking a patient to retype that, when what she wrote was
+                # fine, is both wrong about the cause and a real imposition.
+                #
+                # What is TRUE and worth saying: the words are already saved
+                # (the transcript is written before anything else runs), so
+                # she can move on and the turn can be recovered later with
+                # `adoc intake-replay`.
                 error_outcome = IntakeOutcome(
                     kind="error",
                     text=(
-                        "Sorry — I had trouble recording that one. Nothing is wrong with "
-                        "your case file. Could you say it again, or put it a little "
-                        "differently?"
+                        "Sorry — something went wrong on my side while filing that one. "
+                        "Your message is saved and nothing is wrong with your case file, "
+                        "so please carry on — I'll pick that one up separately. There is "
+                        "no need to retype it."
                     ),
                 )
                 _append_transcript_turn(repo, text, error_outcome)
