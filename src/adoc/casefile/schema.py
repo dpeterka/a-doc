@@ -8,11 +8,14 @@ code, never delegated to a model per `CLAUDE.md` code conventions).
 
 from __future__ import annotations
 
+import logging
 import re
 from datetime import date, datetime
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+logger = logging.getLogger(__name__)
 
 # --- shared literal vocabularies -------------------------------------------------
 
@@ -72,15 +75,42 @@ HYPOTHESIS_ID_PATTERN = re.compile(rf"^{_SLUG_RE}$")
 MONDO_ID_PATTERN = re.compile(r"^MONDO:\d+$")
 
 
+# A model that has just written a ref tends to want to explain it, and appends
+# a parenthetical: `patient-report:2026-09-20 (as referenced in proposed diff;
+# not yet corroborated by clinician exam)`. The ref itself is perfectly valid —
+# only the commentary is not. Stripping it recovers the citation instead of
+# discarding a real one over punctuation. Applied ONLY after a plain match has
+# already failed, so a filename that legitimately contains parentheses is never
+# touched.
+_TRAILING_ANNOTATION_RE = re.compile(r"\s*\([^()]*\)\s*$")
+
+
+def normalize_source_ref(value: str) -> str | None:
+    """The valid ref inside `value`, or `None` if there isn't one.
+
+    Salvage, not guesswork: this only strips a trailing parenthetical and
+    surrounding whitespace. It never rewrites a scheme, invents a date, or
+    maps one ref onto another.
+    """
+    candidate = value.strip()
+    if SOURCE_REF_PATTERN.match(candidate):
+        return candidate
+    stripped = _TRAILING_ANNOTATION_RE.sub("", candidate).strip()
+    if stripped != candidate and SOURCE_REF_PATTERN.match(stripped):
+        return stripped
+    return None
+
+
 def validate_source_ref(value: str) -> str:
     """Validate a claim source ref against the grammar; raise ValueError if invalid."""
-    if not SOURCE_REF_PATTERN.match(value):
+    normalized = normalize_source_ref(value)
+    if normalized is None:
         raise ValueError(
             f"invalid source ref {value!r}: must match labs:<slug>:<date> | "
             "doc:<file>#p<int> | encounter:<file> | pmid:<digits> | "
             "patient-report:<date>"
         )
-    return value
+    return normalized
 
 
 class Provenance(BaseModel):
@@ -119,6 +149,44 @@ class Hypothesis(BaseModel):
     split is what lets invariant (b) tell "just created" apart from
     "created, then actually challenged in a later diff".
     """
+
+    @model_validator(mode="before")
+    @classmethod
+    def _drop_unciteable_evidence(cls, data: Any) -> Any:
+        """Drop evidence whose source ref cannot be salvaged, keep the rest.
+
+        ADR 0028's rule, applied where it plainly was not. A `field_validator`
+        on `Evidence.source` raises, and a raise inside a nested model fails
+        the WHOLE payload: a live Challenger turn died on two bad refs out of
+        one hypothesis's evidence and took every valid op in the verdict with
+        it. One unciteable claim must cost itself and nothing else.
+
+        Logged loudly, because a silently dropped claim is a claim nobody
+        knows was made. The hypothesis survives with the evidence that does
+        resolve; if that leaves it with none, the ledger invariants — not this
+        filter — are what decide whether it may stand.
+        """
+        if not isinstance(data, dict):
+            return data
+        for field in ("evidence_for", "evidence_against"):
+            items = data.get(field)
+            if not isinstance(items, list):
+                continue
+            kept = []
+            for item in items:
+                source = (
+                    item.get("source") if isinstance(item, dict) else getattr(item, "source", None)
+                )
+                if source is None or normalize_source_ref(str(source)) is not None:
+                    kept.append(item)
+                else:
+                    logger.warning(
+                        "dropping evidence with unciteable source %r from hypothesis %r",
+                        source,
+                        data.get("id", "<unknown>"),
+                    )
+            data[field] = kept
+        return data
 
     id: str
     name: str
