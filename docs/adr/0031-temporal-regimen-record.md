@@ -107,10 +107,21 @@ every result and therefore on none.
   grounding passes and only the prompt separates a question from a statement.
   That failure is visible in the record and correctable by a later turn,
   which is why entries carry their source ref.
-- `intake.sections.Medication` / `Supplement` still exist and still carry
-  `still_taking`. `RegimenEntry.still_taking` is a derived property over the
-  interval so callers keep working, but it is a view, never the source of
-  truth. Converging the intake models onto this one is follow-on work.
+- **Intake medications converge here** (`intake.to_regimen`). They were
+  written to `case/medications.md` — 1,549 bytes of real patient-reported
+  medication on the live case file — which no reasoning path ever read. Making
+  that prose visible would have been the smaller fix and the wrong one: a list
+  of names cannot answer whether she was taking something when a specimen was
+  drawn, which is the question this record exists for.
+
+  Converting intake's boolean honestly is the whole difficulty.
+  `still_taking=True` becomes an OPEN interval attested on the date she said
+  it — not a start date, because she said she takes it, not when she began.
+  `still_taking=False` leaves BOTH endpoints unset: recording today as the
+  stop would claim she stopped during the conversation, and any start would be
+  invention. `overlaps()` then answers `unknown`, which is what is actually
+  known. That is a loss of information compared with a proper interval, but it
+  is an honest one, and a later chat turn can supply the dates.
 - Encounter bodies remain unretrievable in general. This ADR fixes the
   regimen case by promoting it out of an encounter; it does not fix the class.
   A patient-report encounter from chat still contributes a title and nothing

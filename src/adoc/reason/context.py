@@ -685,6 +685,82 @@ def _reported_results_section(repo: DataRepo) -> ContextSection | None:
     )
 
 
+INTAKE_HISTORY_SECTION_KEY = "intake_history"
+
+# Artifacts the intake writers produce that no reasoning path ever read.
+# Measured on the real case file: medications 1,549 bytes, family history 644,
+# geography 466, care team 34 — all captured from the patient, all written to
+# disk, all invisible to the review and to every post-intake chat turn.
+#
+# `case-summary.md` was the only intake-derived prose the pack carried, and it
+# is 698 bytes summarising a 141KB fact store. The patient could describe her
+# family history in detail and a reasoner would never see a word of it.
+#
+# `undated-events.md` is included for the same reason it exists: an event the
+# patient cannot date is still an event, and it has no encounter file to be
+# found through.
+_INTAKE_HISTORY_FILES: tuple[tuple[str, str], ...] = (
+    ("case/family-history.md", "Family history"),
+    ("case/geography.md", "Geography & exposures"),
+    ("case/care-team.md", "Care team"),
+    ("case/undated-events.md", "Undated events"),
+)
+
+
+_PLACEHOLDER_RE = re.compile(r"^_.*not yet populated.*_$", re.IGNORECASE)
+
+
+def _has_content(markdown: str) -> bool:
+    """Whether a scaffolded case file has anything real in it.
+
+    Headings and the seeded placeholder do not count. This is deliberately
+    strict about what "empty" means, because the alternative is a section
+    that says "Family history" and then nothing.
+    """
+    for line in markdown.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if _PLACEHOLDER_RE.match(stripped):
+            continue
+        return True
+    return False
+
+
+def _intake_history_section(repo: DataRepo) -> ContextSection | None:
+    """Patient-reported history the intake captured, which nothing read.
+
+    Medications are deliberately NOT here: they belong in the regimen record
+    (ADR 0031), which carries dates and can be compared against lab draws —
+    a prose list cannot answer "was she taking this when that specimen was
+    collected". `intake.convert` folds them there instead.
+
+    Returns `None` when every file is missing or empty, so a case without an
+    intake looks exactly as it did before.
+    """
+    parts: list[str] = []
+    for relpath, title in _INTAKE_HISTORY_FILES:
+        path = repo.root / Path(relpath)
+        if not path.is_file():
+            continue
+        body = path.read_text(encoding="utf-8")
+        if not _has_content(body):
+            # `DataRepo.init_at` scaffolds these with a heading and a
+            # placeholder, so a whole-body equality check misses them and
+            # emits an empty section — "no empty boxes" applies to the
+            # context pack as much as to the UI, and a heading with nothing
+            # under it costs tokens while telling a reasoner nothing.
+            continue
+        parts.append(f"**{title}**\n\n{body.strip()}")
+    if not parts:
+        return None
+    return ContextSection(
+        key=INTAKE_HISTORY_SECTION_KEY,
+        title="Patient-reported history",
+        content="\n\n".join(parts),
+    )
+
+
 def build_context(
     repo: DataRepo,
     db: LabsDb,
@@ -735,6 +811,10 @@ def build_context(
                 content=patient_theories,
             )
         )
+
+    intake_history = _intake_history_section(repo)
+    if intake_history is not None:
+        sections.append(intake_history)
 
     sections.append(_recent_encounters_section(repo, recent_encounters_limit))
     sections.append(_labs_section(db))
