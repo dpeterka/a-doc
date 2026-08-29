@@ -909,9 +909,7 @@ def test_unsummarised_document_with_text_says_the_text_is_available(
     assert "IS on file" in section
 
 
-def test_unsummarised_document_without_text_says_so_plainly(
-    repo: DataRepo, db: LabsDb
-) -> None:
+def test_unsummarised_document_without_text_says_so_plainly(repo: DataRepo, db: LabsDb) -> None:
     """The other half must stay distinguishable — 20 of her 23 unsummarised
     documents genuinely had nothing extracted, and saying otherwise would send
     a reasoner looking for text that is not there."""
