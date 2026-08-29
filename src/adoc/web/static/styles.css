@@ -1031,3 +1031,11 @@ body.lightbox-active {
   padding: 0.05em 0.3em;
   word-break: break-word;
 }
+
+/* Shown when the request for a turn dies before the reply comes back. The
+   answer is not lost — it is already in the transcript on the server — so this
+   says so plainly rather than inviting her to resend and pay for it twice. */
+.chat-lost {
+  color: var(--color-danger);
+  font-size: 0.9rem;
+}

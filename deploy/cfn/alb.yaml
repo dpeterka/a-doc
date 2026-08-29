@@ -54,6 +54,26 @@ Resources:
         - Fn::ImportValue: !Sub "${NetworkStackName}-Subnet2Id"
       SecurityGroups:
         - Fn::ImportValue: !Sub "${NetworkStackName}-AlbSecurityGroupId"
+      LoadBalancerAttributes:
+        # A diagnostic chat turn runs the whole DAG -- ledger_maintainer,
+        # challenger, apply, composer -- as sequential model calls. Measured in
+        # production: 191s + 218s + 4.5s + composer, over ten minutes end to
+        # end, and an informational turn still took 63s.
+        #
+        # The ALB default is 60 SECONDS. Every turn exceeded it, so the load
+        # balancer cut the connection while the app was still working. The work
+        # itself completed and the reply was persisted to the transcript, but
+        # nothing could deliver it -- the patient saw a request that never
+        # returned and reloaded the page repeatedly with nothing to show for it.
+        # That is the "slow or no responses" report.
+        #
+        # 30 minutes leaves real headroom over the ten observed, because the
+        # cost of being wrong here is a silently dropped answer. The page also
+        # polls for the reply now (`web.routes.chat.chat_transcript`), so a
+        # dropped connection is no longer fatal on its own -- but a connection
+        # that survives the turn is still the right default.
+        - Key: idle_timeout.timeout_seconds
+          Value: "1800"
       Tags:
         - Key: Name
           Value: a-doc-alb

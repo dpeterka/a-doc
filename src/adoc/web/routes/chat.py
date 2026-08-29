@@ -250,6 +250,38 @@ def chat_page(
     )
 
 
+@router.get("/transcript")
+def chat_transcript(
+    request: Request,
+    repo: DataRepo = Depends(get_repo),
+) -> Response:
+    """The newest page of the transcript, on its own.
+
+    The page polls this while a turn is in flight. A turn is slow -- measured
+    in production, an informational turn took 63s and a diagnostic one over
+    ten minutes -- and anything between the browser and the app may give up on
+    a request held open that long. The ALB did exactly that at its 60s
+    default: the work finished and `chat_send` had already appended the reply
+    to the transcript, but the response had nowhere to go, so the patient saw
+    nothing and reloaded to find out whether anything had happened.
+
+    The reply is persisted before it is rendered, so it is always here even
+    when the POST never came back. Polling this turns a dropped connection
+    into a few seconds of delay instead of a lost answer.
+    """
+    transcript = read_recent_chat(
+        repo, max_files=_CHAT_HISTORY_FILES, max_turns=_CHAT_HISTORY_TURNS
+    )
+    if not transcript and not intake_is_complete(repo):
+        transcript = [{"role": "assistant", "kind": "informational", "text": INTAKE_OPENER_MESSAGE}]
+    newest_first = list(reversed(transcript))
+    return templates.TemplateResponse(
+        request,
+        "_chat_transcript.html",
+        {"transcript": newest_first[:CHAT_PAGE_SIZE]},
+    )
+
+
 @router.post("/send")
 def chat_send(
     request: Request,

@@ -1,0 +1,6 @@
+{% import "_chat_macros.html" as chat_macros %}
+{# The transcript body alone, shared by the full page and the poller so the
+   two can never drift in how a bubble is rendered. #}
+{% for entry in transcript %}
+  {{ chat_macros.bubble(entry) }}
+{% endfor %}

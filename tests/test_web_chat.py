@@ -1064,3 +1064,57 @@ def test_an_invented_question_id_does_not_break_the_turn(tmp_path: Path) -> None
 
     assert response.status_code == 200
     assert load_questions(repo.root / QUESTIONS_RELPATH).by_id(qid).status == "open"
+
+
+def test_transcript_endpoint_returns_the_newest_bubbles(tmp_path: Path) -> None:
+    """The page polls this while a turn is in flight. A turn is slow — measured
+    in production, an informational turn took 63s and a diagnostic one over ten
+    minutes, against an ALB idle timeout of 60s — so the connection carrying
+    the reply may well die before the reply exists."""
+    app, repo, _db, _calls = build_app(tmp_path)
+    mark_intake_complete(repo)
+    _seed_entries(repo, 4)
+
+    client = TestClient(app)
+    login(client)
+    body = client.get("/chat/transcript").text
+
+    assert "entry-003" in body
+    assert body.index("entry-003") < body.index("entry-000")
+    # The fragment only — not a whole page.
+    assert "<form" not in body
+
+
+def test_a_reply_is_persisted_even_if_the_response_never_arrives(tmp_path: Path) -> None:
+    """The reason polling works at all. `chat_send` appends the assistant entry
+    BEFORE rendering, so a turn whose connection dropped has still recorded its
+    answer — the patient's reply is late, never lost, and she must never be
+    told to send it again and pay for the turn twice."""
+    calls: list = []
+    app, repo, _db, _calls = build_app(
+        tmp_path,
+        primary_transport=make_primary_transport([_PE_CANT_MISS_OP], _PATIENT_REPLY, calls),
+        challenger_transport=make_challenger_transport(
+            counter_arguments=[], additional_ops=[], calls=calls
+        ),
+    )
+    mark_intake_complete(repo)
+    client = TestClient(app)
+    login(client)
+
+    client.post("/chat/send", data={"text": "My joints ache and I am exhausted."})
+
+    # Simulate the patient's browser having given up: fetch the transcript the
+    # way the poller does, with no reference to the POST that produced it.
+    polled = client.get("/chat/transcript").text
+    assert "chat-bubble-assistant" in polled
+
+
+def test_the_transcript_endpoint_needs_a_login(tmp_path: Path) -> None:
+    """It renders case-file content, so it is not a public endpoint."""
+    app, repo, _db, _calls = build_app(tmp_path)
+    mark_intake_complete(repo)
+
+    response = TestClient(app).get("/chat/transcript", follow_redirects=False)
+
+    assert response.status_code in (302, 303, 401, 403)
