@@ -56,6 +56,17 @@ class Settings(BaseSettings):
     # switches itself off with a warning rather than failing.
     hpo_index_path: Path = Path("/opt/hpo-index.json")
 
+    # Longest single chat message accepted. Enforced on the SERVER as well as
+    # in the browser: `maxlength` is a convenience, not a control, and a
+    # paste-heavy client or a stale page can exceed it.
+    #
+    # 2,000 characters is roughly 350 words — longer than any turn in the
+    # patient's successful intake session, whose longest was 1,610. The turn
+    # that failed in production was 6,775 characters and produced a 6,391-token
+    # structured output; splitting that into a few messages is both easier for
+    # her to review and far more likely to be recorded accurately.
+    max_message_chars: int = 2000
+
     # Upper bound on a single `/upload` file, in MB (see `web.routes.upload`):
     # rejected before any pipeline call (ingest/vision), with a warm
     # in-page message rather than an unbounded read into memory/disk.

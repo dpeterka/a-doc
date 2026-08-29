@@ -34,7 +34,7 @@ from adoc.intake.agent import INTAKE_OPENER_MESSAGE, IntakeTurnResult, VisitCapt
 from adoc.labs.db import LabsDb
 from adoc.labs.models import LabDocument, LabResult
 from adoc.reason.client import TransportRequest, TransportResponse
-from adoc.web.casefile_helpers import chat_log_path
+from adoc.web.casefile_helpers import chat_log_path, read_recent_chat
 
 _ANA_SOURCE_DOC_SHA = "c" * 64
 
@@ -736,3 +736,64 @@ def test_chat_form_shows_a_pending_state_while_a_turn_is_in_flight(tmp_path: Pat
     # The wait is inherent, so the copy has to say so rather than imply
     # something is about to appear any second.
     assert "few minutes" in body
+
+
+def test_an_oversized_message_is_refused_before_any_model_call(tmp_path: Path) -> None:
+    """Enforced on the SERVER, not just by the textarea's maxlength — that
+    attribute is a convenience, and a stale page or a non-browser client can
+    exceed it.
+
+    Refused before the transcript is appended or a model is called, so an
+    oversized message costs nothing and leaves no half-recorded turn.
+    """
+    app, repo, _db, calls = build_app(tmp_path)
+    client = TestClient(app)
+    login(client)
+
+    response = client.post("/chat/send", data={"text": "x" * 5000})
+
+    assert response.status_code == 200
+    assert "2,000 at a time" in response.text
+    # Nothing was sent to a model, and nothing was written to the transcript.
+    assert calls == []
+    assert read_recent_chat(repo) == []
+
+
+def test_the_refusal_does_not_blame_the_patient_or_lose_her_text(tmp_path: Path) -> None:
+    """She still has what she typed in the box, and the message says what to
+    do rather than what she did wrong."""
+    app, _repo, _db, _calls = build_app(tmp_path)
+    client = TestClient(app)
+    login(client)
+
+    response = client.post("/chat/send", data={"text": "y" * 3000})
+
+    assert "Nothing is lost" in response.text
+    assert "send it in a couple of parts" in response.text
+
+
+def test_a_message_one_over_the_limit_is_refused(tmp_path: Path) -> None:
+    """The boundary is inclusive, so 2,001 is the first refused length.
+
+    Tested from the refusing side deliberately: a message AT the limit is
+    accepted and goes on to call a model, which this harness forbids — that
+    it proceeds at all is the behaviour being relied on here.
+    """
+    app, _repo, _db, calls = build_app(tmp_path)
+    client = TestClient(app)
+    login(client)
+
+    response = client.post("/chat/send", data={"text": "z" * 2001})
+
+    assert "2,000 at a time" in response.text
+    assert calls == []
+
+
+def test_the_input_box_carries_the_limit(tmp_path: Path) -> None:
+    app, _repo, _db, _calls = build_app(tmp_path)
+    client = TestClient(app)
+    login(client)
+
+    response = client.get("/chat")
+
+    assert 'maxlength="2000"' in response.text

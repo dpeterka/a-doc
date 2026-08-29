@@ -40,7 +40,13 @@
         hx-disabled-elt="find button"
         hx-on--after-request="this.reset()">
     <label for="chat-text" class="sr-only">Message</label>
-    <textarea id="chat-text" name="text" rows="3" placeholder="Type a message..." required></textarea>
+    {# `maxlength` stops the overrun in the browser; the route enforces the
+       same number, because a maxlength attribute is a convenience and not a
+       control. The counter is only shown as the limit approaches — a running
+       tally on every message would nag. #}
+    <textarea id="chat-text" name="text" rows="3" placeholder="Type a message..."
+              maxlength="{{ max_message_chars }}" required></textarea>
+    <p id="chat-remaining" class="chat-remaining" aria-live="polite" hidden></p>
     <div class="button-row">
       <button type="submit">Send</button>
       <span id="chat-pending" class="chat-pending" role="status" aria-live="polite">
@@ -53,6 +59,24 @@
 
   <script>
     (function () {
+      var box = document.getElementById("chat-text");
+      var note = document.getElementById("chat-remaining");
+      var max = {{ max_message_chars }};
+      if (box && note) {
+        box.addEventListener("input", function () {
+          var left = max - box.value.length;
+          // Quiet until the last quarter, then increasingly specific.
+          if (left > max / 4) {
+            note.hidden = true;
+            return;
+          }
+          note.hidden = false;
+          note.textContent = left > 0
+            ? left + " characters left — you can always send another message."
+            : "That is as much as one message holds. Send this, then carry on in the next one.";
+        });
+      }
+
       var params = new URLSearchParams(window.location.search);
       var prefill = params.get("prefill");
       if (prefill) {
