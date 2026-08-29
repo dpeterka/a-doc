@@ -29,6 +29,14 @@ _LIST_ITEM_RE = re.compile(r"^[-*]\s+(.*)$")
 # so snake_case identifiers and `labs:some_analyte` refs are left alone.
 _ITALIC_RE = re.compile(r"(?<![\w`])_(?!\s)([^_`]+?)(?<!\s)_(?![\w`])")
 
+# `*text*` — the form models actually emit. Only the underscore form was
+# handled, so a chat reply reading "help you *find what's already in it*"
+# reached the patient with the asterisks still in it. Applied AFTER
+# `_BOLD_RE`, so `**bold**` is already consumed and cannot be re-matched.
+# The space guards keep arithmetic ("2 * 3") and the word-boundary guards
+# keep intra-word asterisks from becoming emphasis.
+_ITALIC_STAR_RE = re.compile(r"(?<![\w*`])\*(?!\s)([^*`]+?)(?<!\s)\*(?![\w*`])")
+
 # Links are restricted to INTERNAL absolute paths. The source of this markdown
 # is model-authored text, so an unrestricted href would let a reasoning stage
 # put an arbitrary destination — or a `javascript:` URL — in front of the
@@ -43,6 +51,7 @@ _CONTINUATION_INDENT = 2
 def _inline(text: str) -> str:
     out = _BOLD_RE.sub(r"<strong>\1</strong>", text)
     out = _ITALIC_RE.sub(r"<em>\1</em>", out)
+    out = _ITALIC_STAR_RE.sub(r"<em>\1</em>", out)
     return _LINK_RE.sub(r'<a href="\2">\1</a>', out)
 
 

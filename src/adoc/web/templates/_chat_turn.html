@@ -1,8 +1,12 @@
 {% import "_chat_macros.html" as chat_macros %}
-{{ chat_macros.bubble({"role": "patient", "text": user_text}) }}
+{# The transcript reads newest-first and this fragment is prepended, so the
+   reply — the later of the two — has to come out above the message that
+   prompted it. Emitting them in chronological order here would put her own
+   message on top of the answer to it. #}
 {{ chat_macros.bubble({
   "role": "assistant",
   "kind": turn.kind,
   "text": turn.text,
   "tests_to_request": turn.tests_to_request,
 }) }}
+{{ chat_macros.bubble({"role": "patient", "text": user_text}) }}

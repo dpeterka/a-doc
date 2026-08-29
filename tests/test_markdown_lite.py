@@ -57,3 +57,30 @@ def test_indented_lines_stay_inside_their_bullet() -> None:
     assert "Ask for a coeliac blood screen." in html
     # Everything belongs to the item, so no stray paragraph escaped the list.
     assert "<p>" not in html
+
+
+def test_asterisk_italics_render() -> None:
+    """Models emit `*text*`; only the `_text_` form was handled, so a chat
+    reply reading "help you *find what's already in it*" reached the patient
+    with the asterisks still in it."""
+    out = render_markdown_lite("help you *find what is already in it* — not to diagnose")
+
+    assert "<em>find what is already in it</em>" in out
+    assert "*find" not in out
+
+
+def test_asterisk_italics_leave_arithmetic_and_intra_word_stars_alone() -> None:
+    """The guards that keep the new rule from eating text that is not
+    emphasis. Space-hugged stars are arithmetic; word-hugged stars are not a
+    delimiter."""
+    assert "2 * 3 * 4" in render_markdown_lite("2 * 3 * 4")
+    assert "a*b*c" in render_markdown_lite("a*b*c")
+
+
+def test_bold_still_wins_over_the_new_italic_rule() -> None:
+    """`**bold**` must not be re-matched as two italics by the star rule,
+    which is why it runs after the bold substitution."""
+    out = render_markdown_lite("**bold**")
+
+    assert "<strong>bold</strong>" in out
+    assert "<em>" not in out

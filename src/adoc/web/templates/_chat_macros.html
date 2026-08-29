@@ -8,7 +8,12 @@
       {% if entry.kind == "withheld" %}
         <p class="chat-urgent-label">Reply withheld by a safety check</p>
       {% endif %}
-      <p>{{ entry.text }}</p>
+      {# The model writes markdown — headings, bold, bulleted lists. This was
+         a bare `<p>{{ entry.text }}</p>`, so the patient read literal `**`
+         and every list collapsed into one unbroken block. `markdown_lite`
+         escapes its input first and only emits internal links, which is why
+         `| safe` is sound here (same contract as reviews_detail.html). #}
+      <div class="md-body">{{ entry.text | markdown_lite | safe }}</div>
       {% if entry.tests_to_request %}
         <p class="muted">Tests to ask your doctor about:</p>
         <ul>

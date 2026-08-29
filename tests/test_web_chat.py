@@ -797,3 +797,152 @@ def test_the_input_box_carries_the_limit(tmp_path: Path) -> None:
     response = client.get("/chat")
 
     assert 'maxlength="2000"' in response.text
+
+
+def test_assistant_markdown_reaches_the_page_as_html(tmp_path: Path) -> None:
+    """The bubble macro rendered `<p>{{ entry.text }}</p>`, so a reply written
+    in markdown — which is what the model emits — reached the patient with
+    literal `**` around every heading and every bulleted list collapsed into
+    one unbroken block. Reported from production."""
+    app, repo, _db, _calls = build_app(tmp_path)
+    mark_intake_complete(repo)
+
+    when = datetime.now(UTC)
+    path = chat_log_path(repo, when.date())
+    path.parent.mkdir(parents=True, exist_ok=True)
+    entry = {
+        "timestamp": when.isoformat(),
+        "role": "assistant",
+        "kind": "informational",
+        "text": (
+            "**What I am here for**\n\n"
+            "I can help you *find* what is already on file.\n\n"
+            "- **Look up your labs.**\n"
+            "- **Search your documents.**\n"
+        ),
+    }
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(entry) + "\n")
+
+    client = TestClient(app)
+    login(client)
+    body = client.get("/chat").text
+
+    assert "<strong>What I am here for</strong>" in body
+    assert "<em>find</em>" in body
+    assert "<li>" in body
+    # The literal markers must not survive to the patient.
+    assert "**What I am here for**" not in body
+    assert "- **Look up" not in body
+
+
+def test_patient_text_is_never_rendered_as_markup(tmp_path: Path) -> None:
+    """Only the assistant side goes through the markdown filter. Patient text
+    is whatever she typed, and must stay escaped — a message containing HTML
+    is a message, not markup."""
+    app, repo, _db, _calls = build_app(tmp_path)
+    mark_intake_complete(repo)
+
+    when = datetime.now(UTC)
+    path = chat_log_path(repo, when.date())
+    path.parent.mkdir(parents=True, exist_ok=True)
+    entry = {
+        "timestamp": when.isoformat(),
+        "role": "patient",
+        "kind": "informational",
+        "text": "<script>alert(1)</script> and **not bold**",
+    }
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(entry) + "\n")
+
+    client = TestClient(app)
+    login(client)
+    body = client.get("/chat").text
+
+    assert "<script>alert(1)</script>" not in body
+    assert "&lt;script&gt;" in body
+    assert "**not bold**" in body
+
+
+def _seed_entries(repo: DataRepo, count: int) -> None:
+    """`count` alternating patient/assistant entries, oldest first."""
+    when = datetime.now(UTC)
+    path = chat_log_path(repo, when.date())
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as fh:
+        for i in range(count):
+            fh.write(
+                json.dumps(
+                    {
+                        "timestamp": (when + timedelta(seconds=i)).isoformat(),
+                        "role": "patient" if i % 2 == 0 else "assistant",
+                        "kind": "informational",
+                        "text": f"entry-{i:03d}",
+                    }
+                )
+                + "\n"
+            )
+
+
+def test_transcript_reads_newest_first(tmp_path: Path) -> None:
+    """The composer sits at the top of the page, so the newest exchange has to
+    be the thing directly beneath it — not at the bottom of an ever-growing
+    scroll."""
+    app, repo, _db, _calls = build_app(tmp_path)
+    mark_intake_complete(repo)
+    _seed_entries(repo, 4)
+
+    client = TestClient(app)
+    login(client)
+    body = client.get("/chat").text
+
+    assert body.index("entry-003") < body.index("entry-000")
+
+
+def test_transcript_paginates_at_ten_entries(tmp_path: Path) -> None:
+    """Five exchanges per page — a patient message and its reply are two
+    entries."""
+    app, repo, _db, _calls = build_app(tmp_path)
+    mark_intake_complete(repo)
+    _seed_entries(repo, 25)
+
+    client = TestClient(app)
+    login(client)
+    body = client.get("/chat").text
+
+    assert "entry-024" in body
+    assert "entry-015" in body
+    # The eleventh-newest belongs to page 2.
+    assert "entry-014" not in body
+    assert "Page 1 of 3" in body
+
+
+def test_older_pages_are_read_only(tmp_path: Path) -> None:
+    """Sending only makes sense against the live end of the conversation. If
+    the composer stayed on an older page, htmx would prepend the reply to a
+    page it does not belong to."""
+    app, repo, _db, _calls = build_app(tmp_path)
+    mark_intake_complete(repo)
+    _seed_entries(repo, 25)
+
+    client = TestClient(app)
+    login(client)
+    body = client.get("/chat?page=2").text
+
+    assert "entry-014" in body
+    assert 'name="text"' not in body
+    assert "Return to the latest" in body
+
+
+def test_page_beyond_the_end_clamps_to_the_last_page(tmp_path: Path) -> None:
+    """A hand-typed or stale `?page=` must not render an empty transcript."""
+    app, repo, _db, _calls = build_app(tmp_path)
+    mark_intake_complete(repo)
+    _seed_entries(repo, 25)
+
+    client = TestClient(app)
+    login(client)
+    body = client.get("/chat?page=99").text
+
+    assert "Page 3 of 3" in body
+    assert "entry-000" in body
