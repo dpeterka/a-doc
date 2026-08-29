@@ -63,6 +63,14 @@ from pydantic import BaseModel, Field, ValidationError, field_validator, model_v
 from adoc import __version__
 from adoc.casefile.ledger import ACTIVE_STATUSES, load_ledger
 from adoc.casefile.phenotype import PHENOTYPE_RELPATH, load_phenotype
+from adoc.casefile.questions import (
+    QUESTIONS_RELPATH,
+    OpenQuestion,
+    load_questions,
+    merge_proposed,
+    question_id,
+    save_questions,
+)
 from adoc.casefile.repo import HISTORY_RELPATH, LEDGER_RELPATH, DataRepo
 from adoc.casefile.schema import (
     AddEvidence,
@@ -1771,7 +1779,47 @@ def build_review_dag(
         )
         payload = result.parsed
         assert isinstance(payload, TestChooserPayload)
-        markdown = _render_questions_open(payload, ledger)
+
+        # Fold into the durable store BEFORE rendering, so a question she has
+        # already answered is not asked again. The chooser reasons from the
+        # ledger and has no memory of what she told us between reviews; the
+        # store does. `questions-open.md` is the rendering, not the record
+        # (ADR 0033).
+        questions_path = repo.root / QUESTIONS_RELPATH
+        asked_on = clock().date()
+        store = merge_proposed(
+            load_questions(questions_path),
+            [
+                OpenQuestion(
+                    id=question_id(item.panel),
+                    panel=item.panel,
+                    ask=item.ask,
+                    why=item.why,
+                    audience=item.audience,
+                    hypothesis_ids=item.hypothesis_ids,
+                    first_asked_on=asked_on,
+                    last_asked_on=asked_on,
+                )
+                for item in payload.items
+                if item.panel.strip()
+            ],
+            asked_on=asked_on,
+        )
+        save_questions(questions_path, store)
+
+        still_open = {q.id for q in store.open_questions()}
+        answered_count = len(payload.items) - len(
+            [i for i in payload.items if question_id(i.panel) in still_open]
+        )
+        if answered_count:
+            logger.info(
+                "test_chooser: %d proposed item(s) already answered; not re-asking",
+                answered_count,
+            )
+        open_payload = TestChooserPayload(
+            items=[i for i in payload.items if question_id(i.panel) in still_open]
+        )
+        markdown = _render_questions_open(open_payload, ledger)
         repo.write("case/questions-open.md", markdown)
         tc_result = TestChooserResult(items=payload.items, questions_open_markdown=markdown)
         results["test_chooser"] = tc_result
