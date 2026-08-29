@@ -5,6 +5,48 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.0] — 2026-08-29
+
+### Fixed
+
+- **A failed intake turn no longer asks the patient to retype.** A turn ended
+  with "Could you say it again, or put it a little differently?" after a
+  6,775-character message. Nothing was wrong with what she wrote: the model
+  returned `ops` as a JSON string containing a valid list, and the repair for
+  that shape already exists. The message now says the failure is ours, that
+  her words are saved, and that there is no need to retype.
+- **Validation errors name the real fault.** `_validate_with_repairs`
+  propagated the LAST candidate's error — the most heavily rewritten and least
+  informative — so a repair that had already fixed the field was masked by a
+  later candidate re-raising the shallow error. It now reports the candidate
+  that got furthest, and a payload defeating every repair has its shape
+  logged (keys and types, never values).
+
+### Added
+
+- **A single message is capped at 2,000 characters**, enforced by the
+  textarea and again by the route, because `maxlength` is a convenience and
+  not a control. Refused before the transcript is appended or a model is
+  called, so an oversized message costs nothing and leaves no half-recorded
+  turn.
+- **Classification criteria are scored in every review and rendered
+  itemized** — each criterion with its weight and what the record says. A
+  phenotype match raises an item to `possible`, never `met`: the published
+  criteria count an item only when no more likely explanation exists, and two
+  of this patient's matched terms (a bupropion-induced seizure, and an
+  arthritis mention from a list of conditions being considered) would have
+  scored 11 points against a threshold of 10.
+- **Three more criteria sets** — Sjögren 2016, RA 2010, GPA 2022 — chosen
+  because the stored labs can actually feed them. Myositis and APS would have
+  scored nothing but blanks and are deliberately unwritten.
+- Numeric criteria thresholds carry a **unit** and convert; a row whose unit
+  cannot be converted is excluded rather than compared. The GPA eosinophil
+  penalty had matched both `4.5 %` and `320 cells/uL` against a 1×10⁹/L
+  threshold.
+- The phenotype profile is **narrowed before reaching an engine** (8 terms,
+  from a measured sweep) and "myxedema coma" maps to Hypothyroidism rather
+  than matching `Coma` alone.
+
 ## [0.14.1] — 2026-08-28
 
 ### Fixed
