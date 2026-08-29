@@ -28,6 +28,14 @@ from web_support import (
 )
 
 from adoc.casefile.ledger import load_ledger
+from adoc.casefile.questions import (
+    QUESTIONS_RELPATH,
+    OpenQuestion,
+    OpenQuestions,
+    load_questions,
+    question_id,
+    save_questions,
+)
 from adoc.casefile.repo import LEDGER_RELPATH, DataRepo
 from adoc.casefile.schema import Provenance
 from adoc.intake.agent import INTAKE_OPENER_MESSAGE, IntakeTurnResult, VisitCaptureResult
@@ -946,3 +954,113 @@ def test_page_beyond_the_end_clamps_to_the_last_page(tmp_path: Path) -> None:
 
     assert "Page 3 of 3" in body
     assert "entry-000" in body
+
+
+def _capture_transport_with(payload: dict, calls: list):
+    def transport(request: TransportRequest) -> TransportResponse:
+        calls.append(request)
+        assert request.schema is VisitCaptureResult
+        return TransportResponse(text="", tool_input=payload, input_tokens=5, output_tokens=5)
+
+    return transport
+
+
+def _seed_open_question(repo: DataRepo, panel: str) -> str:
+    qid = question_id(panel)
+    save_questions(
+        repo.root / QUESTIONS_RELPATH,
+        OpenQuestions(
+            questions=[
+                OpenQuestion(
+                    id=qid,
+                    panel=panel,
+                    ask="List every supplement and its dose.",
+                    audience="you",
+                    first_asked_on=date(2026, 8, 1),
+                    last_asked_on=date(2026, 8, 1),
+                )
+            ]
+        ),
+    )
+    return qid
+
+
+def test_answering_in_chat_closes_the_open_question(tmp_path: Path) -> None:
+    """The defect this store exists to fix: she answers in chat, the answer is
+    captured as a fact, and the next review asks again because nothing ever
+    recorded that the question was closed."""
+    capture_calls: list = []
+    calls: list = []
+    app, repo, _db, _calls = build_app(
+        tmp_path,
+        primary_transport=make_primary_transport([_PE_CANT_MISS_OP], _PATIENT_REPLY, calls),
+        challenger_transport=make_challenger_transport(
+            counter_arguments=[], additional_ops=[], calls=calls
+        ),
+        visit_capture_transport=_capture_transport_with(
+            {"ops": [], "answered_question_ids": ["your-supplement-labels"]}, capture_calls
+        ),
+    )
+    mark_intake_complete(repo)
+    qid = _seed_open_question(repo, "Your supplement labels")
+    client = TestClient(app)
+    login(client)
+
+    client.post("/chat/send", data={"text": "I take biotin 10mg and vitamin D 2000iu daily."})
+
+    store = load_questions(repo.root / QUESTIONS_RELPATH)
+    assert store.by_id(qid).status == "answered"
+    assert store.open_questions() == []
+
+
+def test_the_capture_pass_is_shown_the_question_ids(tmp_path: Path) -> None:
+    """It cannot report an id it was never shown — ADR 0028's standing rule.
+    The first version of a gloss backfill produced zero glosses for exactly
+    this reason: the prompt asked the model to check a state the pack never
+    showed it."""
+    capture_calls: list = []
+    calls: list = []
+    app, repo, _db, _calls = build_app(
+        tmp_path,
+        primary_transport=make_primary_transport([_PE_CANT_MISS_OP], _PATIENT_REPLY, calls),
+        challenger_transport=make_challenger_transport(
+            counter_arguments=[], additional_ops=[], calls=calls
+        ),
+        visit_capture_transport=_capture_transport_with({"ops": []}, capture_calls),
+    )
+    mark_intake_complete(repo)
+    _seed_open_question(repo, "Your supplement labels")
+    client = TestClient(app)
+    login(client)
+
+    client.post("/chat/send", data={"text": "Nothing new today."})
+
+    sent = capture_calls[0].messages[0].content
+    assert "your-supplement-labels" in sent
+    assert "answered_question_ids" in sent
+
+
+def test_an_invented_question_id_does_not_break_the_turn(tmp_path: Path) -> None:
+    """A bad id costs itself and nothing else; the facts from the same pass
+    still land and the reply still reaches her."""
+    capture_calls: list = []
+    calls: list = []
+    app, repo, _db, _calls = build_app(
+        tmp_path,
+        primary_transport=make_primary_transport([_PE_CANT_MISS_OP], _PATIENT_REPLY, calls),
+        challenger_transport=make_challenger_transport(
+            counter_arguments=[], additional_ops=[], calls=calls
+        ),
+        visit_capture_transport=_capture_transport_with(
+            {"ops": [], "answered_question_ids": ["not-a-real-question"]}, capture_calls
+        ),
+    )
+    mark_intake_complete(repo)
+    qid = _seed_open_question(repo, "Your supplement labels")
+    client = TestClient(app)
+    login(client)
+
+    response = client.post("/chat/send", data={"text": "Hello."})
+
+    assert response.status_code == 200
+    assert load_questions(repo.root / QUESTIONS_RELPATH).by_id(qid).status == "open"

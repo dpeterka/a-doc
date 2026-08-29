@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Literal
 
@@ -45,6 +45,12 @@ from adoc.casefile.patient_updates import (
     PatientUpdateReport,
     ReportedResultClaim,
     apply_patient_updates,
+)
+from adoc.casefile.questions import (
+    QUESTIONS_RELPATH,
+    load_questions,
+    mark_answered,
+    save_questions,
 )
 from adoc.casefile.regimen import REGIMEN_RELPATH, load_regimen, save_regimen
 from adoc.casefile.regimen_chat import (
@@ -763,6 +769,29 @@ def _write_section_from_facts(
     return write_section(repo, section_key, section_data)
 
 
+def _resolve_answered_questions(repo: DataRepo, ids: list[str], *, on: date, note: str) -> None:
+    """Close any next-appointment questions this turn answered.
+
+    Never raises into the caller: a chat turn must not fail because a
+    question could not be closed. An id that matches nothing is logged and
+    dropped — the answer itself is already recorded as a fact regardless.
+    """
+    if not ids:
+        return
+    try:
+        path = repo.root / QUESTIONS_RELPATH
+        updated, unknown = mark_answered(load_questions(path), ids, on=on, note=note)
+        save_questions(path, updated)
+        if unknown:
+            logger.warning(
+                "visit capture: %d answered-question id(s) matched nothing: %s",
+                len(unknown),
+                ", ".join(sorted(unknown)),
+            )
+    except Exception as exc:  # noqa: BLE001 - never fail a turn over this
+        logger.warning("visit capture: could not resolve answered questions: %s", exc)
+
+
 def _sync_regimen_from_facts(repo: DataRepo, facts_store: IntakeFactsStore) -> None:
     """Fold medication/supplement facts into `case/regimen.yaml`.
 
@@ -1265,7 +1294,7 @@ def render_continuity_note(info: ContinuityInfo, *, now: datetime) -> str | None
 # (docs/adr/0013-fact-corroboration.md, "visits grow the record")
 # --------------------------------------------------------------------------
 
-VISIT_CAPTURE_PROMPT_VERSION = "4"
+VISIT_CAPTURE_PROMPT_VERSION = "5"
 
 _VISIT_CAPTURE_SYSTEM_PROMPT = f"""[visit-capture-v{VISIT_CAPTURE_PROMPT_VERSION}]
 You are a silent background process for a-doc, a single-patient longitudinal medical case-file
@@ -1291,6 +1320,16 @@ allergies, care_team, document_drop). Check the active facts already on file bel
 anything -- if this message updates something already recorded, emit `update_fact` (never a
 duplicate `add_fact`) with a substantive note. Never diagnose, never give treatment or dosing
 advice, and never invent or embellish a detail the patient did not actually state.
+
+ANSWERING A NEXT-APPOINTMENT QUESTION -- the `answered_question_ids` field. The context below
+lists the questions the last review queued up, each with an id. If this message actually answers
+one, put its id in `answered_question_ids`, copied EXACTLY as written. This is how a question stops
+being asked: without it the next review regenerates the list from the ledger and asks her again,
+which is precisely what used to happen. Be strict about it -- only report a question as answered
+when the message genuinely answers THAT question. A message that merely touches the same topic
+("I do take some supplements") does not answer "list every supplement and dose". An id you are
+unsure of should be left out; a missed answer costs one repeated question, a wrong one silently
+buries a question nobody ever answered.
 
 FOLLOW-UPS FLAGGED ON A PRIOR VISIT: the context below lists any facts a previous visit flagged
 `follow_up=true` as worth checking back on. If this message genuinely addresses one (the patient
@@ -1348,6 +1387,16 @@ class VisitCaptureResult(BaseModel):
     automatically — a dispute marks a conflict for a human, it does not
     delete a document."""
 
+    answered_question_ids: list[str] = Field(default_factory=list)
+    """Ids of next-appointment questions this message answers.
+
+    The list is a rendering of `case/questions-open.yaml`; a question had no
+    identity before that store existed, so an answer could never close one and
+    the next review asked again. The model does the semantic matching — which
+    of these did she just answer — because that genuinely needs judgement;
+    deterministic code validates the ids and applies the state change, and an
+    id matching nothing costs only itself (ADR 0028)."""
+
     regimen: list[RegimenChange] = Field(default_factory=list)
     """Statements about what the patient takes, applied to
     `case/regimen.yaml` by deterministic code.
@@ -1377,13 +1426,39 @@ def _render_follow_ups(facts_store: IntakeFactsStore) -> str:
     return "\n".join(f"- id: {fact.id} -- {fact.statement!r}" for fact in follow_ups)
 
 
+def _render_open_questions(repo: DataRepo) -> str:
+    """The open next-appointment questions, with their ids.
+
+    Shown to the capture pass because it is asked to report which of them the
+    patient just answered, and the standing rule from ADR 0028 is that a model
+    required to reproduce an identifier must be shown that identifier. The
+    questions she can answer herself come first — those are the ones a chat
+    message plausibly closes.
+    """
+    try:
+        store = load_questions(repo.root / QUESTIONS_RELPATH)
+    except Exception as exc:  # noqa: BLE001 - never fail the pass over this
+        logger.warning("visit capture: could not load open questions: %s", exc)
+        return "_None on file._"
+
+    questions = store.open_questions("you") + store.open_questions("doctor")
+    if not questions:
+        return "_None on file._"
+    return "\n".join(
+        f"- `{q.id}` [{q.audience}] {q.panel}" + (f" — {q.ask}" if q.ask else "") for q in questions
+    )
+
+
 def _build_capture_context(db: LabsDb, repo: DataRepo, facts_store: IntakeFactsStore) -> str:
     return (
         f"## Active facts on file\n\n{_render_active_facts(facts_store)}\n\n"
         "## Follow-ups flagged on a prior visit (system-tracked; clear one with "
         "update_fact(follow_up=false) once genuinely revisited)\n\n"
         f"{_render_follow_ups(facts_store)}\n\n"
-        f"## Documents & encounters already on file\n\n{build_doc_digest(db, repo)}\n"
+        f"## Documents & encounters already on file\n\n{build_doc_digest(db, repo)}\n\n"
+        "## Open next-appointment questions (report the id of any this message "
+        "answers in `answered_question_ids`; use the ids EXACTLY as written)\n\n"
+        f"{_render_open_questions(repo)}\n"
     )
 
 
@@ -1491,6 +1566,19 @@ def run_visit_capture(client: LlmClient, repo: DataRepo, db: LabsDb, text: str) 
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("visit-capture: patient-update commit failed: %s", exc)
+
+    # Applied BEFORE the `ops` early return for the same reason as the regimen
+    # changes above. "Yes, biotin 10mg and vitamin D" may warrant no fact op at
+    # all when both are already on file, and it still definitively answers the
+    # question that asked for them. Gating on `ops` would leave the question
+    # open and the next review would ask her again — the exact defect this
+    # store exists to fix (ADR 0033).
+    _resolve_answered_questions(
+        repo,
+        turn.answered_question_ids,
+        on=datetime.now(UTC).date(),
+        note=text.strip()[:280],
+    )
 
     if not turn.ops:
         return CaptureResult(regimen=regimen_report, updates=updates)
