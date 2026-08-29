@@ -31,3 +31,13 @@ jobs:
 
       - name: Test (with coverage gate)
         run: uv run pytest
+
+      # A release branch must carry the version bump it names. v0.20.0 was
+      # tagged and deployed from a branch whose `chore(release)` commit was
+      # never made, so the tag said 0.20.0 while the package said 0.19.0.
+      # Checked on the PR because deploy fires on the push to `main` — before
+      # the tag exists, so a tag-time check would only report a mislabelled
+      # release after it had already shipped.
+      - name: Release version matches the branch
+        if: startsWith(github.head_ref, 'release/') || startsWith(github.head_ref, 'hotfix/')
+        run: uv run python scripts/check_release_version.py --branch "${{ github.head_ref }}"
