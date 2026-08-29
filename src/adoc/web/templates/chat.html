@@ -48,6 +48,11 @@
     <p id="chat-remaining" class="chat-remaining" aria-live="polite" hidden></p>
     <div class="button-row">
       <button type="submit">Send</button>
+      <span id="chat-lost" class="chat-lost" role="status" aria-live="polite" hidden>
+        The connection dropped while a-doc was still thinking. Your answer is
+        still being worked on and will appear here on its own — you do not need
+        to send the message again.
+      </span>
       <span id="chat-pending" class="chat-pending" role="status" aria-live="polite">
         <span class="chat-pending-dot" aria-hidden="true"></span>
         Thinking. A question about your differential works through your whole case
@@ -66,9 +71,7 @@
   {% endif %}
 
   <div id="chat-transcript" class="chat-transcript">
-    {% for entry in transcript %}
-      {{ chat_macros.bubble(entry) }}
-    {% endfor %}
+    {% include "_chat_transcript.html" %}
   </div>
 
   {% if page_count > 1 %}
@@ -104,6 +107,73 @@
           note.textContent = left > 0
             ? left + " characters left — you can always send another message."
             : "That is as much as one message holds. Send this, then carry on in the next one.";
+        });
+      }
+
+      // A turn is slow and the connection may not survive it. Measured in
+      // production: an informational turn took 63s and a diagnostic one over
+      // ten minutes, against an ALB idle timeout of 60s. The reply is written
+      // to the transcript BEFORE it is rendered, so it is on the server even
+      // when the POST never comes back -- polling turns a dropped connection
+      // into a short delay instead of a lost answer, and covers a phone
+      // changing networks just as well as it covers the load balancer.
+      var poller = null;
+      var pendingSince = 0;
+
+      function bubbleCount() {
+        var box = document.getElementById("chat-transcript");
+        return box ? box.querySelectorAll(".chat-bubble-assistant").length : 0;
+      }
+
+      function stopPolling() {
+        if (poller) {
+          clearInterval(poller);
+          poller = null;
+        }
+        var lost = document.getElementById("chat-lost");
+        if (lost) lost.hidden = true;
+      }
+
+      function startPolling() {
+        if (poller) return;
+        var before = bubbleCount();
+        pendingSince = Date.now();
+        poller = setInterval(function () {
+          // Give up after 20 minutes rather than polling a dead page forever.
+          if (Date.now() - pendingSince > 20 * 60 * 1000) {
+            stopPolling();
+            return;
+          }
+          fetch("/chat/transcript", { headers: { "X-Requested-With": "poll" } })
+            .then(function (r) { return r.ok ? r.text() : null; })
+            .then(function (html) {
+              if (!html) return;
+              var box = document.getElementById("chat-transcript");
+              if (!box) return;
+              var probe = document.createElement("div");
+              probe.innerHTML = html;
+              var now = probe.querySelectorAll(".chat-bubble-assistant").length;
+              if (now > before) {
+                box.innerHTML = html;
+                stopPolling();
+              }
+            })
+            .catch(function () { /* keep polling; a failed poll is not fatal */ });
+        }, 10000);
+      }
+
+      var form = document.querySelector('form[hx-post="/chat/send"]');
+      if (form) {
+        form.addEventListener("htmx:beforeRequest", startPolling);
+        // htmx swapped the reply in itself -- nothing left to wait for.
+        form.addEventListener("htmx:afterSwap", stopPolling);
+        // The request died. Say so, and keep polling: the answer is still coming.
+        ["htmx:sendError", "htmx:timeout", "htmx:responseError"].forEach(function (evt) {
+          form.addEventListener(evt, function () {
+            var lost = document.getElementById("chat-lost");
+            if (lost) lost.hidden = false;
+            startPolling();
+          });
         });
       }
 
