@@ -34,6 +34,12 @@ from adoc.casefile.schema import (
     Provenance,
     validate_source_ref,
 )
+from adoc.intake.facts import (
+    INTAKE_FACTS_RELPATH,
+    IntakeFact,
+    load_intake_facts,
+    save_intake_facts,
+)
 from adoc.labs.db import DocumentTextPage, LabsDb
 from adoc.labs.models import LabDocument, LabFlag, LabResult
 from adoc.reason.citations import check_evidence_citations
@@ -792,17 +798,36 @@ def test_reported_results_are_labelled_and_kept_out_of_the_labs_sections(
     assert "Iron" not in labs
 
 
+def _seed_fact(repo: DataRepo, section: str, kind: str, statement: str) -> None:
+    path = repo.root / INTAKE_FACTS_RELPATH
+    facts = load_intake_facts(path) if path.exists() else []
+    facts.append(
+        IntakeFact(
+            id=f"{section}-{len(facts)}",
+            section=section,
+            kind=kind,
+            statement=statement,
+            provenance=Provenance(
+                app_version="test",
+                prompt_template_version="1",
+                model_id="test-model",
+                dag_node="intake",
+                timestamp=datetime(2026, 1, 1, tzinfo=UTC),
+            ),
+        )
+    )
+    save_intake_facts(path, facts)
+
+
 def test_intake_history_that_nothing_read_is_now_in_the_pack(repo: DataRepo, db: LabsDb) -> None:
-    """Four intake artifacts were written and never read. On the live case
-    file: family history 644 bytes, geography 466, care team 34 — all
+    """Patient-reported topics no other context path carries. On the live
+    case file: 11 family-history facts, 5 geography, 4 care team — all
     captured from the patient, all invisible to the review and to every
     post-intake chat turn."""
-    (repo.root / "case" / "family-history.md").write_text(
-        "# Family History\n\nMother: Hashimoto's thyroiditis, diagnosed in her forties.\n"
+    _seed_fact(
+        repo, "family_history", "relative", "Mother: Hashimoto's thyroiditis in her forties."
     )
-    (repo.root / "case" / "geography.md").write_text(
-        "# Geography\n\nLived in the Ohio River valley until 2015.\n"
-    )
+    _seed_fact(repo, "geography", "location", "Lived in the Ohio River valley until 2015.")
 
     pack = build_context(repo, db, include_ledger=False)
     section = next(s.content for s in pack.sections if s.key == "intake_history")
@@ -812,15 +837,26 @@ def test_intake_history_that_nothing_read_is_now_in_the_pack(repo: DataRepo, db:
     assert "Family history" in section and "Geography" in section
 
 
-def test_a_scaffolded_but_unpopulated_file_makes_no_section(repo: DataRepo, db: LabsDb) -> None:
-    """`DataRepo.init_at` seeds these with a heading and a placeholder. A
-    whole-body equality check misses that and emits a section that says
-    "Family history" with nothing under it — costing tokens and telling a
-    reasoner nothing."""
-    (repo.root / "case" / "family-history.md").write_text(
-        "# Family History\n\n_Not yet populated._\n"
-    )
+def test_uncovered_topic_facts_are_rendered_anyway(repo: DataRepo, db: LabsDb) -> None:
+    """The defect this section was rewritten to close. Section artifacts are
+    written only for topics the coverage state marks covered, so reading the
+    artifact reproduced that blindness: on the live case file 4 care-team
+    facts sat beside a 34-byte artifact holding only its heading, and the
+    section skipped care team as empty. Facts are the source of truth, so
+    coverage state must not gate what a reasoner sees."""
+    _seed_fact(repo, "care_team", "provider", "Dr Smith, endocrinology, at the county clinic.")
+    # Exactly what an uncovered topic leaves behind: a heading, no content.
+    (repo.root / "case" / "care-team.md").write_text("# Care Team\n")
 
+    pack = build_context(repo, db, include_ledger=False)
+    section = next(s.content for s in pack.sections if s.key == "intake_history")
+
+    assert "Dr Smith" in section
+
+
+def test_no_intake_facts_makes_no_section(repo: DataRepo, db: LabsDb) -> None:
+    """A section titled "Family history" with nothing under it costs tokens
+    and tells a reasoner nothing."""
     pack = build_context(repo, db, include_ledger=False)
 
     assert "intake_history" not in pack.keys
@@ -829,11 +865,11 @@ def test_a_scaffolded_but_unpopulated_file_makes_no_section(repo: DataRepo, db: 
 def test_medications_are_not_duplicated_into_the_history_section(
     repo: DataRepo, db: LabsDb
 ) -> None:
-    """Medications converge on the regimen record instead: a prose list
-    cannot answer whether she was taking something when a specimen was
+    """Medications converge on the regimen record instead (ADR 0031): a prose
+    list cannot answer whether she was taking something when a specimen was
     drawn, and the regimen is already rendered against lab dates."""
-    (repo.root / "case" / "medications.md").write_text("# Medications\n\n- Levothyroxine 125 mcg\n")
-    (repo.root / "case" / "care-team.md").write_text("# Care Team\n\nDr Smith, endocrinology.\n")
+    _seed_fact(repo, "medications", "medication", "Levothyroxine 125 mcg daily.")
+    _seed_fact(repo, "care_team", "provider", "Dr Smith, endocrinology.")
 
     pack = build_context(repo, db, include_ledger=False)
     section = next(s.content for s in pack.sections if s.key == "intake_history")

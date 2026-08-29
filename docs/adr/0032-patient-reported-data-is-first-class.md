@@ -89,3 +89,28 @@ discarded dispute is a patient correction going unheard.
   analysis. They are deliberately outside the measured series, so any use of
   them there needs an explicit decision about how an unverified value is
   weighed — which is a clinical question, not a plumbing one.
+
+## Addendum — read the source of truth, not the artifact derived from it
+
+The first `intake_history` section read four markdown files under `case/`.
+Those files are written by `_write_section_from_facts_safe`, which runs only
+for topics the coverage state marks *covered*. So the read path was gated on
+a state that has nothing to do with whether the patient told us something.
+
+Measured on the live case file when the section shipped: 4 care-team facts
+sitting beside a 34-byte artifact holding only its heading, and one
+supplement fact with no artifact at all. The section reported care team as
+empty while four facts sat next to it — the patient had answered, and the
+reasoner was told she had not.
+
+The rule, which generalises past this section: **a derived artifact is never
+the read path for data that has a source of truth.** Facts are the source of
+truth; a case-file artifact is always derived from them. Anything that needs
+the data reads the facts. Artifacts remain what they were built to be —
+human-legible renderings — and their staleness or absence stops being able
+to silence the underlying record.
+
+This is the same shape as ADR 0028's standing rules (*if a model must
+reproduce an identifier, show it the identifier*; *no single field of one
+item may fail a payload*): a derived, lossy stand-in was substituted for the
+real thing, and the loss was silent. Here the loss was a patient's answer.
