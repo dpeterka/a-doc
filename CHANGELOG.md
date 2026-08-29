@@ -5,6 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.17.0] — 2026-08-28
+
+### Fixed
+
+- **Patient-reported history is read from the facts, not from artifacts
+  derived from them.** The `intake_history` context section read four
+  markdown files under `case/`. Those files are written only for topics the
+  coverage state marks *covered*, so the read path was gated on something
+  unrelated to whether the patient had answered. Measured on the live case
+  file: 4 care-team facts sitting beside a 34-byte artifact holding only its
+  heading, and one supplement fact with no artifact at all — the section
+  reported care team as empty while four facts sat next to it. It now reads
+  `IntakeFactsStore.active_facts()` directly, rendering each fact's
+  statement verbatim so the patient's own wording survives. Scope is the
+  three topics no other context path carries (family history, geography,
+  care team); the rest already have one, and medications/supplements stay
+  excluded because they converge on the regimen (ADR 0031).
+- **`Provenance.app_version` had been wrong since 0.10.0.** `adoc.__version__`
+  was a hand-maintained literal that drifted from the packaged version, so
+  every artifact persisted across six releases was stamped `"0.10.0"`. The
+  version is now single-sourced from installed package metadata, with tests
+  pinning it to `pyproject.toml`. Artifacts produced before this release
+  carry the stale stamp; it is not retroactively corrected.
+
+### Documentation
+
+- ADR 0032 addendum: a derived artifact is never the read path for data that
+  has a source of truth.
+
 ## [0.16.0] — 2026-08-29
 
 ### Fixed

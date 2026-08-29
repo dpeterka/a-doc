@@ -16,7 +16,7 @@ from typing import Any
 from fastapi.testclient import TestClient
 from web_support import build_app, login
 
-from adoc.intake.agent import IntakeTurnResult
+from adoc.intake.agent import OPEN_QUESTIONS_RELPATH, IntakeTurnResult
 from adoc.reason.client import TransportRequest, TransportResponse
 
 
@@ -273,3 +273,30 @@ def test_onboard_review_stays_reachable_and_shows_amend_banner_after_completion(
 
     assert response.status_code == 200
     assert "Initial visit complete" in response.text
+
+
+def test_open_questions_render_as_html_not_literal_markdown(tmp_path: Path) -> None:
+    """`case/questions-open.md` is a markdown file. home.html already rendered
+    it through `markdown_lite`; this page interpolated it into a bare `<p>`,
+    so the patient saw the same content as a wall of literal `#` and `**`
+    with every bullet run together. Reported from production."""
+    app, repo, _db, _ = build_app(tmp_path)
+    repo.write(
+        OPEN_QUESTIONS_RELPATH,
+        "# Next Appointment\n\n"
+        "## Questions you can answer yourself\n\n"
+        "- **Your supplement labels** Can you photograph every supplement?\n"
+        "  _Why:_ Biotin can distort immunoassays.\n",
+    )
+    client = TestClient(app)
+    login(client)
+
+    body = client.get("/onboard/review").text
+
+    assert "<h1>Next Appointment</h1>" in body
+    assert "<strong>Your supplement labels</strong>" in body
+    assert "<li>" in body
+    assert "<em>Why:</em>" in body
+    # None of the raw markers may survive to the page.
+    assert "# Next Appointment" not in body
+    assert "**Your supplement labels**" not in body
