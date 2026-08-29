@@ -5,6 +5,38 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.19.0] — 2026-08-29
+
+### Added
+
+- **Open questions are a resolvable record** (`case/questions-open.yaml`,
+  ADR 0033). A next-appointment question was a rendering rather than a
+  thing: `questions-open.md` was rewritten wholesale by every review, so a
+  question had no identity and nothing could record that it had been
+  answered. The patient would answer in chat, the answer was captured
+  correctly as a fact, and the next review regenerated the list from the
+  ledger and asked again — the chooser has no memory of what she said
+  between reviews and there was nowhere for that memory to live.
+
+  Questions now carry a stable id derived from the panel text, so a review
+  re-proposing the same panel inherits its answered state. A review merges
+  rather than overwrites: wording and `last_asked_on` refresh, while
+  `status`, `answered_on` and `answer_note` stay the store's. A question the
+  chooser stops proposing is kept rather than deleted, since an item can
+  drop out of one run and return in the next.
+
+  `VisitCaptureResult` gains `answered_question_ids`. The model decides
+  which queued question a message answers, because that needs judgement;
+  deterministic code validates the ids, closes the questions and persists,
+  and an id matching nothing is logged and dropped rather than failing the
+  payload. The capture pass is shown the ids, since it cannot report an
+  identifier it has never seen.
+
+  Resolution runs before `run_visit_capture`'s `ops` early return, alongside
+  the regimen changes that sit there for the same reason: "yes, biotin 10mg
+  and vitamin D" may warrant no fact op when both are already on file and
+  still definitively answers the question that asked for them.
+
 ## [0.18.0] — 2026-08-29
 
 ### Fixed
