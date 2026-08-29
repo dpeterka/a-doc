@@ -5,6 +5,51 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.18.0] — 2026-08-29
+
+### Fixed
+
+- **Model-authored markdown reached the patient as raw text.** The chat
+  bubble macro interpolated a reply into a bare `<p>`, so headings arrived
+  as `**...**` and every bulleted list collapsed into one unbroken block.
+  The same file-sourced markdown (`case/questions-open.md`) was rendered
+  through `markdown_lite` on the home page but raw on the intake record, so
+  identical content was legible on one page and a wall of `#` and `**` on
+  the other. Both now go through the filter, which escapes its input and
+  emits only internal links.
+- **`markdown_lite` was missing three constructs.** Asterisk italics
+  (`*text*` — the form models actually emit; only `_text_` was handled),
+  pipe tables (the criteria scorers render their per-item breakdown as one,
+  and every row fell through to the paragraph branch to be joined with
+  spaces), and code spans (`` `encounter:...` `` citation refs, whose
+  backticks were literal). Verified against 74,232 characters of live
+  case-file markdown: no unconverted construct remains.
+- **The chat page grew without bound and put the newest reply furthest from
+  the composer.** The composer is now at the top, the transcript reads
+  newest-first beneath it, and history paginates at ten entries — five
+  exchanges — per page. Older pages are read-only, since a composer there
+  would prepend a reply to a page it does not belong to.
+- **The assistant addressed the patient as though she were another system.**
+  The patient-facing prompt was task and safety constraints with nothing
+  about who is being addressed, so the model described the machinery to a
+  peer — "the differential ledger holds 28 active entries", encounter IDs,
+  internal status strings. It now names the reader, forbids the internal
+  vocabulary, and asks for medical terms to be expanded on first use.
+- **A summary placeholder was being reported as absent content.** `(pending
+  review)` is `ingest.pipeline`'s "nobody has written a summary yet"; the
+  context pack rendered it bare and a chat reply told the patient it had
+  "no content from them yet". On the live case file 23 encounters carry the
+  placeholder and 3 hold extracted text — two patient reports of 2,040 and
+  38,965 characters a targeted question would have retrieved. The pack now
+  distinguishes "unsummarised but searchable" from "nothing extracted".
+
+### Changed
+
+- Chat, review and ledger pages use a wider column; a reply or report
+  carrying nested bullets and dated lab values is a document, not a quip.
+  Wide tables scroll inside their own block rather than forcing the page
+  sideways.
+
 ## [0.17.0] — 2026-08-28
 
 ### Fixed
