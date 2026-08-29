@@ -15,6 +15,7 @@ the labs database and renders plain text.
 
 from __future__ import annotations
 
+import logging
 import re
 from datetime import date
 from pathlib import Path
@@ -28,6 +29,7 @@ from adoc.casefile.regimen import REGIMEN_RELPATH, Regimen, RegimenEntry, load_r
 from adoc.casefile.repo import LEDGER_RELPATH, DataRepo
 from adoc.casefile.reported import REPORTED_RESULTS_RELPATH, load_reported_results
 from adoc.casefile.schema import Ledger
+from adoc.intake.facts import IntakeFactsStore
 from adoc.labs.db import LabsDb
 from adoc.labs.models import LabResult
 from adoc.labs.panels import derived_from_note, panel_sort_key
@@ -685,73 +687,57 @@ def _reported_results_section(repo: DataRepo) -> ContextSection | None:
     )
 
 
+logger = logging.getLogger(__name__)
+
 INTAKE_HISTORY_SECTION_KEY = "intake_history"
 
-# Artifacts the intake writers produce that no reasoning path ever read.
-# Measured on the real case file: medications 1,549 bytes, family history 644,
-# geography 466, care team 34 — all captured from the patient, all written to
-# disk, all invisible to the review and to every post-intake chat turn.
-#
-# `case-summary.md` was the only intake-derived prose the pack carried, and it
-# is 698 bytes summarising a 141KB fact store. The patient could describe her
-# family history in detail and a reasoner would never see a word of it.
-#
-# `undated-events.md` is included for the same reason it exists: an event the
-# patient cannot date is still an event, and it has no encounter file to be
-# found through.
-_INTAKE_HISTORY_FILES: tuple[tuple[str, str], ...] = (
-    ("case/family-history.md", "Family history"),
-    ("case/geography.md", "Geography & exposures"),
-    ("case/care-team.md", "Care team"),
-    ("case/undated-events.md", "Undated events"),
+# Patient-reported topics no other context path carries. The rest are already
+# covered: prior diagnoses reach `patient-theories.md`, allergies a
+# `case-summary.md` block, events become encounters, symptoms the phenotype
+# record, and medications/supplements the regimen (ADR 0031).
+_INTAKE_HISTORY_SECTIONS: tuple[tuple[str, str], ...] = (
+    ("family_history", "Family history"),
+    ("geography", "Geography & exposures"),
+    ("care_team", "Care team"),
 )
 
 
-_PLACEHOLDER_RE = re.compile(r"^_.*not yet populated.*_$", re.IGNORECASE)
-
-
-def _has_content(markdown: str) -> bool:
-    """Whether a scaffolded case file has anything real in it.
-
-    Headings and the seeded placeholder do not count. This is deliberately
-    strict about what "empty" means, because the alternative is a section
-    that says "Family history" and then nothing.
-    """
-    for line in markdown.splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        if _PLACEHOLDER_RE.match(stripped):
-            continue
-        return True
-    return False
-
-
 def _intake_history_section(repo: DataRepo) -> ContextSection | None:
-    """Patient-reported history the intake captured, which nothing read.
+    """Patient-reported history, rendered from the FACTS rather than from the
+    markdown artifacts derived from them.
 
-    Medications are deliberately NOT here: they belong in the regimen record
-    (ADR 0031), which carries dates and can be compared against lab draws —
-    a prose list cannot answer "was she taking this when that specimen was
-    collected". `intake.convert` folds them there instead.
+    The artifacts are written only for topics the coverage state marks
+    covered, so an uncovered topic leaves its facts on disk with nothing to
+    read them. Measured on the live case file: 4 care-team facts against a
+    34-byte artifact containing only its heading, and one supplement fact
+    with no artifact at all. Reading the artifact reproduced that blindness
+    exactly — the section skipped care team as empty while four facts sat
+    beside it.
 
-    Returns `None` when every file is missing or empty, so a case without an
-    intake looks exactly as it did before.
+    Facts are the source of truth everywhere else in this system (see
+    `intake.agent`'s "facts are the source of truth, a case-file artifact is
+    always DERIVED from them"), so this reads them directly and coverage
+    state can no longer gate what a reasoner sees.
+
+    Each fact's `statement` is the patient-grounded sentence the intake
+    recorded, so rendering it verbatim keeps her own words rather than a
+    paraphrase built from parsed fields.
     """
+    try:
+        store = IntakeFactsStore(repo.root)
+    except Exception:  # noqa: BLE001 - a missing/unreadable store is not fatal
+        logger.warning("context: intake facts unavailable; skipping the history section")
+        return None
+
     parts: list[str] = []
-    for relpath, title in _INTAKE_HISTORY_FILES:
-        path = repo.root / Path(relpath)
-        if not path.is_file():
+    for section_key, title in _INTAKE_HISTORY_SECTIONS:
+        facts = store.active_facts(section_key)
+        if not facts:
             continue
-        body = path.read_text(encoding="utf-8")
-        if not _has_content(body):
-            # `DataRepo.init_at` scaffolds these with a heading and a
-            # placeholder, so a whole-body equality check misses them and
-            # emits an empty section — "no empty boxes" applies to the
-            # context pack as much as to the UI, and a heading with nothing
-            # under it costs tokens while telling a reasoner nothing.
-            continue
-        parts.append(f"**{title}**\n\n{body.strip()}")
+        lines = [f"- {fact.statement.strip()}" for fact in facts if fact.statement.strip()]
+        if lines:
+            parts.append(f"**{title}**\n" + "\n".join(lines))
+
     if not parts:
         return None
     return ContextSection(
