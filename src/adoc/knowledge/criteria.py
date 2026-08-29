@@ -31,6 +31,7 @@ from dataclasses import dataclass, field
 from pydantic import BaseModel, Field
 
 from adoc.labs.models import LabResult
+from adoc.labs.validate import convert_value
 
 CLASSIFICATION_DISCLAIMER = (
     "Classification criteria, not diagnostic criteria: they exist to define "
@@ -54,8 +55,32 @@ def _normalize_slug(text: str) -> str:
     return _NON_ALNUM_RE.sub("", text.lower())
 
 
+PhenotypeLookup = dict[str, tuple[str, bool, str]]
+"""`{term_id: (label, present, context)}` — the minimum a scorer needs from a
+phenotype profile, passed as a plain mapping so `knowledge` never imports
+`casefile` and the scorers stay unit-testable without a repo."""
+
+
 ItemState = str
-"""One of `met`, `not_met`, `not_assessed`."""
+"""One of `met`, `not_met`, `not_assessed`, `possible`.
+
+`possible` exists because of a specific near-miss. The phenotype profile is
+built by matching text, and text matching cannot know ATTRIBUTION. Two terms
+in this patient's profile would have scored as met SLE criteria:
+
+    Seizure   <- "clonic grand mal seizure while taking wellbutrin"
+    Arthritis <- "mitochondrial dysfunction psoriatic arthritis metabolic..."
+
+The first is a bupropion-induced seizure — a well-known adverse effect, not a
+neuropsychiatric manifestation of lupus. The second reads as an item in a list
+of conditions being CONSIDERED, not a confirmed finding. Together they are 11
+points against a threshold of 10.
+
+The 2019 criteria forbid exactly this in their own text: a criterion counts
+only if there is **no more likely explanation**. An automated matcher cannot
+make that judgement, so it must not claim the criterion. `possible` says what
+is true — something matching this item appears in the record — and leaves the
+attribution to a clinician."""
 
 
 class CriterionItem(BaseModel):
@@ -88,10 +113,19 @@ class CriteriaResult(BaseModel):
     items: list[CriterionItem] = Field(default_factory=list)
     threshold: int
     points: int
-    """Points from `met` items only — a FLOOR, not an estimate."""
+    """Points from `met` items only — a FLOOR, not an estimate. `possible`
+    items are deliberately excluded: they are unattributed."""
+    points_possible: int = 0
+    """What the `possible` items would add IF a clinician attributed them to
+    this condition. Reported separately so the reader can see that the total
+    is one confirmation away from crossing a threshold, without the scorer
+    ever claiming it has."""
     points_not_assessed: int
     """Weight sitting in items no stored data could answer."""
     meets_threshold: bool
+    """Computed from `points` alone. A `possible` item can never carry a
+    patient over a classification threshold — that is the whole reason the
+    state exists."""
     requires_clinical_item: bool = False
     clinical_item_met: bool = False
     disclaimer: str = CLASSIFICATION_DISCLAIMER
@@ -228,7 +262,67 @@ _SLE_APL_NAMES = (
 )
 
 
-def score_sle_2019(rows: Sequence[LabResult]) -> CriteriaResult:
+def _clinical_item(
+    domain: str, name: str, weight: int, phenotype: PhenotypeLookup | None
+) -> CriterionItem:
+    """A clinical criterion, raised to `possible` when the phenotype record
+    contains a matching term — never to `met`.
+
+    Attribution is the reason. The published criteria count an item only when
+    there is no more likely explanation, and a term matched out of narrative
+    text carries no such judgement: a seizure on bupropion and a seizure from
+    lupus produce the same HPO term.
+    """
+    term_ids = _SLE_CLINICAL_TERMS.get(name, ())
+    if phenotype is None or not term_ids:
+        return CriterionItem(
+            domain=domain,
+            name=name,
+            weight=weight,
+            state="not_assessed",
+            basis="Needs a symptom/phenotype record; not computable from labs.",
+        )
+
+    for term_id in term_ids:
+        found = phenotype.get(term_id)
+        if found is None:
+            continue
+        label, present, context = found
+        if not present:
+            return CriterionItem(
+                domain=domain,
+                name=name,
+                weight=weight,
+                state="not_met",
+                basis=f"Recorded as excluded ({label}).",
+                sources=[f"phenotype:{term_id}"],
+            )
+        excerpt = f' from "{context}"' if context else ""
+        return CriterionItem(
+            domain=domain,
+            name=name,
+            weight=weight,
+            state="possible",
+            basis=(
+                f"{label} appears in the record{excerpt}. NOT counted: these "
+                "criteria require that no more likely explanation exists, and "
+                "that judgement is a clinician's."
+            ),
+            sources=[f"phenotype:{term_id}"],
+        )
+
+    return CriterionItem(
+        domain=domain,
+        name=name,
+        weight=weight,
+        state="not_assessed",
+        basis="Nothing matching this appears in the phenotype record.",
+    )
+
+
+def score_sle_2019(
+    rows: Sequence[LabResult], phenotype: PhenotypeLookup | None = None
+) -> CriteriaResult:
     """2019 EULAR/ACR classification criteria for SLE.
 
     Structure of the published set, all of which this preserves: an **entry
@@ -263,17 +357,9 @@ def score_sle_2019(rows: Sequence[LabResult]) -> CriteriaResult:
             "the 2019 criteria do not apply without it."
         )
 
-    # --- clinical domains this system cannot yet see -------------------------
+    # --- clinical domains, answered from the phenotype profile when it can --
     for domain, name, weight in _SLE_CLINICAL_ITEMS:
-        items.append(
-            CriterionItem(
-                domain=domain,
-                name=name,
-                weight=weight,
-                state="not_assessed",
-                basis="Needs a symptom/phenotype record; not computable from labs.",
-            )
-        )
+        items.append(_clinical_item(domain, name, weight, phenotype))
 
     # --- haematologic --------------------------------------------------------
     items.append(
@@ -334,6 +420,24 @@ def score_sle_2019(rows: Sequence[LabResult]) -> CriteriaResult:
         clinical_domains=_SLE_CLINICAL_DOMAINS,
     )
 
+
+# HPO terms that would match each clinical item, used ONLY to raise it to
+# `possible`. Never to `met` — see `ItemState`.
+_SLE_CLINICAL_TERMS: dict[str, tuple[str, ...]] = {
+    "Fever": ("HP:0001945",),
+    "Delirium": ("HP:0031258",),
+    "Psychosis": ("HP:0000709",),
+    "Seizure": ("HP:0001250",),
+    "Non-scarring alopecia": ("HP:0002293", "HP:0001596"),
+    "Oral ulcers": ("HP:0000155",),
+    "Subacute cutaneous or discoid lupus": ("HP:0001056", "HP:0005306"),
+    "Acute cutaneous lupus": ("HP:0011110",),
+    "Pleural or pericardial effusion": ("HP:0002202", "HP:0001698"),
+    "Acute pericarditis": ("HP:0001701",),
+    "Joint involvement": ("HP:0001369",),
+    "Proteinuria >0.5 g/24 h": ("HP:0000093",),
+    "Autoimmune haemolysis": ("HP:0004854",),
+}
 
 _SLE_CLINICAL_ITEMS: tuple[tuple[str, str, int], ...] = (
     ("Constitutional", "Fever", 2),
@@ -554,6 +658,19 @@ def _finalize(
 
     points = sum(item.weight for item in best_by_domain.values())
 
+    # `possible` points, per-domain maxima like the met ones, and reduced by
+    # whatever that domain already scores — confirming a possible item only
+    # gains the difference, not its full weight.
+    best_possible: dict[str, int] = {}
+    for item in items:
+        if item.state != "possible":
+            continue
+        best_possible[item.domain] = max(best_possible.get(item.domain, 0), item.weight)
+    points_possible = sum(
+        max(0, weight - best_by_domain[domain].weight) if domain in best_by_domain else weight
+        for domain, weight in best_possible.items()
+    )
+
     # Unassessed weight is also counted per-domain: the most a domain could
     # still contribute is its single heaviest unanswered item, not their sum.
     not_assessed_by_domain: dict[str, int] = {}
@@ -583,6 +700,7 @@ def _finalize(
         items=items,
         threshold=threshold,
         points=points,
+        points_possible=points_possible,
         points_not_assessed=points_not_assessed,
         meets_threshold=meets,
         requires_clinical_item=requires_clinical_item,
@@ -590,8 +708,439 @@ def _finalize(
     )
 
 
-SCORERS: dict[str, Callable[[Sequence[LabResult]], CriteriaResult]] = {
+# --- Sjögren 2016 ACR/EULAR --------------------------------------------------------------
+
+
+_SJOGREN_SSA = (r"^ss-?a", r"\bro\b", r"ro52", r"ro60", r"sjogren.*a\b")
+
+
+def score_sjogren_2016(
+    rows: Sequence[LabResult], phenotype: PhenotypeLookup | None = None
+) -> CriteriaResult:
+    """2016 ACR/EULAR classification criteria for primary Sjögren's syndrome.
+
+    Five weighted items, threshold 4.
+
+    **Anti-SSB/La is deliberately absent.** It scored in the older AECG
+    criteria and is NOT an item in the 2016 set — its inclusion was dropped
+    because isolated anti-La adds little specificity. Adding it back because
+    the lab reports it would inflate every score by a point against a
+    threshold of four.
+
+    Three of the five items are ophthalmic and salivary measurements — ocular
+    staining score, Schirmer's, unstimulated salivary flow — that no
+    general-purpose record contains. They report `not_assessed`, which is what
+    makes this scorer's headroom the useful output: it says exactly which
+    three tests would settle the question.
+    """
+    view = LabView(rows)
+    items: list[CriterionItem] = []
+
+    entry_met: bool | None = None
+    entry_note = "Entry requires dryness symptoms; nothing on file records them."
+    if phenotype is not None:
+        dry = [t for t in ("HP:0001097", "HP:0000217") if t in phenotype and phenotype[t][1]]
+        if dry:
+            entry_met = True
+            entry_note = "Dryness recorded (" + ", ".join(phenotype[t][0] for t in dry) + ")."
+
+    items.append(
+        _any_positive_item(
+            view,
+            domain="Serology",
+            name="Anti-SSA/Ro positive",
+            weight=3,
+            names=_SJOGREN_SSA,
+        )
+    )
+    items.append(
+        CriterionItem(
+            domain="Histopathology",
+            name="Labial gland focal lymphocytic sialadenitis, focus score ≥1",
+            weight=3,
+            state="not_assessed",
+            basis="Requires a labial salivary gland biopsy report.",
+        )
+    )
+    for name in (
+        "Ocular staining score ≥5 (or van Bijsterveld ≥4)",
+        "Schirmer's test ≤5 mm/5 min",
+        "Unstimulated whole saliva flow ≤0.1 mL/min",
+    ):
+        items.append(
+            CriterionItem(
+                domain="Ocular/salivary tests",
+                name=name,
+                weight=1,
+                state="not_assessed",
+                basis="Requires a measurement no general record contains.",
+            )
+        )
+
+    return _finalize(
+        key="sjogren-2016",
+        name="Sjögren's — 2016 ACR/EULAR classification criteria",
+        citation="Shiboski CH, et al. Ann Rheum Dis. 2017;76(1):9-16.",
+        items=items,
+        threshold=4,
+        entry_met=entry_met,
+        entry_note=entry_note,
+        requires_clinical_item=False,
+        clinical_domains=frozenset({"Ocular/salivary tests", "Histopathology"}),
+    )
+
+
+# --- RA 2010 ACR/EULAR -------------------------------------------------------------------
+
+
+_RA_ACPA = (r"ccp", r"citrullinat")
+_RA_RF = (r"rheumatoid factor",)
+_RA_ACUTE = (r"^crp$", r"hs-?crp", r"^esr$", r"sedimentation")
+
+
+def score_ra_2010(
+    rows: Sequence[LabResult], phenotype: PhenotypeLookup | None = None
+) -> CriteriaResult:
+    """2010 ACR/EULAR classification criteria for rheumatoid arthritis.
+
+    Threshold 6 of 10, over four domains: joint involvement (0–5), serology
+    (0–3), acute-phase reactants (0–1), symptom duration (0–1).
+
+    **This set cannot reach its threshold from stored data, by construction.**
+    Joint involvement is worth 5 of the 10 points and requires a counted joint
+    examination; symptom duration requires a history. Serology and acute-phase
+    reactants together cap at 4.
+
+    That is not a reason to omit the scorer — it is the scorer's most useful
+    output. It says precisely what a clinician would have to supply for the
+    question to be answerable at all, which is exactly the kind of item the
+    next-appointment list exists to carry.
+
+    High-positive means >3× the upper limit of normal in the published
+    criteria. Stored rows carry a high/low flag rather than a multiple, so a
+    flagged-positive result scores the LOW-positive 2 points rather than 3 —
+    understating rather than overstating.
+    """
+    view = LabView(rows)
+    items: list[CriterionItem] = []
+
+    items.append(
+        _clinical_item_for(
+            "Joint involvement",
+            domain="Joints",
+            weight=5,
+            term_ids=("HP:0001369",),
+            phenotype=phenotype,
+            missing_basis="Requires a counted joint examination.",
+        )
+    )
+
+    serology = _any_positive_item(
+        view, domain="Serology", name="RF or ACPA positive", weight=2, names=_RA_ACPA + _RA_RF
+    )
+    if serology.state == "met":
+        serology.basis += (
+            " Scored as LOW-positive (2): the criteria award 3 only above 3× the "
+            "upper limit of normal, which a high/low flag cannot establish."
+        )
+    items.append(serology)
+
+    items.append(
+        _threshold_item_any(
+            view,
+            domain="Acute-phase reactants",
+            name="Abnormal CRP or ESR",
+            weight=1,
+            names=_RA_ACUTE,
+        )
+    )
+    items.append(
+        CriterionItem(
+            domain="Duration",
+            name="Symptoms ≥6 weeks",
+            weight=1,
+            state="not_assessed",
+            basis="Requires a symptom-duration history.",
+        )
+    )
+
+    return _finalize(
+        key="ra-2010",
+        name="Rheumatoid arthritis — 2010 ACR/EULAR classification criteria",
+        citation="Aletaha D, et al. Arthritis Rheum. 2010;62(9):2569-2581.",
+        items=items,
+        threshold=6,
+        entry_met=None,
+        entry_note=(
+            "Target population is a patient with at least one clinically swollen "
+            "joint not better explained by another disease — a clinical judgement."
+        ),
+        requires_clinical_item=False,
+        clinical_domains=frozenset({"Joints", "Duration"}),
+    )
+
+
+# --- ANCA-associated vasculitis (GPA) 2022 ACR/EULAR --------------------------------------
+
+
+_ANCA_PR3 = (r"proteinase", r"\bpr3\b", r"c-?anca")
+_ANCA_MPO = (r"myeloperoxidase", r"\bmpo\b", r"p-?anca")
+_ANCA_EOS = (r"eosinophil",)
+
+
+def score_gpa_2022(
+    rows: Sequence[LabResult], phenotype: PhenotypeLookup | None = None
+) -> CriteriaResult:
+    """2022 ACR/EULAR classification criteria for granulomatosis with
+    polyangiitis. Threshold 5.
+
+    The only set here with NEGATIVELY weighted items: a positive MPO/pANCA
+    scores −1 and a raised eosinophil count −4, because both point at a
+    different vasculitis. `_finalize`'s domain-maximum rule would discard a
+    negative item, so the negatives are totalled separately and always applied.
+    """
+    view = LabView(rows)
+    items: list[CriterionItem] = []
+
+    items.append(
+        _any_positive_item(
+            view, domain="Serology", name="PR3-ANCA or c-ANCA positive", weight=5, names=_ANCA_PR3
+        )
+    )
+    items.append(
+        _clinical_item_for(
+            "Nasal or sinus inflammation",
+            domain="ENT",
+            weight=1,
+            term_ids=("HP:0000246", "HP:0001742"),
+            phenotype=phenotype,
+            missing_basis="No nasal or sinus finding on file.",
+        )
+    )
+    items.append(
+        _clinical_item_for(
+            "Conductive or sensorineural hearing loss",
+            domain="ENT-hearing",
+            weight=1,
+            term_ids=("HP:0000365",),
+            phenotype=phenotype,
+            missing_basis="No hearing finding on file.",
+        )
+    )
+    items.append(
+        _clinical_item_for(
+            "Pauci-immune glomerulonephritis",
+            domain="Renal",
+            weight=1,
+            term_ids=("HP:0000099",),
+            phenotype=phenotype,
+            missing_basis="Requires a renal biopsy or urinary findings.",
+        )
+    )
+    for name, weight, basis in (
+        ("Pulmonary nodules, mass or cavitation", 2, "Requires chest imaging."),
+        ("Granuloma on biopsy", 2, "Requires a biopsy report."),
+        ("Cartilaginous involvement", 2, "Requires an examination finding."),
+    ):
+        items.append(
+            CriterionItem(
+                domain="Imaging/biopsy",
+                name=name,
+                weight=weight,
+                state="not_assessed",
+                basis=basis,
+            )
+        )
+
+    result = _finalize(
+        key="gpa-2022",
+        name="Granulomatosis with polyangiitis — 2022 ACR/EULAR criteria",
+        citation="Robson JC, et al. Ann Rheum Dis. 2022;81(3):315-320.",
+        items=items,
+        threshold=5,
+        entry_met=None,
+        entry_note=(
+            "Applies only once a diagnosis of small- or medium-vessel vasculitis "
+            "is established and mimics are excluded — a clinical judgement."
+        ),
+        requires_clinical_item=False,
+        clinical_domains=frozenset(),
+    )
+
+    # Negative items, applied outside the domain-maximum rule.
+    penalty = 0
+    mpo = _any_positive_item(
+        view,
+        domain="Serology-negative",
+        name="MPO-ANCA or p-ANCA positive",
+        weight=-1,
+        names=_ANCA_MPO,
+    )
+    if mpo.state == "met":
+        penalty -= 1
+    result.items.append(mpo)
+    eos = _count_threshold_item(
+        view,
+        domain="Serology-negative",
+        name="Eosinophil count ≥1×10⁹/L",
+        weight=-4,
+        names=_ANCA_EOS,
+        # 1×10⁹/L is 1000 cells/µL. Expressed in the unit her rows actually
+        # use, so the conversion is visible rather than implied.
+        threshold=1000.0,
+        unit="cells/ul",
+    )
+    if eos.state == "met":
+        penalty -= 4
+    result.items.append(eos)
+
+    result.points += penalty
+    result.meets_threshold = result.points >= result.threshold
+    return result
+
+
+def _count_threshold_item(
+    view: LabView,
+    *,
+    domain: str,
+    name: str,
+    weight: int,
+    names: tuple[str, ...],
+    threshold: float,
+    unit: str,
+) -> CriterionItem:
+    """A numeric criterion whose threshold carries a UNIT.
+
+    Every earlier threshold in this module compared a stored number against a
+    bare constant, which is safe only while every row happens to share one
+    unit. Eosinophils do not: this patient has them as `4.5 %` and
+    `320 cells/uL`, and a naive `value >= 1.0` against the criteria's
+    1×10⁹/L matched BOTH — scoring a -4 penalty for a real count of
+    0.32×10⁹/L.
+
+    That is the third time unit-blindness has produced a wrong clinical
+    conclusion in this system (a trajectory once read `eosinophils rising
+    319,900%` across a unit change). Rows whose unit cannot be converted to
+    the criterion's unit are EXCLUDED rather than compared — a percentage is
+    not a concentration, and treating it as one is how the bug happened.
+    """
+    found = view.find_all(*names)
+    comparable: list[tuple[LabResult, float]] = []
+    for row in found:
+        if row.value is None or not row.ucum_unit:
+            continue
+        converted = convert_value(row.value, row.ucum_unit, unit)
+        if converted is None:
+            continue
+        comparable.append((row, converted))
+
+    if not comparable:
+        return CriterionItem(
+            domain=domain,
+            name=name,
+            weight=weight,
+            state="not_assessed",
+            basis=(
+                f"No result on file in a unit comparable to {unit}." if found else "None on file."
+            ),
+        )
+
+    row, value = max(comparable, key=lambda pair: pair[0].date)
+    met = value >= threshold
+    return CriterionItem(
+        domain=domain,
+        name=name,
+        weight=weight,
+        state="met" if met else "not_met",
+        basis=(
+            f"Most recent {row.name} is {row.value} {row.ucum_unit} "
+            f"= {value:g} {unit} on {row.date.isoformat()}."
+        ),
+        sources=[LabView.ref(row)],
+    )
+
+
+def _clinical_item_for(
+    name: str,
+    *,
+    domain: str,
+    weight: int,
+    term_ids: tuple[str, ...],
+    phenotype: PhenotypeLookup | None,
+    missing_basis: str,
+) -> CriterionItem:
+    """A clinical criterion answered from the phenotype record, `possible`
+    only — the attribution rule in `ItemState` applies to every set, not just
+    SLE."""
+    if phenotype is None:
+        return CriterionItem(
+            domain=domain, name=name, weight=weight, state="not_assessed", basis=missing_basis
+        )
+    for term_id in term_ids:
+        found = phenotype.get(term_id)
+        if found is None:
+            continue
+        label, present, context = found
+        if not present:
+            return CriterionItem(
+                domain=domain,
+                name=name,
+                weight=weight,
+                state="not_met",
+                basis=f"Recorded as excluded ({label}).",
+                sources=[f"phenotype:{term_id}"],
+            )
+        excerpt = f' from "{context}"' if context else ""
+        return CriterionItem(
+            domain=domain,
+            name=name,
+            weight=weight,
+            state="possible",
+            basis=(
+                f"{label} appears in the record{excerpt}. NOT counted: attribution "
+                "to this condition is a clinician's judgement."
+            ),
+            sources=[f"phenotype:{term_id}"],
+        )
+    return CriterionItem(
+        domain=domain, name=name, weight=weight, state="not_assessed", basis=missing_basis
+    )
+
+
+def _threshold_item_any(
+    view: LabView, *, domain: str, name: str, weight: int, names: tuple[str, ...]
+) -> CriterionItem:
+    """Met when ANY matching analyte is flagged abnormal."""
+    found = view.find_all(*names)
+    if not found:
+        return CriterionItem(
+            domain=domain, name=name, weight=weight, state="not_assessed", basis="None on file."
+        )
+    abnormal = [row for row in found if _numeric_above_ref(row)]
+    if abnormal:
+        return CriterionItem(
+            domain=domain,
+            name=name,
+            weight=weight,
+            state="met",
+            basis="; ".join(f"{r.name} {r.value} ({r.date.isoformat()})" for r in abnormal),
+            sources=[LabView.ref(r) for r in abnormal],
+        )
+    return CriterionItem(
+        domain=domain,
+        name=name,
+        weight=weight,
+        state="not_met",
+        basis=f"{len(found)} measured, none flagged abnormal.",
+        sources=[LabView.ref(r) for r in found],
+    )
+
+
+SCORERS: dict[str, Callable[..., CriteriaResult]] = {
     "sle-2019": score_sle_2019,
+    "sjogren-2016": score_sjogren_2016,
+    "ra-2010": score_ra_2010,
+    "gpa-2022": score_gpa_2022,
 }
 """Registry, keyed by criteria-set slug. PLAN.md Phase 3 calls for ~10 of
 these (Sjögren 2016, SLICC, CASPAR, myositis, ANCA vasculitides…); the
@@ -599,7 +1148,11 @@ framework above — three states, domain maxima, cited items, floor totals —
 is shared by all of them."""
 
 
-def score_all(rows: Sequence[LabResult], keys: Iterable[str] | None = None) -> list[CriteriaResult]:
+def score_all(
+    rows: Sequence[LabResult],
+    keys: Iterable[str] | None = None,
+    phenotype: PhenotypeLookup | None = None,
+) -> list[CriteriaResult]:
     """Every registered scorer (or the named subset) against `rows`."""
     selected = list(SCORERS) if keys is None else [k for k in keys if k in SCORERS]
-    return [SCORERS[key](rows) for key in selected]
+    return [SCORERS[key](rows, phenotype) for key in selected]

@@ -20,7 +20,7 @@ positive finding and is stored as one, negated.
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 from pydantic import BaseModel, Field
@@ -120,3 +120,80 @@ def merge_terms(profile: PhenotypeProfile, found: list[PhenotypeTerm]) -> Phenot
         if seen:
             existing.last_seen = max(seen)
     return PhenotypeProfile(entries=list(by_id.values()), updated=profile.updated)
+
+
+ENGINE_TERM_LIMIT = 8
+"""How many terms a phenotype-driven engine is given.
+
+Chosen from a measured sweep, not intuition — the first draft of this
+constant said 12 and the data contradicted it. LIRICAL's composite likelihood
+ratio for its top-ranked disease, against this patient's real profile:
+
+    terms | top-ranked disease                          | LR
+        5 | Autoinflammatory disease, systemic, w/ vasc. |  +2.29
+        6 | (same)                                       |  +4.69
+        8 | (same)                                       |  +4.82
+       10 | (same)                                       |  +2.12
+       12 | Charge syndrome                              |  -0.42
+       15 | Celiac disease, susceptibility to, 1         |  -0.69
+       20 | (same)                                       |  -2.94
+       30 | (same)                                       |  -7.01
+       82 | Autoinflammatory disease, systemic, w/ vasc. | -25.97
+
+Two things that sweep shows. The score declines monotonically with profile
+size, because terms no single disease explains subtract without bound — so a
+complete record makes a poor engine input, however good a record it is. And
+five to ten terms is a STABLE region: four independent term sets converge on
+the same disease, which is a stronger signal than any single run.
+
+Past ten it degrades into noise: "Charge syndrome" at twelve is not a serious
+candidate for this patient.
+
+Caveat worth keeping visible: this is one profile from one patient, so eight
+is a defensible point inside the stable region rather than a universally
+optimal number. What generalises is the shape, not the constant.
+"""
+
+ENGINE_RECENCY_DAYS = 730
+"""How recent a finding must be to count as current. Two years is long enough
+to keep a chronic finding that is only mentioned at annual reviews, short
+enough to drop a resolved 2021 episode from a differential about today."""
+
+
+def select_for_engine(
+    profile: PhenotypeProfile,
+    *,
+    today: date,
+    limit: int = ENGINE_TERM_LIMIT,
+    recency_days: int = ENGINE_RECENCY_DAYS,
+) -> tuple[list[str], list[str]]:
+    """`(observed, excluded)` term ids for a phenotype-driven engine.
+
+    The full profile is the RECORD; this is the QUERY. They are different
+    artifacts and conflating them is what produced an unusable ranking.
+
+    Selection, in order:
+
+    1. **Current first.** A finding last seen inside `recency_days` outranks
+       an older one. A 2021 episode that never recurred is history, and a
+       differential about today should not be asked to explain it.
+    2. **Then corroboration.** More independent sources means more confidence
+       the term is real, which matters because these are matched from text
+       and some matches are wrong.
+    3. **Undated terms come last**, not never — a term with no date may still
+       be current, so it fills remaining slots rather than being dropped.
+
+    Excluded terms are NOT capped the same way. LIRICAL takes negated
+    phenotypes as evidence, there are typically few of them, and each one is
+    a deliberate clinical statement rather than an incidental mention.
+    """
+    present = [e for e in profile.entries if e.present]
+    cutoff = today - timedelta(days=recency_days)
+
+    def rank(entry: PhenotypeTerm) -> tuple[int, int, str]:
+        seen = entry.last_seen or entry.first_seen
+        current = 1 if (seen is not None and seen >= cutoff) else 0
+        return (-current, -len(entry.sources), entry.term_id)
+
+    chosen = sorted(present, key=rank)[:limit]
+    return [e.term_id for e in chosen], profile.excluded_terms()

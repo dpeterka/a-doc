@@ -48,6 +48,7 @@ from starlette.responses import HTMLResponse, Response
 
 from adoc.casefile.ledger import LedgerInvariantError
 from adoc.casefile.repo import LEDGER_RELPATH, DataRepo
+from adoc.config import Settings
 from adoc.intake.agent import (
     INTAKE_OPENER_MESSAGE,
     VISIT_GAP_THRESHOLD_HOURS,
@@ -63,7 +64,7 @@ from adoc.reason.client import LlmClient, LlmError, LlmResult
 from adoc.reason.dag import ContractViolation
 from adoc.reason.stages import PatientReply, route_turn, run_diagnostic_turn, run_informational_turn
 from adoc.web.casefile_helpers import append_chat_entry, last_chat_at, read_recent_chat
-from adoc.web.deps import get_client, get_db, get_repo
+from adoc.web.deps import get_client, get_db, get_repo, get_settings
 from adoc.web.templating import templates
 
 router = APIRouter(prefix="/chat")
@@ -199,7 +200,11 @@ def _handle_turn(text: str, *, client: LlmClient, repo: DataRepo, db: LabsDb) ->
 
 
 @router.get("")
-def chat_page(request: Request, repo: DataRepo = Depends(get_repo)) -> Response:
+def chat_page(
+    request: Request,
+    repo: DataRepo = Depends(get_repo),
+    settings: Settings = Depends(get_settings),
+) -> Response:
     transcript = read_recent_chat(repo)
     intake_incomplete = not intake_is_complete(repo)
     if not transcript and intake_incomplete:
@@ -210,7 +215,11 @@ def chat_page(request: Request, repo: DataRepo = Depends(get_repo)) -> Response:
     return templates.TemplateResponse(
         request,
         "chat.html",
-        {"transcript": transcript, "intake_incomplete": intake_incomplete},
+        {
+            "transcript": transcript,
+            "intake_incomplete": intake_incomplete,
+            "max_message_chars": settings.max_message_chars,
+        },
     )
 
 
@@ -221,12 +230,35 @@ def chat_send(
     repo: DataRepo = Depends(get_repo),
     db: LabsDb = Depends(get_db),
     client: LlmClient = Depends(get_client),
+    settings: Settings = Depends(get_settings),
 ) -> Response:
     stripped = text.strip()
     now = datetime.now(UTC)
 
     if not stripped:
         turn = {"kind": "error", "text": "Please type a message first.", "tests_to_request": []}
+        html = templates.get_template("_chat_turn.html").render(
+            request=request, user_text=text, turn=turn
+        )
+        return HTMLResponse(html)
+
+    # Enforced here as well as by the textarea's `maxlength`: that attribute is
+    # a convenience, not a control — a stale page, a paste, or anything that is
+    # not the browser can exceed it. Rejected BEFORE the transcript is appended
+    # or any model is called, so an oversized message costs nothing and leaves
+    # no half-recorded turn.
+    limit = settings.max_message_chars
+    if len(stripped) > limit:
+        turn = {
+            "kind": "error",
+            "text": (
+                f"That message is {len(stripped):,} characters and I can take "
+                f"{limit:,} at a time. Nothing is lost — send it in a couple of "
+                "parts and I will record them just the same. Shorter messages "
+                "also get filed more accurately."
+            ),
+            "tests_to_request": [],
+        }
         html = templates.get_template("_chat_turn.html").render(
             request=request, user_text=text, turn=turn
         )

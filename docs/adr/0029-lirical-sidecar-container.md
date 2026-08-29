@@ -115,21 +115,44 @@ duplicated as a unit test over the recorded fixture.
   an engine fed them is no longer independent of the ledger — which is the
   entire reason it is here.
 
-- **83 terms is a diffuse profile, and LIRICAL is built for a focused one.**
-  Run against the real profile, every posttest probability came back 0.00%
-  and the ranking was dominated by rare Mendelian syndromes, with only
-  "Autoinflammatory disease, systemic, with vasculitis" and "Celiac disease,
-  susceptibility to, 1" landing anywhere near the case. A decade-wide scrape
-  of every phenotype ever mentioned is not the input this tool expects, which
-  is a real limitation of the current backfill rather than of the engine.
-  Narrowing to current, active findings is the obvious next lever — and the
-  honest measure remains the divergence rate against the panel, not a
-  conviction that the engine must be useful.
-- LIRICAL's disease corpus is dominated by rare Mendelian disease, and this
-  patient's picture reads autoimmune. Its value here is genuinely uncertain,
-  and the honest measure is the divergence rate once it runs against a real
-  phenotype profile. If it contributes only noise, that is a finding worth
-  recording rather than a sunk cost to defend.
+- **The posttest probability is unusable with a large profile; the ranking is
+  not.** Run against the real 82-term profile, every posttest probability
+  reads 0.00%. An earlier version of this ADR called that "a diffuse-profile
+  problem, not an engine problem", which asserted a cause without testing it
+  and cleared the engine on no evidence. Measured properly:
+
+  | profile | top-ranked disease | composite LR | posttest |
+  |---|---|---|---|
+  | all 82 terms | Autoinflammatory disease, systemic, with vasculitis | −25.97 | 0.00% |
+  | best-attested 10 | *the same disease* | **+3.43** | 23.67% |
+  | random 10 (control) | Alstrom syndrome | −2.13 | 0.00% |
+
+  Two effects, not one. **Size**: adding terms no single disease explains
+  drives the composite likelihood ratio from +3.4 to −26, and the probability
+  collapses with it. **Selection**: a random ten does *not* recover it
+  (−2.13), so this is not simply "fewer terms is better".
+
+  And the ordering survives what the calibration does not. The 82-term run
+  shares 8 of its top 20 with the curated subset — including the identical
+  first place — against 2 of 20 for a random subset. So the full profile
+  carries real signal that the posttest percentage hides.
+
+  A caveat on "signal": consistency is not clinical correctness. That shared
+  top-20 also contains entries like "Intellectual developmental disorder,
+  autosomal dominant 77", which is not a serious candidate for this patient.
+  The runs agree with each other; that does not make them right.
+
+  Two consequences for how this engine gets used: feed it a **curated,
+  current** subset rather than every term ever mentioned, and read the
+  **ranking** rather than the posttest probability. Neither was obvious
+  before measuring, and the first version of this section guessed wrong.
+
+- **The profile it was given contains a known-bad term.** "Coma" is the
+  single best-attested term in it, and it is a false positive from "myxedema
+  coma" — a real entity with no HPO term for the compound, so only the
+  second word matched. The best-attested ten produced a positive LR *despite*
+  carrying it.
+
 - Nothing in this ADR touches the ledger. The engine's output becomes a
   candidate differential to be adjudicated against the panel's, through the
   divergence path that already exists.

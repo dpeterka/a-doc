@@ -7,11 +7,15 @@ is never delegated to a model).
 from __future__ import annotations
 
 import json
+import re
 from datetime import date
 
 from adoc.knowledge.criteria import (
     CLASSIFICATION_DISCLAIMER,
     score_all,
+    score_gpa_2022,
+    score_ra_2010,
+    score_sjogren_2016,
     score_sle_2019,
 )
 from adoc.labs.models import LabFlag, LabResult
@@ -25,6 +29,7 @@ def _row(
     value: float | None = None,
     value_text: str | None = None,
     flag: LabFlag | None = None,
+    unit: str | None = None,
     when: date = date(2026, 5, 2),
 ) -> LabResult:
     return LabResult(
@@ -33,6 +38,7 @@ def _row(
         name_raw=name,
         value=value,
         value_text=value_text,
+        ucum_unit=unit,
         flag=flag,
         source_doc=SHA,
         raw_json=json.dumps({"name_raw": name}),
@@ -228,3 +234,165 @@ def test_an_iga_isotype_does_not_score_the_antiphospholipid_item() -> None:
 
     assert apl.state == "not_assessed"
     assert result.points == 0
+
+
+def test_a_phenotype_match_is_possible_never_met() -> None:
+    """The near-miss this state exists for.
+
+    Two terms in this patient's real profile would have scored as met SLE
+    criteria: Seizure, from "clonic grand mal seizure while taking
+    wellbutrin", and Arthritis, from what reads as a list of conditions being
+    considered. Together they are 11 points against a threshold of 10.
+
+    The 2019 criteria count an item only if there is no more likely
+    explanation, and a bupropion-induced seizure has one. A text matcher
+    cannot make that judgement, so it must not claim the criterion.
+    """
+    phenotype = {
+        "HP:0001250": ("Seizure", True, "clonic grand mal seizure while taking wellbutrin"),
+        "HP:0001369": ("Arthritis", True, "psoriatic arthritis"),
+    }
+    result = score_sle_2019([_row("ANA", value_text="1:320")], phenotype)
+
+    seizure = next(i for i in result.items if i.name == "Seizure")
+    assert seizure.state == "possible"
+    assert "wellbutrin" in seizure.basis
+    assert "more likely explanation" in seizure.basis
+
+    assert result.points == 0
+    assert result.points_possible == 11
+    # ...and 11 possible points cannot carry her over a threshold of 10.
+    assert not result.meets_threshold
+
+
+def test_a_phenotype_term_recorded_as_excluded_reads_as_not_met() -> None:
+    """An explicitly denied finding is an answer, not an absence."""
+    phenotype = {"HP:0001945": ("Fever", False, "denies fever")}
+    result = score_sle_2019([_row("ANA", value_text="1:320")], phenotype)
+
+    fever = next(i for i in result.items if i.name == "Fever")
+    assert fever.state == "not_met"
+    assert result.points_possible == 0
+
+
+def test_without_a_phenotype_clinical_items_stay_unassessed() -> None:
+    """No phenotype record means unanswered, never absent."""
+    result = score_sle_2019([_row("ANA", value_text="1:320")])
+
+    assert all(
+        i.state == "not_assessed"
+        for i in result.items
+        if i.name in {"Fever", "Seizure", "Joint involvement"}
+    )
+
+
+# --- the other three sets ---------------------------------------------------
+
+
+def test_sjogren_does_not_score_anti_ssb() -> None:
+    """Anti-SSB/La scored in the older AECG criteria and is NOT an item in the
+    2016 set. Adding it back because the lab reports it would inflate every
+    score by a point against a threshold of four."""
+    result = score_sjogren_2016(
+        [
+            _row("SS-B (La) Antibody", value_text="Positive"),
+            _row("SS-A (Ro) Antibody", value_text="Negative"),
+        ]
+    )
+
+    # Matched on whole words: "La" is a substring of "Labial gland", which is
+    # a legitimate item — the same substring trap this module keeps hitting.
+    assert not any(re.search(r"\bSS-?B\b|\bLa\b", i.name) for i in result.items)
+    # ...and the SSA item is scored on the SSA row alone.
+    ssa = next(i for i in result.items if "SSA" in i.name)
+    assert ssa.state == "not_met"
+    assert ssa.sources == ["labs:ss-a-ro-antibody:2026-05-02"]
+    assert result.points == 0
+
+
+def test_sjogren_entry_needs_recorded_dryness() -> None:
+    result = score_sjogren_2016([_row("SS-A (Ro) Antibody", value_text="Positive")])
+    assert result.entry_met is None
+
+    with_dryness = score_sjogren_2016(
+        [_row("SS-A (Ro) Antibody", value_text="Positive")],
+        {"HP:0000217": ("Xerostomia", True, "dry mouth for years")},
+    )
+    assert with_dryness.entry_met is True
+    assert with_dryness.points == 3
+
+
+def test_ra_cannot_reach_its_threshold_from_stored_data() -> None:
+    """Joint involvement is 5 of the 10 points and needs a counted joint
+    examination; duration needs a history. Serology and acute-phase reactants
+    cap at 4 against a threshold of 6.
+
+    That is the scorer's most useful output, not a defect: it says exactly
+    what a clinician must supply for the question to be answerable.
+    """
+    result = score_ra_2010(
+        [
+            _row("anti-CCP", value_text="Positive"),
+            _row("CRP", value=12.0, flag=LabFlag.HIGH),
+        ]
+    )
+
+    assert result.points <= 4
+    assert not result.meets_threshold
+    joints = next(i for i in result.items if i.name == "Joint involvement")
+    assert joints.state == "not_assessed"
+    assert "counted joint examination" in joints.basis
+
+
+def test_ra_serology_scores_low_positive_not_high() -> None:
+    """High-positive means >3x the upper limit of normal. A stored high/low
+    flag cannot establish a multiple, so a flagged positive scores the LOW
+    band — understating rather than overstating."""
+    result = score_ra_2010([_row("anti-CCP", value_text="Positive")])
+    serology = next(i for i in result.items if i.domain == "Serology")
+
+    assert serology.state == "met"
+    assert serology.weight == 2
+    assert "LOW-positive" in serology.basis
+
+
+def test_a_unit_bearing_threshold_ignores_an_incomparable_unit() -> None:
+    """The bug this helper exists for.
+
+    Eosinophils are stored both as `4.5 %` and `320 cells/uL`. The criteria
+    threshold is 1x10^9/L — 1000 cells/uL. A bare `value >= 1.0` matched BOTH
+    and scored a -4 penalty for a real count of 0.32x10^9/L. A percentage is
+    not a concentration.
+    """
+    result = score_gpa_2022(
+        [
+            _row("Eosinophils", value=4.5, unit="%"),
+            _row("Eosinophils, Absolute", value=320.0, unit="cells/uL"),
+        ]
+    )
+    eos = next(i for i in result.items if "Eosinophil" in i.name)
+
+    assert eos.state == "not_met"
+    assert "cells/ul" in eos.basis.lower()
+    assert result.points == 0
+
+
+def test_a_genuinely_high_eosinophil_count_does_score_the_penalty() -> None:
+    """The penalty must still fire when the count really is above threshold —
+    the fix is unit awareness, not suppression."""
+    result = score_gpa_2022([_row("Eosinophils, Absolute", value=1500.0, unit="cells/uL")])
+    eos = next(i for i in result.items if "Eosinophil" in i.name)
+
+    assert eos.state == "met"
+    assert result.points == -4
+
+
+def test_every_registered_scorer_carries_the_disclaimer_and_a_citation() -> None:
+    """Four sets now; the label is not optional on any of them."""
+    results = score_all([_row("CRP", value=8.5)])
+
+    assert len(results) == 4
+    for result in results:
+        assert result.disclaimer == CLASSIFICATION_DISCLAIMER
+        assert result.citation
+        assert result.threshold > 0
