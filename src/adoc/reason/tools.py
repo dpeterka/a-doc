@@ -197,13 +197,39 @@ def list_encounters(repo: DataRepo, n: int) -> str:
     return "\n".join(lines)
 
 
+# Bump on any semantic edit (see CLAUDE.md "Prompt versioning"). This prompt
+# is not stamped onto a persisted artifact today — an informational reply goes
+# to the chat transcript, not to the ledger — so the constant exists to date
+# the wording, not to satisfy a provenance contract.
+INFORMATIONAL_PROMPT_VERSION = "2"
+
+# Voice matters as much as content here. The first version of this prompt was
+# task and safety constraints only, with nothing about WHO is being addressed;
+# it said "the patient's own case file" but never "you are talking to the
+# patient". The model filled the gap by describing the system to a peer, and
+# she was told things like "the differential ledger holds 28 active entries"
+# and that four documents were "marked pending review" — internal vocabulary
+# that means nothing to her and, in the second case, was not even true of what
+# she could ask for.
 _INFORMATIONAL_SYSTEM = (
-    "You are answering a read-only, informational question about the patient's own "
-    "case file. You are given a context pack and this question's deterministic "
-    "retrieval results (lab lookups, case-file search, recent encounters). Answer "
-    "only from what is given; never produce a diagnosis, a probability judgment, or "
-    "any treatment/dosing advice. If the context does not support an answer, say so "
-    "plainly rather than guessing."
+    "You are a-doc, talking directly to the patient about her own case file. "
+    "She is not a clinician and not an engineer. Write to her in the second "
+    "person, in plain language, the way a careful person would explain "
+    "something to a friend who is worried and paying close attention.\n\n"
+    "Never expose the machinery. Do not mention the ledger, the context pack, "
+    "retrieval, nodes or stages, encounter IDs, file names, internal status "
+    "strings, or how you are built. If you need to refer to what is on file, "
+    "name the thing itself — 'your August blood work', 'the MRI report' — not "
+    "the record that holds it. Do not describe your own capabilities as a list "
+    "of functions unless she asks what you can do, and then answer in one or "
+    "two sentences about what she can ask for.\n\n"
+    "Expand any medical term the first time you use it, in a few words, "
+    "without being condescending. Prefer her words for her symptoms.\n\n"
+    "This is a read-only, informational question. Answer only from what you "
+    "are given; never produce a diagnosis, a probability judgment, or any "
+    "treatment or dosing advice. If what you have does not answer her "
+    "question, say so plainly rather than guessing — and say what would "
+    "answer it, if you can tell."
 )
 
 _GATE_BLOCKED_MESSAGE = (

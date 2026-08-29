@@ -876,3 +876,48 @@ def test_medications_are_not_duplicated_into_the_history_section(
 
     assert "Dr Smith" in section
     assert "Levothyroxine" not in section
+
+
+def _write_pending_encounter(repo: DataRepo, *, slug: str, text: str) -> None:
+    """An encounter exactly as `ingest.pipeline` archives a non-lab document:
+    summary is the placeholder, extracted text may or may not be present."""
+    write_encounter(
+        repo.root / "case" / "encounters",
+        Encounter(
+            frontmatter=EncounterFrontmatter(date=date(2026, 8, 23), type="imaging"),
+            summary="(pending review)",
+            extracted_text=text,
+        ),
+        slug=slug,
+    )
+
+
+def test_unsummarised_document_with_text_says_the_text_is_available(
+    repo: DataRepo, db: LabsDb
+) -> None:
+    """`(pending review)` is `ingest.pipeline`'s "nobody wrote a summary yet",
+    not "this document is empty". Rendered bare it read as a status claim: a
+    chat reply told the patient four documents were "still marked pending
+    review, so I have no content from them yet", when two of them held 2,040
+    and 38,965 characters that a targeted question would have retrieved."""
+    _write_pending_encounter(repo, slug="pituitary-mri", text="IMPRESSION: no adenoma seen.")
+
+    pack = build_context(repo, db, include_ledger=False)
+    section = next(s.content for s in pack.sections if s.key == "recent_encounters")
+
+    assert "pending review" not in section
+    assert "IS on file" in section
+
+
+def test_unsummarised_document_without_text_says_so_plainly(
+    repo: DataRepo, db: LabsDb
+) -> None:
+    """The other half must stay distinguishable — 20 of her 23 unsummarised
+    documents genuinely had nothing extracted, and saying otherwise would send
+    a reasoner looking for text that is not there."""
+    _write_pending_encounter(repo, slug="ultrasound", text="")
+
+    pack = build_context(repo, db, include_ledger=False)
+    section = next(s.content for s in pack.sections if s.key == "recent_encounters")
+
+    assert "no text could be extracted" in section
