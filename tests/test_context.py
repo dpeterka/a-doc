@@ -790,3 +790,53 @@ def test_reported_results_are_labelled_and_kept_out_of_the_labs_sections(
     assert "NOT measured results" in reported
     # ...and nowhere near the measured series.
     assert "Iron" not in labs
+
+
+def test_intake_history_that_nothing_read_is_now_in_the_pack(repo: DataRepo, db: LabsDb) -> None:
+    """Four intake artifacts were written and never read. On the live case
+    file: family history 644 bytes, geography 466, care team 34 — all
+    captured from the patient, all invisible to the review and to every
+    post-intake chat turn."""
+    (repo.root / "case" / "family-history.md").write_text(
+        "# Family History\n\nMother: Hashimoto's thyroiditis, diagnosed in her forties.\n"
+    )
+    (repo.root / "case" / "geography.md").write_text(
+        "# Geography\n\nLived in the Ohio River valley until 2015.\n"
+    )
+
+    pack = build_context(repo, db, include_ledger=False)
+    section = next(s.content for s in pack.sections if s.key == "intake_history")
+
+    assert "Hashimoto" in section
+    assert "Ohio River valley" in section
+    assert "Family history" in section and "Geography" in section
+
+
+def test_a_scaffolded_but_unpopulated_file_makes_no_section(repo: DataRepo, db: LabsDb) -> None:
+    """`DataRepo.init_at` seeds these with a heading and a placeholder. A
+    whole-body equality check misses that and emits a section that says
+    "Family history" with nothing under it — costing tokens and telling a
+    reasoner nothing."""
+    (repo.root / "case" / "family-history.md").write_text(
+        "# Family History\n\n_Not yet populated._\n"
+    )
+
+    pack = build_context(repo, db, include_ledger=False)
+
+    assert "intake_history" not in pack.keys
+
+
+def test_medications_are_not_duplicated_into_the_history_section(
+    repo: DataRepo, db: LabsDb
+) -> None:
+    """Medications converge on the regimen record instead: a prose list
+    cannot answer whether she was taking something when a specimen was
+    drawn, and the regimen is already rendered against lab dates."""
+    (repo.root / "case" / "medications.md").write_text("# Medications\n\n- Levothyroxine 125 mcg\n")
+    (repo.root / "case" / "care-team.md").write_text("# Care Team\n\nDr Smith, endocrinology.\n")
+
+    pack = build_context(repo, db, include_ledger=False)
+    section = next(s.content for s in pack.sections if s.key == "intake_history")
+
+    assert "Dr Smith" in section
+    assert "Levothyroxine" not in section

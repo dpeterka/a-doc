@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.0] — 2026-08-29
+
+### Fixed
+
+- **Patient history the intake captured is no longer invisible.** Intake wrote
+  nine artifacts and the reasoner read three. On the live case file,
+  `family-history.md` (644 bytes), `geography.md` (466) and `care-team.md`
+  (34) were captured from the patient, written to disk, and read by nothing —
+  as was the 141 KB `intake-facts.yaml`. The only intake-derived prose the
+  context pack carried was a 698-byte case summary. Family history,
+  geography, care team and undated events now form an `intake_history`
+  section; a scaffolded-but-unpopulated file makes no section at all.
+- **Intake medications converge on the regimen record** rather than a prose
+  file nothing read. A list of names cannot answer whether she was taking
+  something when a specimen was drawn; the regimen carries intervals and is
+  already compared against lab collection dates. Intake's `still_taking`
+  boolean converts honestly — taking becomes an open interval attested on the
+  date she said it, not a start date, and stopped leaves both endpoints
+  unset rather than claiming she stopped during the conversation.
+
 ## [0.15.0] — 2026-08-29
 
 ### Fixed
