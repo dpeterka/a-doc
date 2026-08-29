@@ -23,7 +23,12 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 
 from adoc.casefile.disputes import DISPUTES_RELPATH, load_disputes
-from adoc.casefile.encounters import DatePrecision, EncounterFrontmatter, read_encounter
+from adoc.casefile.encounters import (
+    DatePrecision,
+    Encounter,
+    EncounterFrontmatter,
+    read_encounter,
+)
 from adoc.casefile.ledger import load_ledger
 from adoc.casefile.regimen import REGIMEN_RELPATH, Regimen, RegimenEntry, load_regimen
 from adoc.casefile.repo import LEDGER_RELPATH, DataRepo
@@ -98,6 +103,35 @@ def _read_or_placeholder(repo: DataRepo, relpath: str, placeholder: str) -> str:
         return placeholder
 
 
+# `ingest.pipeline` writes this as the summary of every non-lab document it
+# archives: it means "nobody has written a summary yet", NOT "this document is
+# empty". Rendered bare, it read to a model as a status claim — a chat reply
+# told the patient four of her documents were "still marked pending review, so
+# I have no content from them yet", when two of the four carried 2,040 and
+# 38,965 characters of extracted text that a targeted question would have
+# retrieved. Same failure as ADR 0032's addendum: a placeholder stood in for
+# the state, and the model reported the placeholder.
+_PENDING_SUMMARY = "(pending review)"
+
+
+def _encounter_summary(encounter: Encounter) -> str:
+    """What to show for an encounter whose summary has not been written.
+
+    Says which it is — text on file and searchable, or genuinely nothing
+    extracted — so a reasoner can tell "unsummarised" from "empty" instead of
+    guessing from a placeholder.
+    """
+    summary = encounter.summary.strip()
+    if summary and summary != _PENDING_SUMMARY:
+        return summary
+    if (encounter.extracted_text or "").strip():
+        return (
+            "_no summary written yet — the full text of this document IS on file "
+            "and searchable; ask about its contents to retrieve it_"
+        )
+    return "_no summary, and no text could be extracted from this document_"
+
+
 def _recent_encounters_section(repo: DataRepo, limit: int) -> ContextSection:
     disputed_targets = load_disputes(repo.root / Path(DISPUTES_RELPATH)).open_targets()
     encounters_dir = repo.root / ENCOUNTERS_RELDIR
@@ -121,7 +155,7 @@ def _recent_encounters_section(repo: DataRepo, limit: int) -> ContextSection:
         encounter = read_encounter(encounters_dir / filename)
         fm = encounter.frontmatter
         provider = f" ({fm.provider})" if fm.provider else ""
-        summary = encounter.summary.strip() or "_no summary_"
+        summary = _encounter_summary(encounter)
         # A patient-reported date is often "2021" or "spring 2022", which the
         # parser resolves to a January 1st. Rendering that bare invites a
         # reasoning stage to treat fabricated precision as real, and to order

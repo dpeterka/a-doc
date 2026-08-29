@@ -175,6 +175,13 @@ a {
   padding: 1rem 1rem 3rem;
 }
 
+/* Opt-in wider column for pages whose content is a long structured document
+   rather than prose. 720px is a good measure for reading paragraphs and a bad
+   one for a reply carrying nested bullets and dated lab values. */
+.app-main-wide {
+  max-width: 1040px;
+}
+
 .card {
   background: var(--color-surface);
   border: 1px solid var(--color-border);
@@ -425,12 +432,57 @@ button.button-danger {
   align-self: flex-end;
   background: var(--color-primary);
   color: white;
+  /* She types multi-line messages; without this her paragraph breaks were
+     collapsed into one run of text on the way back onto the page. */
+  white-space: pre-wrap;
 }
 
 .chat-bubble-assistant {
   align-self: flex-start;
   background: var(--color-surface);
   border: 1px solid var(--color-border);
+  /* An assistant reply is a document, not a quip. Capping it at 85% like the
+     patient's side left a long structured answer wrapping in a ribbon; the
+     patient bubble keeps the cap so the two sides still read as a dialogue. */
+  max-width: 100%;
+}
+
+/* Rendered markdown from a model-authored or file-sourced document, used in
+   chat bubbles and on the intake record. Margins are tightened against the
+   document defaults so a block does not open with a large empty gap. */
+.md-body > :first-child {
+  margin-top: 0;
+}
+
+.md-body > :last-child {
+  margin-bottom: 0;
+}
+
+.md-body p {
+  margin: 0.5rem 0;
+}
+
+.md-body ul,
+.md-body ol {
+  margin: 0.5rem 0;
+  padding-left: 1.4rem;
+}
+
+.md-body li {
+  margin: 0.3rem 0;
+}
+
+.md-body h1,
+.md-body h2,
+.md-body h3,
+.md-body h4 {
+  margin: 0.8rem 0 0.4rem;
+  font-size: 1rem;
+}
+
+/* A continuation line inside a bullet (see markdown_lite.flush_item). */
+.md-body .li-line {
+  margin-top: 0.2rem;
 }
 
 .chat-kind-withheld {
@@ -928,4 +980,54 @@ body.lightbox-active {
      jumped to. */
   outline: 2px solid var(--color-primary);
   outline-offset: 3px;
+}
+
+/* Chat pagination. The whole transcript used to render on one page; with the
+   composer moved to the top, an unbounded history also meant the page grew
+   without limit beneath it. */
+.chat-pager {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  margin: 1rem 0;
+  padding-top: 0.8rem;
+  border-top: 1px solid var(--color-border);
+  font-size: 0.9rem;
+}
+
+/* Markdown tables — the criteria scorers render their per-item breakdown as
+   one. Wide tables scroll inside their own block rather than forcing the page
+   sideways, which matters most on a phone. */
+.md-body table {
+  display: block;
+  overflow-x: auto;
+  max-width: 100%;
+  border-collapse: collapse;
+  margin: 0.8rem 0;
+  font-size: 0.9rem;
+}
+
+.md-body th,
+.md-body td {
+  border: 1px solid var(--color-border);
+  padding: 0.4rem 0.6rem;
+  text-align: left;
+  vertical-align: top;
+}
+
+.md-body thead th {
+  background: var(--color-info-bg);
+  white-space: nowrap;
+}
+
+/* Code spans — citation refs like `encounter:...` in reviews and theories. */
+.md-body code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.85em;
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  padding: 0.05em 0.3em;
+  word-break: break-word;
 }

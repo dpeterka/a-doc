@@ -57,3 +57,94 @@ def test_indented_lines_stay_inside_their_bullet() -> None:
     assert "Ask for a coeliac blood screen." in html
     # Everything belongs to the item, so no stray paragraph escaped the list.
     assert "<p>" not in html
+
+
+def test_asterisk_italics_render() -> None:
+    """Models emit `*text*`; only the `_text_` form was handled, so a chat
+    reply reading "help you *find what's already in it*" reached the patient
+    with the asterisks still in it."""
+    out = render_markdown_lite("help you *find what is already in it* — not to diagnose")
+
+    assert "<em>find what is already in it</em>" in out
+    assert "*find" not in out
+
+
+def test_asterisk_italics_leave_arithmetic_and_intra_word_stars_alone() -> None:
+    """The guards that keep the new rule from eating text that is not
+    emphasis. Space-hugged stars are arithmetic; word-hugged stars are not a
+    delimiter."""
+    assert "2 * 3 * 4" in render_markdown_lite("2 * 3 * 4")
+    assert "a*b*c" in render_markdown_lite("a*b*c")
+
+
+def test_bold_still_wins_over_the_new_italic_rule() -> None:
+    """`**bold**` must not be re-matched as two italics by the star rule,
+    which is why it runs after the bold substitution."""
+    out = render_markdown_lite("**bold**")
+
+    assert "<strong>bold</strong>" in out
+    assert "<em>" not in out
+
+
+def test_pipe_tables_render_as_tables() -> None:
+    """The criteria scorers emit their per-item breakdown as a markdown
+    table. With no rule for it every row fell through to the paragraph branch
+    and was joined with spaces, so the whole table reached the patient as one
+    unbroken line of pipes and dashes."""
+    out = render_markdown_lite(
+        "| | Criterion | Points |\n|---|---|---|\n| ? | Neuropsychiatric — Seizure | 5 |\n"
+    )
+
+    assert "<table>" in out
+    assert "<th>Criterion</th>" in out
+    assert "<td>Neuropsychiatric — Seizure</td>" in out
+    assert "|---|" not in out
+
+
+def test_a_paragraph_containing_pipes_is_not_a_table() -> None:
+    """A row only starts a table when the NEXT line is a divider. Without
+    that pairing, prose mentioning a pipe would be swallowed into a table."""
+    out = render_markdown_lite("The value was recorded as | separated | text.")
+
+    assert "<table>" not in out
+
+
+def test_a_short_row_is_padded_to_the_header_width() -> None:
+    """A malformed row must not skew the rest of the table."""
+    out = render_markdown_lite("| A | B | C |\n|---|---|---|\n| only-one |\n")
+
+    assert out.count("<td>") == 3
+
+
+def test_table_cells_are_still_escaped_and_inlined() -> None:
+    out = render_markdown_lite("| A |\n|---|\n| **bold** <script> |\n")
+
+    assert "<strong>bold</strong>" in out
+    assert "&lt;script&gt;" in out
+
+
+def test_code_spans_render() -> None:
+    """The review report and the theories file cite sources as
+    `encounter:...` / `labs:...`. With no rule for them the backticks reached
+    the patient literally — six of them on the live case file."""
+    out = render_markdown_lite("See `encounter:2026-08-04--scan.md` for detail.")
+
+    assert "<code>encounter:2026-08-04--scan.md</code>" in out
+    assert "`" not in out
+
+
+def test_code_span_contents_are_not_touched_by_emphasis_rules() -> None:
+    """Spans are lifted out before the emphasis rules run and restored after,
+    so a ref containing underscores or stars survives intact."""
+    out = render_markdown_lite("`labs:free_t4` and `a *b* c` and *real italics*")
+
+    assert "<code>labs:free_t4</code>" in out
+    assert "<code>a *b* c</code>" in out
+    assert "<em>real italics</em>" in out
+
+
+def test_code_spans_are_still_escaped() -> None:
+    out = render_markdown_lite("`<script>alert(1)</script>`")
+
+    assert "&lt;script&gt;" in out
+    assert "<script>" not in out

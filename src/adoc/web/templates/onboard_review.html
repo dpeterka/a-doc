@@ -42,7 +42,10 @@
 
       {% if continuity.open_questions %}
         <h3>Open questions on file</h3>
-        <p class="muted">{{ continuity.open_questions }}</p>
+        {# `open-questions.md` is a markdown file; home.html already renders it
+           through the filter and this page did not, so the same content was
+           legible on one page and a wall of literal `**` and `#` on the other. #}
+        <div class="md-body muted">{{ continuity.open_questions | markdown_lite | safe }}</div>
       {% endif %}
     </section>
   {% endif %}

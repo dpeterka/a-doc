@@ -1,9 +1,11 @@
 {% extends "base.html" %}
 {% block title %}{{ filename }} — a-doc{% endblock %}
+{# A review carries the criteria tables; 720px is too narrow for them. #}
+{% block main_class %}app-main-wide{% endblock %}
 {% block content %}
   <p class="muted"><a href="/ledger">&larr; back to the full picture</a></p>
   {% if content is not none %}
-    <article class="card">
+    <article class="card md-body">
       {{ content | markdown_lite | safe }}
     </article>
   {% else %}

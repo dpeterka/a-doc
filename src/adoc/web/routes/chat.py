@@ -199,26 +199,53 @@ def _handle_turn(text: str, *, client: LlmClient, repo: DataRepo, db: LabsDb) ->
     }
 
 
+# Five exchanges — a patient message and its reply are two entries. The whole
+# transcript used to render on one page, which grew without bound and put the
+# newest reply furthest from the composer.
+CHAT_PAGE_SIZE = 10
+
+# The chat page paginates, so it must see more than the dashboard's "recent"
+# window — otherwise page 2 would fall off the end of what was ever loaded.
+_CHAT_HISTORY_FILES = 3650
+_CHAT_HISTORY_TURNS = 100_000
+
+
 @router.get("")
 def chat_page(
     request: Request,
+    page: int = 1,
     repo: DataRepo = Depends(get_repo),
     settings: Settings = Depends(get_settings),
 ) -> Response:
-    transcript = read_recent_chat(repo)
+    transcript = read_recent_chat(
+        repo, max_files=_CHAT_HISTORY_FILES, max_turns=_CHAT_HISTORY_TURNS
+    )
     intake_incomplete = not intake_is_complete(repo)
     if not transcript and intake_incomplete:
         # Deterministic opener, rendered but not yet persisted — it is
         # written into the real transcript on the first patient turn (see
         # chat_send) so later renders show coherent history.
         transcript = [{"role": "assistant", "kind": "informational", "text": INTAKE_OPENER_MESSAGE}]
+
+    # Newest first: the composer sits at the top of the page, so the reply she
+    # just read should be the thing directly beneath it.
+    newest_first = list(reversed(transcript))
+    page_count = max(1, -(-len(newest_first) // CHAT_PAGE_SIZE))
+    page = min(max(page, 1), page_count)
+    start = (page - 1) * CHAT_PAGE_SIZE
+
     return templates.TemplateResponse(
         request,
         "chat.html",
         {
-            "transcript": transcript,
+            "transcript": newest_first[start : start + CHAT_PAGE_SIZE],
             "intake_incomplete": intake_incomplete,
             "max_message_chars": settings.max_message_chars,
+            "page": page,
+            "page_count": page_count,
+            # Sending only makes sense against the live end of the
+            # conversation; an older page is a read-only view of history.
+            "is_latest_page": page == 1,
         },
     )
 

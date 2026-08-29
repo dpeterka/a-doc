@@ -1,6 +1,10 @@
 {% extends "base.html" %}
 {% import "_chat_macros.html" as chat_macros %}
 {% block title %}Chat — a-doc{% endblock %}
+{# Replies are structured documents — headings, nested bullets, lab values
+   with dates — not chat quips. At the shared 720px they wrapped to a
+   ribbon. #}
+{% block main_class %}app-main-wide{% endblock %}
 {% block content %}
   <h1>Chat</h1>
 
@@ -16,12 +20,6 @@
     </p>
   {% endif %}
 
-  <div id="chat-transcript" class="chat-transcript">
-    {% for entry in transcript %}
-      {{ chat_macros.bubble(entry) }}
-    {% endfor %}
-  </div>
-
   {#
     A turn is SLOW: once the initial visit is complete, a diagnostic question
     runs the whole DAG (Ledger-Maintainer -> Challenger -> apply -> Composer,
@@ -33,9 +31,10 @@
     which is exactly how it was reported. The wait is inherent; hiding it is
     the bug.
   #}
+  {% if is_latest_page %}
   <form hx-post="/chat/send"
         hx-target="#chat-transcript"
-        hx-swap="beforeend"
+        hx-swap="afterbegin"
         hx-indicator="#chat-pending"
         hx-disabled-elt="find button"
         hx-on--after-request="this.reset()">
@@ -56,6 +55,37 @@
       </span>
     </div>
   </form>
+  {% else %}
+    {# Sending only makes sense against the live end of the conversation. On an
+       older page the composer is replaced by the way back, so a reply can never
+       be prepended to a page it does not belong to. #}
+    <p class="banner banner-info">
+      You are looking back through earlier conversation.
+      <a href="/chat">Return to the latest</a> to send a message.
+    </p>
+  {% endif %}
+
+  <div id="chat-transcript" class="chat-transcript">
+    {% for entry in transcript %}
+      {{ chat_macros.bubble(entry) }}
+    {% endfor %}
+  </div>
+
+  {% if page_count > 1 %}
+    <nav class="chat-pager" aria-label="Conversation history">
+      {% if page > 1 %}
+        <a href="/chat?page={{ page - 1 }}">&larr; Newer</a>
+      {% else %}
+        <span class="muted">&larr; Newer</span>
+      {% endif %}
+      <span class="muted">Page {{ page }} of {{ page_count }}</span>
+      {% if page < page_count %}
+        <a href="/chat?page={{ page + 1 }}">Older &rarr;</a>
+      {% else %}
+        <span class="muted">Older &rarr;</span>
+      {% endif %}
+    </nav>
+  {% endif %}
 
   <script>
     (function () {
