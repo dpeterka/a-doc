@@ -995,3 +995,39 @@ body.lightbox-active {
   border-top: 1px solid var(--color-border);
   font-size: 0.9rem;
 }
+
+/* Markdown tables — the criteria scorers render their per-item breakdown as
+   one. Wide tables scroll inside their own block rather than forcing the page
+   sideways, which matters most on a phone. */
+.md-body table {
+  display: block;
+  overflow-x: auto;
+  max-width: 100%;
+  border-collapse: collapse;
+  margin: 0.8rem 0;
+  font-size: 0.9rem;
+}
+
+.md-body th,
+.md-body td {
+  border: 1px solid var(--color-border);
+  padding: 0.4rem 0.6rem;
+  text-align: left;
+  vertical-align: top;
+}
+
+.md-body thead th {
+  background: var(--color-info-bg);
+  white-space: nowrap;
+}
+
+/* Code spans — citation refs like `encounter:...` in reviews and theories. */
+.md-body code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.85em;
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  padding: 0.05em 0.3em;
+  word-break: break-word;
+}

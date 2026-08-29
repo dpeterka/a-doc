@@ -54,7 +54,7 @@
       full — it's the same committed, git-tagged report as
       <a href="/reviews/{{ latest_review.filename }}">its own permalink</a>.
     </p>
-    <article class="card">
+    <article class="card md-body">
       {{ latest_review.content | markdown_lite | safe }}
     </article>
   {% else %}

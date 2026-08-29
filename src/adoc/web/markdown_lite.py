@@ -43,16 +43,52 @@ _ITALIC_STAR_RE = re.compile(r"(?<![\w*`])\*(?!\s)([^*`]+?)(?<!\s)\*(?![\w*`])")
 # patient. A relative path can only ever point back into this app.
 _LINK_RE = re.compile(r"\[([^\]]+)\]\((/[^)\s\"\']*)\)")
 
+# Code spans. The review report and the theories file cite sources as
+# `encounter:...` / `labs:...`; with no rule for them the backticks reached
+# the patient literally. Measured on the live case file: 6 of them.
+_CODE_RE = re.compile(r"`([^`\n]+)`")
+
 # A continuation line is indented under a list item and belongs to it. HTML
 # escaping runs first, so this operates on already-escaped text.
 _CONTINUATION_INDENT = 2
 
+# Pipe tables. The criteria scorers render their per-item breakdown as a
+# markdown table; with no rule for it every row fell through to the paragraph
+# branch and `flush_paragraph` joined them with spaces, so the whole table
+# reached the patient as one unbroken line of pipes and dashes.
+_TABLE_ROW_RE = re.compile(r"^\|(.+)\|$")
+_TABLE_DIVIDER_RE = re.compile(r"^\|[\s:|-]+\|$")
+
+
+def _table_cells(row: str) -> list[str]:
+    """Split one `| a | b |` row into its cells.
+
+    The outer pipes are stripped by `_TABLE_ROW_RE`; splitting the remainder
+    keeps interior empties, which matters because the criteria tables lead
+    with an empty state column.
+    """
+    return [cell.strip() for cell in row.split("|")]
+
 
 def _inline(text: str) -> str:
-    out = _BOLD_RE.sub(r"<strong>\1</strong>", text)
+    # Code spans are lifted out FIRST and restored last, so their contents are
+    # never touched by the emphasis rules. A citation ref like
+    # `labs:free_t4` is exactly the kind of text that would otherwise be
+    # chewed on by an underscore rule.
+    spans: list[str] = []
+
+    def _stash(match: re.Match[str]) -> str:
+        spans.append(match.group(1))
+        return f"\x00{len(spans) - 1}\x00"
+
+    out = _CODE_RE.sub(_stash, text)
+    out = _BOLD_RE.sub(r"<strong>\1</strong>", out)
     out = _ITALIC_RE.sub(r"<em>\1</em>", out)
     out = _ITALIC_STAR_RE.sub(r"<em>\1</em>", out)
-    return _LINK_RE.sub(r'<a href="\2">\1</a>', out)
+    out = _LINK_RE.sub(r'<a href="\2">\1</a>', out)
+    for index, span in enumerate(spans):
+        out = out.replace(f"\x00{index}\x00", f"<code>{span}</code>")
+    return out
 
 
 def render_markdown_lite(text: str) -> str:
@@ -91,8 +127,52 @@ def render_markdown_lite(text: str) -> str:
             html_parts.append("</ul>")
             list_open = False
 
-    for line in lines:
+    def flush_table(rows: list[str]) -> None:
+        """Render collected rows as a table. The first row is the header and
+        the divider has already been dropped."""
+        if not rows:
+            return
+        head = _table_cells(rows[0])
+        body = [_table_cells(r) for r in rows[1:]]
+        out = ["<table>", "<thead><tr>"]
+        out += [f"<th>{_inline(c)}</th>" for c in head]
+        out.append("</tr></thead>")
+        if body:
+            out.append("<tbody>")
+            for cells in body:
+                out.append("<tr>")
+                # Pad or trim to the header width so a malformed row cannot
+                # skew the whole table.
+                cells = (cells + [""] * len(head))[: len(head)]
+                out += [f"<td>{_inline(c)}</td>" for c in cells]
+                out.append("</tr>")
+            out.append("</tbody>")
+        out.append("</table>")
+        html_parts.append("".join(out))
+
+    index = 0
+    while index < len(lines):
+        line = lines[index]
         stripped = line.strip()
+
+        # A table is a row whose NEXT line is a divider — that pairing is what
+        # separates a real table from a paragraph that happens to contain pipes.
+        row = _TABLE_ROW_RE.match(stripped)
+        if row and index + 1 < len(lines) and _TABLE_DIVIDER_RE.match(lines[index + 1].strip()):
+            flush_paragraph()
+            close_list()
+            collected = [row.group(1)]
+            index += 2  # skip the divider
+            while index < len(lines):
+                nxt = _TABLE_ROW_RE.match(lines[index].strip())
+                if not nxt:
+                    break
+                collected.append(nxt.group(1))
+                index += 1
+            flush_table(collected)
+            continue
+
+        index += 1
         if not stripped:
             flush_paragraph()
             close_list()

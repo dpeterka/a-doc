@@ -75,3 +75,31 @@ def test_reviews_detail_refuses_path_traversal(tmp_path: Path) -> None:
 
     assert response.status_code == 404
     assert "top secret" not in response.text
+
+
+def test_review_criteria_table_renders_as_a_table(tmp_path: Path) -> None:
+    """The criteria scorers emit a markdown table. `markdown_lite` had no rule
+    for one, so every row fell through to the paragraph branch and was joined
+    with spaces — the whole breakdown reached the page as a single line of
+    pipes and dashes. Reported from production."""
+    app, repo, _db, _calls = build_app(tmp_path)
+    name = "2026-08-29-review.md"
+    path = repo.root / "case" / "reviews" / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "# Review\n\n"
+        "## Classification criteria\n\n"
+        "| | Criterion | Points |\n"
+        "|---|---|---|\n"
+        "| ? | Neuropsychiatric — Seizure | 5 |\n",
+        encoding="utf-8",
+    )
+
+    client = TestClient(app)
+    login(client)
+    body = client.get(f"/reviews/{name}").text
+
+    assert "<table>" in body
+    assert "<th>Criterion</th>" in body
+    assert "<td>Neuropsychiatric — Seizure</td>" in body
+    assert "|---|" not in body
