@@ -5,27 +5,65 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.20.0] — 2026-08-29
+## [0.21.0] — 2026-08-29
 
 ### Fixed
 
-- **A slow chat turn lost its reply.** The patient reported slow or absent
-  responses. Measured in production: an informational turn finished 63
-  seconds in with no POST completion logged, and a diagnostic turn was
-  still running past seven minutes (`ledger_maintainer` 191s, `challenger`
-  218s) while she reloaded the page three times. The ALB's idle timeout was
-  60 seconds — the AWS default, never set in `alb.yaml` — so the load
-  balancer cut the connection while the app was still working. The DAG
-  completed and the ledger updated; the reply had nowhere to go.
+- **One bad source ref could discard an entire Challenger verdict.** A live
+  turn failed with two validation errors and lost every valid op alongside
+  them. `Evidence.source` used a `field_validator`, which raises, and a
+  raise inside a nested model fails everything containing it — so two
+  unciteable evidence items in one hypothesis threw away the whole payload.
+  ADR 0028 already required that no single field of one item may fail a
+  payload; this is where that was not true. Unsalvageable evidence is now
+  dropped from the hypothesis and logged loudly, while the hypothesis and
+  the rest of the verdict survive.
+- **A valid ref was rejected for carrying commentary.**
+  `patient-report:2026-09-20 (as referenced in proposed diff...)` is a
+  correct ref with an explanation appended — a model that has just written
+  a ref tends to want to explain it. The trailing parenthetical is now
+  stripped and the ref recovered. Salvage only: it strips a parenthetical
+  and nothing else, so an invalid scheme stays invalid, and stripping runs
+  only after a plain match has already failed, leaving a filename that
+  legitimately contains parentheses untouched. The grammar is unchanged and
+  constructing an `Evidence` directly with a bad ref is still an error.
+- **A release could be tagged without its version bump.** `v0.20.0` was
+  tagged and deployed from a branch whose `chore(release)` commit was never
+  made — the bump and changelog edits were left unstaged — so the tag said
+  0.20.0 while the package, and every provenance stamp it produced, said
+  0.19.0. `tests/test_version.py` could not catch it: `pyproject.toml` and
+  `adoc.__version__` agreed with each other and were merely stale relative
+  to the tag. CI now refuses a tag that disagrees with the packaged
+  version.
+
+## [0.20.0] — 2026-08-29
+
+*Released and deployed, but tagged without its version bump — the package
+reported 0.19.0. Recorded here after the fact; see 0.21.0.*
+
+### Fixed
+
+- **A slow chat turn lost its reply.** Measured in production: an
+  informational turn finished 63 seconds in with no POST completion logged,
+  and a diagnostic turn was still running past seven minutes
+  (`ledger_maintainer` 191s, `challenger` 218s) while the patient reloaded
+  the page three times. The ALB's idle timeout was 60 seconds — the AWS
+  default, never set in `alb.yaml` — so the load balancer cut the
+  connection while the app was still working. The DAG completed and the
+  ledger updated; the reply had nowhere to go.
 
   The timeout is now 1800s. Independently, the page no longer depends on
   that connection surviving: `chat_send` persists the assistant entry
-  before rendering it, so a new `GET /chat/transcript` can return the reply
-  and the page polls for it while a turn is in flight. A dropped connection
+  before rendering it, so `GET /chat/transcript` can return the reply and
+  the page polls for it while a turn is in flight. A dropped connection
   becomes a short delay instead of a lost answer, which also covers a phone
-  changing networks. When a request does die, the patient is told the
-  answer is still coming and that she need not resend — resending would
-  cost a second full DAG run.
+  changing networks.
+
+### Documentation
+
+- ADR 0034 records the phenotype **record-versus-query** rule: the full
+  profile is the record, what an engine receives is a query. LIRICAL scores
+  +4.82 at eight terms and −25.97 at eighty-two.
 
 ## [0.19.0] — 2026-08-29
 
