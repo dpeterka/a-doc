@@ -89,6 +89,7 @@ from adoc.casefile.schema import (
     validate_source_ref,
 )
 from adoc.knowledge.criteria import CriteriaResult, score_all
+from adoc.knowledge.pubmed import PUBMED_CACHE_RELPATH, PubMedArticle, PubMedClient
 from adoc.labs.db import LabsDb
 from adoc.labs.queries import abnormal_summary
 from adoc.labs.validate import canonicalize, trend_outlier
@@ -1284,6 +1285,124 @@ def _render_criteria(scan: CriteriaScanResult) -> list[str]:
     return out
 
 
+LITERATURE_RELPATH = "case/literature.yaml"
+
+# How many hypotheses get a literature refresh per review (PLAN.md: "literature
+# refresh on top-3 hypotheses"). Bounded on purpose: each one is two NCBI calls
+# plus a verification per citation, and a review that queried every hypothesis
+# would spend minutes on leads nobody is acting on.
+LITERATURE_TOP_N = 3
+
+LITERATURE_PER_HYPOTHESIS = 3
+
+# Mirrors `web.casefile_helpers.sort_hypotheses`. Duplicated rather than
+# imported because `reason` importing `web` would invert this codebase's
+# dependency direction and cycle. `test_review_literature` pins the two to the
+# same ordering, so drift fails a test instead of silently ranking the report
+# and the UI differently.
+_LIT_TIER_RANK = {"most-likely": 0, "cant-miss": 1, "expanded": 2}
+_LIT_PROBABILITY_RANK = {"high": 0, "moderate": 1, "low": 2, "minimal": 3}
+
+
+class HypothesisLiterature(BaseModel):
+    """Citations found for one hypothesis. Every article comes from PubMed."""
+
+    hypothesis_id: str
+    hypothesis_name: str
+    query: str = ""
+    total: int = 0
+    articles: list[PubMedArticle] = Field(default_factory=list)
+    error: str = ""
+
+
+class LiteratureRefreshResult(BaseModel):
+    """The review's literature pass.
+
+    Empty is a valid, non-exceptional outcome: NCBI may be unreachable, or a
+    hypothesis may genuinely have no indexed review literature. A review must
+    complete either way, so nothing here is allowed to raise.
+    """
+
+    entries: list[HypothesisLiterature] = Field(default_factory=list)
+
+    @property
+    def citation_count(self) -> int:
+        return sum(len(e.articles) for e in self.entries)
+
+
+def top_hypotheses_for_literature(
+    ledger: Ledger, *, limit: int = LITERATURE_TOP_N
+) -> list[Hypothesis]:
+    """The hypotheses worth spending literature calls on.
+
+    Active only, tier first, probability within tier, then name so the order is
+    stable between reviews — a refresh that reshuffled every run would make the
+    report's literature section look like it changed when it had not.
+    """
+    active = [h for h in ledger.hypotheses if h.status == "active"]
+    return sorted(
+        active,
+        key=lambda h: (
+            _LIT_TIER_RANK.get(h.tier, 99),
+            _LIT_PROBABILITY_RANK.get(h.probability, 99),
+            h.name.lower(),
+        ),
+    )[:limit]
+
+
+def refresh_literature(
+    client: PubMedClient,
+    ledger: Ledger,
+    *,
+    limit: int = LITERATURE_TOP_N,
+    per_hypothesis: int = LITERATURE_PER_HYPOTHESIS,
+) -> LiteratureRefreshResult:
+    """Search PubMed for each of the top hypotheses.
+
+    Deterministic in what it asks for: the query is built by code from the
+    hypothesis name, never written by a model. Never raises — `PubMedClient`
+    reports failure in `error` rather than throwing, and a hypothesis whose
+    search failed simply carries no citations.
+    """
+    entries: list[HypothesisLiterature] = []
+    for hypothesis in top_hypotheses_for_literature(ledger, limit=limit):
+        result = client.search_topic(hypothesis.name, retmax=per_hypothesis)
+        entries.append(
+            HypothesisLiterature(
+                hypothesis_id=hypothesis.id,
+                hypothesis_name=hypothesis.name,
+                query=result.query,
+                total=result.total,
+                articles=result.articles,
+                error=result.error,
+            )
+        )
+    return LiteratureRefreshResult(entries=entries)
+
+
+def render_literature(result: LiteratureRefreshResult) -> list[str]:
+    """The report's literature section.
+
+    Every line carries its PMID, because that is the acceptance criterion and
+    because a citation a reader cannot look up is not a citation. `total` is
+    shown alongside what was fetched so "3 shown" is never mistaken for "3
+    exist"."""
+    lines: list[str] = []
+    for entry in result.entries:
+        lines.append(f"**{entry.hypothesis_name}**")
+        if entry.error:
+            lines.append(f"- _No literature this week: {entry.error}._")
+        elif not entry.articles:
+            lines.append("- _No indexed review literature found for this term._")
+        else:
+            for article in entry.articles:
+                lines.append(f"- {article.short_citation()}  `{article.citation_ref}`")
+            if entry.total > len(entry.articles):
+                lines.append(f"  _{len(entry.articles)} of {entry.total} matching papers shown._")
+        lines.append("")
+    return lines
+
+
 def render_review_markdown(
     *,
     review_date: date,
@@ -1298,6 +1417,7 @@ def render_review_markdown(
     ledger_before: Ledger,
     ledger_after: Ledger,
     criteria: CriteriaScanResult | None = None,
+    literature: LiteratureRefreshResult | None = None,
     trigger_summary: str = "",
 ) -> str:
     """Render the review report: plain-language "what changed"/"what to
@@ -1416,6 +1536,16 @@ def render_review_markdown(
         lines.append("")
         lines += _render_criteria(criteria)
         lines.append("")
+
+    if literature is not None and literature.entries:
+        lines.append("## What the literature says")
+        lines.append("")
+        lines.append(
+            "Recent review articles for the leads above. Every one is a real, "
+            "looked-up paper — the reference in backticks is its PubMed id."
+        )
+        lines.append("")
+        lines += render_literature(literature)
 
     lines.append("## Metrics appendix")
     lines.append("")
@@ -1588,6 +1718,23 @@ def _review_relpath_and_tag(repo: DataRepo, review_date: date, *, now: datetime)
 # --------------------------------------------------------------------------
 
 
+def _default_pubmed_client(repo: DataRepo) -> PubMedClient:
+    """A PubMed client for this repo, configured from settings.
+
+    Settings are read here rather than threaded through `build_review_dag`
+    because the NCBI credentials are optional and only this one node needs
+    them. Tests inject a client instead and never construct this.
+    """
+    from adoc.config import Settings
+
+    settings = Settings()
+    return PubMedClient(
+        repo.root / PUBMED_CACHE_RELPATH,
+        email=settings.eutils_email,
+        api_key=settings.eutils_api_key,
+    )
+
+
 def build_review_dag(
     client: LlmClient,
     repo: DataRepo,
@@ -1598,6 +1745,7 @@ def build_review_dag(
     sink: dict[str, BaseModel] | None = None,
     resolver: SourceTextResolver | None = None,
     entailment_cache: EntailmentCache | None = None,
+    pubmed: PubMedClient | None = None,
     trigger_summary: str = "",
 ) -> Dag:
     """Assemble the weekly-review DAG (PLAN.md loop (c)) — see the module
@@ -1825,6 +1973,23 @@ def build_review_dag(
         results["test_chooser"] = tc_result
         return tc_result
 
+    def _literature_refresh_fn(ctx: Ctx) -> BaseModel:
+        ledger = ctx["apply_review_diff"]
+        assert isinstance(ledger, Ledger)
+        try:
+            searcher = pubmed or _default_pubmed_client(repo)
+            result = refresh_literature(searcher, ledger)
+        except Exception as exc:  # noqa: BLE001 - literature must never fail a review
+            logger.warning("literature refresh failed: %s", exc)
+            result = LiteratureRefreshResult()
+        logger.info(
+            "literature refresh: %d citation(s) across %d hypothes(es)",
+            result.citation_count,
+            len(result.entries),
+        )
+        results["literature_refresh"] = result
+        return result
+
     def _staleness_scan_fn(ctx: Ctx) -> BaseModel:
         ledger = ctx["apply_review_diff"]
         assert isinstance(ledger, Ledger)
@@ -1888,6 +2053,10 @@ def build_review_dag(
         assert isinstance(trend_scan, TrendScanResult)
         criteria = results.get("criteria_scan")
 
+        raw_literature = results.get("literature_refresh")
+        literature_result = (
+            raw_literature if isinstance(raw_literature, LiteratureRefreshResult) else None
+        )
         markdown = render_review_markdown(
             review_date=review_date,
             trend_findings=trend_scan.findings,
@@ -1902,6 +2071,7 @@ def build_review_dag(
             ledger_after=ledger_after,
             trigger_summary=trigger_summary,
             criteria=criteria if isinstance(criteria, CriteriaScanResult) else None,
+            literature=literature_result,
         )
         relpath, tag_name = _review_relpath_and_tag(repo, review_date, now=clock())
         repo.write(relpath, markdown)
@@ -2023,11 +2193,20 @@ def build_review_dag(
     )
     nodes.append(
         Node(
+            name="literature_refresh",
+            fn=_literature_refresh_fn,
+            input_model=TestChooserResult,
+            output_model=LiteratureRefreshResult,
+            depends_on="test_chooser",
+        )
+    )
+    nodes.append(
+        Node(
             name="staleness_scan",
             fn=_staleness_scan_fn,
-            input_model=TestChooserResult,
+            input_model=LiteratureRefreshResult,
             output_model=StalenessReport,
-            depends_on="test_chooser",
+            depends_on="literature_refresh",
         )
     )
     nodes.append(

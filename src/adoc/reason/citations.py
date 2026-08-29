@@ -49,6 +49,7 @@ from adoc.casefile.schema import (
     LedgerDiff,
     LedgerOp,
 )
+from adoc.knowledge.pubmed import fetch_with_retry
 from adoc.labs.db import LabsDb
 from adoc.labs.models import LabResult
 from adoc.labs.validate import canonicalize
@@ -182,7 +183,13 @@ class EutilsPmidVerifier:
 
         url = f"{_EUTILS_ESUMMARY_URL}?db=pubmed&id={pmid}&retmode=json"
         try:
-            raw = self._transport(url)
+            # Share the throttle with PubMed search. Both hit E-utilities, and
+            # two independent limiters produce twice the published rate between
+            # them -- which is how a real, findable PMID ends up recorded
+            # `unverifiable` for no better reason than our own traffic. Observed
+            # live: one of two freshly-searched PMIDs came back "error" purely
+            # because the search that produced it had just used the budget.
+            raw = fetch_with_retry(self._transport, url)
             data = json.loads(raw)
             result = data.get("result", {})
             uids = result.get("uids", [])

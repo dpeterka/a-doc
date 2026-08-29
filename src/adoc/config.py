@@ -41,6 +41,15 @@ class Settings(BaseSettings):
     models_file: Path = _DEFAULT_MODELS_FILE
     dropbox_folder: str = "Dropbox/a-doc-inbox"
 
+    # NCBI E-utilities, used by PubMed search and PMID verification. Both are
+    # optional: anonymous access works at a lower rate limit, which is why the
+    # shared limiter paces on whether a key is present rather than requiring
+    # one. `eutils_email` is the address NCBI would contact about excessive
+    # use — configuration rather than a constant, because a personal address
+    # does not belong hard-coded in a public repo.
+    eutils_email: str = ""
+    eutils_api_key: str = ""
+
     # SQLite journal mode for `labs.sqlite` (see `labs.db.LabsDb.__init__`'s
     # docstring for the full rationale): "WAL" is the fast local/dev/test
     # default; the deployed ECS/Fargate tasks set
