@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.20.0] — 2026-08-29
+
+### Fixed
+
+- **A slow chat turn lost its reply.** The patient reported slow or absent
+  responses. Measured in production: an informational turn finished 63
+  seconds in with no POST completion logged, and a diagnostic turn was
+  still running past seven minutes (`ledger_maintainer` 191s, `challenger`
+  218s) while she reloaded the page three times. The ALB's idle timeout was
+  60 seconds — the AWS default, never set in `alb.yaml` — so the load
+  balancer cut the connection while the app was still working. The DAG
+  completed and the ledger updated; the reply had nowhere to go.
+
+  The timeout is now 1800s. Independently, the page no longer depends on
+  that connection surviving: `chat_send` persists the assistant entry
+  before rendering it, so a new `GET /chat/transcript` can return the reply
+  and the page polls for it while a turn is in flight. A dropped connection
+  becomes a short delay instead of a lost answer, which also covers a phone
+  changing networks. When a request does die, the patient is told the
+  answer is still coming and that she need not resend — resending would
+  cost a second full DAG run.
+
 ## [0.19.0] — 2026-08-29
 
 ### Added
