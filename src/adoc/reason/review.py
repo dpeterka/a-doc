@@ -72,6 +72,12 @@ from adoc.casefile.questions import (
     save_questions,
 )
 from adoc.casefile.repo import HISTORY_RELPATH, LEDGER_RELPATH, DataRepo
+from adoc.casefile.retirement import (
+    RetirementReport,
+    propose_retirements,
+    render_retirements,
+    retirements_to_diff,
+)
 from adoc.casefile.schema import (
     AddEvidence,
     AddHypothesis,
@@ -1416,6 +1422,7 @@ def render_review_markdown(
     metrics: OpsMetrics,
     ledger_before: Ledger,
     ledger_after: Ledger,
+    retirements: RetirementReport | None = None,
     criteria: CriteriaScanResult | None = None,
     literature: LiteratureRefreshResult | None = None,
     trigger_summary: str = "",
@@ -1505,6 +1512,11 @@ def render_review_markdown(
                     f"- ({deferred_finding.hypothesis_id}) {deferred_claim!r}: {deferred_rationale}"
                 )
         lines.append("")
+
+    if retirements is not None and (retirements.retirements or retirements.protected_count):
+        lines.append("## No longer on the list")
+        lines.append("")
+        lines += render_retirements(retirements)
 
     lines.append("## What to ask your doctor")
     lines.append("")
@@ -1973,6 +1985,47 @@ def build_review_dag(
         results["test_chooser"] = tc_result
         return tc_result
 
+    def _retirement_pass_fn(ctx: Ctx) -> BaseModel:
+        """Retire hypotheses that have stopped earning their place (ADR 0035).
+
+        Deterministic, never a model call. Runs AFTER `apply_review_diff` so
+        it judges the ledger this review produced, and applies its own diff so
+        the ledger invariants still get to check it — retirement is a status
+        change like any other and does not get a private back door.
+
+        `cant-miss` and patient-origin hypotheses are excluded absolutely; see
+        `casefile.retirement`.
+        """
+        ledger = ctx["apply_review_diff"]
+        assert isinstance(ledger, Ledger)
+        report = propose_retirements(ledger, today=clock().date())
+        if not report.retirements:
+            logger.info("retirement: nothing retired (%d protected)", report.protected_count)
+            results["retirement_pass"] = report
+            return report
+
+        diff = retirements_to_diff(
+            report,
+            provenance=Provenance(
+                app_version=__version__,
+                prompt_template_version="n/a-deterministic",
+                model_id="none",
+                dag_node="retirement_pass",
+                timestamp=clock(),
+            ),
+        )
+        assert diff is not None
+        try:
+            repo.apply_ledger_diff(ledger_path, repo.root / HISTORY_RELPATH, diff)
+        except Exception as exc:  # noqa: BLE001 - a failed retirement must not fail a review
+            logger.warning("retirement: could not apply: %s", exc)
+            results["retirement_pass"] = RetirementReport(protected_count=report.protected_count)
+            return results["retirement_pass"]
+
+        logger.info("retirement: %d retired, %d protected", report.count, report.protected_count)
+        results["retirement_pass"] = report
+        return report
+
     def _literature_refresh_fn(ctx: Ctx) -> BaseModel:
         ledger = ctx["apply_review_diff"]
         assert isinstance(ledger, Ledger)
@@ -2057,6 +2110,8 @@ def build_review_dag(
         literature_result = (
             raw_literature if isinstance(raw_literature, LiteratureRefreshResult) else None
         )
+        raw_retire = results.get("retirement_pass")
+        retirement_result = raw_retire if isinstance(raw_retire, RetirementReport) else None
         markdown = render_review_markdown(
             review_date=review_date,
             trend_findings=trend_scan.findings,
@@ -2070,6 +2125,7 @@ def build_review_dag(
             ledger_before=ledger_before,
             ledger_after=ledger_after,
             trigger_summary=trigger_summary,
+            retirements=retirement_result,
             criteria=criteria if isinstance(criteria, CriteriaScanResult) else None,
             literature=literature_result,
         )
@@ -2184,11 +2240,20 @@ def build_review_dag(
     )
     nodes.append(
         Node(
+            name="retirement_pass",
+            fn=_retirement_pass_fn,
+            input_model=Ledger,
+            output_model=RetirementReport,
+            depends_on="apply_review_diff",
+        )
+    )
+    nodes.append(
+        Node(
             name="test_chooser",
             fn=_test_chooser_fn,
-            input_model=Ledger,
+            input_model=RetirementReport,
             output_model=TestChooserResult,
-            depends_on="apply_review_diff",
+            depends_on="retirement_pass",
         )
     )
     nodes.append(
