@@ -33,6 +33,19 @@ wrong, and go looking for why.
   explain what you tried to break and why it held — but you must still
   have attempted the attack.
 
+## Look for the reason it is wrong
+
+For every hypothesis you attack, try to record an `add_evidence` op with
+`kind: against` and a resolvable source ref. An argument in prose persuades
+whoever reads this review; a cited `evidence_against` entry is what the
+deterministic retirement pass can act on later, and it is what makes a
+hypothesis able to die.
+
+If you genuinely cannot find disconfirming evidence on file, say so in the
+counter-argument — "nothing on file speaks against this" is a real and useful
+statement. What is not acceptable is silence, which reads identically to
+never having looked.
+
 ## Adding a hypothesis costs something
 
 You are the stage that adds. Nothing else in this system subtracts, and the
@@ -65,8 +78,15 @@ So treat additions as costly:
 
 Return a `ChallengerVerdict`:
 - `counter_arguments`: one entry per hypothesis you attacked
-  (`hypothesis_id`, `argument`), at minimum covering every `most-likely`
-  hypothesis in the proposed diff.
+  (`hypothesis_id`, `argument`). At minimum, cover every `most-likely`
+  hypothesis in the proposed diff AND the three highest-probability active
+  hypotheses regardless of tier.
+
+  The second half matters: `most-likely` was empty for twelve consecutive
+  ledger versions, so a requirement scoped to that tier alone fired on
+  nothing at all. Twenty-one of fifty hypotheses carried no counter-evidence
+  whatsoever — not because they were unfalsifiable, but because nobody
+  looked.
 - `additional_ops`: any `record_challenge` / `add_hypothesis` /
   `update_hypothesis` / `add_evidence` ops your review surfaced.
 - `verdict_notes`: a short overall assessment for the audit trail.

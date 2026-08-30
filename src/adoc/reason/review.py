@@ -62,7 +62,7 @@ from pydantic import BaseModel, Field, ValidationError, field_validator, model_v
 
 from adoc import __version__
 from adoc.casefile.ledger import ACTIVE_STATUSES, load_ledger
-from adoc.casefile.phenotype import PHENOTYPE_RELPATH, load_phenotype
+from adoc.casefile.phenotype import PHENOTYPE_RELPATH, load_phenotype, select_for_engine
 from adoc.casefile.questions import (
     QUESTIONS_RELPATH,
     OpenQuestion,
@@ -95,6 +95,13 @@ from adoc.casefile.schema import (
     validate_source_ref,
 )
 from adoc.knowledge.criteria import CriteriaResult, score_all
+from adoc.knowledge.lirical import LiricalRequest
+from adoc.knowledge.lirical_divergence import (
+    LiricalComparison,
+    compare_to_ledger,
+    render_comparison,
+)
+from adoc.knowledge.lirical_runner import LIRICAL_WORK_RELDIR, EcsLiricalRunner, LiricalRunner
 from adoc.knowledge.pubmed import PUBMED_CACHE_RELPATH, PubMedArticle, PubMedClient
 from adoc.labs.db import LabsDb
 from adoc.labs.queries import abnormal_summary
@@ -1424,6 +1431,7 @@ def render_review_markdown(
     ledger_after: Ledger,
     retirements: RetirementReport | None = None,
     criteria: CriteriaScanResult | None = None,
+    lirical: LiricalComparison | None = None,
     literature: LiteratureRefreshResult | None = None,
     trigger_summary: str = "",
 ) -> str:
@@ -1548,6 +1556,11 @@ def render_review_markdown(
         lines.append("")
         lines += _render_criteria(criteria)
         lines.append("")
+
+    if lirical is not None and (lirical.findings or lirical.error):
+        lines.append("## A second opinion from the phenotype engine")
+        lines.append("")
+        lines += render_comparison(lirical)
 
     if literature is not None and literature.entries:
         lines.append("## What the literature says")
@@ -1730,6 +1743,27 @@ def _review_relpath_and_tag(repo: DataRepo, review_date: date, *, now: datetime)
 # --------------------------------------------------------------------------
 
 
+def _default_lirical_runner(repo: DataRepo) -> LiricalRunner:
+    """The production runner, configured from settings.
+
+    Read here rather than threaded through `build_review_dag` for the same
+    reason as the PubMed client: only this node needs them, they are all
+    optional, and tests inject a runner instead.
+    """
+    from adoc.config import Settings
+
+    settings = Settings()
+    work_dir = repo.root / LIRICAL_WORK_RELDIR
+    return EcsLiricalRunner(
+        work_dir,
+        cluster=settings.lirical_cluster,
+        task_definition=settings.lirical_task_definition,
+        subnets=settings.lirical_subnet_ids(),
+        security_groups=settings.lirical_security_group_ids(),
+        container_work_dir=str(work_dir),
+    )
+
+
 def _default_pubmed_client(repo: DataRepo) -> PubMedClient:
     """A PubMed client for this repo, configured from settings.
 
@@ -1758,6 +1792,7 @@ def build_review_dag(
     resolver: SourceTextResolver | None = None,
     entailment_cache: EntailmentCache | None = None,
     pubmed: PubMedClient | None = None,
+    lirical: LiricalRunner | None = None,
     trigger_summary: str = "",
 ) -> Dag:
     """Assemble the weekly-review DAG (PLAN.md loop (c)) — see the module
@@ -2026,6 +2061,58 @@ def build_review_dag(
         results["retirement_pass"] = report
         return report
 
+    def _lirical_divergence_fn(ctx: Ctx) -> BaseModel:
+        """Run the phenotype engine and compare it to the ledger.
+
+        Deliberately AFTER `apply_review_diff`, so it compares against the
+        ledger this review actually produced rather than the one it started
+        with — otherwise every hypothesis the review just added would read as
+        `engine_only`.
+
+        The ledger is RELOADED from disk rather than taken from the context,
+        because `retirement_pass` runs in between and writes its own diff. The
+        context still holds the pre-retirement object, and comparing against
+        that would report every just-retired hypothesis as a `ledger_only`
+        divergence — the engine disagreeing with a differential that no longer
+        exists.
+
+        Never raises. `docs/research/scoring-across-engines.md`: this is a
+        divergence report, not a fifth score to average in.
+        """
+        ledger = load_ledger(ledger_path)
+        try:
+            profile = load_phenotype(repo.root / Path(PHENOTYPE_RELPATH))
+            observed, negated = select_for_engine(profile, today=clock().date())
+            if not observed:
+                return LiricalComparison(ran=False, error="no current phenotype findings to run on")
+
+            runner = lirical or _default_lirical_runner(repo)
+            run = runner.run(
+                LiricalRequest(observed=observed, negated=negated, sample_id="patient")
+            )
+            if not run.ok or run.result is None:
+                logger.info("lirical: not run this review — %s", run.error)
+                return LiricalComparison(ran=False, error=run.error)
+
+            comparison = compare_to_ledger(
+                run.result,
+                ledger,
+                terms_used=run.terms_used,
+                terms_excluded=run.terms_excluded,
+            )
+            logger.info(
+                "lirical: %d finding(s), %d divergence(s), in %.1fs",
+                len(comparison.findings),
+                comparison.divergence_count,
+                run.duration_seconds,
+            )
+        except Exception as exc:  # noqa: BLE001 - the engine must never fail a review
+            logger.warning("lirical: comparison failed: %s", exc)
+            return LiricalComparison(ran=False, error=f"{type(exc).__name__}: {exc}")
+
+        results["lirical_divergence"] = comparison
+        return comparison
+
     def _literature_refresh_fn(ctx: Ctx) -> BaseModel:
         ledger = ctx["apply_review_diff"]
         assert isinstance(ledger, Ledger)
@@ -2106,6 +2193,8 @@ def build_review_dag(
         assert isinstance(trend_scan, TrendScanResult)
         criteria = results.get("criteria_scan")
 
+        raw_lirical = results.get("lirical_divergence")
+        lirical_result = raw_lirical if isinstance(raw_lirical, LiricalComparison) else None
         raw_literature = results.get("literature_refresh")
         literature_result = (
             raw_literature if isinstance(raw_literature, LiteratureRefreshResult) else None
@@ -2127,6 +2216,7 @@ def build_review_dag(
             trigger_summary=trigger_summary,
             retirements=retirement_result,
             criteria=criteria if isinstance(criteria, CriteriaScanResult) else None,
+            lirical=lirical_result,
             literature=literature_result,
         )
         relpath, tag_name = _review_relpath_and_tag(repo, review_date, now=clock())
@@ -2258,11 +2348,20 @@ def build_review_dag(
     )
     nodes.append(
         Node(
+            name="lirical_divergence",
+            fn=_lirical_divergence_fn,
+            input_model=TestChooserResult,
+            output_model=LiricalComparison,
+            depends_on="test_chooser",
+        )
+    )
+    nodes.append(
+        Node(
             name="literature_refresh",
             fn=_literature_refresh_fn,
-            input_model=TestChooserResult,
+            input_model=LiricalComparison,
             output_model=LiteratureRefreshResult,
-            depends_on="test_chooser",
+            depends_on="lirical_divergence",
         )
     )
     nodes.append(
