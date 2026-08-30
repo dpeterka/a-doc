@@ -297,9 +297,15 @@ Resources:
                 - Sid: PassOnlyTheRolesLiricalNeeds
                   Effect: Allow
                   Action: iam:PassRole
+                  # Constructed from the role NAMES rather than !GetAtt.
+                  # `TaskRole` cannot `!GetAtt` itself — this policy is
+                  # attached to it — and CloudFormation reports that as a
+                  # circular dependency at change-set creation. Both roles
+                  # declare an explicit `RoleName`, so the ARN is fully
+                  # determined without a reference.
                   Resource:
-                    - !GetAtt TaskExecutionRole.Arn
-                    - !GetAtt TaskRole.Arn
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/a-doc-task-execution-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/a-doc-task-role"
                   Condition:
                     StringEquals:
                       iam:PassedToService: ecs-tasks.amazonaws.com
