@@ -26,6 +26,7 @@ from pydantic import BaseModel, Field
 from adoc import __version__
 from adoc.casefile.ledger import load_ledger
 from adoc.casefile.repo import HISTORY_RELPATH, DataRepo
+from adoc.casefile.rule_out import strip_ops_missing_rule_out
 from adoc.casefile.schema import (
     AddEvidence,
     AddHypothesis,
@@ -474,6 +475,29 @@ def apply_stage(
     promotion gating, staleness, confirmed-by-doctor bar, version bump)
     enforce the rest, evaluated fresh inside that critical section."""
     combined_ops = list(diff.ops) + list(verdict.additional_ops)
+
+    # A new hypothesis must state what would kill it (ADR 0035). The prompts
+    # require it; this is what makes it true. Strip rather than reject, per
+    # ADR 0016 (revised) and ADR 0028 — a missing `rule_out` on one hypothesis
+    # must never discard a whole verdict, which is the exact defect fixed in
+    # v0.21.0. Dropping the op is a real cost, accepted because a hypothesis
+    # the model will not state a falsification condition for is precisely the
+    # speculative addition ADR 0035 exists to stop, and the next review can
+    # re-add it properly.
+    # Deliberately NOT a DAG contract. A precondition on this node runs BEFORE
+    # this function, so it would raise on exactly the input the strip handles
+    # cleanly — failing a whole turn over one missing field, which is the ADR
+    # 0028 defect fixed in v0.21.0. A postcondition cannot work either: the
+    # fifty hypotheses that predate ADR 0035 all have an empty `rule_out`, so
+    # any check over the resulting ledger fires on all of them forever. The
+    # strip is the enforcement.
+    combined_ops, dropped_no_rule_out = strip_ops_missing_rule_out(combined_ops)
+    for hypothesis_id, name in dropped_no_rule_out:
+        logger.warning(
+            "dropped add_hypothesis %r (%s): no usable rule_out (ADR 0035)",
+            hypothesis_id,
+            name,
+        )
     rationale = diff.rationale
     if verdict.verdict_notes.strip():
         rationale = f"{rationale}\n\nChallenger: {verdict.verdict_notes.strip()}"
