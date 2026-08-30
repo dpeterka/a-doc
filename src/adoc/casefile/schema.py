@@ -210,6 +210,32 @@ class Hypothesis(BaseModel):
     evidence_for: list[Evidence] = Field(default_factory=list)
     evidence_against: list[Evidence] = Field(default_factory=list)
     discriminators: list[str] = Field(default_factory=list)
+    """Findings that would tell this hypothesis apart from its neighbours.
+
+    Undocumented until now, and nothing ever asked a stage to populate it:
+    the only mention in any prompt was `test_chooser.md` telling the chooser
+    not to duplicate one. On the live ledger that left 11 of 50 populated and
+    3 of the 39 retirement-eligible, so the mechanism existed and could never
+    fire (ADR 0035).
+    """
+
+    rule_out: str = ""
+    """The finding that would KILL this hypothesis, stated when it is created.
+
+    Distinct from `discriminators`, and pointing the other way in time. A
+    discriminator separates this hypothesis from a neighbour; a rule-out is
+    the specific result that ends it — "a normal repeat FSH on a draw four or
+    more weeks later", "a negative cartilage biopsy".
+
+    This is what lets a hypothesis die of natural causes. Without it a
+    well-supported but wrong hypothesis lives forever, because nothing ever
+    defines what would settle it: across twelve ledger versions not one of
+    fifty hypotheses had ever left `active`.
+
+    Defaulted so every existing ledger round-trips, exactly as
+    `plain_language` was.
+    """
+
     challenger_notes: str = ""
     last_challenged: date | None = None
     last_challenged_version: int | None = None
@@ -258,6 +284,9 @@ class UpdateHypothesis(BaseModel):
     probability: ProbabilityBucket | None = None
     status: HypothesisStatus | None = None
     discriminators: list[str] | None = None
+    rule_out: str | None = None
+    """Settable after creation so a later review can supply the falsification
+    condition for a hypothesis that predates the field (ADR 0035)."""
 
 
 class AddEvidence(BaseModel):
