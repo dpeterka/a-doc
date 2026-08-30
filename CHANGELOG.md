@@ -5,6 +5,68 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.22.0] — 2026-08-30
+
+### Added
+
+- **The ledger can now end a hypothesis** (ADR 0035). Measured at ledger
+  version 12: 50 hypotheses, every one `active`, none ever retired across
+  twelve versions, zero in the `most-likely` tier, 21 with no
+  counter-evidence at all. `ruled-out` appeared in no prompt and no code —
+  reachable in the type system, unreachable in practice. One stage added
+  and no stage subtracted, so the ledger could only grow.
+
+  Four changes: a deterministic retirement pass in the review; a required
+  `rule_out` on every new hypothesis (the specific finding that would end
+  it, never "further testing"); a displacement budget on the Challenger,
+  which produced 47 of the 50; and a requirement that `most-likely` be
+  populated or its emptiness explained.
+
+  Two exclusions in the retirement pass are absolute: a `cant-miss`
+  hypothesis is never auto-retired, because the cost of missing one is
+  catastrophic and asymmetric, and a patient-origin hypothesis is never
+  auto-retired, because her theory is hers to withdraw (ADR 0032). Nothing
+  is deleted — retirement is a status change applied through a `LedgerDiff`
+  so the existing invariants still check it, and reversible by any later
+  review that finds support. Dry-run against the live ledger: 50 active
+  → 42, with 11 protected and never assessed.
+
+- **LIRICAL runs in the review and reports where it disagrees.** The
+  engine is compared against the differential rather than folded into it:
+  its composite likelihood ratio is the only genuine LR in the system,
+  while criteria scorers produce points against a threshold and the panel
+  produces uncalibrated buckets, and averaging those is the unit-blindness
+  that has already produced three wrong clinical conclusions here. Three
+  outcomes per item — the engine raises what the differential lacks, the
+  differential holds what the engine cannot support (explicitly not a
+  refutation, since LIRICAL sees only phenotype), and agreement, which is
+  recorded rather than dropped.
+
+  It runs on the phenotype QUERY, not the record (ADR 0034): eight terms
+  rather than ninety, because the composite LR declines monotonically with
+  profile size. Invoked as a sibling ECS task with narrowly scoped IAM —
+  `RunTask` on one task-definition family in one cluster, `PassRole` for
+  exactly the two roles that definition names and conditioned on
+  `ecs-tasks`.
+
+### Fixed
+
+- **A Challenger rule that fired on nothing.** Its counter-arguments had to
+  cover "every `most-likely` hypothesis", and `most-likely` was empty for
+  twelve consecutive versions — so the requirement was satisfied
+  vacuously every time. That is why 21 of 50 hypotheses carried no
+  counter-evidence: not because they were unfalsifiable, but because
+  nobody looked. Coverage now extends to the three highest-probability
+  active hypotheses regardless of tier, and the stage is asked for cited
+  `evidence_against` rather than prose alone, because a citation is what
+  the retirement pass can act on later.
+
+### Documentation
+
+- `docs/research/scoring-across-engines.md` — why scores from different
+  engines are not comparable, and why the ledger was not converging.
+- ADR 0035, ADR 0034.
+
 ## [0.21.0] — 2026-08-29
 
 ### Fixed
