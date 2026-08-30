@@ -62,7 +62,7 @@ from pydantic import BaseModel, Field, ValidationError, field_validator, model_v
 
 from adoc import __version__
 from adoc.casefile.ledger import ACTIVE_STATUSES, load_ledger
-from adoc.casefile.phenotype import PHENOTYPE_RELPATH, load_phenotype
+from adoc.casefile.phenotype import PHENOTYPE_RELPATH, load_phenotype, select_for_engine
 from adoc.casefile.questions import (
     QUESTIONS_RELPATH,
     OpenQuestion,
@@ -72,6 +72,12 @@ from adoc.casefile.questions import (
     save_questions,
 )
 from adoc.casefile.repo import HISTORY_RELPATH, LEDGER_RELPATH, DataRepo
+from adoc.casefile.retirement import (
+    RetirementReport,
+    propose_retirements,
+    render_retirements,
+    retirements_to_diff,
+)
 from adoc.casefile.schema import (
     AddEvidence,
     AddHypothesis,
@@ -89,6 +95,14 @@ from adoc.casefile.schema import (
     validate_source_ref,
 )
 from adoc.knowledge.criteria import CriteriaResult, score_all
+from adoc.knowledge.lirical import LiricalRequest
+from adoc.knowledge.lirical_divergence import (
+    LiricalComparison,
+    compare_to_ledger,
+    render_comparison,
+)
+from adoc.knowledge.lirical_runner import LIRICAL_WORK_RELDIR, EcsLiricalRunner, LiricalRunner
+from adoc.knowledge.pubmed import PUBMED_CACHE_RELPATH, PubMedArticle, PubMedClient
 from adoc.labs.db import LabsDb
 from adoc.labs.queries import abnormal_summary
 from adoc.labs.validate import canonicalize, trend_outlier
@@ -1284,6 +1298,124 @@ def _render_criteria(scan: CriteriaScanResult) -> list[str]:
     return out
 
 
+LITERATURE_RELPATH = "case/literature.yaml"
+
+# How many hypotheses get a literature refresh per review (PLAN.md: "literature
+# refresh on top-3 hypotheses"). Bounded on purpose: each one is two NCBI calls
+# plus a verification per citation, and a review that queried every hypothesis
+# would spend minutes on leads nobody is acting on.
+LITERATURE_TOP_N = 3
+
+LITERATURE_PER_HYPOTHESIS = 3
+
+# Mirrors `web.casefile_helpers.sort_hypotheses`. Duplicated rather than
+# imported because `reason` importing `web` would invert this codebase's
+# dependency direction and cycle. `test_review_literature` pins the two to the
+# same ordering, so drift fails a test instead of silently ranking the report
+# and the UI differently.
+_LIT_TIER_RANK = {"most-likely": 0, "cant-miss": 1, "expanded": 2}
+_LIT_PROBABILITY_RANK = {"high": 0, "moderate": 1, "low": 2, "minimal": 3}
+
+
+class HypothesisLiterature(BaseModel):
+    """Citations found for one hypothesis. Every article comes from PubMed."""
+
+    hypothesis_id: str
+    hypothesis_name: str
+    query: str = ""
+    total: int = 0
+    articles: list[PubMedArticle] = Field(default_factory=list)
+    error: str = ""
+
+
+class LiteratureRefreshResult(BaseModel):
+    """The review's literature pass.
+
+    Empty is a valid, non-exceptional outcome: NCBI may be unreachable, or a
+    hypothesis may genuinely have no indexed review literature. A review must
+    complete either way, so nothing here is allowed to raise.
+    """
+
+    entries: list[HypothesisLiterature] = Field(default_factory=list)
+
+    @property
+    def citation_count(self) -> int:
+        return sum(len(e.articles) for e in self.entries)
+
+
+def top_hypotheses_for_literature(
+    ledger: Ledger, *, limit: int = LITERATURE_TOP_N
+) -> list[Hypothesis]:
+    """The hypotheses worth spending literature calls on.
+
+    Active only, tier first, probability within tier, then name so the order is
+    stable between reviews — a refresh that reshuffled every run would make the
+    report's literature section look like it changed when it had not.
+    """
+    active = [h for h in ledger.hypotheses if h.status == "active"]
+    return sorted(
+        active,
+        key=lambda h: (
+            _LIT_TIER_RANK.get(h.tier, 99),
+            _LIT_PROBABILITY_RANK.get(h.probability, 99),
+            h.name.lower(),
+        ),
+    )[:limit]
+
+
+def refresh_literature(
+    client: PubMedClient,
+    ledger: Ledger,
+    *,
+    limit: int = LITERATURE_TOP_N,
+    per_hypothesis: int = LITERATURE_PER_HYPOTHESIS,
+) -> LiteratureRefreshResult:
+    """Search PubMed for each of the top hypotheses.
+
+    Deterministic in what it asks for: the query is built by code from the
+    hypothesis name, never written by a model. Never raises — `PubMedClient`
+    reports failure in `error` rather than throwing, and a hypothesis whose
+    search failed simply carries no citations.
+    """
+    entries: list[HypothesisLiterature] = []
+    for hypothesis in top_hypotheses_for_literature(ledger, limit=limit):
+        result = client.search_topic(hypothesis.name, retmax=per_hypothesis)
+        entries.append(
+            HypothesisLiterature(
+                hypothesis_id=hypothesis.id,
+                hypothesis_name=hypothesis.name,
+                query=result.query,
+                total=result.total,
+                articles=result.articles,
+                error=result.error,
+            )
+        )
+    return LiteratureRefreshResult(entries=entries)
+
+
+def render_literature(result: LiteratureRefreshResult) -> list[str]:
+    """The report's literature section.
+
+    Every line carries its PMID, because that is the acceptance criterion and
+    because a citation a reader cannot look up is not a citation. `total` is
+    shown alongside what was fetched so "3 shown" is never mistaken for "3
+    exist"."""
+    lines: list[str] = []
+    for entry in result.entries:
+        lines.append(f"**{entry.hypothesis_name}**")
+        if entry.error:
+            lines.append(f"- _No literature this week: {entry.error}._")
+        elif not entry.articles:
+            lines.append("- _No indexed review literature found for this term._")
+        else:
+            for article in entry.articles:
+                lines.append(f"- {article.short_citation()}  `{article.citation_ref}`")
+            if entry.total > len(entry.articles):
+                lines.append(f"  _{len(entry.articles)} of {entry.total} matching papers shown._")
+        lines.append("")
+    return lines
+
+
 def render_review_markdown(
     *,
     review_date: date,
@@ -1297,7 +1429,10 @@ def render_review_markdown(
     metrics: OpsMetrics,
     ledger_before: Ledger,
     ledger_after: Ledger,
+    retirements: RetirementReport | None = None,
     criteria: CriteriaScanResult | None = None,
+    lirical: LiricalComparison | None = None,
+    literature: LiteratureRefreshResult | None = None,
     trigger_summary: str = "",
 ) -> str:
     """Render the review report: plain-language "what changed"/"what to
@@ -1386,6 +1521,11 @@ def render_review_markdown(
                 )
         lines.append("")
 
+    if retirements is not None and (retirements.retirements or retirements.protected_count):
+        lines.append("## No longer on the list")
+        lines.append("")
+        lines += render_retirements(retirements)
+
     lines.append("## What to ask your doctor")
     lines.append("")
     if test_chooser.items:
@@ -1416,6 +1556,21 @@ def render_review_markdown(
         lines.append("")
         lines += _render_criteria(criteria)
         lines.append("")
+
+    if lirical is not None and (lirical.findings or lirical.error):
+        lines.append("## A second opinion from the phenotype engine")
+        lines.append("")
+        lines += render_comparison(lirical)
+
+    if literature is not None and literature.entries:
+        lines.append("## What the literature says")
+        lines.append("")
+        lines.append(
+            "Recent review articles for the leads above. Every one is a real, "
+            "looked-up paper — the reference in backticks is its PubMed id."
+        )
+        lines.append("")
+        lines += render_literature(literature)
 
     lines.append("## Metrics appendix")
     lines.append("")
@@ -1588,6 +1743,44 @@ def _review_relpath_and_tag(repo: DataRepo, review_date: date, *, now: datetime)
 # --------------------------------------------------------------------------
 
 
+def _default_lirical_runner(repo: DataRepo) -> LiricalRunner:
+    """The production runner, configured from settings.
+
+    Read here rather than threaded through `build_review_dag` for the same
+    reason as the PubMed client: only this node needs them, they are all
+    optional, and tests inject a runner instead.
+    """
+    from adoc.config import Settings
+
+    settings = Settings()
+    work_dir = repo.root / LIRICAL_WORK_RELDIR
+    return EcsLiricalRunner(
+        work_dir,
+        cluster=settings.lirical_cluster,
+        task_definition=settings.lirical_task_definition,
+        subnets=settings.lirical_subnet_ids(),
+        security_groups=settings.lirical_security_group_ids(),
+        container_work_dir=str(work_dir),
+    )
+
+
+def _default_pubmed_client(repo: DataRepo) -> PubMedClient:
+    """A PubMed client for this repo, configured from settings.
+
+    Settings are read here rather than threaded through `build_review_dag`
+    because the NCBI credentials are optional and only this one node needs
+    them. Tests inject a client instead and never construct this.
+    """
+    from adoc.config import Settings
+
+    settings = Settings()
+    return PubMedClient(
+        repo.root / PUBMED_CACHE_RELPATH,
+        email=settings.eutils_email,
+        api_key=settings.eutils_api_key,
+    )
+
+
 def build_review_dag(
     client: LlmClient,
     repo: DataRepo,
@@ -1598,6 +1791,8 @@ def build_review_dag(
     sink: dict[str, BaseModel] | None = None,
     resolver: SourceTextResolver | None = None,
     entailment_cache: EntailmentCache | None = None,
+    pubmed: PubMedClient | None = None,
+    lirical: LiricalRunner | None = None,
     trigger_summary: str = "",
 ) -> Dag:
     """Assemble the weekly-review DAG (PLAN.md loop (c)) — see the module
@@ -1825,6 +2020,116 @@ def build_review_dag(
         results["test_chooser"] = tc_result
         return tc_result
 
+    def _retirement_pass_fn(ctx: Ctx) -> BaseModel:
+        """Retire hypotheses that have stopped earning their place (ADR 0035).
+
+        Deterministic, never a model call. Runs AFTER `apply_review_diff` so
+        it judges the ledger this review produced, and applies its own diff so
+        the ledger invariants still get to check it — retirement is a status
+        change like any other and does not get a private back door.
+
+        `cant-miss` and patient-origin hypotheses are excluded absolutely; see
+        `casefile.retirement`.
+        """
+        ledger = ctx["apply_review_diff"]
+        assert isinstance(ledger, Ledger)
+        report = propose_retirements(ledger, today=clock().date())
+        if not report.retirements:
+            logger.info("retirement: nothing retired (%d protected)", report.protected_count)
+            results["retirement_pass"] = report
+            return report
+
+        diff = retirements_to_diff(
+            report,
+            provenance=Provenance(
+                app_version=__version__,
+                prompt_template_version="n/a-deterministic",
+                model_id="none",
+                dag_node="retirement_pass",
+                timestamp=clock(),
+            ),
+        )
+        assert diff is not None
+        try:
+            repo.apply_ledger_diff(ledger_path, repo.root / HISTORY_RELPATH, diff)
+        except Exception as exc:  # noqa: BLE001 - a failed retirement must not fail a review
+            logger.warning("retirement: could not apply: %s", exc)
+            results["retirement_pass"] = RetirementReport(protected_count=report.protected_count)
+            return results["retirement_pass"]
+
+        logger.info("retirement: %d retired, %d protected", report.count, report.protected_count)
+        results["retirement_pass"] = report
+        return report
+
+    def _lirical_divergence_fn(ctx: Ctx) -> BaseModel:
+        """Run the phenotype engine and compare it to the ledger.
+
+        Deliberately AFTER `apply_review_diff`, so it compares against the
+        ledger this review actually produced rather than the one it started
+        with — otherwise every hypothesis the review just added would read as
+        `engine_only`.
+
+        The ledger is RELOADED from disk rather than taken from the context,
+        because `retirement_pass` runs in between and writes its own diff. The
+        context still holds the pre-retirement object, and comparing against
+        that would report every just-retired hypothesis as a `ledger_only`
+        divergence — the engine disagreeing with a differential that no longer
+        exists.
+
+        Never raises. `docs/research/scoring-across-engines.md`: this is a
+        divergence report, not a fifth score to average in.
+        """
+        ledger = load_ledger(ledger_path)
+        try:
+            profile = load_phenotype(repo.root / Path(PHENOTYPE_RELPATH))
+            observed, negated = select_for_engine(profile, today=clock().date())
+            if not observed:
+                return LiricalComparison(ran=False, error="no current phenotype findings to run on")
+
+            runner = lirical or _default_lirical_runner(repo)
+            run = runner.run(
+                LiricalRequest(observed=observed, negated=negated, sample_id="patient")
+            )
+            if not run.ok or run.result is None:
+                logger.info("lirical: not run this review — %s", run.error)
+                return LiricalComparison(ran=False, error=run.error)
+
+            comparison = compare_to_ledger(
+                run.result,
+                ledger,
+                terms_used=run.terms_used,
+                terms_excluded=run.terms_excluded,
+            )
+            logger.info(
+                "lirical: %d finding(s), %d divergence(s), in %.1fs",
+                len(comparison.findings),
+                comparison.divergence_count,
+                run.duration_seconds,
+            )
+        except Exception as exc:  # noqa: BLE001 - the engine must never fail a review
+            logger.warning("lirical: comparison failed: %s", exc)
+            return LiricalComparison(ran=False, error=f"{type(exc).__name__}: {exc}")
+
+        results["lirical_divergence"] = comparison
+        return comparison
+
+    def _literature_refresh_fn(ctx: Ctx) -> BaseModel:
+        ledger = ctx["apply_review_diff"]
+        assert isinstance(ledger, Ledger)
+        try:
+            searcher = pubmed or _default_pubmed_client(repo)
+            result = refresh_literature(searcher, ledger)
+        except Exception as exc:  # noqa: BLE001 - literature must never fail a review
+            logger.warning("literature refresh failed: %s", exc)
+            result = LiteratureRefreshResult()
+        logger.info(
+            "literature refresh: %d citation(s) across %d hypothes(es)",
+            result.citation_count,
+            len(result.entries),
+        )
+        results["literature_refresh"] = result
+        return result
+
     def _staleness_scan_fn(ctx: Ctx) -> BaseModel:
         ledger = ctx["apply_review_diff"]
         assert isinstance(ledger, Ledger)
@@ -1888,6 +2193,14 @@ def build_review_dag(
         assert isinstance(trend_scan, TrendScanResult)
         criteria = results.get("criteria_scan")
 
+        raw_lirical = results.get("lirical_divergence")
+        lirical_result = raw_lirical if isinstance(raw_lirical, LiricalComparison) else None
+        raw_literature = results.get("literature_refresh")
+        literature_result = (
+            raw_literature if isinstance(raw_literature, LiteratureRefreshResult) else None
+        )
+        raw_retire = results.get("retirement_pass")
+        retirement_result = raw_retire if isinstance(raw_retire, RetirementReport) else None
         markdown = render_review_markdown(
             review_date=review_date,
             trend_findings=trend_scan.findings,
@@ -1901,7 +2214,10 @@ def build_review_dag(
             ledger_before=ledger_before,
             ledger_after=ledger_after,
             trigger_summary=trigger_summary,
+            retirements=retirement_result,
             criteria=criteria if isinstance(criteria, CriteriaScanResult) else None,
+            lirical=lirical_result,
+            literature=literature_result,
         )
         relpath, tag_name = _review_relpath_and_tag(repo, review_date, now=clock())
         repo.write(relpath, markdown)
@@ -2014,20 +2330,47 @@ def build_review_dag(
     )
     nodes.append(
         Node(
+            name="retirement_pass",
+            fn=_retirement_pass_fn,
+            input_model=Ledger,
+            output_model=RetirementReport,
+            depends_on="apply_review_diff",
+        )
+    )
+    nodes.append(
+        Node(
             name="test_chooser",
             fn=_test_chooser_fn,
-            input_model=Ledger,
+            input_model=RetirementReport,
             output_model=TestChooserResult,
-            depends_on="apply_review_diff",
+            depends_on="retirement_pass",
+        )
+    )
+    nodes.append(
+        Node(
+            name="lirical_divergence",
+            fn=_lirical_divergence_fn,
+            input_model=TestChooserResult,
+            output_model=LiricalComparison,
+            depends_on="test_chooser",
+        )
+    )
+    nodes.append(
+        Node(
+            name="literature_refresh",
+            fn=_literature_refresh_fn,
+            input_model=LiricalComparison,
+            output_model=LiteratureRefreshResult,
+            depends_on="lirical_divergence",
         )
     )
     nodes.append(
         Node(
             name="staleness_scan",
             fn=_staleness_scan_fn,
-            input_model=TestChooserResult,
+            input_model=LiteratureRefreshResult,
             output_model=StalenessReport,
-            depends_on="test_chooser",
+            depends_on="literature_refresh",
         )
     )
     nodes.append(

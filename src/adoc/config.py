@@ -41,6 +41,37 @@ class Settings(BaseSettings):
     models_file: Path = _DEFAULT_MODELS_FILE
     dropbox_folder: str = "Dropbox/a-doc-inbox"
 
+    # NCBI E-utilities, used by PubMed search and PMID verification. Both are
+    # optional: anonymous access works at a lower rate limit, which is why the
+    # shared limiter paces on whether a key is present rather than requiring
+    # one. `eutils_email` is the address NCBI would contact about excessive
+    # use — configuration rather than a constant, because a personal address
+    # does not belong hard-coded in a public repo.
+    eutils_email: str = ""
+    eutils_api_key: str = ""
+
+    # Launching the LIRICAL sidecar (ADR 0029: separate image, input and
+    # output exchanged on EFS). All optional and all empty by default: a local
+    # run has no cluster, and the review reports "the phenotype engine did not
+    # run" rather than failing. The deployed task definitions supply them.
+    #
+    # Not derived from the running task's metadata, though that would work:
+    # the review must be runnable from a laptop against a copy of the data,
+    # and configuration that only resolves inside ECS would make that
+    # impossible to test.
+    lirical_cluster: str = ""
+    lirical_task_definition: str = "a-doc-lirical"
+    lirical_subnets: str = ""
+    """Comma-separated. A string rather than a list because it arrives as one
+    environment variable."""
+    lirical_security_groups: str = ""
+
+    def lirical_subnet_ids(self) -> list[str]:
+        return [s.strip() for s in self.lirical_subnets.split(",") if s.strip()]
+
+    def lirical_security_group_ids(self) -> list[str]:
+        return [s.strip() for s in self.lirical_security_groups.split(",") if s.strip()]
+
     # SQLite journal mode for `labs.sqlite` (see `labs.db.LabsDb.__init__`'s
     # docstring for the full rationale): "WAL" is the fast local/dev/test
     # default; the deployed ECS/Fargate tasks set
