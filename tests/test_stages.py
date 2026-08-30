@@ -184,6 +184,7 @@ _SLE_MOST_LIKELY_OP = {
     "op": "add_hypothesis",
     "hypothesis": {
         "id": "sle-01",
+        "rule_out": "a negative anti-dsDNA and normal complement on repeat testing",
         "name": "Systemic lupus erythematosus",
         "tier": "most-likely",
         "probability": "moderate",
@@ -200,6 +201,7 @@ _PE_CANT_MISS_OP = {
     "op": "add_hypothesis",
     "hypothesis": {
         "id": "pe-01",
+        "rule_out": "a negative anti-dsDNA and normal complement on repeat testing",
         "name": "Pulmonary embolism",
         "tier": "cant-miss",
         "probability": "low",
@@ -302,6 +304,7 @@ def test_redteam_patient_theory_is_quarantined_and_context_wired_through(
             "op": "add_hypothesis",
             "hypothesis": {
                 "id": "mcas-01",
+                "rule_out": "a negative anti-dsDNA and normal complement on repeat testing",
                 "name": "Mast cell activation syndrome",
                 "tier": "expanded",
                 "probability": "low",
@@ -1333,6 +1336,7 @@ _NO_EVIDENCE_MOST_LIKELY_OP = {
     "op": "add_hypothesis",
     "hypothesis": {
         "id": "no-evidence-01",
+        "rule_out": "a negative anti-dsDNA and normal complement on repeat testing",
         "name": "Undifferentiated connective tissue disease",
         "tier": "most-likely",
         "probability": "moderate",

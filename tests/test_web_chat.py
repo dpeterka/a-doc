@@ -75,6 +75,7 @@ _SLE_MOST_LIKELY_OP = {
     "op": "add_hypothesis",
     "hypothesis": {
         "id": "sle-01",
+        "rule_out": "a negative anti-dsDNA and normal complement on repeat testing",
         "name": "Systemic lupus erythematosus",
         "tier": "most-likely",
         "probability": "moderate",
@@ -91,6 +92,7 @@ _PE_CANT_MISS_OP = {
     "op": "add_hypothesis",
     "hypothesis": {
         "id": "pe-01",
+        "rule_out": "a negative anti-dsDNA and normal complement on repeat testing",
         "name": "Pulmonary embolism",
         "tier": "cant-miss",
         "probability": "low",
@@ -350,6 +352,7 @@ _ACTIVE_NO_CANT_MISS_OP = {
     "op": "add_hypothesis",
     "hypothesis": {
         "id": "sle-01",
+        "rule_out": "a negative anti-dsDNA and normal complement on repeat testing",
         "name": "Systemic lupus erythematosus",
         "tier": "expanded",
         "probability": "moderate",
