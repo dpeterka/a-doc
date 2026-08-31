@@ -5,6 +5,47 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.26.0] — 2026-08-31
+
+*Closes the loop ADR 0033 opened: a question answered in conversation now
+stops being asked.*
+
+### Added
+
+- **The ordinary chat can close a next-appointment question.** The prompt
+  instruction, the `answered_question_ids` field and the resolution call had
+  all existed since ADR 0033 — inside `intake/agent.py`, and nowhere else.
+  The diagnostic turn had no question handling at all, so answering one in
+  normal conversation closed nothing.
+
+  `resolve_answered` now lives in `casefile/questions.py` and both callers
+  share it. The ledger-maintainer prompt (v3 → v4) is told to use the ids it
+  can now see, and to ask one conversationally when it follows from what she
+  just said — one at a time, the way intake does, never as a list.
+
+  Resolution runs after the diff settles, so a citation retry cannot close a
+  question on an attempt that was then discarded, and it is deliberately not
+  gated on the ledger changing: "here is every supplement I take" updates the
+  record without changing the differential.
+
+### Fixed
+
+- **The reasoner read a stale copy of the open questions.** `context.py` fed
+  every stage `case/questions-open.md`, a rendering nothing regenerates,
+  instead of `questions-open.yaml`, the store that holds the answered state.
+  Measured in production: 43 questions, all `open`, none ever answered, while
+  the answers sat in the record as facts — and 9 of 122 documents already
+  mentioned the supplements she was being asked for again.
+
+  ADR 0032's addendum in one line: a derived artifact is never the read path
+  for data that has a source of truth.
+
+- **An uncited can't-miss lead no longer leads the page** (ADR 0037). A
+  can't-miss entry with no citations and low confidence was printed above
+  leads her own labs point at. It stays in the leading group and is never
+  hidden — the tier exists because missing one is catastrophic — but it now
+  sorts last within it.
+
 ## [0.25.5] — 2026-08-31
 
 ### Fixed
