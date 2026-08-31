@@ -162,3 +162,41 @@ def test_no_match_renders_plainly() -> None:
 
 def test_a_missing_index_is_not_an_error(tmp_path: Path) -> None:
     assert load_statpearls_index(tmp_path / "absent.sqlite") is None
+
+
+# --- concurrency ------------------------------------------------------------
+
+
+def test_concurrent_searches_do_not_corrupt_the_shared_connection(tmp_path: Path) -> None:
+    """One connection, many threads.
+
+    `StatPearlsIndex` is an `lru_cache` singleton queried from sync FastAPI
+    routes, which run in a threadpool — so two requests can drive the same
+    sqlite3 connection at once. `labs.db.LabsDb` learned this the hard way:
+    a production `sqlite3.InterfaceError: bad parameter or other API misuse`
+    raised while three routes were served in the same second.
+
+    `check_same_thread=False` only disables sqlite3's own guard; the RLock is
+    what makes the sharing safe.
+    """
+    import threading
+
+    index = _index(tmp_path)
+    errors: list[Exception] = []
+    results: list[int] = []
+
+    def hammer() -> None:
+        try:
+            for _ in range(25):
+                results.append(len(index.search("Sjogren Disease").articles))
+        except Exception as exc:  # noqa: BLE001 - the point of the test
+            errors.append(exc)
+
+    threads = [threading.Thread(target=hammer) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors, f"concurrent search raised: {errors[:3]}"
+    assert results and all(r == 1 for r in results)
