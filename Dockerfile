@@ -68,6 +68,7 @@ COPY scripts/build_hpo_index.py /tmp/build_hpo_index.py
 COPY scripts/build_semsim_index.py /tmp/build_semsim_index.py
 COPY scripts/build_mondo_index.py /tmp/build_mondo_index.py
 COPY scripts/build_orphadata_index.py /tmp/build_orphadata_index.py
+COPY scripts/build_statpearls_index.py /tmp/build_statpearls_index.py
 # One layer, deliberately: Docker layers are additive, so downloading 22MB of
 # hp.json plus 35MB of phenotype.hpoa in one layer and deleting them in the
 # next leaves the full 57MB in the lower layer and saves nothing. The same
@@ -86,9 +87,14 @@ RUN curl -sSL -o /tmp/hp.json \
        done \
     && python /tmp/build_orphadata_index.py /tmp/en_product1.xml \
          /tmp/en_product9_prev.xml /tmp/en_product9_ages.xml /opt/orphadata-index.json \
+    && curl -sSL -o /tmp/statpearls.tar.gz \
+      https://ftp.ncbi.nlm.nih.gov/pub/litarch/3d/12/statpearls_NBK430685.tar.gz \
+    && python /tmp/build_statpearls_index.py /tmp/statpearls.tar.gz /opt/statpearls.sqlite \
     && rm -f /tmp/hp.json /tmp/phenotype.hpoa /tmp/mondo.json /tmp/en_product*.xml \
+             /tmp/statpearls.tar.gz \
              /tmp/build_hpo_index.py /tmp/build_semsim_index.py \
-             /tmp/build_mondo_index.py /tmp/build_orphadata_index.py
+             /tmp/build_mondo_index.py /tmp/build_orphadata_index.py \
+             /tmp/build_statpearls_index.py
 
 USER adoc
 
