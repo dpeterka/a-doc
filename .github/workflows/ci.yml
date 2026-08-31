@@ -41,3 +41,21 @@ jobs:
       - name: Release version matches the branch
         if: startsWith(github.head_ref, 'release/') || startsWith(github.head_ref, 'hotfix/')
         run: uv run python scripts/check_release_version.py --branch "${{ github.head_ref }}"
+
+  backmerge-drift:
+    # A release merged to main must be merged back to develop. Missed three
+    # times here, and each time the symptom arrived a release late: the next
+    # version bump found no string to replace and produced an empty pull
+    # request. This names it immediately instead.
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Compare main and develop versions
+        run: |
+          git fetch origin develop:refs/remotes/origin/develop
+          main_v=$(git show origin/main:pyproject.toml | sed -n 's/^version = "\(.*\)"/\1/p')
+          dev_v=$(git show origin/develop:pyproject.toml | sed -n 's/^version = "\(.*\)"/\1/p')
+          python scripts/check_release_version.py --backmerge "$main_v" "$dev_v"
