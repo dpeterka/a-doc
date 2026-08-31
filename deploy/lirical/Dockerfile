@@ -24,6 +24,9 @@ RUN curl -sSL -o lirical.zip \
     && rm lirical.zip \
     && ln -s "/opt/lirical-cli-${LIRICAL_VERSION}/lirical-cli-${LIRICAL_VERSION}.jar" /opt/lirical.jar
 
+# Read by knowledge/lirical_runner.py's LIRICAL_DATA_DIR, which passes it as
+# `-d` on every prioritize call. The two are pinned together by a test; they
+# disagreed once and every launched task exited 1 on missing data files.
 ENV LIRICAL_DATA=/opt/liricaldata
 
 # --- data download and its two required fixes, in ONE layer -----------------
