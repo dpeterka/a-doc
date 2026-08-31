@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.22.1] — 2026-08-30
+
+### Fixed
+
+- **The 0.22.0 deploy failed on a circular dependency and never shipped.**
+  The LIRICAL runner's IAM policy is attached to `TaskRole` and granted
+  `iam:PassRole` on `!GetAtt TaskRole.Arn` — a role referencing itself,
+  which CloudFormation rejects when it builds the change set. Both roles
+  declare an explicit `RoleName`, so the ARNs are now constructed from the
+  account id and name instead.
+
+  Production was never modified: the change set failed before any
+  resource changed, so v0.21.0 stayed live throughout.
+
+  `aws cloudformation validate-template` does not catch this — it passed
+  on the broken template. Only creating a change set does, which is now
+  how an IAM change to this stack gets verified before release.
+
 ## [0.22.0] — 2026-08-30
 
 ### Added
