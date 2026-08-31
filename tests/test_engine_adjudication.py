@@ -573,3 +573,57 @@ def test_a_reference_path_resolves_with_no_data_repo_configured(
         resolved = config.reference_path(field)
         assert resolved == Path(str(config.Settings.model_fields[field].default))
         assert resolved.is_absolute(), "a reference artifact path must not depend on the cwd"
+
+
+# -- both engines naming the same candidate ---------------------------------
+
+
+def test_the_same_candidate_from_both_engines_is_adopted_once() -> None:
+    """The expected case, not an edge one.
+
+    Both engines rank from the same phenotype terms, so both surfacing the
+    same disease the ledger lacks is ordinary. Checking only against the
+    ledger adopted it twice under one id; the ledger invariants then rejected
+    the entire diff, losing the agreement evidence riding along with it.
+    """
+    finding = _finding("engine_only", disease_name="Behcet disease", rank=1, composite_lr=9.0)
+    divergences = collect_divergences(_ran(finding), _ran(finding))
+    assert len(divergences) == 2, "both engines must still be heard separately"
+
+    verdicts = [
+        EngineVerdictPayload(
+            divergence=d.id,
+            direction="corroborates",
+            rationale="Recurrent ulceration with uveitis is recorded.",
+            rule_out="No recurrent oral ulceration over 12 months.",
+        )
+        for d in divergences
+    ]
+
+    ops, _ = verdicts_to_ops(divergences, verdicts, _ledger(), today=_TODAY)
+    ids = [op.hypothesis.id for op in ops]  # type: ignore[union-attr]
+
+    assert ids == ["behcet-disease"], f"adopted more than once: {ids}"
+
+
+def test_a_name_with_no_usable_id_is_skipped_not_raised() -> None:
+    """`Hypothesis.id` rejects the empty string, and this stage's whole
+    contract is that the engines never fail a review — so a name that slugs
+    to nothing has to be a note, not an exception."""
+    divergences = collect_divergences(
+        _ran(_finding("engine_only", disease_name="???", rank=1, composite_lr=9.0)),
+        LiricalComparison(),
+    )
+    verdicts = [
+        EngineVerdictPayload(
+            divergence=divergences[0].id,
+            direction="corroborates",
+            rationale="Something matched, though the name is unusable.",
+            rule_out="A negative confirmatory test.",
+        )
+    ]
+
+    ops, notes = verdicts_to_ops(divergences, verdicts, _ledger(), today=_TODAY)
+
+    assert ops == []
+    assert any("no usable hypothesis id" in note for note in notes)

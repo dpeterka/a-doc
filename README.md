@@ -411,32 +411,43 @@ individually. And **absence of a call is not absence of the variant**: the
 FMR1 premutation on the ledger is a repeat expansion that neither an array
 nor imputation can see, so having genome data on file does not cover it.
 
-## Knowledge layer (Phase 3, in progress)
+## Knowledge layer (Phase 3)
 
-`src/adoc/knowledge/` holds the deterministic, non-LLM half of the
-diagnostic reasoning — the third independent check alongside the
-cross-family Challenger and the ledger-blind panel.
+`src/adoc/knowledge/` is the deterministic, non-LLM half of the diagnostic
+reasoning — a third independent check alongside the cross-family Challenger
+and the ledger-blind panel. No module here calls a model.
 
-- **`criteria.py`** — hand-encoded classification-criteria scorers, computed
-  from stored labs. SLE 2019 EULAR/ACR is implemented; the framework (three
-  states per item, domain maxima, cited items, floor totals, entry criteria)
-  is shared by the ~9 still to come. Every item is `met` / `not_met` /
-  `not_assessed`, and totals are a **floor**: most items in these sets are
-  clinical and no lab row can answer them, so scoring an unseen item as
-  `not_met` would report a confident low total that is an artifact of missing
-  input.
-- **`lirical.py` + `deploy/lirical/`** — LIRICAL v2.4.1 as a sidecar
-  container (ADR 0029), phenotype-only. The Python side builds the
-  invocation and parses the TSV; it never computes a ranking.
+**Classification criteria** (`criteria.py`) — seven hand-encoded scorers:
+SLE 2019, Sjögren 2016, RA 2010, and the full 2022 ACR/EULAR ANCA trio
+(GPA, EGPA, MPA), plus Behçet ICBD 2014. Every item is `met` / `not_met` /
+`not_assessed` / `possible`, and totals are a **floor**: many items are
+clinical and no lab row can answer them, so scoring an unseen item `not_met`
+would report a confident low total that is an artifact of missing input.
+`possible` covers findings matched from text that no matcher can *attribute*
+— it never crosses a threshold. `icap.py` maps an ANA immunofluorescence
+pattern to the antibodies worth testing next, and rides along with the same
+scan.
 
-**Neither is wired into the review DAG yet, and the LIRICAL image is not
-deployable yet.** CI builds and pushes exactly one image (`a-doc`); the
-sidecar has no ECR repository, no CI build step and no ECS task definition.
-It is validated locally only — `docker build -t adoc-lirical deploy/lirical/`
-runs a build-time smoke test that fails the build if LIRICAL's data
-expectations change. The blocking dependency for both is an HPO phenotype
-profile, which does not exist: LIRICAL's input is a list of HPO terms, and
-the clinical items of every criteria scorer need the same thing.
+**Phenotype engines** — `lirical.py` runs LIRICAL v2.4.1 as a sibling ECS
+task (ADR 0029), phenotype-only; `semsim.py` ranks by shared information
+content. Both run inside the deep review and both are *adjudicated* into the
+ledger rather than merely rendered (ADR 0036): a model states a direction
+per divergence, and plain code decides what that does. Scores are never
+combined across engines — a likelihood ratio and a Resnik similarity are not
+commensurable.
+
+Their input is the phenotype QUERY, not the whole record: `case/phenotype.yaml`
+is built by `adoc phenotype-backfill` from HPO label matching, and ADR 0034
+measures why a scoped query beats the full profile (+4.82 at eight terms
+against −25.97 at eighty-two).
+
+**Reference lookups**, all local FTS5 or JSON indexes built at image-build
+time — `mondo.py` (cross-references, so a vocabulary mismatch is not read as
+a disagreement), `orphadata.py` (definitions, prevalence, onset),
+`statpearls.py` (clinical review text, quoted and attributed under
+CC BY-NC-ND), `disease_lookup.py` (the chat-facing tool over all of them).
+`pubmed.py` is the one network caller: E-utilities search, so literature
+citations come from a real lookup rather than model recall.
 
 ## Currently deployed
 
@@ -452,7 +463,7 @@ document is still current.
 | 0 | Project scaffold | complete |
 | 1 | MVP (onboarding, ingestion, DAG reasoning, web UI, AWS deploy) | complete |
 | 2 | Grounding & anti-hallucination hardening | complete |
-| 3 | Knowledge layer (HPO/LIRICAL/Monarch, ACR/EULAR criteria) + full eval | **next** |
-| 4 | Extras (Apple Health import, specialist finder, notifications) | not started |
+| 3 | Knowledge layer (HPO/LIRICAL/Monarch, ACR/EULAR criteria) + full eval | complete |
+| 4 | Extras (Apple Health import, specialist finder, notifications) | **next** |
 
 See `PLAN.md` for phase acceptance criteria.
