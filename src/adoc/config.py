@@ -87,6 +87,13 @@ class Settings(BaseSettings):
     # switches itself off with a warning rather than failing.
     hpo_index_path: Path = Path("/opt/hpo-index.json")
 
+    # The phenotype-similarity index (`scripts/build_semsim_index.py`), baked
+    # into the image beside the HPO index and for the same reasons: it is a
+    # build artifact of a public ontology, not patient data, and versioning it
+    # with the release is what makes a ranking reproducible. Absent locally,
+    # the similarity engine switches itself off rather than failing.
+    semsim_index_path: Path = Path("/opt/semsim-index.json")
+
     # Longest single chat message accepted. Enforced on the SERVER as well as
     # in the browser: `maxlength` is a convenience, not a control, and a
     # paste-heavy client or a stale page can exceed it.
