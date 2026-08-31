@@ -283,7 +283,10 @@ def test_missing_case_files_fall_back_to_placeholders(tmp_path: Path, db: LabsDb
     case_summary = next(s.content for s in pack.sections if s.key == "case_summary")
     open_questions = next(s.content for s in pack.sections if s.key == "open_questions")
     assert case_summary == "_Not yet populated._"
-    assert open_questions == "_None yet._"
+    # Open questions render from the STORE now, not `questions-open.md` — a
+    # markdown file nothing regenerated, so it could not know what had been
+    # answered. The empty state says so in the store's own words.
+    assert open_questions == "_No open questions._"
 
 
 def test_genomics_inventory_section_included_when_present(repo: DataRepo, db: LabsDb) -> None:

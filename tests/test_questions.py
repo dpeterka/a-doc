@@ -13,6 +13,7 @@ from datetime import date
 from pathlib import Path
 
 from adoc.casefile.questions import (
+    QUESTIONS_RELPATH,
     OpenQuestion,
     OpenQuestions,
     load_questions,
@@ -151,3 +152,63 @@ def test_round_trips_through_disk(tmp_path: Path) -> None:
 def test_a_missing_file_is_an_empty_store(tmp_path: Path) -> None:
     """A repo that has never had a review must not fail to load."""
     assert load_questions(tmp_path / "nope.yaml").questions == []
+
+
+# --- the loop that was never closed -----------------------------------------
+
+
+def test_context_renders_only_open_questions_with_their_ids() -> None:
+    """The reasoning stages read the STORE, not `questions-open.md`.
+
+    The markdown was a rendering nothing regenerated, so it could not know
+    what had been answered: production held 43 questions, all `open`, none
+    ever answered, while the answers sat in the record as facts. Every review
+    re-read the stale list and asked again.
+
+    Ids are shown because a model that must close a question has to name it.
+    """
+    from adoc.casefile.questions import render_for_context
+
+    mine = _question("Every supplement you take", audience="you")
+    theirs = _question("ACTH stimulation test", audience="doctor")
+    done = _question("Already answered", audience="you")
+    store, _ = mark_answered(
+        OpenQuestions(questions=[mine, theirs, done]),
+        [done.id],
+        on=date(2026, 9, 1),
+        note="told us",
+    )
+
+    rendered = render_for_context(store)
+
+    assert f"`{mine.id}`" in rendered
+    assert f"`{theirs.id}`" in rendered
+    assert done.id not in rendered, "an answered question was offered again"
+    assert rendered.index(mine.id) < rendered.index(theirs.id), "hers should come first"
+
+
+def test_resolve_answered_closes_and_survives_a_bad_id(tmp_path: Path) -> None:
+    """Shared by intake and the ordinary diagnostic turn. Never raises: a
+    chat turn must not fail because a question could not be closed."""
+    from adoc.casefile.questions import resolve_answered
+
+    mine = _question("Every supplement you take")
+    path = tmp_path / QUESTIONS_RELPATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    save_questions(path, OpenQuestions(questions=[mine]))
+
+    closed = resolve_answered(
+        tmp_path, [mine.id, "not-a-question"], on=date(2026, 9, 1), note="Answered in chat."
+    )
+
+    assert closed == 1
+    reloaded = load_questions(path)
+    assert reloaded.by_id(mine.id).status == "answered"
+    assert reloaded.open_questions() == []
+
+
+def test_resolve_answered_on_an_unwritable_store_returns_zero(tmp_path: Path) -> None:
+    """A turn must survive a broken store."""
+    from adoc.casefile.questions import resolve_answered
+
+    assert resolve_answered(tmp_path / "nope", ["x"], on=date(2026, 9, 1), note="") == 0

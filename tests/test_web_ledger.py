@@ -333,8 +333,12 @@ def test_a_large_ledger_leads_with_what_matters_and_folds_the_tail() -> None:
 
     groups = group_hypotheses(hyps)
 
-    # most-likely first, then can't-miss at ANY probability, then high/moderate
-    assert [h.id for h in groups["leading"]] == ["h4", "h2", "h3"]
+    # most-likely first, then substantiated leads, and an UNCITED can't-miss
+    # last within the group (ADR 0037). `h2` is can't-miss at `minimal` with
+    # no evidence — a placeholder the challenger raised as a safety net. It
+    # stays in the leading group and is never hidden; it is simply not what
+    # she reads first.
+    assert [h.id for h in groups["leading"]] == ["h4", "h3", "h2"]
     assert [h.id for h in groups["secondary"]] == ["h5", "h1"]
 
 
@@ -491,3 +495,32 @@ def test_an_empty_evidence_section_says_why(tmp_path: Path) -> None:
 
     assert "Evidence for" in response.text
     assert "No citations recorded yet" in response.text
+
+
+def test_an_uncited_cant_miss_placeholder_does_not_lead_the_page() -> None:
+    """ "Empty priority items appear prioritized" — the owner, on seeing a
+    can't-miss lead with no citations sitting above the supported ones.
+
+    The can't-miss tier is a safety net, so the challenger raises entries
+    there speculatively before anything supports them; that is the tier
+    working. What is wrong is such an entry reading with the same weight as a
+    lead the labs actually point at. It stays on the page and stays in the
+    lead group — it is simply not what she reads first.
+    """
+    from types import SimpleNamespace
+
+    from adoc.web.casefile_helpers import group_hypotheses
+
+    def h(name: str, tier: str, probability: str, evidence: list[str]) -> SimpleNamespace:
+        return SimpleNamespace(name=name, tier=tier, probability=probability, evidence_for=evidence)
+
+    placeholder = h("Hereditary breast and ovarian cancer", "cant-miss", "low", [])
+    supported = h("Pulmonary embolism", "cant-miss", "moderate", ["labs:d-dimer:2026-01-01"])
+    likely = h("Sjogren syndrome", "expanded", "high", ["labs:ssa:2026-01-01"])
+
+    groups = group_hypotheses([placeholder, supported, likely])
+    leading = [x.name for x in groups["leading"]]
+
+    assert placeholder.name in leading, "a can't-miss lead must never be hidden"
+    assert leading[-1] == placeholder.name, "the uncited placeholder is still leading the page"
+    assert leading[0] == supported.name
