@@ -5,6 +5,33 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.23.0] — 2026-08-30
+
+### Added
+
+- **`rule_out` is enforced in code, not only asked for in the prompt.** ADR
+  0035 recorded the gap: a model that ignored the requirement produced an
+  empty field and nothing rejected it. A new hypothesis without a usable
+  falsification condition is now stripped from the diff before it reaches
+  the ledger.
+
+  A strip rather than a DAG contract, deliberately. A precondition runs
+  before `apply_stage` and would raise on exactly the input the strip
+  handles cleanly — failing a whole turn over one missing field, the defect
+  fixed in v0.21.0. A postcondition cannot work either: the fifty
+  hypotheses predating ADR 0035 all have an empty `rule_out`, so any check
+  over the resulting ledger would fire on all of them forever.
+
+  Stripping a hypothesis also removes every op that targets it. A verdict
+  carries `add_evidence` and `record_challenge` ops pointing at what it
+  adds, and leaving those behind produced a diff referencing an id nothing
+  creates — which the ledger invariants reject outright, turning a
+  contained strip back into the whole-payload failure it exists to avoid.
+
+  Patient-origin and `cant-miss` hypotheses are excluded, exactly as they
+  are from the retirement pass. The red-team suite caught this: a patient's
+  own theory was being stripped before the quarantine could see it.
+
 ## [0.22.1] — 2026-08-30
 
 ### Fixed
