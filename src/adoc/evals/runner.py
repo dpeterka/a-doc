@@ -86,9 +86,21 @@ def _suites() -> dict[str, Suite]:
     # Imported lazily (not at module level) so importing `evals.runner`
     # never requires the suites' own dependencies to already be wired up,
     # and to keep this module import-cycle-safe against `evals.suites.*`.
-    from adoc.evals.suites import extraction, hallucination, redteam
+    from adoc.evals.suites import (
+        extraction,
+        hallucination,
+        rare_disease_recall,
+        redteam,
+        self_case_replay,
+    )
 
-    return {"extraction": extraction, "hallucination": hallucination, "redteam": redteam}
+    return {
+        "extraction": extraction,
+        "hallucination": hallucination,
+        "rare_disease_recall": rare_disease_recall,
+        "redteam": redteam,
+        "self_case_replay": self_case_replay,
+    }
 
 
 def known_suites() -> list[str]:

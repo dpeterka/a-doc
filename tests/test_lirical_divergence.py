@@ -190,3 +190,50 @@ def test_a_failed_run_renders_as_a_plain_note() -> None:
 
     assert "did not run" in text
     assert "task timed out" in text
+
+
+def _mondo_index():
+    from adoc.knowledge.mondo import MondoIndex
+
+    return MondoIndex(
+        names={"MONDO:0010030": "Sjogren syndrome"},
+        xrefs={"OMIM:270150": "MONDO:0010030"},
+        labels={"sicca syndrome": "MONDO:0010030"},
+    )
+
+
+def test_mondo_matches_across_a_name_mismatch() -> None:
+    """The bug Mondo exists to fix. The engine returns `OMIM:270150` named
+    "Sjogren syndrome"; the ledger holds the same disease under "Sicca
+    syndrome". Name comparison reports that as BOTH an `engine_only` finding
+    and a `ledger_only` one — two spurious divergences for a case where the
+    two sources agree completely."""
+    result = LiricalResult(
+        diseases=[_disease("Sjogren syndrome", rank=1, lr=3.1, curie="OMIM:270150")]
+    )
+    ledger = _ledger(_hypothesis("Sicca syndrome", hid="sicca"))
+
+    without = compare_to_ledger(result, ledger)
+    with_mondo = compare_to_ledger(result, ledger, mondo=_mondo_index())
+
+    # Without the index: two findings, neither of them agreement.
+    assert [f.kind for f in without.of_kind("agreement")] == []
+    assert without.divergence_count == 2
+
+    # With it: one agreement, no divergence.
+    agreements = with_mondo.of_kind("agreement")
+    assert len(agreements) == 1
+    assert agreements[0].ledger_hypothesis_id == "sicca"
+    assert agreements[0].matched_by == "mondo"
+    assert with_mondo.divergence_count == 0
+
+
+def test_without_an_index_matching_is_exactly_what_it_was() -> None:
+    """A local checkout, or an image built before the index existed, must
+    behave as it did before rather than degrading."""
+    result = LiricalResult(diseases=[_disease("Sjogren syndrome", rank=1, lr=3.1)])
+    ledger = _ledger(_hypothesis("Sjögren's syndrome", hid="sj"))
+
+    comparison = compare_to_ledger(result, ledger, mondo=None)
+
+    assert [f.matched_by for f in comparison.of_kind("agreement")] == ["name"]

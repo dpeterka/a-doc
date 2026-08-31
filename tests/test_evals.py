@@ -29,8 +29,21 @@ def _unreachable_client_factory() -> LlmClient:
 # --- runner dispatch ----------------------------------------------------------------------------
 
 
-def test_known_suites_lists_all_three_suites() -> None:
-    assert known_suites() == ["extraction", "hallucination", "redteam"]
+def test_known_suites_lists_every_registered_suite() -> None:
+    """An exact list, not a subset check.
+
+    `--suite` offers exactly these names and `adoc eval` with no argument runs
+    all of them, so a suite that is written but never registered is a suite
+    that silently never runs. Pinning the exact list means adding one is a
+    deliberate edit here rather than an omission nobody notices.
+    """
+    assert known_suites() == [
+        "extraction",
+        "hallucination",
+        "rare_disease_recall",
+        "redteam",
+        "self_case_replay",
+    ]
 
 
 def test_run_suite_unknown_name_raises() -> None:
