@@ -2166,6 +2166,23 @@ def build_review_dag(
         results["retirement_pass"] = report
         return report
 
+    def _record_engine(name: str, comparison: LiricalComparison) -> LiricalComparison:
+        """Put an engine's outcome in the results sink, success or not.
+
+        `render_review_markdown` reads the engines from `results`, not from the
+        DAG context — so a node that returned early WITHOUT writing here left
+        the report with no engine section at all, silently. LIRICAL had been
+        returning "lirical task is not configured" on every review since ADR
+        0029 and the report never said so: the "did not run this week" line,
+        which exists precisely to make absence visible, could not render
+        because nothing reached the sink.
+
+        Absence has to be as visible as presence. Every path goes through
+        here.
+        """
+        results[name] = comparison
+        return comparison
+
     def _lirical_divergence_fn(ctx: Ctx) -> BaseModel:
         """Run the phenotype engine and compare it to the ledger.
 
@@ -2190,7 +2207,10 @@ def build_review_dag(
             profile = load_phenotype(repo.root / Path(PHENOTYPE_RELPATH))
             observed, negated = select_for_engine(profile, today=clock().date())
             if not observed:
-                return LiricalComparison(ran=False, error="no current phenotype findings to run on")
+                return _record_engine(
+                    "lirical_divergence",
+                    LiricalComparison(ran=False, error="no current phenotype findings to run on"),
+                )
 
             runner = lirical or _default_lirical_runner(repo)
             run = runner.run(
@@ -2198,7 +2218,9 @@ def build_review_dag(
             )
             if not run.ok or run.result is None:
                 logger.info("lirical: not run this review — %s", run.error)
-                return LiricalComparison(ran=False, error=run.error)
+                return _record_engine(
+                    "lirical_divergence", LiricalComparison(ran=False, error=run.error)
+                )
 
             comparison = compare_to_ledger(
                 run.result,
@@ -2215,10 +2237,12 @@ def build_review_dag(
             )
         except Exception as exc:  # noqa: BLE001 - the engine must never fail a review
             logger.warning("lirical: comparison failed: %s", exc)
-            return LiricalComparison(ran=False, error=f"{type(exc).__name__}: {exc}")
+            return _record_engine(
+                "lirical_divergence",
+                LiricalComparison(ran=False, error=f"{type(exc).__name__}: {exc}"),
+            )
 
-        results["lirical_divergence"] = comparison
-        return comparison
+        return _record_engine("lirical_divergence", comparison)
 
     def _semsim_divergence_fn(_ctx: Ctx) -> BaseModel:
         """Rank diseases by phenotype similarity and compare to the ledger.
@@ -2240,16 +2264,24 @@ def build_review_dag(
         try:
             index = load_index(reference_path("semsim_index_path"))
             if index is None:
-                return LiricalComparison(ran=False, error="no similarity index in this image")
+                return _record_engine(
+                    "semsim_divergence",
+                    LiricalComparison(ran=False, error="no similarity index in this image"),
+                )
 
             profile = load_phenotype(repo.root / Path(PHENOTYPE_RELPATH))
             observed, _ = select_for_engine(profile, today=clock().date())
             if not observed:
-                return LiricalComparison(ran=False, error="no current phenotype findings to run on")
+                return _record_engine(
+                    "semsim_divergence",
+                    LiricalComparison(ran=False, error="no current phenotype findings to run on"),
+                )
 
             ranked = index.rank(observed)
             if not ranked.ok:
-                return LiricalComparison(ran=False, error=ranked.error)
+                return _record_engine(
+                    "semsim_divergence", LiricalComparison(ran=False, error=ranked.error)
+                )
 
             comparison = compare_semsim_to_ledger(
                 ranked,
@@ -2264,10 +2296,12 @@ def build_review_dag(
             )
         except Exception as exc:  # noqa: BLE001 - never fail a review
             logger.warning("semsim: comparison failed: %s", exc)
-            return LiricalComparison(ran=False, error=f"{type(exc).__name__}: {exc}")
+            return _record_engine(
+                "semsim_divergence",
+                LiricalComparison(ran=False, error=f"{type(exc).__name__}: {exc}"),
+            )
 
-        results["semsim_divergence"] = comparison
-        return comparison
+        return _record_engine("semsim_divergence", comparison)
 
     def _engine_adjudication_fn(ctx: Ctx) -> BaseModel:
         """Decide what the engines' disagreements MEAN, and let that reach the

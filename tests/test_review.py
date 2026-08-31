@@ -28,6 +28,7 @@ from adoc.casefile.schema import (
     Provenance,
 )
 from adoc.config import ModelBinding
+from adoc.knowledge.lirical_divergence import LiricalComparison
 from adoc.labs.db import LabsDb
 from adoc.labs.models import DocumentStatus, LabDocument, LabResult
 from adoc.reason.client import (
@@ -2055,3 +2056,57 @@ def test_a_missing_engine_verdict_fails_the_contract(repo: DataRepo, db: LabsDb)
 
     assert excinfo.value.contract_name == "engine_adjudication_covers_every_divergence"
     assert excinfo.value.node == "engine_adjudication"
+
+
+# --- an engine that does not run must still reach the report -------------------------------------
+
+
+class _UnconfiguredLirical:
+    """The production runner's behaviour when nothing told it where to run:
+    `EcsLiricalRunner.run` returns this in 0.0s without launching anything."""
+
+    def run(self, _request: Any) -> Any:
+        from adoc.knowledge.lirical_runner import LiricalRun
+
+        return LiricalRun(ok=False, error="lirical task is not configured")
+
+
+def test_an_engine_that_did_not_run_is_still_reported(repo: DataRepo, db: LabsDb) -> None:
+    """Absence has to be as visible as presence.
+
+    `render_review_markdown` reads the engines out of the `results` sink, and
+    every early return in the engine nodes used to skip writing to it — so a
+    LIRICAL that never ran produced no engine section at all, not even the
+    "did not run this week" line that exists to say so.
+
+    In production that hid a real fault for the entire life of ADR 0029:
+    `ADOC_LIRICAL_CLUSTER` was never set on any task definition, the runner
+    returned "lirical task is not configured" on every single review, and no
+    report ever mentioned it.
+    """
+    _seed_ledger(repo)
+    _seed_phenotype(repo)
+    sink: dict[str, BaseModel] = {}
+    calls: list[TransportRequest] = []
+    client = _build_client(_engine_transport(calls, {}))
+    dag = build_review_dag(
+        client,
+        repo,
+        db,
+        repo.root / LEDGER_RELPATH,
+        clock=_fixed_clock,
+        sink=sink,
+        lirical=_UnconfiguredLirical(),
+    )
+    dag_run(
+        dag,
+        {"initial": Marker(), "blind_context_pack": build_context(repo, db, include_ledger=False)},
+    )
+
+    recorded = sink.get("lirical_divergence")
+    assert isinstance(recorded, LiricalComparison), "the failure never reached the results sink"
+    assert recorded.ran is False
+    assert "not configured" in recorded.error
+
+    report = (repo.root / "case" / "reviews" / "2026-08-23-review.md").read_text(encoding="utf-8")
+    assert "did not run" in report, "the report is silent about an engine that never ran"

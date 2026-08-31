@@ -367,6 +367,43 @@ Resources:
                 Fn::ImportValue: !Sub "${BackupStackName}-BucketName"
             - Name: ADOC_TRUST_FORWARDED_FOR
               Value: "true"
+            # Where to launch the LIRICAL sidecar (ADR 0029). Without these
+            # three the app has no idea the sidecar exists: `Settings` defaults
+            # them to empty, `EcsLiricalRunner.run` returns "lirical task is
+            # not configured" in 0.0s, and the review carries on without a
+            # phenotype engine.
+            #
+            # They were never wired. The image was built, the ECR repository
+            # created, the task definition registered and the `ecs:RunTask`
+            # IAM granted — and nothing ever told the application where to run
+            # it, so LIRICAL had not executed once since ADR 0029.
+            #
+            # Gated on the same condition as the sidecar task definition:
+            # pointing the app at a task definition that does not exist would
+            # trade a silent no-op for a noisy one.
+            - !If
+              - HasLiricalImage
+              - Name: ADOC_LIRICAL_CLUSTER
+                Value: !Ref Cluster
+              - !Ref AWS::NoValue
+            - !If
+              - HasLiricalImage
+              - Name: ADOC_LIRICAL_TASK_DEFINITION
+                Value: !Ref LiricalTaskDefinition
+              - !Ref AWS::NoValue
+            - !If
+              - HasLiricalImage
+              - Name: ADOC_LIRICAL_SUBNETS
+                Value: !Join
+                  - ","
+                  - - Fn::ImportValue: !Sub "${NetworkStackName}-SubnetId"
+                    - Fn::ImportValue: !Sub "${NetworkStackName}-Subnet2Id"
+              - !Ref AWS::NoValue
+            - !If
+              - HasLiricalImage
+              - Name: ADOC_LIRICAL_SECURITY_GROUPS
+                Value: !GetAtt ServiceSecurityGroup.GroupId
+              - !Ref AWS::NoValue
           Secrets:
             - Name: ANTHROPIC_API_KEY
               ValueFrom: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/a-doc/anthropic-api-key"
@@ -425,6 +462,43 @@ Resources:
                 Fn::ImportValue: !Sub "${BackupStackName}-BucketName"
             - Name: ADOC_TRUST_FORWARDED_FOR
               Value: "true"
+            # Where to launch the LIRICAL sidecar (ADR 0029). Without these
+            # three the app has no idea the sidecar exists: `Settings` defaults
+            # them to empty, `EcsLiricalRunner.run` returns "lirical task is
+            # not configured" in 0.0s, and the review carries on without a
+            # phenotype engine.
+            #
+            # They were never wired. The image was built, the ECR repository
+            # created, the task definition registered and the `ecs:RunTask`
+            # IAM granted — and nothing ever told the application where to run
+            # it, so LIRICAL had not executed once since ADR 0029.
+            #
+            # Gated on the same condition as the sidecar task definition:
+            # pointing the app at a task definition that does not exist would
+            # trade a silent no-op for a noisy one.
+            - !If
+              - HasLiricalImage
+              - Name: ADOC_LIRICAL_CLUSTER
+                Value: !Ref Cluster
+              - !Ref AWS::NoValue
+            - !If
+              - HasLiricalImage
+              - Name: ADOC_LIRICAL_TASK_DEFINITION
+                Value: !Ref LiricalTaskDefinition
+              - !Ref AWS::NoValue
+            - !If
+              - HasLiricalImage
+              - Name: ADOC_LIRICAL_SUBNETS
+                Value: !Join
+                  - ","
+                  - - Fn::ImportValue: !Sub "${NetworkStackName}-SubnetId"
+                    - Fn::ImportValue: !Sub "${NetworkStackName}-Subnet2Id"
+              - !Ref AWS::NoValue
+            - !If
+              - HasLiricalImage
+              - Name: ADOC_LIRICAL_SECURITY_GROUPS
+                Value: !GetAtt ServiceSecurityGroup.GroupId
+              - !Ref AWS::NoValue
             # The real Dropbox app-folder backend nests the inbox one level
             # deeper than the remote name alone suggests
             # (deploy/container/run-ingest.sh reads this to build its
