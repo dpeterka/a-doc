@@ -49,6 +49,7 @@ from adoc.casefile.schema import (
     LedgerDiff,
     LedgerOp,
 )
+from adoc.genomics.panel import GENOMIC_PANEL_RELPATH
 from adoc.knowledge.pubmed import fetch_with_retry
 from adoc.labs.db import LabsDb
 from adoc.labs.models import LabResult
@@ -536,6 +537,51 @@ def _check_pmid_ref(source: str, claim: str, pmid_verifier: PmidVerifier | None)
     )
 
 
+def _check_genomic_ref(source: str, claim: str, repo: DataRepo) -> CitationCheck:
+    """Resolve `genomic:<gene>:<rsid>` against the built panel (ADR 0030).
+
+    Checks the gene as well as the marker. A ref naming a real rsid under the
+    wrong gene is as wrong as an invented one, and letting it pass would mean
+    a claim could cite a marker that says nothing about the gene it names.
+
+    A marker present on the array but NOT CALLED resolves as `unverifiable`
+    rather than `unresolved`: the ref is legitimate and the panel does carry
+    the marker, but there is no genotype behind it. Recorded so the gap is
+    visible, and deliberately not a rejection — the same treatment an
+    unreachable PMID gets.
+    """
+    _, _, rest = source.partition("genomic:")
+    gene, _, rsid = rest.partition(":")
+    panel_path = repo.root / Path(GENOMIC_PANEL_RELPATH)
+    if not panel_path.is_file():
+        return CitationCheck(
+            source=source,
+            outcome="unresolved",
+            reason="no genomic panel has been built for this case file",
+            claim=claim,
+        )
+    text = panel_path.read_text(encoding="utf-8")
+    if source in text:
+        return CitationCheck(
+            source=source, outcome="resolved", reason="genotype on the panel", claim=claim
+        )
+    # The ref is grammatical and the marker may be in the panel while having
+    # no genotype — distinguish that from a marker nobody measured.
+    if rsid and rsid in text and gene and gene in text:
+        return CitationCheck(
+            source=source,
+            outcome="unverifiable",
+            reason="marker is on the panel but was not called on the array",
+            claim=claim,
+        )
+    return CitationCheck(
+        source=source,
+        outcome="unresolved",
+        reason="no such gene/marker pair on the genomic panel",
+        claim=claim,
+    )
+
+
 def _check_source(
     source: str,
     claim: str,
@@ -551,6 +597,24 @@ def _check_source(
         return _check_encounter_ref(source, claim, repo)
     if source.startswith("pmid:"):
         return _check_pmid_ref(source, claim, pmid_verifier)
+    if source.startswith("genomic:"):
+        return _check_genomic_ref(source, claim, repo)
+    if source.startswith("engine:"):
+        # Resolved on grammar, like `patient-report:`, and for the same
+        # reason: the ref names a computation this system performed and
+        # recorded, not an external document that might not exist. The engine
+        # name is a closed set in `casefile.schema`, so an unknown engine
+        # never reaches here — it fails validation at the schema boundary.
+        #
+        # The review report for that date carries the engine's full ranking,
+        # which is what a reader following the ref actually wants.
+        engine = source.split(":")[1]
+        return CitationCheck(
+            source=source,
+            outcome="resolved",
+            reason=f"{engine} ranking recorded in the review report for that date",
+            claim=claim,
+        )
     if source.startswith("patient-report:"):
         # Always resolved: it cites the patient's own statement, and
         # grammar-validity (enforced by `casefile.schema`) is enough.

@@ -34,7 +34,7 @@ jobs:
         run: uv run adoc eval --suite redteam --suite extraction --suite hallucination --out tmp
 
       - name: Upload eval reports
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: eval-reports
           path: tmp/

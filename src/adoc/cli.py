@@ -61,6 +61,12 @@ from adoc.casefile.repo import LEDGER_RELPATH, DataRepo
 from adoc.config import Settings, load_model_bindings
 from adoc.evals.report import write_comparison_report, write_report
 from adoc.evals.runner import known_suites, run_suite
+from adoc.genomics.panel import (
+    GENOMIC_PANEL_RELPATH,
+    build_panel,
+    find_raw_array,
+    render_panel,
+)
 from adoc.ingest.archive import PageRenderer, pdftoppm_renderer
 from adoc.ingest.doctext import backfill_document_text
 from adoc.ingest.pipeline import IngestReport, ingest_directory, ingest_inbox
@@ -846,6 +852,47 @@ def _cmd_backfill_doc_text(_args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_genomics_panel(_args: argparse.Namespace) -> int:
+    """Build `case/genomics-panel.md` from the raw array export (ADR 0030).
+
+    Reads ONLY the raw array. The phased exports and the imputed BCFs are
+    excluded by that ADR and this command does not look at them.
+    """
+    try:
+        settings = Settings()
+    except Exception as exc:  # noqa: BLE001 - surface any config error to the user
+        print(f"genomics-panel: configuration error: {exc}", file=sys.stderr)
+        return 1
+
+    repo = DataRepo(settings.data_dir)
+    if not repo.is_initialized:
+        print(f"genomics-panel: data repo not initialized at {settings.data_dir}", file=sys.stderr)
+        return 1
+
+    array = find_raw_array(repo.root)
+    if array is None:
+        print(
+            "genomics-panel: no raw array export found under sources/genomics/. "
+            "The phased exports and imputed BCFs are deliberately not usable "
+            "(ADR 0030).",
+            file=sys.stderr,
+        )
+        return 1
+
+    result = build_panel(array)
+    repo.write(GENOMIC_PANEL_RELPATH, render_panel(result))
+    if not result.ok:
+        print(f"genomics-panel: {result.error}", file=sys.stderr)
+        return 1
+    called = sum(1 for r in result.results if r.interpretation != "no_call")
+    print(
+        f"genomics-panel: wrote {GENOMIC_PANEL_RELPATH} — "
+        f"{result.markers_found}/{result.markers_sought} markers on the array, "
+        f"{called} called"
+    )
+    return 0
+
+
 def _cmd_phenotype_backfill(_args: argparse.Namespace) -> int:
     """Build `case/phenotype.yaml` from encounter bodies and case prose
     (`casefile.phenotype_backfill`; NO LLM calls — `knowledge.hpo` matches
@@ -1137,6 +1184,13 @@ def build_parser() -> argparse.ArgumentParser:
             "(no LLM calls; HPO label/synonym matching)"
         ),
     ).set_defaults(func=_cmd_phenotype_backfill)
+    subparsers.add_parser(
+        "genomics-panel",
+        help=(
+            "build case/genomics-panel.md from the raw array export "
+            "(no LLM calls; curated panel only, never a variant dump)"
+        ),
+    ).set_defaults(func=_cmd_genomics_panel)
     subparsers.add_parser(
         "regimen-backfill",
         help=("seed case/regimen.yaml from regimen encounters on disk (no LLM calls; idempotent)"),
