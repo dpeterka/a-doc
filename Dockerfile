@@ -65,10 +65,18 @@ RUN mkdir -p /data \
 #
 # One RUN so the 22MB source never lands in a layer of its own.
 COPY scripts/build_hpo_index.py /tmp/build_hpo_index.py
+COPY scripts/build_semsim_index.py /tmp/build_semsim_index.py
+# One layer, deliberately: Docker layers are additive, so downloading 22MB of
+# hp.json plus 35MB of phenotype.hpoa in one layer and deleting them in the
+# next leaves the full 57MB in the lower layer and saves nothing. The same
+# mistake in deploy/lirical/Dockerfile produced a 1.18GB image.
 RUN curl -sSL -o /tmp/hp.json \
       https://github.com/obophenotype/human-phenotype-ontology/releases/latest/download/hp.json \
+    && curl -sSL -o /tmp/phenotype.hpoa \
+      https://github.com/obophenotype/human-phenotype-ontology/releases/latest/download/phenotype.hpoa \
     && python /tmp/build_hpo_index.py /tmp/hp.json /opt/hpo-index.json \
-    && rm -f /tmp/hp.json /tmp/build_hpo_index.py
+    && python /tmp/build_semsim_index.py /tmp/hp.json /tmp/phenotype.hpoa /opt/semsim-index.json \
+    && rm -f /tmp/hp.json /tmp/phenotype.hpoa /tmp/build_hpo_index.py /tmp/build_semsim_index.py
 
 USER adoc
 

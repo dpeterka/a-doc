@@ -35,6 +35,7 @@ from pydantic import BaseModel, Field
 
 from adoc.casefile.schema import Hypothesis, Ledger
 from adoc.knowledge.lirical import LiricalDisease, LiricalResult
+from adoc.knowledge.semsim import SemSimResult
 
 # How far down LIRICAL's ranking counts as "ranked highly". LIRICAL returns a
 # long tail; past the top handful its own composite LR is at or below zero on
@@ -302,4 +303,120 @@ def render_comparison(comparison: LiricalComparison) -> list[str]:
             lines.append(f"- {f.ledger_hypothesis_name} — {lr}")
         lines.append("")
 
+    return lines
+
+
+def compare_semsim_to_ledger(
+    result: SemSimResult,
+    ledger: Ledger,
+    *,
+    top_n: int = ENGINE_TOP_N,
+) -> LiricalComparison:
+    """The same comparison, for the semantic-similarity engine.
+
+    Deliberately reuses this module's shape rather than growing a parallel
+    one. The two engines answer differently — LIRICAL by likelihood ratio
+    against a curated model, similarity by shared information content — but
+    the QUESTION asked of both is identical: what does the engine raise that
+    the differential lacks, and what does the differential hold that the
+    engine does not support. One renderer cannot drift from itself.
+
+    No `lr_floor` here: a similarity is not a likelihood ratio and has no
+    "worse than chance" point. Every disease the engine ranks in its top `n`
+    is a candidate; the ranking itself is the filter.
+    """
+    active = [h for h in ledger.hypotheses if h.status == "active"]
+    by_key: dict[str, Hypothesis] = {}
+    for hypothesis in active:
+        by_key.setdefault(normalise_disease_name(hypothesis.name), hypothesis)
+
+    findings: list[LiricalFinding] = []
+    matched_ids: set[str] = set()
+
+    for rank, disease in enumerate(result.diseases[:top_n], start=1):
+        matched = by_key.get(normalise_disease_name(disease.name))
+        if matched is not None:
+            matched_ids.add(matched.id)
+            findings.append(
+                LiricalFinding(
+                    kind="agreement",
+                    disease_name=disease.name,
+                    curie=disease.disease_id,
+                    rank=rank,
+                    composite_lr=disease.score,
+                    ledger_hypothesis_id=matched.id,
+                    ledger_hypothesis_name=matched.name,
+                    ledger_probability=matched.probability,
+                    ledger_tier=matched.tier,
+                    matched_by="name",
+                    note="Both the similarity engine and the differential hold this.",
+                )
+            )
+            continue
+        findings.append(
+            LiricalFinding(
+                kind="engine_only",
+                disease_name=disease.name,
+                curie=disease.disease_id,
+                rank=rank,
+                composite_lr=disease.score,
+                matched_by="none",
+                note=(
+                    "Ranked by phenotype similarity; no active hypothesis matches it. "
+                    "Matching is by name, so a vocabulary mismatch can look like this."
+                ),
+            )
+        )
+
+    return LiricalComparison(
+        ran=True,
+        terms_used=list(result.terms_used),
+        terms_excluded=list(result.terms_unknown),
+        findings=findings,
+    )
+
+
+def render_semsim_comparison(comparison: LiricalComparison) -> list[str]:
+    """The similarity engine's report section.
+
+    Its own renderer rather than the LIRICAL one, because the number means
+    something different and must not be labelled "likelihood ratio". Calling a
+    similarity an LR is precisely the unit-blindness
+    `docs/research/scoring-across-engines.md` argues against.
+    """
+    if not comparison.ran:
+        return [f"_The similarity engine did not run this week: {comparison.error}._", ""]
+    if not comparison.findings:
+        return []
+
+    lines = [
+        "A second independent engine ranked diseases by how much INFORMATION your "
+        "findings share with each one — a different question from the likelihood "
+        "ratio above, and a different scale. The number is a similarity, not a "
+        "probability, and is only meaningful compared with the other numbers in "
+        "this list.",
+        "",
+    ]
+    if comparison.terms_used:
+        lines.append(f"_Ran on {len(comparison.terms_used)} current findings._")
+        lines.append("")
+
+    agreements = comparison.of_kind("agreement")
+    if agreements:
+        lines.append("**Both agree on**")
+        for f in agreements:
+            lines.append(
+                f"- {f.disease_name} — similarity rank {f.rank} (score {f.composite_lr:.2f}); "
+                f"differential holds it as {f.ledger_probability}"
+            )
+        lines.append("")
+
+    engine_only = comparison.of_kind("engine_only")
+    if engine_only:
+        lines.append("**The similarity engine raises, the differential does not hold**")
+        for f in engine_only:
+            lines.append(
+                f"- {f.disease_name} (`{f.curie}`) — rank {f.rank}, score {f.composite_lr:.2f}"
+            )
+        lines.append("")
     return lines
