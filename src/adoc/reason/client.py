@@ -707,7 +707,11 @@ class LlmClient:
         return bindings[binding_index]
 
     def context_budget(
-        self, role: str, *, completion_reserve: int = CONTEXT_COMPLETION_RESERVE
+        self,
+        role: str,
+        *,
+        binding_index: int | None = None,
+        completion_reserve: int = CONTEXT_COMPLETION_RESERVE,
     ) -> int | None:
         """Usable input budget for `role`: the SMALLEST declared window among
         its bindings, minus what this call may actually spend on completion.
@@ -732,6 +736,18 @@ class LlmClient:
         worse than not checking.
         """
         bindings = self._bindings.get(role) or []
+        if binding_index is not None and 0 <= binding_index < len(bindings):
+            # This call goes to exactly ONE model. `complete()` resolves a
+            # single binding by index, and `blind_panel` calls it once per
+            # member rather than fanning one request out to all three — so the
+            # payload only has to fit the binding actually being called.
+            #
+            # Sizing every call to the smallest window in the role made a
+            # 200,000-token Opus call fail because a 64,000-token DeepSeek
+            # shared the role. That is not conservatism, it is the wrong
+            # question: no request is ever sent to all three at once.
+            window = bindings[binding_index].context_window
+            return None if window is None else window - completion_reserve
         windows = [b.context_window for b in bindings]
         if not windows or any(w is None for w in windows):
             return None
@@ -793,7 +809,9 @@ class LlmClient:
         # model; letting it through surfaces as a provider error that says
         # nothing about which of three families was too small, or — worse on
         # some hosts — as a silently truncated input.
-        budget = self.context_budget(role, completion_reserve=max_tokens)
+        budget = self.context_budget(
+            role, binding_index=binding_index, completion_reserve=max_tokens
+        )
         if budget is not None:
             estimated = estimate_tokens(scrubbed_system) + sum(
                 estimate_tokens(m.content) for m in scrubbed_messages

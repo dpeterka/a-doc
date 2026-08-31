@@ -1873,23 +1873,6 @@ def _default_pubmed_client(repo: DataRepo) -> PubMedClient:
     )
 
 
-# Completion budget for one blind-panel member, and so also the input
-# budget it leaves: the smallest bound window minus this figure.
-#
-# The default 32,768 is sized for a reasoning model that may think at length.
-# A blind differential is not that: it is a short JSON list of hypotheses with
-# a sentence of rationale each. Reserving half of DeepSeek's 64,000-token
-# window for that output left 31,232 tokens of input, and the blind context
-# pack reached 31,261 — the deep review failed in production by 29 tokens,
-# 0.09% over, and could not run at all.
-#
-# 16,384 still allows a reasoning model room to think and roughly doubles the
-# usable context. If it ever proves too small the failure is loud, not silent:
-# `LlmClient` raises on a truncated completion rather than returning a
-# half-finished differential.
-BLIND_PANEL_MAX_TOKENS = 16384
-
-
 def build_review_dag(
     client: LlmClient,
     repo: DataRepo,
@@ -1979,7 +1962,6 @@ def build_review_dag(
                 messages=[Message(role="user", content=user_content)],
                 schema=BlindDifferentialPayload,
                 binding_index=index,
-                max_tokens=BLIND_PANEL_MAX_TOKENS,
             )
             payload = result.parsed
             assert isinstance(payload, BlindDifferentialPayload)
