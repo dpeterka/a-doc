@@ -43,12 +43,46 @@ def declared_version(label: str) -> str | None:
     return match.group(1) if match else None
 
 
+def check_backmerge(main_version: str, develop_version: str) -> int:
+    """Fail when `develop` is behind `main`'s released version.
+
+    Every release is merged to `main` and must be merged back to `develop`, or
+    develop keeps building on a version that has already shipped. It has been
+    missed three times in this project, and each time the symptom was the same
+    and arrived late: the NEXT release bump found no version string to
+    replace, produced an empty commit, and opened a pull request containing
+    nothing.
+
+    Comparing the two branches after a release turns that into an immediate,
+    named failure instead of a puzzle one release later.
+    """
+    if main_version == develop_version:
+        print(f"check-release-version: OK — develop and main agree at {main_version}")
+        return 0
+    print(
+        f"check-release-version: develop is at {develop_version} but main has released "
+        f"{main_version} — the back-merge after that release was missed. Merge main into "
+        "develop before cutting the next release.",
+        file=sys.stderr,
+    )
+    return 1
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--branch", default="", help="e.g. release/0.21.0")
     parser.add_argument("--tag", default="", help="e.g. v0.21.0")
     parser.add_argument("--root", default=".", help="repo root")
+    parser.add_argument(
+        "--backmerge",
+        nargs=2,
+        metavar=("MAIN_VERSION", "DEVELOP_VERSION"),
+        help="fail when develop is behind main's released version",
+    )
     args = parser.parse_args(argv)
+
+    if args.backmerge:
+        return check_backmerge(*args.backmerge)
 
     label = args.branch or args.tag
     if not label:
