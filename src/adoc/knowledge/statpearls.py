@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+import threading
 import urllib.parse
 from functools import lru_cache
 from pathlib import Path
@@ -229,6 +230,17 @@ class StatPearlsIndex:
     def __init__(self, path: Path) -> None:
         # Read-only URI so a query can never write to a build artifact, and
         # `immutable` because it never changes after the image is built.
+        #
+        # `check_same_thread=False` only DISABLES sqlite3's own same-thread
+        # guard; it does not make sharing safe. The lock is what does that.
+        # This index is an `lru_cache` singleton queried from sync FastAPI
+        # routes, which run in a threadpool, so two requests can drive this
+        # one connection at the same moment — and `labs.db.LabsDb` carries a
+        # long comment about the production crash that exact situation
+        # produced there (`sqlite3.InterfaceError: bad parameter or other API
+        # misuse`, while three routes were served in the same second). Same
+        # pattern, same guard.
+        self._lock = threading.RLock()
         self._connection = sqlite3.connect(
             f"file:{path}?immutable=1&mode=ro", uri=True, check_same_thread=False
         )
@@ -246,14 +258,15 @@ class StatPearlsIndex:
         rows: list[tuple[str, str]] = []
         for query in queries:
             try:
-                rows = self._connection.execute(
-                    # bm25 with the title weighted far above the body: an
-                    # article ABOUT the condition beats one that merely
-                    # mentions it in passing.
-                    "SELECT title, body FROM articles "
-                    "WHERE articles MATCH ? ORDER BY bm25(articles, 10.0, 1.0) LIMIT ?",
-                    (query, limit + _CANDIDATE_POOL),
-                ).fetchall()
+                with self._lock:
+                    rows = self._connection.execute(
+                        # bm25 with the title weighted far above the body:
+                        # an article ABOUT the condition beats one that merely
+                        # mentions it in passing.
+                        "SELECT title, body FROM articles "
+                        "WHERE articles MATCH ? ORDER BY bm25(articles, 10.0, 1.0) LIMIT ?",
+                        (query, limit + _CANDIDATE_POOL),
+                    ).fetchall()
             except sqlite3.Error as exc:
                 logger.warning("statpearls: query failed for %r: %s", query, exc)
                 continue
