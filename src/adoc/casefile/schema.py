@@ -39,6 +39,7 @@ EvidenceStrength = Literal["strong", "moderate", "weak"]
 #   encounter:<filename>
 #   pmid:<digits>
 #   patient-report:<YYYY-MM-DD>
+#   genomic:<gene>:<rsid>
 #   engine:<engine-name>:<YYYY-MM-DD>
 
 _DATE_RE = r"\d{4}-\d{2}-\d{2}"
@@ -76,6 +77,12 @@ SOURCE_REF_PATTERN = re.compile(
     rf"|encounter:{_FILENAME_RE}"
     rf"|pmid:\d+"
     rf"|patient-report:{_DATE_RE}"
+    # `genomic:<gene>:<rsid>` — a claim about a genotype the array actually
+    # measured (ADR 0030). The gene is carried as well as the marker so a
+    # reader can see what is being claimed without looking it up, and the
+    # resolver checks BOTH: a ref naming a real rsid under the wrong gene is
+    # as wrong as an invented one.
+    rf"|genomic:{_SLUG_RE}:rs\d+"
     # A phenotype engine's own verdict, dated by the review that ran it:
     # `engine:lirical:2026-08-31`. LIRICAL's likelihood ratio and the
     # similarity index's Resnik score are real, reproducible observations
@@ -130,7 +137,7 @@ def validate_source_ref(value: str) -> str:
         raise ValueError(
             f"invalid source ref {value!r}: must match labs:<slug>:<date> | "
             "doc:<file>#p<int> | encounter:<file> | pmid:<digits> | "
-            "patient-report:<date>"
+            "patient-report:<date> | genomic:<gene>:<rsid> | engine:<engine>:<date>"
         )
     return normalized
 
