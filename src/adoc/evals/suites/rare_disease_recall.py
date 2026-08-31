@@ -39,6 +39,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+from adoc.config import reference_path
 from adoc.evals.runner import ClientFactory, SuiteCaseResult, SuiteMetric, SuiteResult
 from adoc.knowledge.semsim import SemSimIndex, load_index
 
@@ -85,25 +86,12 @@ def _index_path() -> Path:
     """Where the phenotype index lives, without requiring a data repo.
 
     This suite is entirely synthetic — it needs the ontology and no patient
-    data at all — but `Settings()` has no default for `data_dir` and raises
-    when none is configured. Reading the path through a full `Settings()`
-    therefore made the suite unrunnable in CI, and it reported the reason as
-    "no phenotype-similarity index in this environment" when the truth was a
-    missing data dir. Three tests that monkeypatched `load_index` passed
-    locally and failed in CI for exactly that reason: the skip fired before
-    the patched function was ever called.
-
-    So: use the configured path when there is a configuration, and fall back
-    to the field's own default when there is not. The default is a fixed
-    absolute path that does not depend on `data_dir`.
+    data at all — so a missing data repo must not make it unrunnable. See
+    `config.reference_path`, which carries the full story: the same mistake
+    silently disabled the LIRICAL comparison inside the review, and reported
+    a missing index when the truth was a missing data dir.
     """
-    from adoc.config import Settings
-
-    try:
-        return Settings().semsim_index_path
-    except Exception:  # noqa: BLE001 - no data repo configured; the ontology is elsewhere
-        default = Settings.model_fields["semsim_index_path"].default
-        return Path(str(default))
+    return reference_path("semsim_index_path")
 
 
 def _usable_diseases(index: SemSimIndex) -> list[str]:

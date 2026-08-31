@@ -209,3 +209,29 @@ def load_model_bindings(path: Path | None = None) -> dict[str, list[ModelBinding
         else:
             bindings[role] = [ModelBinding.model_validate(value)]
     return bindings
+
+
+def reference_path(field: str) -> Path:
+    """A reference-artifact path, without requiring a configured data repo.
+
+    `Settings` has no default for `data_dir` and so RAISES when none is
+    configured. Every ontology and index path on it is an absolute build
+    artifact that has nothing to do with the patient's data — but reading one
+    through a bare `Settings()` couples it to that requirement anyway, and the
+    call sites all sit inside broad `except` blocks that must never fail a
+    review or an eval.
+
+    The result was the same silent failure three times over: with no data repo
+    the exception was swallowed and the caller reported the artifact missing.
+    A review said "the phenotype engine did not run" when the truth was an
+    unset `ADOC_DATA_DIR`, and the eval suite said "no similarity index in
+    this environment" for the same reason. Both messages named the wrong
+    cause, which is worse than the failure itself.
+
+    So: the configured path when there is a configuration, the field's own
+    default when there is not.
+    """
+    try:
+        return Path(getattr(Settings(), field))
+    except Exception:  # noqa: BLE001 - no data repo configured; the artifact is elsewhere
+        return Path(str(Settings.model_fields[field].default))
