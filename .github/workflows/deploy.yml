@@ -33,6 +33,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          # HEAD~1 must exist for the sidecar change check below. The
+          # default shallow clone has no parent, so `git diff HEAD~1 HEAD`
+          # errored, the error went to /dev/null, and the check fell
+          # through to "changed" on EVERY deploy — rebuilding the sidecar
+          # every time and defeating its own purpose.
+          fetch-depth: 2
 
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v6
@@ -78,14 +85,35 @@ jobs:
       - name: Check whether the LIRICAL sidecar changed
         id: lirical_changed
         run: |
-          if git diff --quiet HEAD~1 HEAD -- deploy/lirical/ 2>/dev/null; then
+          # Report WHY, rather than silently defaulting to a rebuild: the
+          # previous version sent the error to /dev/null, so a shallow clone
+          # looked identical to a real change.
+          if ! git rev-parse HEAD~1 >/dev/null 2>&1; then
+            echo "no parent commit available — assuming the sidecar changed"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          elif git diff --quiet HEAD~1 HEAD -- deploy/lirical/; then
+            echo "deploy/lirical/ unchanged — reusing the sidecar image in ECR"
             echo "changed=false" >> "$GITHUB_OUTPUT"
           else
+            echo "deploy/lirical/ changed — rebuilding the sidecar"
             echo "changed=true" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Build and push the LIRICAL sidecar image
         if: steps.lirical_changed.outputs.changed == 'true'
+        # NEVER blocks the application deploy. This build downloads LIRICAL's
+        # data from external hosts at image-build time, so it fails for
+        # reasons that have nothing to do with this repository — and it did:
+        # a transient download failure during the v0.25.2 deploy skipped
+        # "Deploy ECS stack" entirely, so an application fix did not ship
+        # because an OPTIONAL sidecar could not be rebuilt.
+        #
+        # The sidecar is supplementary by design: a review completes with
+        # `LiricalComparison(ran=False)` when it is unavailable. "Resolve the
+        # LIRICAL sidecar image" below falls back to whatever :latest is
+        # already in ECR, so a failed rebuild costs a stale sidecar, never a
+        # blocked release.
+        continue-on-error: true
         env:
           IMAGE_URI: ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ vars.AWS_REGION }}.amazonaws.com/a-doc-lirical
         run: |
