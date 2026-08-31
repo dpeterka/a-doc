@@ -95,6 +95,7 @@ from adoc.casefile.schema import (
     validate_source_ref,
 )
 from adoc.knowledge.criteria import CriteriaResult, score_all
+from adoc.knowledge.icap import IcapReport, render_icap, scan_ana_patterns
 from adoc.knowledge.lirical import LiricalRequest
 from adoc.knowledge.lirical_divergence import (
     LiricalComparison,
@@ -646,6 +647,10 @@ class CriteriaScanResult(BaseModel):
         checked — but it is not what a reader should look at first.
         """
         return [r for r in self.results if r.entry_met is not False]
+
+    icap: IcapReport = Field(default_factory=IcapReport)
+    """ANA-pattern mapping. Empty for a seronegative patient, which is the
+    ordinary outcome and not a failure — see `knowledge.icap`."""
 
 
 class StaleArtifact(BaseModel):
@@ -1556,6 +1561,11 @@ def render_review_markdown(
         lines.append("")
         lines += _render_criteria(criteria)
         lines.append("")
+        icap_lines = render_icap(criteria.icap)
+        if icap_lines:
+            lines.append("### What the ANA pattern points at")
+            lines.append("")
+            lines += icap_lines
 
     if lirical is not None and (lirical.findings or lirical.error):
         lines.append("## A second opinion from the phenotype engine")
@@ -1841,7 +1851,14 @@ def build_review_dag(
             )
             for entry in phenotype.entries
         }
-        result = CriteriaScanResult(results=score_all(db.all_non_rejected_rows(), phenotype=lookup))
+        rows = db.all_non_rejected_rows()
+        result = CriteriaScanResult(
+            results=score_all(rows, phenotype=lookup),
+            # ICAP rides along with the criteria scan rather than taking its
+            # own node: both are pure code over the same rows, and a second
+            # node would double the DAG bookkeeping for one function call.
+            icap=scan_ana_patterns(rows),
+        )
         results["criteria_scan"] = result
         return result
 
