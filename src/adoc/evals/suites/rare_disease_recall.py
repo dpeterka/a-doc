@@ -37,6 +37,7 @@ cleanly when it does not.
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 from adoc.evals.runner import ClientFactory, SuiteCaseResult, SuiteMetric, SuiteResult
 from adoc.knowledge.semsim import SemSimIndex, load_index
@@ -78,6 +79,31 @@ RECALL_AT = (1, 3, 10)
 # A first draft of this constant said 0.70, which was aspiration and would
 # have shipped a suite that failed on the day it was written.
 MIN_RECALL_AT_10 = 0.40
+
+
+def _index_path() -> Path:
+    """Where the phenotype index lives, without requiring a data repo.
+
+    This suite is entirely synthetic — it needs the ontology and no patient
+    data at all — but `Settings()` has no default for `data_dir` and raises
+    when none is configured. Reading the path through a full `Settings()`
+    therefore made the suite unrunnable in CI, and it reported the reason as
+    "no phenotype-similarity index in this environment" when the truth was a
+    missing data dir. Three tests that monkeypatched `load_index` passed
+    locally and failed in CI for exactly that reason: the skip fired before
+    the patched function was ever called.
+
+    So: use the configured path when there is a configuration, and fall back
+    to the field's own default when there is not. The default is a fixed
+    absolute path that does not depend on `data_dir`.
+    """
+    from adoc.config import Settings
+
+    try:
+        return Settings().semsim_index_path
+    except Exception:  # noqa: BLE001 - no data repo configured; the ontology is elsewhere
+        default = Settings.model_fields["semsim_index_path"].default
+        return Path(str(default))
 
 
 def _usable_diseases(index: SemSimIndex) -> list[str]:
@@ -131,12 +157,10 @@ def run(*, client_factory: ClientFactory, candidate: str | None = None) -> Suite
     code, so a model binding cannot change its result. Reporting a binding
     label it did not use would be misleading, so it says so.
     """
-    from adoc.config import Settings
-
     label = "deterministic (no model binding used)"
     try:
-        index = load_index(Settings().semsim_index_path)
-    except Exception as exc:  # noqa: BLE001 - a config problem is a skip, not a crash
+        index = load_index(_index_path())
+    except Exception as exc:  # noqa: BLE001 - a bad artifact is a skip, not a crash
         logger.warning("%s: could not load the index: %s", SUITE_NAME, exc)
         index = None
 

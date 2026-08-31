@@ -188,6 +188,61 @@ def test_recall_is_monotonic_across_cutoffs(monkeypatch: pytest.MonkeyPatch) -> 
     assert by_name["recall_at_1"] <= by_name["recall_at_3"] <= by_name["recall_at_10"]
 
 
+# -- configuration ----------------------------------------------------------
+
+
+class _SettingsThatNeedsADataRepo:
+    """`Settings()` as it behaves with no `ADOC_DATA_DIR`: it raises.
+
+    `data_dir` is a required field with no default, so every attribute on
+    `Settings` — including paths that have nothing to do with patient data —
+    is unreachable without a configured repo.
+    """
+
+    model_fields = None  # replaced in the fixture below
+
+    def __init__(self, *_args: object, **_kwargs: object) -> None:
+        raise ValueError("data_dir: Field required")
+
+
+@pytest.fixture
+def no_data_repo(monkeypatch: pytest.MonkeyPatch) -> None:
+    import adoc.config as config
+
+    _SettingsThatNeedsADataRepo.model_fields = config.Settings.model_fields  # type: ignore[assignment]
+    monkeypatch.setattr(config, "Settings", _SettingsThatNeedsADataRepo)
+
+
+def test_the_index_path_falls_back_when_no_data_repo_is_configured(
+    no_data_repo: None,
+) -> None:
+    """This suite is entirely synthetic and needs no patient data, so a
+    missing data repo must not make it unrunnable."""
+    import adoc.config as config
+
+    expected = Path(str(config.Settings.model_fields["semsim_index_path"].default))
+
+    assert suite._index_path() == expected
+
+
+def test_the_suite_runs_with_an_index_but_no_data_repo(
+    no_data_repo: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The exact CI failure, pinned.
+
+    Reading the index path through a full `Settings()` meant the skip fired
+    before anything else ran, so three tests passed locally — where a data dir
+    is configured — and failed in CI. The reported reason was "no
+    phenotype-similarity index", which was not the truth.
+    """
+    monkeypatch.setattr(suite, "load_index", lambda _p: _index())
+
+    result = suite.run(client_factory=None)  # type: ignore[arg-type]
+
+    assert not any(m.name == "skipped" for m in result.metrics)
+    assert [c for c in result.cases if c.case_id.startswith("recall:")]
+
+
 # -- absence ----------------------------------------------------------------
 
 
