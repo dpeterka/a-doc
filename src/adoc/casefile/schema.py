@@ -68,6 +68,12 @@ SOURCE_REF_PATTERN = re.compile(
     rf"|encounter:{_FILENAME_RE}"
     rf"|pmid:\d+"
     rf"|patient-report:{_DATE_RE}"
+    # `genomic:<gene>:<rsid>` — a claim about a genotype the array actually
+    # measured (ADR 0030). The gene is carried as well as the marker so a
+    # reader can see what is being claimed without looking it up, and the
+    # resolver checks BOTH: a ref naming a real rsid under the wrong gene is
+    # as wrong as an invented one.
+    rf"|genomic:{_SLUG_RE}:rs\d+"
     rf")$"
 )
 
