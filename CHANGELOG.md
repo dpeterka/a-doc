@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.25.1] — 2026-08-31
+
+### Fixed
+
+- **The deep review could not run in production.** It failed at
+  `blind_panel_0` with a context of ~31,261 tokens against a budget of
+  31,232 — over by 29 tokens, 0.09%.
+
+  `LlmClient.context_budget` subtracted a flat `CONTEXT_COMPLETION_RESERVE`
+  (32,768) from the smallest bound window regardless of what the call would
+  actually request. On DeepSeek-R1's 64,000-token window that reserves half
+  the window for an output that is a short JSON list of hypotheses, leaving
+  31,232 tokens of input — and the blind context pack had grown past it as
+  phase 3 added sections to the pack.
+
+  The reserve now describes the call: `context_budget` takes a
+  `completion_reserve`, and `complete()` passes its own `max_tokens`. The
+  blind panel asks for `BLIND_PANEL_MAX_TOKENS` (16,384), which still leaves
+  a reasoning model room to think and raises the usable input budget from
+  31,232 to 47,616 — 52% headroom over the pack that failed.
+
+  If that ever proves too small the failure is loud rather than silent:
+  `LlmClient` already raises on a truncated completion instead of returning a
+  half-finished differential.
+
 ## [0.25.0] — 2026-08-31
 
 *Closes every remaining PLAN.md phase 3 item. The knowledge layer stops being
