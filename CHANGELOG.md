@@ -5,6 +5,57 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.24.0] — 2026-08-30
+
+*Tagged but deliberately NOT deployed. Both engines below are latent: ICAP
+renders nothing until a positive ANA with a reported pattern arrives, and
+the similarity index is only present in an image built from this tag.*
+
+### Added
+
+- **ICAP ANA-pattern mapping.** Maps an immunofluorescence pattern
+  (AC-1 … AC-29) to the antibodies worth testing next and the conditions it
+  is associated with. Pure code over a fixed reference table.
+
+  Built knowing it renders nothing on the current case file, and shipped as
+  latent capability. Measured first: all seven ANA screens from 2017 to 2025
+  are negative — three by IFA, the method that produces patterns — every ENA
+  antibody is negative, and no pattern word appears in the document corpus.
+  A pattern is a property of a POSITIVE result. Verified against the real
+  corpus: 2,079 rows scanned, 7 ANA results found, latest read as negative,
+  zero patterns matched, zero lines rendered.
+
+  Matching is longest-phrase-first because the substring traps change the
+  clinical meaning: "homogeneous nucleolar" is AC-8 and points at systemic
+  sclerosis while plain "homogeneous" is AC-1 and points at lupus, and
+  "dense fine speckled" is AC-2, which argues AGAINST an ANA-associated
+  rheumatic disease, while "fine speckled" is AC-4, which points at
+  Sjogren's. Both pinned by test. Every rendering says a pattern is an
+  association, not a diagnosis.
+
+- **Phenotype semantic similarity**, a second independent engine beside
+  LIRICAL. The two answer different questions — likelihood ratio against a
+  curated model versus shared information content — so agreement is
+  corroboration from genuinely different methods and disagreement is the
+  finding. Not folded into a combined score: a similarity is not a
+  probability.
+
+  Resnik with symmetric best-match average, information content computed
+  over disease frequency with annotations propagated to ancestors. A new
+  build artifact from the public HPO release, baked into the image beside
+  the existing HPO index: 19,835 parent edges and 11,645 diseases in 4.9MB.
+
+  Validated against the real 2026-06-23 release. On the marfanoid triad
+  LIRICAL's own smoke test uses, the top six are thoracic-aortic-aneurysm
+  and Loeys-Dietz disorders with Marfan syndrome at 21 of 9,691, and
+  information content is properly monotonic from 0.00 at the root to 5.20
+  for "aortic root aneurysm".
+
+  A known artefact is documented rather than tuned away: rare diseases with
+  few specific annotations can outrank the obvious answer on a short query.
+  That is a property of the measure and the concrete reason this engine
+  reports divergence rather than an answer.
+
 ## [0.23.0] — 2026-08-30
 
 ### Added
