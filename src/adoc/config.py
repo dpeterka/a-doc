@@ -94,6 +94,13 @@ class Settings(BaseSettings):
     # the similarity engine switches itself off rather than failing.
     semsim_index_path: Path = Path("/opt/semsim-index.json")
 
+    # The Mondo cross-reference index (`scripts/build_mondo_index.py`). Gives
+    # a disease one identity across OMIM, ORPHA and free-text names, so an
+    # engine's curie and a hypothesis's name can be compared as ids rather
+    # than as strings. Absent locally, the divergence matchers fall back to
+    # name comparison — which is exactly what they did before it existed.
+    mondo_index_path: Path = Path("/opt/mondo-index.json")
+
     # Longest single chat message accepted. Enforced on the SERVER as well as
     # in the browser: `maxlength` is a convenience, not a control, and a
     # paste-heavy client or a stale page can exceed it.
