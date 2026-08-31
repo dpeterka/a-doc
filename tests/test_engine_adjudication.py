@@ -9,6 +9,9 @@ answer is silent — a mistaken `opposes` becomes counter-evidence, and
 from __future__ import annotations
 
 from datetime import UTC, date, datetime
+from pathlib import Path
+
+import pytest
 
 from adoc.casefile.schema import (
     AddEvidence,
@@ -536,3 +539,37 @@ def test_the_contract_tolerates_the_engines_being_down() -> None:
 
 def test_the_contract_rejects_a_wrong_artifact_type() -> None:
     assert "did not produce" in (_engine_adjudication_completeness_contract().check({}, None) or "")
+
+
+# -- reference paths must not need a data repo -------------------------------
+#
+# This bug landed three separate times before it was named, each time
+# swallowed by a broad `except` that then reported the wrong cause.
+
+
+def test_a_reference_path_resolves_with_no_data_repo_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`Settings` has no default for `data_dir` and raises without one.
+
+    Every ontology and index path on it is an absolute build artifact with
+    nothing to do with patient data, so reading one must not be coupled to
+    having a configured repo. It was: the review's LIRICAL node called
+    `Settings().mondo_index_path` INSIDE the try block that must never fail a
+    review, so with no data dir the comparison reported "the phenotype engine
+    did not run" — naming the wrong cause entirely.
+    """
+    import adoc.config as config
+
+    class _NeedsADataRepo:
+        model_fields = config.Settings.model_fields
+
+        def __init__(self, *_a: object, **_k: object) -> None:
+            raise ValueError("data_dir: Field required")
+
+    monkeypatch.setattr(config, "Settings", _NeedsADataRepo)
+
+    for field in ("mondo_index_path", "semsim_index_path", "hpo_index_path"):
+        resolved = config.reference_path(field)
+        assert resolved == Path(str(config.Settings.model_fields[field].default))
+        assert resolved.is_absolute(), "a reference artifact path must not depend on the cwd"

@@ -94,6 +94,7 @@ from adoc.casefile.schema import (
     UpdateHypothesis,
     validate_source_ref,
 )
+from adoc.config import reference_path
 from adoc.knowledge.criteria import CriteriaResult, score_all
 from adoc.knowledge.icap import IcapReport, render_icap, scan_ana_patterns
 from adoc.knowledge.lirical import LiricalRequest
@@ -2183,7 +2184,6 @@ def build_review_dag(
         Never raises. `docs/research/scoring-across-engines.md`: this is a
         divergence report, not a fifth score to average in.
         """
-        from adoc.config import Settings
 
         ledger = load_ledger(ledger_path)
         try:
@@ -2205,7 +2205,7 @@ def build_review_dag(
                 ledger,
                 terms_used=run.terms_used,
                 terms_excluded=run.terms_excluded,
-                mondo=load_mondo_index(Settings().mondo_index_path),
+                mondo=load_mondo_index(reference_path("mondo_index_path")),
             )
             logger.info(
                 "lirical: %d finding(s), %d divergence(s), in %.1fs",
@@ -2238,9 +2238,7 @@ def build_review_dag(
         checkout, not an error.
         """
         try:
-            from adoc.config import Settings
-
-            index = load_index(Settings().semsim_index_path)
+            index = load_index(reference_path("semsim_index_path"))
             if index is None:
                 return LiricalComparison(ran=False, error="no similarity index in this image")
 
@@ -2256,7 +2254,7 @@ def build_review_dag(
             comparison = compare_semsim_to_ledger(
                 ranked,
                 load_ledger(ledger_path),
-                mondo=load_mondo_index(Settings().mondo_index_path),
+                mondo=load_mondo_index(reference_path("mondo_index_path")),
             )
             logger.info(
                 "semsim: %d finding(s), %d divergence(s) over %d diseases",
