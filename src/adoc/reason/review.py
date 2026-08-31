@@ -95,14 +95,18 @@ from adoc.casefile.schema import (
     validate_source_ref,
 )
 from adoc.knowledge.criteria import CriteriaResult, score_all
+from adoc.knowledge.icap import IcapReport, render_icap, scan_ana_patterns
 from adoc.knowledge.lirical import LiricalRequest
 from adoc.knowledge.lirical_divergence import (
     LiricalComparison,
+    compare_semsim_to_ledger,
     compare_to_ledger,
     render_comparison,
+    render_semsim_comparison,
 )
 from adoc.knowledge.lirical_runner import LIRICAL_WORK_RELDIR, EcsLiricalRunner, LiricalRunner
 from adoc.knowledge.pubmed import PUBMED_CACHE_RELPATH, PubMedArticle, PubMedClient
+from adoc.knowledge.semsim import load_index
 from adoc.labs.db import LabsDb
 from adoc.labs.queries import abnormal_summary
 from adoc.labs.validate import canonicalize, trend_outlier
@@ -646,6 +650,10 @@ class CriteriaScanResult(BaseModel):
         checked — but it is not what a reader should look at first.
         """
         return [r for r in self.results if r.entry_met is not False]
+
+    icap: IcapReport = Field(default_factory=IcapReport)
+    """ANA-pattern mapping. Empty for a seronegative patient, which is the
+    ordinary outcome and not a failure — see `knowledge.icap`."""
 
 
 class StaleArtifact(BaseModel):
@@ -1432,6 +1440,7 @@ def render_review_markdown(
     retirements: RetirementReport | None = None,
     criteria: CriteriaScanResult | None = None,
     lirical: LiricalComparison | None = None,
+    semsim: LiricalComparison | None = None,
     literature: LiteratureRefreshResult | None = None,
     trigger_summary: str = "",
 ) -> str:
@@ -1556,11 +1565,21 @@ def render_review_markdown(
         lines.append("")
         lines += _render_criteria(criteria)
         lines.append("")
+        icap_lines = render_icap(criteria.icap)
+        if icap_lines:
+            lines.append("### What the ANA pattern points at")
+            lines.append("")
+            lines += icap_lines
 
     if lirical is not None and (lirical.findings or lirical.error):
         lines.append("## A second opinion from the phenotype engine")
         lines.append("")
         lines += render_comparison(lirical)
+
+    if semsim is not None and semsim.findings:
+        lines.append("## A third opinion: phenotype similarity")
+        lines.append("")
+        lines += render_semsim_comparison(semsim)
 
     if literature is not None and literature.entries:
         lines.append("## What the literature says")
@@ -1841,7 +1860,14 @@ def build_review_dag(
             )
             for entry in phenotype.entries
         }
-        result = CriteriaScanResult(results=score_all(db.all_non_rejected_rows(), phenotype=lookup))
+        rows = db.all_non_rejected_rows()
+        result = CriteriaScanResult(
+            results=score_all(rows, phenotype=lookup),
+            # ICAP rides along with the criteria scan rather than taking its
+            # own node: both are pure code over the same rows, and a second
+            # node would double the DAG bookkeeping for one function call.
+            icap=scan_ana_patterns(rows),
+        )
         results["criteria_scan"] = result
         return result
 
@@ -2113,6 +2139,53 @@ def build_review_dag(
         results["lirical_divergence"] = comparison
         return comparison
 
+    def _semsim_divergence_fn(_ctx: Ctx) -> BaseModel:
+        """Rank diseases by phenotype similarity and compare to the ledger.
+
+        A second, independent engine beside LIRICAL. They answer differently —
+        one by likelihood ratio against a curated model, the other by shared
+        information content — so where both rank a disease highly that is
+        corroboration from genuinely different methods, and where they diverge
+        that is the thing worth a clinician's attention
+        (`docs/research/scoring-across-engines.md`).
+
+        Reads the ledger from disk for the same reason the LIRICAL node does:
+        `retirement_pass` runs earlier and writes its own diff, so the DAG
+        context holds a pre-retirement object.
+
+        Never raises. A missing index is the ordinary state of a local
+        checkout, not an error.
+        """
+        try:
+            from adoc.config import Settings
+
+            index = load_index(Settings().semsim_index_path)
+            if index is None:
+                return LiricalComparison(ran=False, error="no similarity index in this image")
+
+            profile = load_phenotype(repo.root / Path(PHENOTYPE_RELPATH))
+            observed, _ = select_for_engine(profile, today=clock().date())
+            if not observed:
+                return LiricalComparison(ran=False, error="no current phenotype findings to run on")
+
+            ranked = index.rank(observed)
+            if not ranked.ok:
+                return LiricalComparison(ran=False, error=ranked.error)
+
+            comparison = compare_semsim_to_ledger(ranked, load_ledger(ledger_path))
+            logger.info(
+                "semsim: %d finding(s), %d divergence(s) over %d diseases",
+                len(comparison.findings),
+                comparison.divergence_count,
+                index.disease_count,
+            )
+        except Exception as exc:  # noqa: BLE001 - never fail a review
+            logger.warning("semsim: comparison failed: %s", exc)
+            return LiricalComparison(ran=False, error=f"{type(exc).__name__}: {exc}")
+
+        results["semsim_divergence"] = comparison
+        return comparison
+
     def _literature_refresh_fn(ctx: Ctx) -> BaseModel:
         ledger = ctx["apply_review_diff"]
         assert isinstance(ledger, Ledger)
@@ -2195,6 +2268,8 @@ def build_review_dag(
 
         raw_lirical = results.get("lirical_divergence")
         lirical_result = raw_lirical if isinstance(raw_lirical, LiricalComparison) else None
+        raw_semsim = results.get("semsim_divergence")
+        semsim_result = raw_semsim if isinstance(raw_semsim, LiricalComparison) else None
         raw_literature = results.get("literature_refresh")
         literature_result = (
             raw_literature if isinstance(raw_literature, LiteratureRefreshResult) else None
@@ -2217,6 +2292,7 @@ def build_review_dag(
             retirements=retirement_result,
             criteria=criteria if isinstance(criteria, CriteriaScanResult) else None,
             lirical=lirical_result,
+            semsim=semsim_result,
             literature=literature_result,
         )
         relpath, tag_name = _review_relpath_and_tag(repo, review_date, now=clock())
@@ -2357,11 +2433,20 @@ def build_review_dag(
     )
     nodes.append(
         Node(
+            name="semsim_divergence",
+            fn=_semsim_divergence_fn,
+            input_model=LiricalComparison,
+            output_model=LiricalComparison,
+            depends_on="lirical_divergence",
+        )
+    )
+    nodes.append(
+        Node(
             name="literature_refresh",
             fn=_literature_refresh_fn,
             input_model=LiricalComparison,
             output_model=LiteratureRefreshResult,
-            depends_on="lirical_divergence",
+            depends_on="semsim_divergence",
         )
     )
     nodes.append(
