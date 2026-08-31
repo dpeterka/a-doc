@@ -10,13 +10,17 @@ Built entirely on indexes the image already carries — the phenotype-similarity
 index for disease annotations and the HPO index for readable labels. No new
 download, no network call, no model.
 
-## Features are ranked by information content, not listed
+## Features are ranked by how CHARACTERISTIC they are
 
-A curated disease can carry forty annotations, most of them generic
-("abnormality of the immune system"). Listing them in file order buries the
-distinguishing ones. Ranking by information content puts the features that
-actually characterise the disease first — the same measure the similarity
-engine ranks on, used here to answer a different question.
+Two signals, in order: HPO's curated frequency band, then information content.
+
+Frequency first, because ranking by information content alone answers the
+wrong question. IC measures how SPECIFIC a finding is, not how characteristic:
+on Marfan syndrome, pure IC put "spontaneous cerebrospinal fluid leak" and
+"medial rotation of the medial malleolus" at the top — both genuinely rare,
+therefore highly informative, and neither something anyone would recognise the
+disease by. Specificity then breaks ties within a frequency band, so a common
+finding that is also distinctive outranks a common generic one.
 
 ## What this is not
 
@@ -34,6 +38,8 @@ from collections.abc import Sequence
 from pydantic import BaseModel, Field
 
 from adoc.knowledge.hpo import HpoIndex
+from adoc.knowledge.mondo import MondoIndex
+from adoc.knowledge.orphadata import OrphaIndex, OrphaRecord, render_record
 from adoc.knowledge.semsim import SemSimIndex
 
 # How many characteristic features to show per disease. Enough to recognise a
@@ -78,6 +84,12 @@ class DiseaseCard(BaseModel):
     feature_count: int = 0
     """How many annotations the disease has in total, so "8 of 41 shown" is
     never mistaken for "these are all of them"."""
+
+    orpha: OrphaRecord | None = None
+    """Orphanet's curated definition, prevalence, onset and inheritance, when
+    the disease resolves to an ORPHA code. This is the half a patient actually
+    reads — a feature list is useful to a clinician and close to useless to
+    the person whose case file it is."""
 
 
 def _normalise(text: str) -> str:
@@ -126,6 +138,8 @@ def describe_disease(
     disease_id: str,
     *,
     max_features: int = MAX_FEATURES,
+    orpha: OrphaIndex | None = None,
+    mondo: MondoIndex | None = None,
 ) -> DiseaseCard | None:
     """A reference card for one disease, features most-distinctive first."""
     name = index.disease_name(disease_id)
@@ -133,7 +147,16 @@ def describe_disease(
         return None
 
     terms = index.disease_terms(disease_id)
-    ranked = sorted(terms, key=lambda t: (-index.information_content(t), t))
+    # Frequency band FIRST, then specificity. Ranking by information content
+    # alone answers the wrong question: IC measures how specific a finding is,
+    # not how characteristic. On Marfan syndrome pure IC led with "spontaneous
+    # cerebrospinal fluid leak" and "medial rotation of the medial malleolus"
+    # — both genuinely rare, hence highly informative, and neither anything a
+    # reader would recognise the disease by.
+    ranked = sorted(
+        terms,
+        key=lambda t: (index.frequency_band(disease_id, t), -index.information_content(t), t),
+    )
 
     features: list[str] = []
     for term in ranked:
@@ -145,11 +168,27 @@ def describe_disease(
         if len(features) >= max_features:
             break
 
+    # Orphanet is keyed by ORPHA; a disease found under an OMIM id reaches it
+    # through Mondo. Without a Mondo index only an already-ORPHA id resolves,
+    # which is graceful degradation rather than failure.
+    record: OrphaRecord | None = None
+    if orpha is not None:
+        code = (
+            mondo.orpha_code_for(curie=disease_id, name=name)
+            if mondo is not None
+            else (disease_id if disease_id.startswith("ORPHA:") else None)
+        )
+        if code:
+            found = orpha.get(code)
+            if found is not None and not found.is_empty:
+                record = found
+
     return DiseaseCard(
         disease_id=disease_id,
         name=name,
         features=features,
         feature_count=len(terms),
+        orpha=record,
     )
 
 
@@ -159,6 +198,8 @@ def lookup_diseases(
     queries: Sequence[str],
     *,
     limit: int = MAX_MATCHES,
+    orpha: OrphaIndex | None = None,
+    mondo: MondoIndex | None = None,
 ) -> list[DiseaseCard]:
     """Cards for every disease named in `queries`, deduplicated."""
     if index is None:
@@ -167,10 +208,22 @@ def lookup_diseases(
     seen: set[str] = set()
     for query in queries:
         for disease_id in find_diseases(index, query, limit=limit):
-            if disease_id in seen:
+            # Deduplicate on IDENTITY, not on id. `OMIM:154700` and
+            # `ORPHA:558` are both Marfan syndrome, and showing a reader the
+            # same condition twice under two vocabularies — with two
+            # different feature lists, because the two annotation sets differ
+            # — is exactly the confusion Mondo exists to remove. Falls back to
+            # the raw id when there is no Mondo index, which is the behaviour
+            # that shipped before.
+            identity = (
+                mondo.resolve(curie=disease_id, name=index.disease_name(disease_id) or "")
+                if mondo is not None
+                else None
+            ) or disease_id
+            if identity in seen:
                 continue
-            seen.add(disease_id)
-            card = describe_disease(index, hpo, disease_id)
+            seen.add(identity)
+            card = describe_disease(index, hpo, disease_id, orpha=orpha, mondo=mondo)
             if card is not None:
                 cards.append(card)
     return cards
@@ -195,6 +248,10 @@ def render_disease_cards(cards: Sequence[DiseaseCard]) -> str:
     ]
     for card in cards:
         lines.append(f"**{card.name}** (`{card.disease_id}`)")
+        # Definition first: it is what a reader wants, and the feature list is
+        # qualification on it.
+        if card.orpha is not None:
+            lines += render_record(card.orpha)
         if card.features:
             shown = len(card.features)
             suffix = f" ({shown} of {card.feature_count} annotated features)"

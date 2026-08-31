@@ -105,6 +105,7 @@ from adoc.knowledge.lirical_divergence import (
     render_semsim_comparison,
 )
 from adoc.knowledge.lirical_runner import LIRICAL_WORK_RELDIR, EcsLiricalRunner, LiricalRunner
+from adoc.knowledge.mondo import load_mondo_index
 from adoc.knowledge.pubmed import PUBMED_CACHE_RELPATH, PubMedArticle, PubMedClient
 from adoc.knowledge.semsim import load_index
 from adoc.labs.db import LabsDb
@@ -2105,6 +2106,8 @@ def build_review_dag(
         Never raises. `docs/research/scoring-across-engines.md`: this is a
         divergence report, not a fifth score to average in.
         """
+        from adoc.config import Settings
+
         ledger = load_ledger(ledger_path)
         try:
             profile = load_phenotype(repo.root / Path(PHENOTYPE_RELPATH))
@@ -2125,6 +2128,7 @@ def build_review_dag(
                 ledger,
                 terms_used=run.terms_used,
                 terms_excluded=run.terms_excluded,
+                mondo=load_mondo_index(Settings().mondo_index_path),
             )
             logger.info(
                 "lirical: %d finding(s), %d divergence(s), in %.1fs",
@@ -2172,7 +2176,11 @@ def build_review_dag(
             if not ranked.ok:
                 return LiricalComparison(ran=False, error=ranked.error)
 
-            comparison = compare_semsim_to_ledger(ranked, load_ledger(ledger_path))
+            comparison = compare_semsim_to_ledger(
+                ranked,
+                load_ledger(ledger_path),
+                mondo=load_mondo_index(Settings().mondo_index_path),
+            )
             logger.info(
                 "semsim: %d finding(s), %d divergence(s) over %d diseases",
                 len(comparison.findings),

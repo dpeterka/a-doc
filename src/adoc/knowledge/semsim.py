@@ -86,6 +86,13 @@ DEFAULT_TOP_N = 10
 # silent.
 _UNSEEN_IC = 0.0
 
+# Where a term with no curated frequency sorts: between "occasional" and "very
+# rare". The annotation exists so the finding is real, but nobody recorded how
+# often it occurs. Treating it as common would be a guess; treating it as
+# rarest would bury the many well-attested findings that simply lack a
+# frequency. Must match `scripts/build_semsim_index.py`.
+UNSPECIFIED_BAND = 2
+
 
 class SemSimDisease(BaseModel):
     """One ranked disease."""
@@ -127,6 +134,12 @@ class SemSimIndex:
         self._parents = parents
         self._disease_names = {d: str(v.get("name", d)) for d, v in diseases.items()}
         self._disease_terms = {d: list(v.get("terms", [])) for d, v in diseases.items()}
+        # Sparse: over half of all HPO annotations carry no frequency.
+        self._disease_freq: dict[str, dict[str, int]] = {
+            d: {str(k): int(band) for k, band in dict(v.get("freq", {})).items()}
+            for d, v in diseases.items()
+            if v.get("freq")
+        }
         self._ancestors: dict[str, frozenset[str]] = {}
         self._ic: dict[str, float] = {}
         self._closed_terms: dict[str, frozenset[str]] = {}
@@ -188,6 +201,17 @@ class SemSimIndex:
         reader wants "what does this look like", not every generalisation of
         it up to "phenotypic abnormality"."""
         return list(self._disease_terms.get(disease_id, ()))
+
+    def frequency_band(self, disease_id: str, term: str) -> int:
+        """How commonly `disease_id` presents with `term`; lower is commoner.
+
+        `UNSPECIFIED_BAND` when no frequency was curated — the annotation is
+        real, nobody recorded how often. Used for RANKING a disease's features
+        for a reader, never for scoring: similarity asks how specific the
+        overlap is, and weighting it by frequency would conflate two
+        questions.
+        """
+        return int(self._disease_freq.get(disease_id, {}).get(term, UNSPECIFIED_BAND))
 
     def iter_diseases(self) -> Iterable[tuple[str, str]]:
         """`(id, name)` for every disease, for name search."""

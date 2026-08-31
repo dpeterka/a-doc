@@ -144,3 +144,84 @@ def test_the_rendering_says_this_is_not_about_the_patient() -> None:
 
 def test_no_match_renders_plainly() -> None:
     assert "No matching condition" in render_disease_cards([])
+
+
+def _freq_index() -> SemSimIndex:
+    """A disease whose rarest annotation is also its most specific.
+
+    This is the Marfan shape: pure information-content ranking put
+    "spontaneous cerebrospinal fluid leak" first — genuinely rare, therefore
+    highly informative, and nothing anyone would recognise the disease by.
+    """
+    return SemSimIndex(
+        parents={"common": ["root"], "rare": ["root"]},
+        diseases={
+            "ORPHA:1": {
+                "name": "Test disease",
+                "terms": ["common", "rare"],
+                # 0 = very frequent, 3 = very rare.
+                "freq": {"common": 0, "rare": 3},
+            },
+            "ORPHA:2": {"name": "Filler", "terms": ["common", "root"]},
+        },
+    )
+
+
+def test_a_frequent_feature_outranks_a_rarer_but_more_specific_one() -> None:
+    """Frequency answers "would you recognise the disease by this"; IC answers
+    "how specific is it". For a reader the first question is the one that
+    matters, so it is ranked on first."""
+    index = _freq_index()
+    hpo = HpoIndex(terms={"common": "Common finding", "rare": "Rare finding"}, lookup={})
+
+    # `rare` has the higher information content — confirm that, so the test
+    # proves frequency is overriding specificity rather than agreeing with it.
+    assert index.information_content("rare") > index.information_content("common")
+
+    card = describe_disease(index, hpo, "ORPHA:1")
+
+    assert card.features[0] == "Common finding"
+
+
+def test_an_uncurated_frequency_does_not_sink_a_feature() -> None:
+    """Over half of HPO annotations carry no frequency. Ranking those last
+    would bury well-attested findings that simply lack the field."""
+    index = SemSimIndex(
+        parents={"a": ["root"], "b": ["root"]},
+        diseases={
+            "ORPHA:1": {"name": "D", "terms": ["a", "b"], "freq": {"b": 3}},
+            "ORPHA:2": {"name": "F", "terms": ["a", "root"]},
+        },
+    )
+    hpo = HpoIndex(terms={"a": "Unspecified", "b": "Very rare"}, lookup={})
+
+    card = describe_disease(index, hpo, "ORPHA:1")
+
+    # `a` has no frequency, `b` is banded "very rare": unspecified must win.
+    assert card.features[0] == "Unspecified"
+
+
+def test_the_same_disease_under_two_vocabularies_appears_once() -> None:
+    """`OMIM:154700` and `ORPHA:558` are both Marfan syndrome. Showing a
+    reader the same condition twice — with two different feature lists,
+    because the annotation sets differ — is the confusion Mondo removes."""
+    from adoc.knowledge.mondo import MondoIndex
+
+    index = SemSimIndex(
+        parents={"x": ["root"]},
+        diseases={
+            "OMIM:154700": {"name": "Marfan syndrome", "terms": ["x", "root"]},
+            "ORPHA:558": {"name": "Marfan syndrome", "terms": ["x", "root"]},
+        },
+    )
+    mondo = MondoIndex(
+        names={"MONDO:0007947": "Marfan syndrome"},
+        xrefs={"OMIM:154700": "MONDO:0007947", "ORPHA:558": "MONDO:0007947"},
+        labels={"marfan syndrome": "MONDO:0007947"},
+    )
+
+    without = lookup_diseases(index, _hpo(), ["Marfan syndrome"])
+    with_mondo = lookup_diseases(index, _hpo(), ["Marfan syndrome"], mondo=mondo)
+
+    assert len(without) == 2
+    assert len(with_mondo) == 1

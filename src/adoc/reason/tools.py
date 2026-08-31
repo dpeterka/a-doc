@@ -275,6 +275,8 @@ def lookup_conditions(repo: DataRepo, question: str) -> str:
         from adoc.config import Settings
         from adoc.knowledge.disease_lookup import lookup_diseases, render_disease_cards
         from adoc.knowledge.hpo import HpoIndex
+        from adoc.knowledge.mondo import load_mondo_index
+        from adoc.knowledge.orphadata import load_orpha_index
         from adoc.knowledge.semsim import load_index
 
         settings = Settings()
@@ -291,10 +293,48 @@ def lookup_conditions(repo: DataRepo, question: str) -> str:
             return "_The question does not name a condition from your differential._"
 
         hpo = HpoIndex.load(settings.hpo_index_path)
-        return render_disease_cards(lookup_diseases(index, hpo, named[:_MAX_CONDITION_LOOKUPS]))
+        return render_disease_cards(
+            lookup_diseases(
+                index,
+                hpo,
+                named[:_MAX_CONDITION_LOOKUPS],
+                orpha=load_orpha_index(settings.orphadata_index_path),
+                mondo=load_mondo_index(settings.mondo_index_path),
+            )
+        )
     except Exception as exc:  # noqa: BLE001 - a retrieval helper never fails a turn
         logger.warning("lookup_conditions failed: %s", exc)
         return "_Condition reference lookup unavailable this turn._"
+
+
+def clinical_review(repo: DataRepo, question: str) -> str:
+    """A quoted clinical-review paragraph for a condition on the differential.
+
+    Same candidate rule as `lookup_conditions`: names come from the ledger, not
+    from parsing the question, so this cannot retrieve a condition nobody has
+    raised. Quoted verbatim and attributed, because the source is CC BY-NC-ND
+    (see `knowledge.statpearls`).
+    """
+    try:
+        from adoc.config import Settings
+        from adoc.knowledge.statpearls import load_statpearls_index, render_articles
+
+        settings = Settings()
+        index = load_statpearls_index(settings.statpearls_index_path)
+        if index is None:
+            return "_No clinical review index in this build._"
+
+        ledger = load_ledger(repo.root / Path(LEDGER_RELPATH))
+        asked = question.lower()
+        named = [
+            h.name for h in ledger.hypotheses if h.status == "active" and _mentions(asked, h.name)
+        ]
+        if not named:
+            return "_The question does not name a condition from your differential._"
+        return render_articles(index.search(named[0]))
+    except Exception as exc:  # noqa: BLE001 - a retrieval helper never fails a turn
+        logger.warning("clinical_review failed: %s", exc)
+        return "_Clinical review lookup unavailable this turn._"
 
 
 def _mentions(haystack: str, disease_name: str) -> bool:
@@ -320,6 +360,7 @@ def _deterministic_retrieval(repo: DataRepo, db: LabsDb, question: str) -> str:
             f"### search_documents\n\n{search_documents(db, question)}",
             f"### list_encounters (last 5)\n\n{list_encounters(repo, 5)}",
             f"### lookup_conditions\n\n{lookup_conditions(repo, question)}",
+            f"### clinical_review\n\n{clinical_review(repo, question)}",
         ]
     )
 
