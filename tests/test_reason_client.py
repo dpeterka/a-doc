@@ -752,28 +752,31 @@ def test_a_smaller_completion_reserve_buys_input_budget() -> None:
     assert client.context_budget("blind_panel", completion_reserve=16_384) > observed_pack
 
 
-def test_the_real_panel_bindings_can_hold_the_observed_pack() -> None:
+def test_every_panel_binding_can_hold_the_observed_pack() -> None:
     """Against `models.yaml` as configured, not a synthetic fixture.
 
-    The blind context pack measured 31,261 tokens in production. Two of the
-    three panel members have room for it many times over; the third does not,
-    and that is a binding decision rather than an arithmetic one — recorded
-    here so the constraint is visible rather than rediscovered.
+    The blind context pack measured 31,261 tokens in production, and a member
+    that cannot receive it fails the whole review — which is exactly what
+    happened when DeepSeek's window was declared as 64,000.
+
+    The comparison is parenthesised deliberately. Written first as
+    `budget or 0 > pack`, Python parses that as `budget or (0 > pack)`: a
+    truthy int, so the assertion held no matter how small the budgets were.
+    It passed vacuously, which is the one thing a guard must never do.
     """
     from adoc.config import load_model_bindings
 
     observed_pack = 31_261
     bindings = load_model_bindings()
     client = LlmClient(bindings=bindings, providers={})
-    fits = [
-        client.context_budget("blind_panel", binding_index=i) or observed_pack < 0
-        for i in range(len(bindings["blind_panel"]))
-    ]
 
-    assert sum(bool(f) for f in fits) >= 2, (
-        "fewer than two panel members can hold the observed context pack; "
-        "the panel is no longer a panel"
+    too_small = sorted(
+        binding.model
+        for index, binding in enumerate(bindings["blind_panel"])
+        if (client.context_budget("blind_panel", binding_index=index) or 0) <= observed_pack
     )
+
+    assert not too_small, f"these panel members cannot hold the observed context pack: {too_small}"
 
 
 def test_a_call_is_sized_to_the_binding_it_actually_goes_to() -> None:
