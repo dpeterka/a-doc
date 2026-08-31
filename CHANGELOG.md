@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.25.5] — 2026-08-31
+
+### Fixed
+
+- **The LIRICAL runner and its image disagreed on the data directory.** With
+  the configuration wired in 0.25.4 the sidecar finally launched, and every
+  task exited 1 on `Missing required file hp.json in /lirical-data`. The
+  image downloads to `/opt/liricaldata`; the runner passed `/lirical-data`.
+
+  The build-time smoke test could not catch this: it invokes `prioritize -d
+  "$LIRICAL_DATA"` using the image's own env var, so it exercised the correct
+  path while the only real caller passed a different one. A green build
+  proved nothing about the call that matters — which is why the sidecar was
+  described as "validated locally" and had still never worked.
+
+  A test now parses `ENV LIRICAL_DATA` out of the Dockerfile and asserts it
+  equals `LIRICAL_DATA_DIR`.
+
+### Changed
+
+- A release that lands on `main` without its back-merge to `develop` now
+  fails CI immediately. It had been missed three times, and the symptom
+  always arrived a release late: the next version bump found no version
+  string to replace and produced an empty pull request.
+
 ## [0.25.4] — 2026-08-31
 
 ### Fixed
