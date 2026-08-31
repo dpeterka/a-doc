@@ -5,6 +5,39 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.25.2] — 2026-08-31
+
+### Fixed
+
+- **Both phenotype engines proposing the same disease adopted it twice.**
+  `verdicts_to_ops` checked candidate ids against the ledger only, never
+  against what the same pass had already adopted, so two `AddHypothesis` ops
+  arrived with one id — the ledger invariants then rejected the *entire*
+  engine diff, losing the agreement evidence riding along with it. Both
+  engines rank from the same phenotype terms, so both surfacing the same
+  missing candidate is the ordinary case rather than an edge one.
+
+- **An unusable disease name would have failed the whole review.** A name
+  that slugs to an empty id raises out of `Hypothesis` validation, and
+  `build_engine_diff` was called outside the try in `_apply_engine_diff_fn`.
+  Diff construction now sits inside the guard, and an unusable name is a
+  reported note.
+
+### Changed
+
+- Documentation reviewed against the code. `CLAUDE.md` no longer enumerates
+  CLI subcommands (the list had already gone stale, missing `genomics-panel`)
+  and points at `adoc --help` instead. README's knowledge-layer section
+  rewritten: it claimed one scorer where there are seven, that neither engine
+  was wired into the review DAG, that the LIRICAL image was not deployable,
+  and that no HPO phenotype profile existed — all four false. Phase 3 marked
+  complete.
+
+- `docs/dag-topology.md` — mermaid diagrams of all three reasoning DAGs, and
+  what drawing them revealed: eight of twenty review nodes read context they
+  do not declare, execution is sequential so the graph's one real branch (the
+  blind panel) is decorative, and several edges exist only to sequence.
+
 ## [0.25.1] — 2026-08-31
 
 ### Fixed
