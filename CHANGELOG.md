@@ -5,6 +5,38 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.25.4] — 2026-08-31
+
+### Fixed
+
+- **LIRICAL had never run — not once since ADR 0029.**
+  `ADOC_LIRICAL_CLUSTER`, `ADOC_LIRICAL_SUBNETS` and
+  `ADOC_LIRICAL_SECURITY_GROUPS` appeared nowhere in the repository, so
+  `Settings` defaulted them to empty and `EcsLiricalRunner.run` returned
+  "lirical task is not configured" in 0.0s on every review without launching
+  anything.
+
+  The image was built, the ECR repository created, `a-doc-lirical:1`
+  registered and the narrow `ecs:RunTask` IAM granted — and nothing ever told
+  the application where to run it. Measured in production: `cluster=''`,
+  `subnets=[]`, `security_groups=[]`, against a healthy phenotype query of 8
+  terms from 90 entries.
+
+  Now wired into both task definitions, gated on the same condition as the
+  sidecar. Verified with a CloudFormation change set rather than
+  `validate-template`, which passed on the circular-dependency template in
+  v0.22.0.
+
+- **An engine that did not run left no trace in the report.**
+  `render_review_markdown` reads the engines from the `results` sink, and
+  every early return in both engine nodes skipped writing to it — only the
+  success path recorded anything. So the "did not run this week" line, which
+  exists precisely to make an absent engine visible, could never render.
+
+  That is why a fault present since ADR 0029 never showed up in a single
+  report. Both engine nodes now route every path through the sink; the
+  identical defect in the similarity-engine node is fixed with it.
+
 ## [0.25.3] — 2026-08-31
 
 *The release that lets the deep review run again. It had been failing before
