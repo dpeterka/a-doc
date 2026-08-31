@@ -29,12 +29,14 @@ vocabulary miss.
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from typing import Literal
 
 from pydantic import BaseModel, Field
 
 from adoc.casefile.schema import Hypothesis, Ledger
 from adoc.knowledge.lirical import LiricalDisease, LiricalResult
+from adoc.knowledge.mondo import MondoIndex
 from adoc.knowledge.semsim import SemSimResult
 
 # How far down LIRICAL's ranking counts as "ranked highly". LIRICAL returns a
@@ -48,7 +50,7 @@ ENGINE_TOP_N = 10
 # the phenotype no better than chance".
 SUPPORTIVE_LR_FLOOR = 0.0
 
-MatchRoute = Literal["name", "none"]
+MatchRoute = Literal["mondo", "name", "none"]
 LiricalDivergenceKind = Literal["engine_only", "ledger_only", "agreement"]
 
 _NORMALISE_RE = re.compile(r"[^a-z0-9]+")
@@ -141,6 +143,43 @@ class LiricalComparison(BaseModel):
         return len([f for f in self.findings if f.kind != "agreement"])
 
 
+class _Matcher:
+    """Pairs an engine result with a ledger hypothesis.
+
+    Mondo first, name second. A cross-reference is an assertion by a curated
+    ontology that two identifiers denote the same disease; a name match is a
+    string that happens to agree. Trying the id route first is what stops
+    `OMIM:270150` and a hypothesis called "Sjogren syndrome" being reported as
+    a disagreement when they are the same thing (ADR: see the Mondo index).
+
+    With no Mondo index — a local checkout, or an image built before it
+    existed — every match falls back to the name route, which is exactly the
+    behaviour that shipped before. `matched_by` records which route fired, so
+    a reader can tell a real disagreement from a vocabulary miss.
+    """
+
+    def __init__(self, active: Sequence[Hypothesis], mondo: MondoIndex | None) -> None:
+        self._mondo = mondo
+        self._by_name: dict[str, Hypothesis] = {}
+        self._by_mondo: dict[str, Hypothesis] = {}
+        for hypothesis in active:
+            self._by_name.setdefault(normalise_disease_name(hypothesis.name), hypothesis)
+            if mondo is not None:
+                resolved = mondo.resolve(curie=hypothesis.mondo or "", name=hypothesis.name)
+                if resolved is not None:
+                    self._by_mondo.setdefault(resolved, hypothesis)
+
+    def find(self, *, name: str, curie: str) -> tuple[Hypothesis | None, MatchRoute]:
+        if self._mondo is not None:
+            resolved = self._mondo.resolve(curie=curie, name=name)
+            if resolved is not None:
+                hypothesis = self._by_mondo.get(resolved)
+                if hypothesis is not None:
+                    return hypothesis, "mondo"
+        hypothesis = self._by_name.get(normalise_disease_name(name))
+        return (hypothesis, "name") if hypothesis is not None else (None, "none")
+
+
 def compare_to_ledger(
     result: LiricalResult,
     ledger: Ledger,
@@ -149,6 +188,7 @@ def compare_to_ledger(
     terms_excluded: list[str] | None = None,
     top_n: int = ENGINE_TOP_N,
     lr_floor: float = SUPPORTIVE_LR_FLOOR,
+    mondo: MondoIndex | None = None,
 ) -> LiricalComparison:
     """Where the engine and the ledger disagree.
 
@@ -166,17 +206,14 @@ def compare_to_ledger(
       and reporting only disagreement throws it away.
     """
     active = [h for h in ledger.hypotheses if h.status == "active"]
-    by_key: dict[str, Hypothesis] = {}
-    for hypothesis in active:
-        by_key.setdefault(normalise_disease_name(hypothesis.name), hypothesis)
+    matcher = _Matcher(active, mondo)
 
     findings: list[LiricalFinding] = []
     matched_ids: set[str] = set()
 
     ranked: list[LiricalDisease] = sorted(result.diseases, key=lambda d: d.rank)[:top_n]
     for disease in ranked:
-        key = normalise_disease_name(disease.name)
-        matched = by_key.get(key)
+        matched, route = matcher.find(name=disease.name, curie=disease.curie)
         supportive = disease.composite_lr > lr_floor
 
         if matched is not None:
@@ -193,7 +230,7 @@ def compare_to_ledger(
                     ledger_hypothesis_name=matched.name,
                     ledger_probability=matched.probability,
                     ledger_tier=matched.tier,
-                    matched_by="name",
+                    matched_by=route,
                     note="Both the phenotype engine and the differential hold this.",
                 )
             )
@@ -311,6 +348,7 @@ def compare_semsim_to_ledger(
     ledger: Ledger,
     *,
     top_n: int = ENGINE_TOP_N,
+    mondo: MondoIndex | None = None,
 ) -> LiricalComparison:
     """The same comparison, for the semantic-similarity engine.
 
@@ -326,15 +364,13 @@ def compare_semsim_to_ledger(
     is a candidate; the ranking itself is the filter.
     """
     active = [h for h in ledger.hypotheses if h.status == "active"]
-    by_key: dict[str, Hypothesis] = {}
-    for hypothesis in active:
-        by_key.setdefault(normalise_disease_name(hypothesis.name), hypothesis)
+    matcher = _Matcher(active, mondo)
 
     findings: list[LiricalFinding] = []
     matched_ids: set[str] = set()
 
     for rank, disease in enumerate(result.diseases[:top_n], start=1):
-        matched = by_key.get(normalise_disease_name(disease.name))
+        matched, route = matcher.find(name=disease.name, curie=disease.disease_id)
         if matched is not None:
             matched_ids.add(matched.id)
             findings.append(
@@ -348,7 +384,7 @@ def compare_semsim_to_ledger(
                     ledger_hypothesis_name=matched.name,
                     ledger_probability=matched.probability,
                     ledger_tier=matched.tier,
-                    matched_by="name",
+                    matched_by=route,
                     note="Both the similarity engine and the differential hold this.",
                 )
             )
