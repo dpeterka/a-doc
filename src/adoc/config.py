@@ -94,6 +94,26 @@ class Settings(BaseSettings):
     # the similarity engine switches itself off rather than failing.
     semsim_index_path: Path = Path("/opt/semsim-index.json")
 
+    # The Mondo cross-reference index (`scripts/build_mondo_index.py`). Gives
+    # a disease one identity across OMIM, ORPHA and free-text names, so an
+    # engine's curie and a hypothesis's name can be compared as ids rather
+    # than as strings. Absent locally, the divergence matchers fall back to
+    # name comparison — which is exactly what they did before it existed.
+    mondo_index_path: Path = Path("/opt/mondo-index.json")
+
+    # The Orphanet reference index (`scripts/build_orphadata_index.py`):
+    # curated definitions, prevalence, age of onset and inheritance, keyed by
+    # ORPHA code. Absent locally, the disease lookup falls back to the
+    # HPO-annotation view alone.
+    orphadata_index_path: Path = Path("/opt/orphadata-index.json")
+
+    # The StatPearls lead-section FTS5 index
+    # (`scripts/build_statpearls_index.py`). 41MB, from a 1.9GB archive: only
+    # the title and orienting sections are kept, because a full-text index
+    # would be 300-400MB in an image whose other reference artifacts total
+    # about 21MB. Absent locally, clinical-review lookup switches itself off.
+    statpearls_index_path: Path = Path("/opt/statpearls.sqlite")
+
     # Longest single chat message accepted. Enforced on the SERVER as well as
     # in the browser: `maxlength` is a convenience, not a control, and a
     # paste-heavy client or a stale page can exceed it.
@@ -189,3 +209,29 @@ def load_model_bindings(path: Path | None = None) -> dict[str, list[ModelBinding
         else:
             bindings[role] = [ModelBinding.model_validate(value)]
     return bindings
+
+
+def reference_path(field: str) -> Path:
+    """A reference-artifact path, without requiring a configured data repo.
+
+    `Settings` has no default for `data_dir` and so RAISES when none is
+    configured. Every ontology and index path on it is an absolute build
+    artifact that has nothing to do with the patient's data — but reading one
+    through a bare `Settings()` couples it to that requirement anyway, and the
+    call sites all sit inside broad `except` blocks that must never fail a
+    review or an eval.
+
+    The result was the same silent failure three times over: with no data repo
+    the exception was swallowed and the caller reported the artifact missing.
+    A review said "the phenotype engine did not run" when the truth was an
+    unset `ADOC_DATA_DIR`, and the eval suite said "no similarity index in
+    this environment" for the same reason. Both messages named the wrong
+    cause, which is worse than the failure itself.
+
+    So: the configured path when there is a configuration, the field's own
+    default when there is not.
+    """
+    try:
+        return Path(getattr(Settings(), field))
+    except Exception:  # noqa: BLE001 - no data repo configured; the artifact is elsewhere
+        return Path(str(Settings.model_fields[field].default))

@@ -12,6 +12,7 @@ from datetime import date
 
 from adoc.knowledge.criteria import (
     CLASSIFICATION_DISCLAIMER,
+    SCORERS,
     score_all,
     score_gpa_2022,
     score_ra_2010,
@@ -388,11 +389,125 @@ def test_a_genuinely_high_eosinophil_count_does_score_the_penalty() -> None:
 
 
 def test_every_registered_scorer_carries_the_disclaimer_and_a_citation() -> None:
-    """Four sets now; the label is not optional on any of them."""
+    """However many sets there are, the label is not optional on any of them.
+
+    Counted from the registry rather than hardcoded: the literal said 4 and
+    went stale the moment the ANCA siblings and Behçet were added, which
+    turned a real invariant into an arithmetic assertion about how many
+    scorers exist.
+    """
     results = score_all([_row("CRP", value=8.5)])
 
-    assert len(results) == 4
+    assert len(results) == len(SCORERS)
     for result in results:
         assert result.disclaimer == CLASSIFICATION_DISCLAIMER
         assert result.citation
         assert result.threshold > 0
+
+
+# --- the two ANCA siblings (EGPA / MPA 2022) ----------------------------------------------
+#
+# The 2022 ACR/EULAR criteria come as a set of three. Encoding only GPA left
+# the other two arms of the same decision unmodelled.
+
+
+def test_one_eosinophil_count_moves_the_three_vasculitis_sets_in_opposite_directions() -> None:
+    """The reason for encoding all three rather than the one.
+
+    A raised eosinophil count is the heaviest single item in EGPA (+5) and a
+    heavy penalty in both GPA and MPA (−4). One CBC differential is far more
+    informative across the trio than it is against any of them alone.
+    """
+    rows = [_row("Eosinophils Absolute", value=1800.0, unit="cells/uL")]
+
+    by_key = {r.key: r for r in score_all(rows, keys=["gpa-2022", "egpa-2022", "mpa-2022"])}
+
+    assert by_key["egpa-2022"].points == 5
+    assert by_key["gpa-2022"].points == -4
+    assert by_key["mpa-2022"].points == -4
+
+
+def test_mpo_anca_alone_classifies_mpa_and_penalises_gpa() -> None:
+    """Faithful to the published set: in an established small-vessel
+    vasculitis that one serology is close to decisive between the three."""
+    rows = [_row("Myeloperoxidase Ab", value_text="Positive", flag="H")]
+
+    by_key = {r.key: r for r in score_all(rows, keys=["gpa-2022", "egpa-2022", "mpa-2022"])}
+
+    assert by_key["mpa-2022"].points == 6
+    assert by_key["mpa-2022"].meets_threshold
+    assert by_key["gpa-2022"].points == -1
+    assert not by_key["gpa-2022"].meets_threshold
+
+
+def test_pr3_penalises_both_siblings() -> None:
+    rows = [_row("Proteinase 3 Ab", value_text="Positive", flag="H")]
+
+    by_key = {r.key: r for r in score_all(rows, keys=["egpa-2022", "mpa-2022"])}
+
+    assert by_key["egpa-2022"].points == -3
+    assert by_key["mpa-2022"].points == -1
+
+
+def test_a_negative_item_only_subtracts_when_it_is_actually_met() -> None:
+    """Negatives follow the same rule as positives.
+
+    A negative clinical item read from the text-matched phenotype reaches
+    `possible` at most, and `possible` must not move a total in EITHER
+    direction — the attribution rule exists precisely because matched text
+    cannot know whether a finding belongs to this condition.
+    """
+    phenotype = {"HP:0001742": ("Nasal congestion", True, "stuffy nose most mornings")}
+
+    result = score_all([], keys=["mpa-2022"], phenotype=phenotype)[0]
+
+    nasal = next(i for i in result.items if i.domain == "ENT-negative")
+    assert nasal.state == "possible"
+    assert result.points == 0, "an unattributed finding talked the score down"
+
+
+# --- Behçet ICBD 2014 ---------------------------------------------------------------------
+
+
+def test_behcet_reads_no_labs_at_all() -> None:
+    """The first set here with no laboratory item.
+
+    There is no serological marker for Behçet, so a condition diagnosed
+    clinically would otherwise be invisible to this layer no matter how well
+    the record described it.
+    """
+    result = score_all([_row("Anti-dsDNA", value=300.0)], keys=["behcet-icbd-2014"])[0]
+
+    assert not result.assessable
+    assert all(item.state == "not_assessed" for item in result.items)
+
+
+def test_behcet_reports_what_attribution_would_add_without_claiming_it() -> None:
+    """Three findings worth 6 points against a threshold of 4 — and the score
+    stays 0, because a text-matched phenotype cannot attribute them.
+
+    This is the honest output for a set with no confirmatory test: it says
+    the record contains matching findings and leaves attribution where it
+    belongs.
+    """
+    phenotype = {
+        "HP:0000155": ("Oral ulcer", True, "recurrent mouth ulcers"),
+        "HP:0003249": ("Genital ulcers", True, "genital ulceration"),
+        "HP:0000554": ("Uveitis", True, "anterior uveitis"),
+    }
+
+    result = score_all([], keys=["behcet-icbd-2014"], phenotype=phenotype)[0]
+
+    assert result.points == 0
+    assert result.points_possible == 6
+    assert result.threshold == 4
+    assert not result.meets_threshold, "possible items must never cross a threshold"
+
+
+def test_every_registered_scorer_survives_an_empty_record() -> None:
+    """A new scorer that raises on a patient with no matching data would take
+    the whole `criteria_scan` node down with it."""
+    results = score_all([], phenotype=None)
+
+    assert len(results) == len(SCORERS)
+    assert all(r.citation for r in results), "every set must be traceable to its publication"

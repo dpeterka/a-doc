@@ -52,6 +52,31 @@ _MIN_COLUMNS = 11
 # that one term. Monarch's own tooling filters similarly.
 MIN_TERMS_PER_DISEASE = 3
 
+_FREQUENCY_COLUMN = 7
+
+# HPO's frequency vocabulary, mapped to a band. Lower is commoner.
+#
+# This exists because ranking a disease's features by information content
+# alone answers the wrong question. IC measures how SPECIFIC a finding is, not
+# how CHARACTERISTIC it is: on Marfan syndrome, pure IC put "spontaneous
+# cerebrospinal fluid leak" and "medial rotation of the medial malleolus" at
+# the top — both genuinely rare, hence highly informative, and neither
+# something a reader would recognise the disease by. Frequency separates the
+# two.
+_FREQUENCY_BANDS = {
+    "HP:0040281": 0,  # Very frequent (99-80%)
+    "HP:0040282": 1,  # Frequent (79-30%)
+    "HP:0040283": 2,  # Occasional (29-5%)
+    "HP:0040284": 3,  # Very rare (<4-1%)
+    "HP:0040285": 4,  # Excluded (0%)
+}
+
+# An unspecified frequency sorts between "occasional" and "very rare": the
+# annotation exists, so the finding is real, but nobody recorded how often it
+# occurs. Ranking it as common would be a guess; ranking it last would bury
+# the many well-attested findings that simply lack a frequency.
+UNSPECIFIED_BAND = 2
+
 
 def _term_id(raw: str) -> str | None:
     """`http://purl.obolibrary.org/obo/HP_0001250` -> `HP:0001250`."""
@@ -85,10 +110,41 @@ def parse_parents(hp_json: Path) -> dict[str, list[str]]:
     }
 
 
+def _frequency_band(raw: str) -> int | None:
+    """A frequency band from an HPO term or an observed fraction.
+
+    Fractions ("3/4") are how curators record small cohorts; converting them
+    to the same bands keeps one comparable scale instead of two.
+    """
+    value = (raw or "").strip()
+    if not value:
+        return None
+    if value in _FREQUENCY_BANDS:
+        return _FREQUENCY_BANDS[value]
+    if "/" in value:
+        head, _, tail = value.partition("/")
+        try:
+            observed, total = float(head), float(tail)
+        except ValueError:
+            return None
+        if total <= 0:
+            return None
+        ratio = observed / total
+        if ratio >= 0.8:
+            return 0
+        if ratio >= 0.3:
+            return 1
+        if ratio >= 0.05:
+            return 2
+        return 3
+    return None
+
+
 def parse_annotations(hpoa: Path) -> dict[str, dict[str, object]]:
-    """Disease id -> `{name, terms}` from `phenotype.hpoa`."""
+    """Disease id -> `{name, terms, freq}` from `phenotype.hpoa`."""
     diseases: dict[str, dict[str, object]] = {}
     terms_by_disease: dict[str, set[str]] = defaultdict(set)
+    freq_by_disease: dict[str, dict[str, int]] = defaultdict(dict)
     names: dict[str, str] = {}
 
     with hpoa.open("r", encoding="utf-8") as handle:
@@ -108,11 +164,29 @@ def parse_annotations(hpoa: Path) -> dict[str, dict[str, object]]:
                 continue
             terms_by_disease[disease].add(term)
             names.setdefault(disease, columns[_DISEASE_NAME_COLUMN].strip())
+            band = _frequency_band(columns[_FREQUENCY_COLUMN])
+            if band is not None:
+                # A term annotated twice at different frequencies keeps the
+                # commoner one: the disease demonstrably presents that way in
+                # at least one described cohort.
+                current = freq_by_disease[disease].get(term)
+                if current is None or band < current:
+                    freq_by_disease[disease][term] = band
 
     for disease, terms in terms_by_disease.items():
         if len(terms) < MIN_TERMS_PER_DISEASE:
             continue
-        diseases[disease] = {"name": names.get(disease, disease), "terms": sorted(terms)}
+        record: dict[str, object] = {
+            "name": names.get(disease, disease),
+            "terms": sorted(terms),
+        }
+        bands = freq_by_disease.get(disease)
+        if bands:
+            # Sparse on purpose: over half of all annotations carry no
+            # frequency, and storing a default for each would inflate the
+            # artifact to say nothing.
+            record["freq"] = bands
+        diseases[disease] = record
     return diseases
 
 

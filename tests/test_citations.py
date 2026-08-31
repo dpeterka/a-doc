@@ -259,6 +259,26 @@ def test_patient_report_ref_always_resolved(db: LabsDb, repo: DataRepo) -> None:
     assert report.checks[0].outcome == "resolved"
 
 
+# --- engine: ref resolution -------------------------------------------------------------------
+
+
+def test_engine_ref_resolves_and_names_the_engine(db: LabsDb, repo: DataRepo) -> None:
+    """Resolved on grammar, like `patient-report:`, and for the same reason:
+    it names a computation this system performed and recorded, not an
+    external document that might not exist. The engine name is a closed set
+    in `casefile.schema`, so an unknown engine fails validation before it
+    can reach the checker at all."""
+    op = _evidence_op(
+        "engine:lirical:2026-08-31", claim="Independently ranked by lirical at rank 2."
+    )
+
+    report = check_ops_citations([op], db, repo)
+
+    assert report.checks[0].outcome == "resolved"
+    assert "lirical" in report.checks[0].reason
+    assert not report.failing
+
+
 # --- pmid: ref resolution (fake verifier) -----------------------------------------------------
 
 
