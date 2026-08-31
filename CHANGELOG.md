@@ -5,6 +5,56 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.25.3] — 2026-08-31
+
+*The release that lets the deep review run again. It had been failing before
+doing any work, since the blind context pack outgrew a mis-declared window.*
+
+### Fixed
+
+- **DeepSeek's context window was declared 64,000; it is 131,072.** This is
+  what took the review down: the blind context pack reached 31,261 tokens
+  against a budget of 64,000 − 32,768 = 31,232 — over by 29 tokens, 0.09%.
+
+  Verified against the live API rather than the docs. Featherless reports
+  `context_length: 131072` for this exact model with `max_completion_tokens:
+  32768` — precisely our completion reserve — and a 90,009-token prompt was
+  accepted. Budget for that binding goes 31,232 → 98,304. Same model, same
+  family, same behaviour; only a wrong number changes.
+
+- **A call is now sized to the binding it actually goes to.** `complete()`
+  resolves one binding by index and `blind_panel` calls it once per member,
+  so no request is ever fanned out to all three at once. Sizing every call to
+  the smallest window in the role failed a 200,000-token Opus call because a
+  64,000-token DeepSeek shared the role.
+
+- **Both engines proposing the same disease adopted it twice**, which the
+  ledger invariants rejected — losing the entire engine diff, agreement
+  evidence included. Both engines rank from the same phenotype, so this was
+  the ordinary case, not an edge one.
+
+- **An unusable disease name would have failed the whole review.**
+  `build_engine_diff` sat outside its own try block, so a name that slugs to
+  an invalid id raised out of a stage contracted never to fail a review.
+
+- **`StatPearlsIndex` shared one sqlite connection across threadpool requests
+  with no lock** — the pattern that already caused a production
+  `sqlite3.InterfaceError` in `LabsDb`, which carries a long comment about it.
+
+- **An optional sidecar could block the whole application deploy.** A
+  transient failure in LIRICAL's build-time data download skipped "Deploy ECS
+  stack", so v0.25.2 shipped nothing until the job was re-run. That build is
+  now `continue-on-error`, and its change check — which compared against
+  `HEAD~1` on a shallow clone, swallowed the error and therefore rebuilt on
+  every deploy — works now the checkout fetches depth 2.
+
+### Changed
+
+- `docs/dag-topology.md`: mermaid diagrams of all three reasoning DAGs, and
+  what drawing them revealed — eight of twenty review nodes read context they
+  never declare, execution is sequential so the graph's one real branch is
+  decorative, and several edges exist only to sequence.
+
 ## [0.25.2] — 2026-08-31
 
 ### Fixed
