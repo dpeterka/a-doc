@@ -5,6 +5,110 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.25.0] — 2026-08-31
+
+*Closes every remaining PLAN.md phase 3 item. The knowledge layer stops being
+a set of parallel opinions and starts changing the differential.*
+
+### Added
+
+- **Phenotype-engine divergence is adjudicated into the ledger** (ADR 0036).
+  LIRICAL and the similarity index had run inside the review since ADR 0029
+  and neither could change anything: both nodes sit after `apply_review_diff`,
+  so by the time either spoke the ledger for that review was already written.
+  The report got longer and the differential did not get sharper — exactly the
+  failure `docs/research/scoring-across-engines.md` predicted.
+
+  Two new nodes, `engine_adjudication` → `apply_engine_diff`. The model
+  supplies a DIRECTION per divergence (corroborates / opposes / neutral) with
+  a rationale; a postcondition contract enforces coverage, uniqueness, a
+  substantive rationale each, and rejects one rationale reused everywhere.
+  What a direction DOES to the ledger is plain code.
+
+  Scores are never combined. A likelihood ratio and a Resnik similarity are
+  not commensurable; both engines happen to store theirs in the same field, so
+  the label is chosen by engine (`LR 12.4` vs `similarity 3.81`).
+
+  `neutral` is a first-class outcome and the load-bearing decision. A
+  phenotype-only engine that never ranked a hypothesis has not refuted it.
+  Reading `ledger_only` as opposition would manufacture counter-evidence every
+  week against precisely those hypotheses whose support lives in a modality
+  the engine cannot see — and the retirement pass, which retires on
+  accumulated counter-evidence, would start killing them.
+
+  Guards: evidence-only ops (never a probability or tier re-grade), a
+  mandatory rule-out before adopting anything, `expanded`/`low` entry tier, a
+  cap of 3 adoptions per review, and `moderate` strength never `strong`.
+  Engine agreement is recorded deterministically with no model call.
+
+- **`engine:<lirical|semsim>:<YYYY-MM-DD>` citation scheme.** A hypothesis
+  that exists BECAUSE an engine ranked it has to be able to say so. Unlike
+  every other slug in the grammar this is a CLOSED set, so `engine:liricl:…`
+  is a validation error rather than a citation resolving to nothing.
+
+- **Three more classification scorers**, taking the registry from four to
+  seven. EGPA 2022 and MPA 2022 complete the ANCA trio — published as a set of
+  three, and encoding only GPA left the other two arms unmodelled. The payoff
+  is their opposition: one eosinophil count now reads +5 for EGPA and −4 for
+  both GPA and MPA, and MPO-ANCA alone classifies MPA while penalising GPA.
+
+  Behçet ICBD 2014 is the first set reading NO labs — there is no serological
+  marker, so a clinically diagnosed condition would otherwise be invisible to
+  this layer however well the record described it. It reports
+  `points_possible` against the threshold and never claims classification from
+  text-matched findings.
+
+  Every HPO id was verified against `hp.json` rather than recalled; two
+  plausible guesses were wrong (`HP:0002383` is infectious encephalitis,
+  `HP:0100648` a tongue neoplasm) and either would have produced a criterion
+  that silently never matched.
+
+- **Two eval suites, enabling gated model rotation.**
+  `adoc eval --suite rare_disease_recall` builds 40 simulated patients from
+  HPO annotations (4 of the disease's own terms plus 2 from an unrelated one),
+  the way LIRICAL and Exomiser are themselves benchmarked. Measured on the
+  2026-06-23 release: recall@1 0.225, recall@3 0.400, recall@10 0.525, median
+  rank 2 when found. Gated at 0.40 — below the measured rate, so an ontology
+  release that shifts a few cases does not cry wolf. A recall MISS does not
+  fail a case: `adoc eval` ANDs every case into its verdict, so that would
+  fail the suite permanently at any recall below 100%.
+
+  `--suite self_case_replay` deliberately does not do what PLAN.md item (d)
+  describes; that design needs a doctor-confirmed finding and there is none.
+  It pins reproducibility and internal consistency of the deterministic layers
+  over the real ledger instead. It skips visibly when no data repo is present
+  AND when the ledger is empty — every check it makes is a bound or a floor,
+  so its first run reported six green cases against an 83-byte ledger header.
+
+- **Knowledge chat tools**: Mondo cross-references, Orphanet definitions and
+  prevalence, StatPearls clinical-review lookup, and a disease-lookup tool.
+
+- **The deterministic genomics panel** (ADR 0030): 5 markers, all called
+  against the real array.
+
+### Fixed
+
+- **Reference-artifact paths no longer require a configured data repo.** The
+  same bug had landed three times. `Settings` has no default for `data_dir`
+  and raises without one, every ontology path on it is an absolute build
+  artifact unrelated to patient data, and all the call sites sit inside broad
+  `except` blocks. The exception was swallowed and each caller reported the
+  wrong cause — most seriously, the review's LIRICAL node reported "the
+  phenotype engine did not run" when the truth was an unset `ADOC_DATA_DIR`,
+  silently disabling engine comparison in any environment without one. One
+  `config.reference_path()` helper now serves all four call sites.
+
+- **The review report showed a stale "after" ledger.** It read `ledger_after`
+  from `apply_review_diff`, the PRE-retirement object, so since ADR 0035 a
+  review that retired hypotheses reported a version it had already moved past
+  and rendered a "what changed" ledger still containing every hypothesis it
+  had just retired.
+
+### Changed
+
+- Dependency bumps: anthropic 1.2.0, openai 3.5.0, boto3 1.43.82,
+  GitPython 3.1.61, actions/upload-artifact v7.
+
 ## [0.24.0] — 2026-08-30
 
 *Tagged but deliberately NOT deployed. Both engines below are latent: ICAP
