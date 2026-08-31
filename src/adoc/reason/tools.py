@@ -41,10 +41,13 @@ that node's MVP body.
 
 from __future__ import annotations
 
+import logging
 import re
+from pathlib import Path
 
 from adoc.casefile.encounters import read_encounter
-from adoc.casefile.repo import DataRepo
+from adoc.casefile.ledger import load_ledger
+from adoc.casefile.repo import LEDGER_RELPATH, DataRepo
 from adoc.labs.db import LabsDb
 from adoc.labs.models import LabResult
 from adoc.labs.queries import trend_series
@@ -52,6 +55,12 @@ from adoc.labs.validate import canonicalize
 from adoc.reason.client import LlmClient, LlmResult, Message
 from adoc.reason.context import build_context
 from adoc.reason.safety import GateResult, treatment_gate
+
+logger = logging.getLogger(__name__)
+
+# How many conditions one turn looks up. She asks about one or two, not ten;
+# beyond this the retrieval block crowds out the case file itself.
+_MAX_CONDITION_LOOKUPS = 3
 
 _MAX_SERIES_POINTS = 8
 _MAX_GREP_HITS = 10
@@ -249,6 +258,58 @@ _INFORMATIONAL_GATE_ATTEMPTS = 2
 _WITHHELD_MARKER = "[withheld: this passage failed a-doc's dosing/treatment safety gate]"
 
 
+def lookup_conditions(repo: DataRepo, question: str) -> str:
+    """Reference entries for any condition the question names.
+
+    Candidates come from the LEDGER's own hypothesis names rather than from
+    free-text parsing of the question. That is deliberate and it is the whole
+    trick: the patient asks "what is relapsing polychondritis" using a name
+    she got from her own report, so matching against the names already on her
+    differential finds it exactly, with no fuzzy matching and no chance of
+    retrieving a disease nobody has raised.
+
+    A question naming nothing on the ledger returns nothing, which is correct
+    — this is not a general medical encyclopaedia and must not become one.
+    """
+    try:
+        from adoc.config import Settings
+        from adoc.knowledge.disease_lookup import lookup_diseases, render_disease_cards
+        from adoc.knowledge.hpo import HpoIndex
+        from adoc.knowledge.semsim import load_index
+
+        settings = Settings()
+        index = load_index(settings.semsim_index_path)
+        if index is None:
+            return "_No disease reference index in this build._"
+
+        ledger = load_ledger(repo.root / Path(LEDGER_RELPATH))
+        asked = question.lower()
+        named = [
+            h.name for h in ledger.hypotheses if h.status == "active" and _mentions(asked, h.name)
+        ]
+        if not named:
+            return "_The question does not name a condition from your differential._"
+
+        hpo = HpoIndex.load(settings.hpo_index_path)
+        return render_disease_cards(lookup_diseases(index, hpo, named[:_MAX_CONDITION_LOOKUPS]))
+    except Exception as exc:  # noqa: BLE001 - a retrieval helper never fails a turn
+        logger.warning("lookup_conditions failed: %s", exc)
+        return "_Condition reference lookup unavailable this turn._"
+
+
+def _mentions(haystack: str, disease_name: str) -> bool:
+    """Whether the question names this condition.
+
+    Matches on the distinctive words of the name, not the whole string: she
+    writes "relapsing polychondritis" where the ledger says "Relapsing
+    polychondritis (auricular and nasal)", and requiring the full name would
+    find nothing. A word must be long enough to be distinctive, so "disease"
+    and "of" cannot trigger a match on their own.
+    """
+    words = [w for w in re.findall(r"[a-z]{6,}", disease_name.lower())]
+    return any(w in haystack for w in words)
+
+
 def _deterministic_retrieval(repo: DataRepo, db: LabsDb, question: str) -> str:
     """Run every deterministic retrieval helper unconditionally (the MVP
     tool loop — see module docstring) and fold the results into one block."""
@@ -258,6 +319,7 @@ def _deterministic_retrieval(repo: DataRepo, db: LabsDb, question: str) -> str:
             f"### search_case\n\n{search_case(repo, db, question)}",
             f"### search_documents\n\n{search_documents(db, question)}",
             f"### list_encounters (last 5)\n\n{list_encounters(repo, 5)}",
+            f"### lookup_conditions\n\n{lookup_conditions(repo, question)}",
         ]
     )
 
