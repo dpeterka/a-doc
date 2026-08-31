@@ -180,6 +180,19 @@ class SemSimIndex:
     def disease_count(self) -> int:
         return len(self._disease_terms)
 
+    def disease_name(self, disease_id: str) -> str | None:
+        return self._disease_names.get(disease_id)
+
+    def disease_terms(self, disease_id: str) -> list[str]:
+        """The disease's DIRECT annotations, not the ancestor closure. A
+        reader wants "what does this look like", not every generalisation of
+        it up to "phenotypic abnormality"."""
+        return list(self._disease_terms.get(disease_id, ()))
+
+    def iter_diseases(self) -> Iterable[tuple[str, str]]:
+        """`(id, name)` for every disease, for name search."""
+        return self._disease_names.items()
+
     def information_content(self, term: str) -> float:
         return self._ic.get(term, _UNSEEN_IC)
 
