@@ -23,13 +23,17 @@ rather than guessing which old one it meant.
 
 from __future__ import annotations
 
+import logging
 import re
+from collections.abc import Sequence
 from datetime import date
 from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, Field
 from ruamel.yaml import YAML
+
+logger = logging.getLogger(__name__)
 
 QUESTIONS_RELPATH = "case/questions-open.yaml"
 
@@ -172,3 +176,67 @@ def mark_answered(
         question.answered_on = on
         question.answer_note = note.strip()
     return updated, unknown
+
+
+def resolve_answered(root: Path, ids: Sequence[str], *, on: date, note: str) -> int:
+    """Close the questions `ids` names. Returns how many actually closed.
+
+    Never raises into the caller: a chat turn must not fail because a
+    question could not be closed, and the answer itself is already recorded
+    as a fact regardless. An id matching nothing is logged and dropped.
+
+    Shared by the intake agent and the ordinary diagnostic turn. It lived
+    only inside `intake/agent.py` for its first life, which is why answering
+    a question in normal chat closed nothing: 43 questions stood open in
+    production and not one had ever been answered.
+    """
+    if not ids:
+        return 0
+    try:
+        path = root / QUESTIONS_RELPATH
+        updated, unknown = mark_answered(load_questions(path), list(ids), on=on, note=note)
+        save_questions(path, updated)
+        if unknown:
+            logger.warning(
+                "questions: %d answered id(s) matched nothing: %s",
+                len(unknown),
+                ", ".join(sorted(unknown)),
+            )
+        return len(ids) - len(unknown)
+    except Exception as exc:  # noqa: BLE001 - never fail a turn over this
+        logger.warning("questions: could not resolve answered questions: %s", exc)
+        return 0
+
+
+def render_for_context(store: OpenQuestions) -> str:
+    """The open questions, as the reasoning stages should see them.
+
+    Ids are included because a model that must close a question has to name
+    it — the same rule ADR 0028 states for any identifier a model has to
+    reproduce: if it must repeat it, show it.
+
+    Only OPEN questions appear. That is the whole point: the context used to
+    be built from `questions-open.md`, a file nothing regenerated from this
+    store, so every review re-read a list that had no idea what had been
+    answered and asked again. ADR 0032's addendum in one line — a derived
+    artifact is never the read path for data that has a source of truth.
+    """
+    lines: list[str] = []
+    audiences: tuple[tuple[Audience, str], ...] = (
+        ("you", "She can answer these herself — ask them in conversation"),
+        ("doctor", "For a doctor — do not ask her to answer these"),
+    )
+    for audience, heading in audiences:
+        items = store.open_questions(audience)
+        if not items:
+            continue
+        lines.append(f"**{heading}**")
+        lines.append("")
+        for question in items:
+            lines.append(f"- `{question.id}` — {question.panel}")
+            if question.ask:
+                lines.append(f"  - {question.ask}")
+        lines.append("")
+    if not lines:
+        return "_No open questions._"
+    return "\n".join(lines).rstrip()

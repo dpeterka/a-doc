@@ -30,6 +30,7 @@ from adoc.casefile.encounters import (
     read_encounter,
 )
 from adoc.casefile.ledger import load_ledger
+from adoc.casefile.questions import QUESTIONS_RELPATH, load_questions, render_for_context
 from adoc.casefile.regimen import REGIMEN_RELPATH, Regimen, RegimenEntry, load_regimen
 from adoc.casefile.repo import LEDGER_RELPATH, DataRepo
 from adoc.casefile.reported import REPORTED_RESULTS_RELPATH, load_reported_results
@@ -855,7 +856,15 @@ def build_context(
             )
         )
 
-    open_questions = _read_or_placeholder(repo, OPEN_QUESTIONS_RELPATH, "_None yet._")
+    # From the STORE, not `questions-open.md`.
+    #
+    # The markdown is a rendering that nothing regenerates, so it could not
+    # know which questions had been answered — every review re-read a stale
+    # list and asked again. Measured in production: 43 questions, all `open`,
+    # none ever answered, while the answers sat in the record as facts. ADR
+    # 0032's addendum: a derived artifact is never the read path for data
+    # that has a source of truth.
+    open_questions = render_for_context(load_questions(repo.root / Path(QUESTIONS_RELPATH)))
     sections.append(
         ContextSection(key="open_questions", title="Open Questions", content=open_questions)
     )

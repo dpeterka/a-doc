@@ -78,14 +78,42 @@ def sort_hypotheses(hypotheses: Sequence[Any]) -> list[Any]:
     )
 
 
+def is_unsubstantiated(hypothesis: Any) -> bool:
+    """A lead with nothing behind it yet: no supporting evidence, and not
+    thought likely.
+
+    The can't-miss tier is a safety net, so the challenger is expected to
+    raise entries there speculatively — "if this were true, missing it would
+    be catastrophic" — before anything supports them. That is the tier
+    working as intended. What is NOT intended is such an entry appearing at
+    the top of the page with the same weight as a lead the labs actually
+    point at.
+
+    A can't-miss placeholder is kept and never hidden; it is simply not what
+    to read first.
+    """
+    return not getattr(hypothesis, "evidence_for", None) and (
+        hypothesis.probability in SECONDARY_PROBABILITIES
+    )
+
+
 def group_hypotheses(hypotheses: Sequence[Any]) -> dict[str, list[Any]]:
     """Split a sorted differential into what to lead with and what to fold
     away: `leading` (can't-miss at any probability, plus anything high or
-    moderate) and `secondary` (the low/minimal tail)."""
+    moderate) and `secondary` (the low/minimal tail).
+
+    Within `leading`, substantiated leads come first. A can't-miss entry with
+    no cited evidence and low or minimal probability is a placeholder the
+    challenger raised as a safety net — it belongs on the page, but reading
+    it above a lead the labs actually support tells the patient the wrong
+    thing about her own case.
+    """
     ordered = sort_hypotheses(hypotheses)
     leading = [
         h for h in ordered if h.tier == "cant-miss" or h.probability not in SECONDARY_PROBABILITIES
     ]
+    # Stable: `sort_hypotheses` order is preserved inside each half.
+    leading.sort(key=is_unsubstantiated)
     secondary = [h for h in ordered if h not in leading]
     return {"leading": leading, "secondary": secondary}
 

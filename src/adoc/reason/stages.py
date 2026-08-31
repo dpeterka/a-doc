@@ -25,6 +25,7 @@ from pydantic import BaseModel, Field
 
 from adoc import __version__
 from adoc.casefile.ledger import load_ledger
+from adoc.casefile.questions import resolve_answered
 from adoc.casefile.repo import HISTORY_RELPATH, DataRepo
 from adoc.casefile.rule_out import strip_ops_missing_rule_out
 from adoc.casefile.schema import (
@@ -139,6 +140,13 @@ class _LedgerDiffPayload(BaseModel):
     rationale: str
     ops: list[LedgerOp] = Field(default_factory=list)
     insufficient_evidence: list[InsufficientEvidenceNote] = Field(default_factory=list)
+    answered_question_ids: list[str] = Field(default_factory=list)
+    """Ids of open next-appointment questions this message answered.
+
+    The intake agent has had this since ADR 0033; the ordinary diagnostic
+    turn did not, so answering one in normal conversation closed nothing.
+    Measured in production: 43 questions open, none ever answered, while the
+    answers themselves sat in the record as facts."""
 
 
 def _build_provenance(prompt: Prompt, model_id: str, dag_node: str) -> Provenance:
@@ -316,6 +324,7 @@ def ledger_maintainer_stage(
     messages = [Message(role="user", content=user_content)]
 
     diff: LedgerDiff | None = None
+    answered_question_ids: list[str] = []
     for _attempt in range(_CITATION_RETRY_ATTEMPTS):
         result = client.complete(
             "primary_reasoner",
@@ -330,6 +339,7 @@ def ledger_maintainer_stage(
         diff = LedgerDiff(
             provenance=provenance, rationale=_render_diff_rationale(payload), ops=payload.ops
         )
+        answered_question_ids = list(payload.answered_question_ids)
 
         citation_report = check_ops_citations(diff.ops, db, repo, pmid_verifier=pmid_verifier)
         log_citation_report(repo, citation_report, dag_node="ledger_maintainer")
@@ -359,6 +369,22 @@ def ledger_maintainer_stage(
         stripped_ops, removed = strip_not_entailed_ops(diff.ops, verification_report)
         log_stripped_claims(repo, removed, dag_node="ledger_maintainer")
         diff = diff.model_copy(update={"ops": stripped_ops})
+
+    # Close any next-appointment question this message answered.
+    #
+    # AFTER the diff is settled, not inside the retry loop: a citation retry
+    # would otherwise close a question on an attempt that was then thrown
+    # away. Deliberately NOT gated on `diff.ops` being non-empty — answering
+    # "yes, here is every supplement I take" changes the record without
+    # necessarily changing the differential, and gating on ops is the exact
+    # mistake that made the intake version do nothing for the messages it was
+    # written for.
+    resolve_answered(
+        repo.root,
+        answered_question_ids,
+        on=datetime.now(UTC).date(),
+        note="Answered in conversation.",
+    )
     return diff
 
 
