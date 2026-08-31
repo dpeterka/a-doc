@@ -28,6 +28,16 @@ a-doc is a single-patient, longitudinal medical-diagnostic assistant (Python). R
 
 ## Infrastructure
 
+**Read `docs/deployment-dependencies.md` before adding anything the runtime
+depends on** — an env var, a secret, a reference index, a sidecar. Every
+dependency there fails SILENTLY except `ADOC_DATA_DIR`, so absence looks
+exactly like working: LIRICAL was built, pushed, given a task definition and
+IAM, and never ran once because nothing wired `ADOC_LIRICAL_CLUSTER`. Adding a
+dependency means adding a row to that file and verifying it in production once
+by measurement. `uv run python scripts/check_deploy_deps.py` checks the live
+deployment against it.
+
+
 - All AWS resources are CloudFormation in `deploy/cfn/` (network, backup, alb, ecs, ci). No console-created resources; changes go through PRs and change sets. Deploys run from GitHub Actions via the OIDC role, which also builds/pushes the application image to ECR.
 - The app runs as ECS Fargate tasks (`deploy/cfn/ecs.yaml`) on a shared EFS filesystem, not EC2 (ADR 0006). No direct public ingress: the service security group admits only the ALB's security group, on the app port. A shell is reachable via `aws ecs execute-command` only (`EnableExecuteCommand: true`). The app is reached through a public ALB (`deploy/cfn/alb.yaml`) at `https://adoc.petabloc.io`, with username/password auth + in-app rate limiting in `src/adoc/web` (ADR 0007).
 - `labs.sqlite`'s journal mode is `TRUNCATE` in the deployed environment (`ADOC_SQLITE_JOURNAL_MODE`, `config.Settings.sqlite_journal_mode`) because WAL is unsafe on EFS/NFS — see `labs/db.py`'s `LabsDb.__init__` docstring. The web service only ever runs one task at a time (`DeploymentConfiguration` max 100%/min 0%) — SQLite + git still want a single writer.
