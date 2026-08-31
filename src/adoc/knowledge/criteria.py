@@ -1136,11 +1136,306 @@ def _threshold_item_any(
     )
 
 
+# --- EGPA / MPA 2022 ACR/EULAR (GPA's two siblings) --------------------------------------
+#
+# The 2022 ACR/EULAR vasculitis criteria come as a set of three, and encoding
+# only GPA left the other two arms of the same decision unmodelled. They reuse
+# GPA's analyte mappings exactly — the same ANCA and eosinophil rows already
+# proven to resolve against this patient's data — so the marginal cost is the
+# item table, not new plumbing.
+#
+# Both carry negatively weighted items, like GPA: a finding that points at one
+# sibling counts AGAINST the others. `_finalize`'s domain-maximum rule would
+# discard a negative item, so they are totalled separately.
+
+
+def _negative_penalty(result: CriteriaResult, items: list[CriterionItem]) -> None:
+    """Apply negatively weighted items to an already-finalized result.
+
+    Only `met` items count, exactly as for positive ones. A negative clinical
+    item read from the text-matched phenotype can be `possible` at most (the
+    attribution rule in `ItemState` applies to negatives too), so it will not
+    subtract — which is the conservative direction: it declines to talk a
+    score DOWN on an unattributed finding, just as it declines to talk one up.
+    """
+    penalty = sum(item.weight for item in items if item.state == "met")
+    result.items.extend(items)
+    result.points += penalty
+    result.meets_threshold = result.points >= result.threshold
+    if result.entry_met is False:
+        result.meets_threshold = False
+
+
+def score_egpa_2022(
+    rows: Sequence[LabResult], phenotype: PhenotypeLookup | None = None
+) -> CriteriaResult:
+    """2022 ACR/EULAR criteria for eosinophilic granulomatosis with
+    polyangiitis (Churg-Strauss). Threshold 6.
+
+    The eosinophil count is the heaviest single item here (+5) and the same
+    row scores −4 under GPA. That opposition is the point of encoding all
+    three: one CBC differential moves the three sets in different directions,
+    which is far more informative than any of them alone.
+    """
+    view = LabView(rows)
+    items: list[CriterionItem] = [
+        _clinical_item_for(
+            "Obstructive airway disease",
+            domain="Airway",
+            weight=3,
+            term_ids=("HP:0006536",),
+            phenotype=phenotype,
+            missing_basis="No airway-obstruction finding on file.",
+        ),
+        _clinical_item_for(
+            "Nasal polyps",
+            domain="ENT",
+            weight=3,
+            term_ids=("HP:0100582",),
+            phenotype=phenotype,
+            missing_basis="No nasal polyp finding on file.",
+        ),
+        _clinical_item_for(
+            "Mononeuritis multiplex",
+            domain="Neuro",
+            weight=1,
+            term_ids=("HP:0032018", "HP:0009831"),
+            phenotype=phenotype,
+            missing_basis="No multiple-mononeuropathy finding on file.",
+        ),
+        _count_threshold_item(
+            view,
+            domain="Eosinophils",
+            name="Eosinophil count ≥1×10⁹/L",
+            weight=5,
+            names=_ANCA_EOS,
+            threshold=1000.0,
+            unit="cells/ul",
+        ),
+        CriterionItem(
+            domain="Biopsy",
+            name="Extravascular eosinophil-predominant inflammation",
+            weight=2,
+            state="not_assessed",
+            basis="Requires a biopsy report.",
+        ),
+    ]
+
+    result = _finalize(
+        key="egpa-2022",
+        name="Eosinophilic granulomatosis with polyangiitis — 2022 ACR/EULAR criteria",
+        citation="Grayson PC, et al. Ann Rheum Dis. 2022;81(3):309-314.",
+        items=items,
+        threshold=6,
+        entry_met=None,
+        entry_note=(
+            "Applies only once a diagnosis of small- or medium-vessel vasculitis "
+            "is established and mimics are excluded — a clinical judgement."
+        ),
+        requires_clinical_item=False,
+        clinical_domains=frozenset(),
+    )
+    _negative_penalty(
+        result,
+        [
+            _any_positive_item(
+                view,
+                domain="Serology-negative",
+                name="PR3-ANCA or c-ANCA positive",
+                weight=-3,
+                names=_ANCA_PR3,
+            ),
+            _clinical_item_for(
+                "Haematuria",
+                domain="Renal-negative",
+                weight=-1,
+                term_ids=("HP:0000790",),
+                phenotype=phenotype,
+                missing_basis="No haematuria finding on file.",
+            ),
+        ],
+    )
+    return result
+
+
+def score_mpa_2022(
+    rows: Sequence[LabResult], phenotype: PhenotypeLookup | None = None
+) -> CriteriaResult:
+    """2022 ACR/EULAR criteria for microscopic polyangiitis. Threshold 5.
+
+    MPO-ANCA alone (+6) clears the threshold on its own, which is faithful to
+    the published set: in an established small-vessel vasculitis, that one
+    serology is close to decisive between these three.
+    """
+    view = LabView(rows)
+    items: list[CriterionItem] = [
+        _any_positive_item(
+            view,
+            domain="Serology",
+            name="MPO-ANCA or p-ANCA positive",
+            weight=6,
+            names=_ANCA_MPO,
+        ),
+        _clinical_item_for(
+            "Pulmonary fibrosis or interstitial lung disease",
+            domain="Chest",
+            weight=3,
+            term_ids=("HP:0002206", "HP:0006515"),
+            phenotype=phenotype,
+            missing_basis="Requires chest imaging.",
+        ),
+    ]
+
+    result = _finalize(
+        key="mpa-2022",
+        name="Microscopic polyangiitis — 2022 ACR/EULAR criteria",
+        citation="Suppiah R, et al. Ann Rheum Dis. 2022;81(3):321-326.",
+        items=items,
+        threshold=5,
+        entry_met=None,
+        entry_note=(
+            "Applies only once a diagnosis of small- or medium-vessel vasculitis "
+            "is established and mimics are excluded — a clinical judgement."
+        ),
+        requires_clinical_item=False,
+        clinical_domains=frozenset(),
+    )
+    _negative_penalty(
+        result,
+        [
+            _clinical_item_for(
+                "Nasal involvement (bloody discharge, ulcers, crusting, congestion)",
+                domain="ENT-negative",
+                weight=-3,
+                term_ids=("HP:0000246", "HP:0001742"),
+                phenotype=phenotype,
+                missing_basis="No nasal or sinus finding on file.",
+            ),
+            _any_positive_item(
+                view,
+                domain="Serology-negative",
+                name="PR3-ANCA or c-ANCA positive",
+                weight=-1,
+                names=_ANCA_PR3,
+            ),
+            _count_threshold_item(
+                view,
+                domain="Eosinophils-negative",
+                name="Eosinophil count ≥1×10⁹/L",
+                weight=-4,
+                names=_ANCA_EOS,
+                threshold=1000.0,
+                unit="cells/ul",
+            ),
+        ],
+    )
+    return result
+
+
+# --- Behçet ICBD 2014 --------------------------------------------------------------------
+
+
+def score_behcet_icbd_2014(
+    rows: Sequence[LabResult], phenotype: PhenotypeLookup | None = None
+) -> CriteriaResult:
+    """International Criteria for Behçet's Disease (2014). Threshold 4.
+
+    The first set here that reads NO labs at all — there is no serological
+    marker for Behçet, and the diagnosis is made on the pattern of clinical
+    findings. It is included precisely because of that: every other scorer is
+    gated on analytes, so a condition diagnosed clinically would otherwise be
+    invisible to this layer no matter how well the record described it.
+
+    In practice this means the score reports `points_possible` rather than
+    `points`, since a text-matched phenotype can only ever reach `possible`.
+    That is the honest output: it says "the record contains findings matching
+    N points of this set" and leaves attribution to a clinician, which for a
+    set with no confirmatory test is exactly where it belongs.
+    """
+    del rows  # no laboratory item exists in this set
+    items: list[CriterionItem] = [
+        _clinical_item_for(
+            "Ocular lesions (uveitis or retinal vasculitis)",
+            domain="Eye",
+            weight=2,
+            term_ids=("HP:0000554", "HP:0012122", "HP:0025188"),
+            phenotype=phenotype,
+            missing_basis="No uveitis or retinal-vasculitis finding on file.",
+        ),
+        _clinical_item_for(
+            "Genital aphthosis",
+            domain="Genital",
+            weight=2,
+            term_ids=("HP:0003249",),
+            phenotype=phenotype,
+            missing_basis="No genital-ulcer finding on file.",
+        ),
+        _clinical_item_for(
+            "Oral aphthosis",
+            domain="Oral",
+            weight=2,
+            term_ids=("HP:0000155", "HP:0032154", "HP:0011107"),
+            phenotype=phenotype,
+            missing_basis="No oral-ulcer finding on file.",
+        ),
+        _clinical_item_for(
+            "Skin lesions (erythema nodosum or cutaneous vasculitis)",
+            domain="Skin",
+            weight=1,
+            term_ids=("HP:0012219", "HP:0200029"),
+            phenotype=phenotype,
+            missing_basis="No erythema nodosum or skin vasculitis on file.",
+        ),
+        _clinical_item_for(
+            "Neurological manifestations",
+            domain="Neuro",
+            weight=1,
+            term_ids=("HP:0005305", "HP:0033724"),
+            phenotype=phenotype,
+            missing_basis="No central-nervous or dural-sinus finding on file.",
+        ),
+        _clinical_item_for(
+            "Vascular manifestations",
+            domain="Vascular",
+            weight=1,
+            term_ids=("HP:0004936", "HP:0002625"),
+            phenotype=phenotype,
+            missing_basis="No venous-thrombosis finding on file.",
+        ),
+        _clinical_item_for(
+            "Positive pathergy test",
+            domain="Pathergy",
+            weight=1,
+            term_ids=("HP:0025532",),
+            phenotype=phenotype,
+            missing_basis="Requires a pathergy skin test, which is rarely performed here.",
+        ),
+    ]
+
+    return _finalize(
+        key="behcet-icbd-2014",
+        name="Behçet's disease — International Criteria (ICBD) 2014",
+        citation=(
+            "International Team for the Revision of the International Criteria for "
+            "Behçet's Disease. J Eur Acad Dermatol Venereol. 2014;28(3):338-347."
+        ),
+        items=items,
+        threshold=4,
+        entry_met=None,
+        entry_note="",
+        requires_clinical_item=False,
+        clinical_domains=frozenset(),
+    )
+
+
 SCORERS: dict[str, Callable[..., CriteriaResult]] = {
     "sle-2019": score_sle_2019,
     "sjogren-2016": score_sjogren_2016,
     "ra-2010": score_ra_2010,
     "gpa-2022": score_gpa_2022,
+    "egpa-2022": score_egpa_2022,
+    "mpa-2022": score_mpa_2022,
+    "behcet-icbd-2014": score_behcet_icbd_2014,
 }
 """Registry, keyed by criteria-set slug. PLAN.md Phase 3 calls for ~10 of
 these (Sjögren 2016, SLICC, CASPAR, myositis, ANCA vasculitides…); the

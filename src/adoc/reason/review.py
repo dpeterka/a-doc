@@ -94,6 +94,7 @@ from adoc.casefile.schema import (
     UpdateHypothesis,
     validate_source_ref,
 )
+from adoc.config import reference_path
 from adoc.knowledge.criteria import CriteriaResult, score_all
 from adoc.knowledge.icap import IcapReport, render_icap, scan_ana_patterns
 from adoc.knowledge.lirical import LiricalRequest
@@ -122,6 +123,13 @@ from adoc.reason.dag import (
     edge_payload_lacks_section,
     forbid_context_key,
     run,
+)
+from adoc.reason.engine_adjudication import (
+    EngineAdjudicationPayload,
+    EngineAdjudicationResult,
+    build_engine_diff,
+    collect_divergences,
+    render_engine_adjudication,
 )
 from adoc.reason.prompts import load_prompt
 from adoc.reason.review_trigger import (
@@ -1442,6 +1450,8 @@ def render_review_markdown(
     criteria: CriteriaScanResult | None = None,
     lirical: LiricalComparison | None = None,
     semsim: LiricalComparison | None = None,
+    engine_adjudication: EngineAdjudicationResult | None = None,
+    engine_notes: list[str] | None = None,
     literature: LiteratureRefreshResult | None = None,
     trigger_summary: str = "",
 ) -> str:
@@ -1582,6 +1592,14 @@ def render_review_markdown(
         lines.append("")
         lines += render_semsim_comparison(semsim)
 
+    # Immediately after both engines, because it is the verdict ON them.
+    # Rendering it further down would leave the reader with two rankings and
+    # no statement of what they were taken to mean.
+    if engine_adjudication is not None:
+        adjudicated = render_engine_adjudication(engine_adjudication, engine_notes or [])
+        if adjudicated:
+            lines += adjudicated
+
     if literature is not None and literature.entries:
         lines.append("## What the literature says")
         lines.append("")
@@ -1677,6 +1695,60 @@ def _adjudication_completeness_contract() -> Contract:
         return None
 
     return Contract(name="adjudication_covers_every_divergence", predicate=predicate)
+
+
+def _engine_adjudication_completeness_contract() -> Contract:
+    """Every engine divergence gets its own substantive verdict.
+
+    The same shape as the panel-adjudication contract above and for the same
+    reason: a stage that is allowed to skip the awkward divergences, or to
+    answer all of them with one sentence, is not adjudicating. The failure
+    mode here is specific — a model that finds engine output hard to reason
+    about will happily return "neutral, the engine did not rank it" for
+    everything, which is a restatement of the input.
+
+    Unlike the panel contract this one tolerates the engines being down: with
+    no divergences to judge there is nothing to cover, and `ran=False` after
+    a sidecar timeout is an ordinary review, not a contract breach.
+    """
+
+    def predicate(ctx: Ctx, value: BaseModel | None) -> str | None:
+        if not isinstance(value, EngineAdjudicationResult):
+            return "engine adjudication did not produce an EngineAdjudicationResult"
+        if not value.ran or not value.divergences:
+            return None
+
+        expected = {d.id for d in value.divergences}
+        seen = [v.divergence for v in value.verdicts]
+        missing = expected - set(seen)
+        if missing:
+            return f"no verdict for engine divergence id(s): {sorted(missing)}"
+
+        duplicated = {d for d in seen if seen.count(d) > 1}
+        if duplicated:
+            return f"more than one verdict for engine divergence id(s): {sorted(duplicated)}"
+
+        by_id = {v.divergence: v for v in value.verdicts}
+        insubstantial = sorted(
+            div_id
+            for div_id in expected
+            if len(by_id[div_id].rationale.strip()) < MIN_SUBSTANTIVE_LENGTH
+        )
+        if insubstantial:
+            return (
+                f"engine adjudication rationale too short (< {MIN_SUBSTANTIVE_LENGTH} chars "
+                f"after stripping) for divergence id(s): {insubstantial}"
+            )
+
+        rationales = [by_id[div_id].rationale.strip() for div_id in expected]
+        if len(rationales) > 1 and len(set(rationales)) == 1:
+            return (
+                "engine adjudication rationale is identical across every divergence — not a "
+                "substantive, per-divergence adjudication"
+            )
+        return None
+
+    return Contract(name="engine_adjudication_covers_every_divergence", predicate=predicate)
 
 
 def _challenge_sweep_completeness_contract() -> Contract:
@@ -1836,6 +1908,12 @@ def build_review_dag(
     source_text)` pair) when omitted; tests should always inject fakes.
     """
     results: dict[str, BaseModel] = sink if sink is not None else {}
+    # What the engine adjudication considered and deliberately did NOT act on.
+    # Kept beside `results` rather than inside the node's own artifact because
+    # the deterministic apply is what discovers them, and the report renders
+    # them: a verdict that changed nothing is a real outcome and dropping it
+    # silently would make the stage look like it did less than it did.
+    engine_notes: list[str] = []
     num_panel = len(client._bindings.get("blind_panel", []))  # noqa: SLF001
     if num_panel < 1:
         raise ValueError("role 'blind_panel' must have at least one model binding")
@@ -2106,7 +2184,6 @@ def build_review_dag(
         Never raises. `docs/research/scoring-across-engines.md`: this is a
         divergence report, not a fifth score to average in.
         """
-        from adoc.config import Settings
 
         ledger = load_ledger(ledger_path)
         try:
@@ -2128,7 +2205,7 @@ def build_review_dag(
                 ledger,
                 terms_used=run.terms_used,
                 terms_excluded=run.terms_excluded,
-                mondo=load_mondo_index(Settings().mondo_index_path),
+                mondo=load_mondo_index(reference_path("mondo_index_path")),
             )
             logger.info(
                 "lirical: %d finding(s), %d divergence(s), in %.1fs",
@@ -2161,9 +2238,7 @@ def build_review_dag(
         checkout, not an error.
         """
         try:
-            from adoc.config import Settings
-
-            index = load_index(Settings().semsim_index_path)
+            index = load_index(reference_path("semsim_index_path"))
             if index is None:
                 return LiricalComparison(ran=False, error="no similarity index in this image")
 
@@ -2179,7 +2254,7 @@ def build_review_dag(
             comparison = compare_semsim_to_ledger(
                 ranked,
                 load_ledger(ledger_path),
-                mondo=load_mondo_index(Settings().mondo_index_path),
+                mondo=load_mondo_index(reference_path("mondo_index_path")),
             )
             logger.info(
                 "semsim: %d finding(s), %d divergence(s) over %d diseases",
@@ -2194,8 +2269,126 @@ def build_review_dag(
         results["semsim_divergence"] = comparison
         return comparison
 
+    def _engine_adjudication_fn(ctx: Ctx) -> BaseModel:
+        """Decide what the engines' disagreements MEAN, and let that reach the
+        ledger (`reason/engine_adjudication.py`).
+
+        Until this node existed both engines ran, were rendered, and changed
+        nothing — the review got longer while the differential stayed exactly
+        as it was. Direction only: no score from one engine is ever compared
+        with or folded into a score from the other.
+
+        Never raises. The engines are supplementary and a review completes
+        without them.
+        """
+        lirical_comparison = ctx["lirical_divergence"]
+        semsim_comparison = ctx["semsim_divergence"]
+        assert isinstance(lirical_comparison, LiricalComparison)
+        assert isinstance(semsim_comparison, LiricalComparison)
+
+        divergences = collect_divergences(lirical_comparison, semsim_comparison)
+        if not divergences:
+            # Nothing to adjudicate is an ordinary review, not a failure — and
+            # it must not cost a model call. Agreement evidence is still
+            # written by the apply node below, which needs no adjudication.
+            result = EngineAdjudicationResult(ran=True)
+            results["engine_adjudication"] = result
+            return result
+
+        try:
+            context_pack = build_context(repo, db, include_ledger=True)
+            prompt = load_prompt("engine_adjudicator")
+            divergences_json = EngineAdjudicationResult(divergences=divergences).model_dump_json(
+                include={"divergences"}, indent=2
+            )
+            user_content = (
+                f"{context_pack.render()}\n\n## Engine Divergences To Adjudicate\n\n"
+                f"```json\n{divergences_json}\n```\n"
+            )
+            completion = client.complete(
+                "challenger",
+                system=prompt.text,
+                messages=[Message(role="user", content=user_content)],
+                schema=EngineAdjudicationPayload,
+            )
+            payload = completion.parsed
+            assert isinstance(payload, EngineAdjudicationPayload)
+            result = EngineAdjudicationResult(
+                ran=True,
+                divergences=divergences,
+                verdicts=payload.verdicts,
+                model_id=completion.model_id,
+                prompt_template_version=f"{prompt.name}@v{prompt.version}",
+            )
+            logger.info(
+                "engine adjudication: %d divergence(s) -> %s",
+                len(divergences),
+                result.by_direction,
+            )
+        except Exception as exc:  # noqa: BLE001 - the engines must never fail a review
+            logger.warning("engine adjudication failed: %s", exc)
+            result = EngineAdjudicationResult(
+                ran=False, divergences=divergences, error=f"{type(exc).__name__}: {exc}"
+            )
+
+        results["engine_adjudication"] = result
+        return result
+
+    def _apply_engine_diff_fn(ctx: Ctx) -> BaseModel:
+        """Write the adjudicated verdicts, and engine agreement, to the ledger.
+
+        Deterministic: the direction came from the model, the mapping from
+        direction to op is plain code in `reason/engine_adjudication.py`.
+
+        Applies its own diff for the same reason `retirement_pass` does — a
+        status or evidence change is a ledger mutation like any other and does
+        not get a private back door around the invariants.
+        """
+        adjudication = ctx["engine_adjudication"]
+        assert isinstance(adjudication, EngineAdjudicationResult)
+        lirical_comparison = ctx["lirical_divergence"]
+        semsim_comparison = ctx["semsim_divergence"]
+        assert isinstance(lirical_comparison, LiricalComparison)
+        assert isinstance(semsim_comparison, LiricalComparison)
+
+        # Reloaded from disk, not taken from the context: `retirement_pass`
+        # wrote its own diff after `apply_review_diff`, so the context object
+        # is stale and evidence would land on a superseded ledger.
+        ledger = load_ledger(ledger_path)
+        diff, notes = build_engine_diff(
+            adjudication,
+            lirical_comparison,
+            semsim_comparison,
+            ledger,
+            today=clock().date(),
+            provenance=Provenance(
+                app_version=__version__,
+                prompt_template_version=adjudication.prompt_template_version or "n/a-deterministic",
+                model_id=adjudication.model_id or "none",
+                dag_node="apply_engine_diff",
+                timestamp=clock(),
+            ),
+        )
+        engine_notes.extend(notes)
+        if diff is None:
+            logger.info("engine adjudication: nothing to apply")
+            results["apply_engine_diff"] = ledger
+            return ledger
+
+        try:
+            ledger = repo.apply_ledger_diff(ledger_path, repo.root / HISTORY_RELPATH, diff)
+            logger.info("engine adjudication: applied %d op(s)", len(diff.ops))
+        except Exception as exc:  # noqa: BLE001 - a failed apply must not fail a review
+            logger.warning("engine adjudication: could not apply: %s", exc)
+        results["apply_engine_diff"] = ledger
+        return ledger
+
     def _literature_refresh_fn(ctx: Ctx) -> BaseModel:
-        ledger = ctx["apply_review_diff"]
+        # The post-engine ledger, not `apply_review_diff`: a hypothesis the
+        # engines just contributed is exactly the kind that needs a citation,
+        # and reading the earlier object would leave it uncited until the next
+        # review.
+        ledger = ctx["apply_engine_diff"]
         assert isinstance(ledger, Ledger)
         try:
             searcher = pubmed or _default_pubmed_client(repo)
@@ -2254,7 +2447,12 @@ def build_review_dag(
         review_date = clock().date()
         ledger_before = ctx["current_ledger"]
         assert isinstance(ledger_before, Ledger)
-        ledger_after = ctx["apply_review_diff"]
+        # The ledger as it FINALLY stands, after retirement and the engine
+        # adjudication both wrote their own diffs. Reading `apply_review_diff`
+        # here reported a before/after that omitted every change made by the
+        # two stages that run last.
+        raw_final = results.get("apply_engine_diff")
+        ledger_after = raw_final if isinstance(raw_final, Ledger) else ctx["apply_review_diff"]
         assert isinstance(ledger_after, Ledger)
         divergence_set = ctx["divergence_diff"]
         assert isinstance(divergence_set, DivergenceSet)
@@ -2284,6 +2482,8 @@ def build_review_dag(
         )
         raw_retire = results.get("retirement_pass")
         retirement_result = raw_retire if isinstance(raw_retire, RetirementReport) else None
+        raw_engine = results.get("engine_adjudication")
+        engine_result = raw_engine if isinstance(raw_engine, EngineAdjudicationResult) else None
         markdown = render_review_markdown(
             review_date=review_date,
             trend_findings=trend_scan.findings,
@@ -2301,6 +2501,8 @@ def build_review_dag(
             criteria=criteria if isinstance(criteria, CriteriaScanResult) else None,
             lirical=lirical_result,
             semsim=semsim_result,
+            engine_adjudication=engine_result,
+            engine_notes=list(engine_notes),
             literature=literature_result,
         )
         relpath, tag_name = _review_relpath_and_tag(repo, review_date, now=clock())
@@ -2450,11 +2652,30 @@ def build_review_dag(
     )
     nodes.append(
         Node(
+            name="engine_adjudication",
+            fn=_engine_adjudication_fn,
+            input_model=LiricalComparison,
+            output_model=EngineAdjudicationResult,
+            depends_on="semsim_divergence",
+            postconditions=[_engine_adjudication_completeness_contract()],
+        )
+    )
+    nodes.append(
+        Node(
+            name="apply_engine_diff",
+            fn=_apply_engine_diff_fn,
+            input_model=EngineAdjudicationResult,
+            output_model=Ledger,
+            depends_on="engine_adjudication",
+        )
+    )
+    nodes.append(
+        Node(
             name="literature_refresh",
             fn=_literature_refresh_fn,
-            input_model=LiricalComparison,
+            input_model=Ledger,
             output_model=LiteratureRefreshResult,
-            depends_on="semsim_divergence",
+            depends_on="apply_engine_diff",
         )
     )
     nodes.append(

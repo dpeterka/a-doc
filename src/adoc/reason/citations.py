@@ -551,6 +551,22 @@ def _check_source(
         return _check_encounter_ref(source, claim, repo)
     if source.startswith("pmid:"):
         return _check_pmid_ref(source, claim, pmid_verifier)
+    if source.startswith("engine:"):
+        # Resolved on grammar, like `patient-report:`, and for the same
+        # reason: the ref names a computation this system performed and
+        # recorded, not an external document that might not exist. The engine
+        # name is a closed set in `casefile.schema`, so an unknown engine
+        # never reaches here — it fails validation at the schema boundary.
+        #
+        # The review report for that date carries the engine's full ranking,
+        # which is what a reader following the ref actually wants.
+        engine = source.split(":")[1]
+        return CitationCheck(
+            source=source,
+            outcome="resolved",
+            reason=f"{engine} ranking recorded in the review report for that date",
+            claim=claim,
+        )
     if source.startswith("patient-report:"):
         # Always resolved: it cites the patient's own statement, and
         # grammar-validity (enforced by `casefile.schema`) is enough.
