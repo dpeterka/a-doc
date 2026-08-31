@@ -273,6 +273,14 @@ def verdicts_to_ops(
     """
     by_id = {d.id: d for d in divergences}
     existing = {h.id: h for h in ledger.hypotheses}
+    # Ids adopted DURING this pass, folded in below as each one lands.
+    #
+    # Both engines rank from the same phenotype, so both proposing the same
+    # disease the ledger lacks is the expected case, not an edge one — and
+    # checking only against the ledger adopted it twice under one id. The
+    # ledger invariants then rejected the whole diff, losing the agreement
+    # evidence riding along with it.
+    adopted_ids: set[str] = set()
     ops: list[LedgerOp] = []
     notes: list[str] = []
     adoptions = 0
@@ -332,8 +340,19 @@ def verdicts_to_ops(
             )
             continue
         new_id = _slug(divergence.name)
-        if new_id in existing:
+        if not new_id:
+            # A name that survives slugging as nothing — punctuation only, or
+            # a non-Latin script the slug rule strips entirely. `Hypothesis.id`
+            # rejects the empty string, and that exception would otherwise
+            # propagate out of a stage whose whole contract is that the
+            # engines never fail a review.
+            notes.append(f"{divergence.name!r}: not adopted — no usable hypothesis id")
             continue
+        if new_id in existing or new_id in adopted_ids:
+            # Already on the ledger, or already adopted a moment ago from the
+            # other engine's identical finding.
+            continue
+        adopted_ids.add(new_id)
         ops.append(
             AddHypothesis(
                 hypothesis=Hypothesis(
