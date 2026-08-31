@@ -2373,31 +2373,40 @@ def build_review_dag(
         # wrote its own diff after `apply_review_diff`, so the context object
         # is stale and evidence would land on a superseded ledger.
         ledger = load_ledger(ledger_path)
-        diff, notes = build_engine_diff(
-            adjudication,
-            lirical_comparison,
-            semsim_comparison,
-            ledger,
-            today=clock().date(),
-            provenance=Provenance(
-                app_version=__version__,
-                prompt_template_version=adjudication.prompt_template_version or "n/a-deterministic",
-                model_id=adjudication.model_id or "none",
-                dag_node="apply_engine_diff",
-                timestamp=clock(),
-            ),
-        )
-        engine_notes.extend(notes)
-        if diff is None:
-            logger.info("engine adjudication: nothing to apply")
-            results["apply_engine_diff"] = ledger
-            return ledger
-
+        # BUILDING the diff is inside the try, not just applying it.
+        #
+        # `verdicts_to_ops` constructs `Hypothesis` objects from model-supplied
+        # names, and a name that slugs to an invalid id raises out of pydantic
+        # validation. With construction outside the guard, that exception ended
+        # the whole review — from a stage whose entire contract is that the
+        # engines are supplementary and never fail one.
         try:
-            ledger = repo.apply_ledger_diff(ledger_path, repo.root / HISTORY_RELPATH, diff)
-            logger.info("engine adjudication: applied %d op(s)", len(diff.ops))
-        except Exception as exc:  # noqa: BLE001 - a failed apply must not fail a review
+            diff, notes = build_engine_diff(
+                adjudication,
+                lirical_comparison,
+                semsim_comparison,
+                ledger,
+                today=clock().date(),
+                provenance=Provenance(
+                    app_version=__version__,
+                    prompt_template_version=(
+                        adjudication.prompt_template_version or "n/a-deterministic"
+                    ),
+                    model_id=adjudication.model_id or "none",
+                    dag_node="apply_engine_diff",
+                    timestamp=clock(),
+                ),
+            )
+            engine_notes.extend(notes)
+            if diff is None:
+                logger.info("engine adjudication: nothing to apply")
+            else:
+                ledger = repo.apply_ledger_diff(ledger_path, repo.root / HISTORY_RELPATH, diff)
+                logger.info("engine adjudication: applied %d op(s)", len(diff.ops))
+        except Exception as exc:  # noqa: BLE001 - the engines must never fail a review
             logger.warning("engine adjudication: could not apply: %s", exc)
+            ledger = load_ledger(ledger_path)
+
         results["apply_engine_diff"] = ledger
         return ledger
 
