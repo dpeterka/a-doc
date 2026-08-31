@@ -724,3 +724,43 @@ def test_a_context_inside_the_budget_is_allowed() -> None:
     )
 
     assert result.text == "ok"
+
+
+# --- the reserve describes the call, not the worst call --------------------------------------
+
+
+def test_the_reserve_defaults_to_the_pessimistic_global() -> None:
+    """Unchanged behaviour for a caller that does not say what it needs."""
+    client = LlmClient(bindings=_panel_bindings(64_000), providers={})
+
+    assert client.context_budget("blind_panel") == 64_000 - CONTEXT_COMPLETION_RESERVE
+
+
+def test_a_smaller_completion_reserve_buys_input_budget() -> None:
+    """The production failure this exists to prevent.
+
+    The deep review died at `blind_panel_0` with a context of ~31,261 tokens
+    against a budget of 31,232 — over by 29 tokens, 0.09% — because a flat
+    32,768 was reserved for a completion that is a short JSON list of
+    hypotheses. Half of DeepSeek's 64,000-token window was being held back for
+    output that never approaches it.
+    """
+    client = LlmClient(bindings=_panel_bindings(64_000), providers={})
+    observed_pack = 31_261
+
+    assert client.context_budget("blind_panel") < observed_pack, "the failing configuration"
+    assert client.context_budget("blind_panel", completion_reserve=16_384) > observed_pack
+
+
+def test_the_blind_panel_asks_for_a_budget_its_pack_fits_in() -> None:
+    """Pins the two constants against each other rather than against a
+    literal, so raising one without the other cannot silently re-break it."""
+    from adoc.reason.review import BLIND_PANEL_MAX_TOKENS
+
+    client = LlmClient(bindings=_panel_bindings(64_000), providers={})
+    budget = client.context_budget("blind_panel", completion_reserve=BLIND_PANEL_MAX_TOKENS)
+
+    assert budget is not None and budget >= 40_000, (
+        "the blind context pack was 31,261 tokens in production and grows with the "
+        "case file; a budget without real headroom will fail again"
+    )

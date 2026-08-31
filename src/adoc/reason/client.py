@@ -706,9 +706,20 @@ class LlmClient:
             )
         return bindings[binding_index]
 
-    def context_budget(self, role: str) -> int | None:
+    def context_budget(
+        self, role: str, *, completion_reserve: int = CONTEXT_COMPLETION_RESERVE
+    ) -> int | None:
         """Usable input budget for `role`: the SMALLEST declared window among
-        its bindings, minus the completion reserve.
+        its bindings, minus what this call may actually spend on completion.
+
+        `completion_reserve` defaults to the global pessimistic figure but
+        should be the call's own `max_tokens`. Reserving a flat 32,768 for
+        every call regardless of what it asked for took the deep review down
+        in production: the blind context pack reached 31,261 tokens against a
+        budget of 31,232 — over by 29 tokens, 0.09% — because half of
+        DeepSeek's 64,000-token window was being held back for an output that
+        is a short JSON list of hypotheses. The reserve has to describe the
+        call, not the worst call the system can make.
 
         The weakest link, deliberately — a multi-bound role sends one payload
         to every binding (`blind_panel` renders a single context pack for
@@ -724,7 +735,7 @@ class LlmClient:
         windows = [b.context_window for b in bindings]
         if not windows or any(w is None for w in windows):
             return None
-        return min(w for w in windows if w is not None) - CONTEXT_COMPLETION_RESERVE
+        return min(w for w in windows if w is not None) - completion_reserve
 
     def _call_with_retry(self, provider: Provider, request: TransportRequest) -> TransportResponse:
         last_exc: Exception | None = None
@@ -782,7 +793,7 @@ class LlmClient:
         # model; letting it through surfaces as a provider error that says
         # nothing about which of three families was too small, or — worse on
         # some hosts — as a silently truncated input.
-        budget = self.context_budget(role)
+        budget = self.context_budget(role, completion_reserve=max_tokens)
         if budget is not None:
             estimated = estimate_tokens(scrubbed_system) + sum(
                 estimate_tokens(m.content) for m in scrubbed_messages
@@ -796,7 +807,7 @@ class LlmClient:
                     f"role {role!r}: context is ~{estimated:,} tokens but the budget is "
                     f"{budget:,} — set by the smallest bound model "
                     f"({smallest.model}, {smallest.context_window:,}-token window) minus a "
-                    f"{CONTEXT_COMPLETION_RESERVE:,}-token completion reserve. Every binding "
+                    f"{max_tokens:,}-token completion reserve for this call. Every binding "
                     "for this role receives the same payload, so it must fit the smallest."
                 )
 
