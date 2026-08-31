@@ -161,3 +161,40 @@ def test_good_evidence_is_untouched() -> None:
     )
 
     assert len(hypothesis.evidence_for) == 2
+
+
+# --- the `engine:` scheme (phenotype-engine verdicts) ------------------------
+
+
+@pytest.mark.parametrize(
+    "ref",
+    ["engine:lirical:2026-08-31", "engine:semsim:2026-01-01"],
+)
+def test_an_engine_ref_is_citable(ref: str) -> None:
+    """A hypothesis that exists BECAUSE an engine ranked it has to be able to
+    say so. Before this scheme there was nowhere for that evidence to point:
+    `doc:` and `encounter:` describe files that do not exist for a
+    computation, and a `pmid:` for the engine's method would attribute a claim
+    about this patient to a paper that never saw her."""
+    assert validate_source_ref(ref) == ref
+
+
+@pytest.mark.parametrize(
+    "ref",
+    [
+        "engine:liricl:2026-08-31",  # typo'd engine name
+        "engine:monarch:2026-08-31",  # an engine this system does not run
+        "engine:lirical:2026-8-31",  # not an ISO date
+        "engine:lirical",  # no date at all
+    ],
+)
+def test_an_unknown_engine_or_bad_date_is_refused(ref: str) -> None:
+    """Deliberately a CLOSED set, unlike every other slug in the grammar.
+
+    The other schemes name things the patient's record already contains, so
+    they must accept whatever is on file. An engine ref names a component of
+    this system, and the list of engines is known at build time — a typo
+    should be a validation error, not a citation that resolves to nothing.
+    """
+    with pytest.raises(ValueError, match="unciteable source|source ref"):
+        validate_source_ref(ref)

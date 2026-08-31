@@ -39,6 +39,7 @@ EvidenceStrength = Literal["strong", "moderate", "weak"]
 #   encounter:<filename>
 #   pmid:<digits>
 #   patient-report:<YYYY-MM-DD>
+#   engine:<engine-name>:<YYYY-MM-DD>
 
 _DATE_RE = r"\d{4}-\d{2}-\d{2}"
 # Slugs are model-generated from real analyte names, which include %, ., (),
@@ -53,6 +54,13 @@ _SLUG_RE = r"[^\s:]+"
 # exactly that name. `#` stays excluded because it delimits the optional
 # `#p<int>` page suffix, and newlines because a ref is one line.
 _FILENAME_RE = r"[^#\n]+"
+# Deliberately a CLOSED set, unlike the other slugs here. Every other ref
+# names something the patient's record already contains, so the grammar has
+# to accept whatever is on file; an engine ref names a component of this
+# system, and the list of engines is known at build time. A typo'd
+# `engine:liricl:...` should be a validation error, not a citation that
+# resolves to nothing.
+_ENGINE_RE = r"(?:lirical|semsim)"
 
 SOURCE_REF_PATTERN = re.compile(
     rf"^(?:"
@@ -68,6 +76,20 @@ SOURCE_REF_PATTERN = re.compile(
     rf"|encounter:{_FILENAME_RE}"
     rf"|pmid:\d+"
     rf"|patient-report:{_DATE_RE}"
+    # A phenotype engine's own verdict, dated by the review that ran it:
+    # `engine:lirical:2026-08-31`. LIRICAL's likelihood ratio and the
+    # similarity index's Resnik score are real, reproducible observations
+    # about this patient's phenotype, and a hypothesis that exists BECAUSE an
+    # engine ranked it has to be able to say so. Without a scheme of its own
+    # that evidence had nowhere to point: `doc:` and `encounter:` describe
+    # files that do not exist for a computation, and citing a `pmid:` for the
+    # engine's method would attribute a claim about this patient to a paper
+    # that never saw her.
+    #
+    # The engine name is a fixed slug, not a free run: the review report for
+    # that date carries the full ranking, so `engine:lirical:<date>` resolves
+    # to something a reader can actually go and check.
+    rf"|engine:{_ENGINE_RE}:{_DATE_RE}"
     rf")$"
 )
 
