@@ -74,7 +74,17 @@ roles:
         effort: high
     - provider: featherless
       model: deepseek-ai/DeepSeek-R1-0528
-      context_window: 64000
+      # 131,072, not 64,000. The smaller figure was simply wrong, and it took
+      # the deep review down: the blind context pack reached 31,261 tokens
+      # against a budget of 64,000 - 32,768 = 31,232, and the review could not
+      # run at all. Verified against the live API rather than the docs — a
+      # 90,009-token prompt (as Featherless counted it) was accepted by this
+      # exact model, and its own metadata reports context_length 131072 with
+      # max_completion_tokens 32768, which is precisely our reserve.
+      #
+      # Same model, same family, same behaviour: only the declared ceiling
+      # changes. Budget goes 31,232 -> 98,304 against a pack of 31,261.
+      context_window: 131072
       params: {}
 
   extractor_pass_a:
