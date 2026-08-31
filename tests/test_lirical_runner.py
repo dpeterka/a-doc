@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from adoc.knowledge.lirical import LiricalRequest
-from adoc.knowledge.lirical_runner import EcsLiricalRunner
+from adoc.knowledge.lirical_runner import LIRICAL_DATA_DIR, EcsLiricalRunner
 
 _TSV = """\
 ! LIRICAL TSV Output (v2.4.1)
@@ -199,3 +199,28 @@ def test_a_request_with_no_valid_terms_is_reported(tmp_path: Path) -> None:
 
     assert not run.ok
     assert "could not prepare run" in run.error
+
+
+def test_the_data_dir_matches_the_sidecar_image() -> None:
+    """Pins `LIRICAL_DATA_DIR` against the Dockerfile that builds the image.
+
+    These are two artifacts that must agree and have no compiler between
+    them. They disagreed — the image downloads to /opt/liricaldata, the
+    runner passed /lirical-data — and every launched task exited 1 with
+    "Missing required file `hp.json`".
+
+    The build-time smoke test could not catch it: it invokes prioritize with
+    the image's own `$LIRICAL_DATA`, so it exercised the correct path while
+    the only real caller passed a different one.
+    """
+    import re
+    from pathlib import Path
+
+    dockerfile = Path(__file__).resolve().parents[1] / "deploy" / "lirical" / "Dockerfile"
+    match = re.search(r"^ENV LIRICAL_DATA=(\S+)", dockerfile.read_text(), re.M)
+
+    assert match, "deploy/lirical/Dockerfile no longer sets ENV LIRICAL_DATA"
+    assert match.group(1) == LIRICAL_DATA_DIR, (
+        f"the image stores LIRICAL's data in {match.group(1)} but the runner passes "
+        f"{LIRICAL_DATA_DIR}; every launched task will exit 1 on missing data files"
+    )

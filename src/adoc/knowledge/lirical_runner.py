@@ -57,7 +57,20 @@ LIRICAL_WORK_RELDIR = "work/lirical"
 
 # LIRICAL's own data directory inside its image (deploy/lirical/), baked in at
 # build time so a running container has no network dependency.
-LIRICAL_DATA_DIR = "/lirical-data"
+# Where LIRICAL's data sits INSIDE the sidecar image. This must match
+# `ENV LIRICAL_DATA` in deploy/lirical/Dockerfile exactly.
+#
+# It did not. The image downloads to /opt/liricaldata and this said
+# /lirical-data, so every launched task died with "Missing required file
+# `hp.json` in `/lirical-data`" and exit 1. The build-time smoke test could
+# not catch it: that test invokes `prioritize -d "$LIRICAL_DATA"`, using the
+# image's own env var, so it exercised the correct path while the only real
+# caller passed a different one. A green build proved nothing about the call
+# that matters.
+#
+# `tests/test_lirical_runner.py` now pins this against the Dockerfile so the
+# two cannot drift again.
+LIRICAL_DATA_DIR = "/opt/liricaldata"
 
 
 class LiricalRun(BaseModel):
