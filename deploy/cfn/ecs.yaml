@@ -270,6 +270,55 @@ Resources:
                   - ssmmessages:OpenControlChannel
                   - ssmmessages:OpenDataChannel
                 Resource: "*"
+        # The deep review launches LIRICAL as a sibling task and waits for it
+        # (ADR 0029: separate image, input and output exchanged on EFS). That
+        # needs RunTask on exactly one task definition, PassRole for the two
+        # roles that definition names, and DescribeTasks to poll for the exit.
+        #
+        # Scoped tightly on purpose: RunTask is constrained to the
+        # `a-doc-lirical` family and to this cluster, and PassRole is
+        # constrained to the two specific roles AND to ecs-tasks - without
+        # that condition, PassRole on a role is close to being that role.
+        # Only present when the LIRICAL image exists, matching the task
+        # definition's own condition.
+        - !If
+          - HasLiricalImage
+          - PolicyName: a-doc-lirical-runner
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Sid: RunLiricalTaskOnly
+                  Effect: Allow
+                  Action: ecs:RunTask
+                  Resource: !Sub "arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:task-definition/a-doc-lirical:*"
+                  Condition:
+                    ArnEquals:
+                      ecs:cluster: !GetAtt Cluster.Arn
+                - Sid: PassOnlyTheRolesLiricalNeeds
+                  Effect: Allow
+                  Action: iam:PassRole
+                  # Constructed from the role NAMES rather than !GetAtt.
+                  # `TaskRole` cannot `!GetAtt` itself — this policy is
+                  # attached to it — and CloudFormation reports that as a
+                  # circular dependency at change-set creation. Both roles
+                  # declare an explicit `RoleName`, so the ARN is fully
+                  # determined without a reference.
+                  Resource:
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/a-doc-task-execution-role"
+                    - !Sub "arn:aws:iam::${AWS::AccountId}:role/a-doc-task-role"
+                  Condition:
+                    StringEquals:
+                      iam:PassedToService: ecs-tasks.amazonaws.com
+                - Sid: PollTheLaunchedTask
+                  Effect: Allow
+                  Action:
+                    - ecs:DescribeTasks
+                    - ecs:StopTask
+                  Resource: !Sub "arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:task/*"
+                  Condition:
+                    ArnEquals:
+                      ecs:cluster: !GetAtt Cluster.Arn
+          - !Ref AWS::NoValue
 
   # --------------------------------------------------------------------
   # Task definitions. Both share the same image/container name/env

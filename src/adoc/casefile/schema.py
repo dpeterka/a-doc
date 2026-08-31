@@ -39,6 +39,8 @@ EvidenceStrength = Literal["strong", "moderate", "weak"]
 #   encounter:<filename>
 #   pmid:<digits>
 #   patient-report:<YYYY-MM-DD>
+#   genomic:<gene>:<rsid>
+#   engine:<engine-name>:<YYYY-MM-DD>
 
 _DATE_RE = r"\d{4}-\d{2}-\d{2}"
 # Slugs are model-generated from real analyte names, which include %, ., (),
@@ -53,6 +55,13 @@ _SLUG_RE = r"[^\s:]+"
 # exactly that name. `#` stays excluded because it delimits the optional
 # `#p<int>` page suffix, and newlines because a ref is one line.
 _FILENAME_RE = r"[^#\n]+"
+# Deliberately a CLOSED set, unlike the other slugs here. Every other ref
+# names something the patient's record already contains, so the grammar has
+# to accept whatever is on file; an engine ref names a component of this
+# system, and the list of engines is known at build time. A typo'd
+# `engine:liricl:...` should be a validation error, not a citation that
+# resolves to nothing.
+_ENGINE_RE = r"(?:lirical|semsim)"
 
 SOURCE_REF_PATTERN = re.compile(
     rf"^(?:"
@@ -68,6 +77,26 @@ SOURCE_REF_PATTERN = re.compile(
     rf"|encounter:{_FILENAME_RE}"
     rf"|pmid:\d+"
     rf"|patient-report:{_DATE_RE}"
+    # `genomic:<gene>:<rsid>` — a claim about a genotype the array actually
+    # measured (ADR 0030). The gene is carried as well as the marker so a
+    # reader can see what is being claimed without looking it up, and the
+    # resolver checks BOTH: a ref naming a real rsid under the wrong gene is
+    # as wrong as an invented one.
+    rf"|genomic:{_SLUG_RE}:rs\d+"
+    # A phenotype engine's own verdict, dated by the review that ran it:
+    # `engine:lirical:2026-08-31`. LIRICAL's likelihood ratio and the
+    # similarity index's Resnik score are real, reproducible observations
+    # about this patient's phenotype, and a hypothesis that exists BECAUSE an
+    # engine ranked it has to be able to say so. Without a scheme of its own
+    # that evidence had nowhere to point: `doc:` and `encounter:` describe
+    # files that do not exist for a computation, and citing a `pmid:` for the
+    # engine's method would attribute a claim about this patient to a paper
+    # that never saw her.
+    #
+    # The engine name is a fixed slug, not a free run: the review report for
+    # that date carries the full ranking, so `engine:lirical:<date>` resolves
+    # to something a reader can actually go and check.
+    rf"|engine:{_ENGINE_RE}:{_DATE_RE}"
     rf")$"
 )
 
@@ -108,7 +137,7 @@ def validate_source_ref(value: str) -> str:
         raise ValueError(
             f"invalid source ref {value!r}: must match labs:<slug>:<date> | "
             "doc:<file>#p<int> | encounter:<file> | pmid:<digits> | "
-            "patient-report:<date>"
+            "patient-report:<date> | genomic:<gene>:<rsid> | engine:<engine>:<date>"
         )
     return normalized
 
@@ -210,6 +239,32 @@ class Hypothesis(BaseModel):
     evidence_for: list[Evidence] = Field(default_factory=list)
     evidence_against: list[Evidence] = Field(default_factory=list)
     discriminators: list[str] = Field(default_factory=list)
+    """Findings that would tell this hypothesis apart from its neighbours.
+
+    Undocumented until now, and nothing ever asked a stage to populate it:
+    the only mention in any prompt was `test_chooser.md` telling the chooser
+    not to duplicate one. On the live ledger that left 11 of 50 populated and
+    3 of the 39 retirement-eligible, so the mechanism existed and could never
+    fire (ADR 0035).
+    """
+
+    rule_out: str = ""
+    """The finding that would KILL this hypothesis, stated when it is created.
+
+    Distinct from `discriminators`, and pointing the other way in time. A
+    discriminator separates this hypothesis from a neighbour; a rule-out is
+    the specific result that ends it — "a normal repeat FSH on a draw four or
+    more weeks later", "a negative cartilage biopsy".
+
+    This is what lets a hypothesis die of natural causes. Without it a
+    well-supported but wrong hypothesis lives forever, because nothing ever
+    defines what would settle it: across twelve ledger versions not one of
+    fifty hypotheses had ever left `active`.
+
+    Defaulted so every existing ledger round-trips, exactly as
+    `plain_language` was.
+    """
+
     challenger_notes: str = ""
     last_challenged: date | None = None
     last_challenged_version: int | None = None
@@ -258,6 +313,9 @@ class UpdateHypothesis(BaseModel):
     probability: ProbabilityBucket | None = None
     status: HypothesisStatus | None = None
     discriminators: list[str] | None = None
+    rule_out: str | None = None
+    """Settable after creation so a later review can supply the falsification
+    condition for a hypothesis that predates the field (ADR 0035)."""
 
 
 class AddEvidence(BaseModel):

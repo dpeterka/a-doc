@@ -62,7 +62,7 @@ from pydantic import BaseModel, Field, ValidationError, field_validator, model_v
 
 from adoc import __version__
 from adoc.casefile.ledger import ACTIVE_STATUSES, load_ledger
-from adoc.casefile.phenotype import PHENOTYPE_RELPATH, load_phenotype
+from adoc.casefile.phenotype import PHENOTYPE_RELPATH, load_phenotype, select_for_engine
 from adoc.casefile.questions import (
     QUESTIONS_RELPATH,
     OpenQuestion,
@@ -72,6 +72,12 @@ from adoc.casefile.questions import (
     save_questions,
 )
 from adoc.casefile.repo import HISTORY_RELPATH, LEDGER_RELPATH, DataRepo
+from adoc.casefile.retirement import (
+    RetirementReport,
+    propose_retirements,
+    render_retirements,
+    retirements_to_diff,
+)
 from adoc.casefile.schema import (
     AddEvidence,
     AddHypothesis,
@@ -88,8 +94,21 @@ from adoc.casefile.schema import (
     UpdateHypothesis,
     validate_source_ref,
 )
+from adoc.config import reference_path
 from adoc.knowledge.criteria import CriteriaResult, score_all
+from adoc.knowledge.icap import IcapReport, render_icap, scan_ana_patterns
+from adoc.knowledge.lirical import LiricalRequest
+from adoc.knowledge.lirical_divergence import (
+    LiricalComparison,
+    compare_semsim_to_ledger,
+    compare_to_ledger,
+    render_comparison,
+    render_semsim_comparison,
+)
+from adoc.knowledge.lirical_runner import LIRICAL_WORK_RELDIR, EcsLiricalRunner, LiricalRunner
+from adoc.knowledge.mondo import load_mondo_index
 from adoc.knowledge.pubmed import PUBMED_CACHE_RELPATH, PubMedArticle, PubMedClient
+from adoc.knowledge.semsim import load_index
 from adoc.labs.db import LabsDb
 from adoc.labs.queries import abnormal_summary
 from adoc.labs.validate import canonicalize, trend_outlier
@@ -104,6 +123,13 @@ from adoc.reason.dag import (
     edge_payload_lacks_section,
     forbid_context_key,
     run,
+)
+from adoc.reason.engine_adjudication import (
+    EngineAdjudicationPayload,
+    EngineAdjudicationResult,
+    build_engine_diff,
+    collect_divergences,
+    render_engine_adjudication,
 )
 from adoc.reason.prompts import load_prompt
 from adoc.reason.review_trigger import (
@@ -633,6 +659,10 @@ class CriteriaScanResult(BaseModel):
         checked — but it is not what a reader should look at first.
         """
         return [r for r in self.results if r.entry_met is not False]
+
+    icap: IcapReport = Field(default_factory=IcapReport)
+    """ANA-pattern mapping. Empty for a seronegative patient, which is the
+    ordinary outcome and not a failure — see `knowledge.icap`."""
 
 
 class StaleArtifact(BaseModel):
@@ -1416,7 +1446,12 @@ def render_review_markdown(
     metrics: OpsMetrics,
     ledger_before: Ledger,
     ledger_after: Ledger,
+    retirements: RetirementReport | None = None,
     criteria: CriteriaScanResult | None = None,
+    lirical: LiricalComparison | None = None,
+    semsim: LiricalComparison | None = None,
+    engine_adjudication: EngineAdjudicationResult | None = None,
+    engine_notes: list[str] | None = None,
     literature: LiteratureRefreshResult | None = None,
     trigger_summary: str = "",
 ) -> str:
@@ -1506,6 +1541,11 @@ def render_review_markdown(
                 )
         lines.append("")
 
+    if retirements is not None and (retirements.retirements or retirements.protected_count):
+        lines.append("## No longer on the list")
+        lines.append("")
+        lines += render_retirements(retirements)
+
     lines.append("## What to ask your doctor")
     lines.append("")
     if test_chooser.items:
@@ -1536,6 +1576,29 @@ def render_review_markdown(
         lines.append("")
         lines += _render_criteria(criteria)
         lines.append("")
+        icap_lines = render_icap(criteria.icap)
+        if icap_lines:
+            lines.append("### What the ANA pattern points at")
+            lines.append("")
+            lines += icap_lines
+
+    if lirical is not None and (lirical.findings or lirical.error):
+        lines.append("## A second opinion from the phenotype engine")
+        lines.append("")
+        lines += render_comparison(lirical)
+
+    if semsim is not None and semsim.findings:
+        lines.append("## A third opinion: phenotype similarity")
+        lines.append("")
+        lines += render_semsim_comparison(semsim)
+
+    # Immediately after both engines, because it is the verdict ON them.
+    # Rendering it further down would leave the reader with two rankings and
+    # no statement of what they were taken to mean.
+    if engine_adjudication is not None:
+        adjudicated = render_engine_adjudication(engine_adjudication, engine_notes or [])
+        if adjudicated:
+            lines += adjudicated
 
     if literature is not None and literature.entries:
         lines.append("## What the literature says")
@@ -1634,6 +1697,60 @@ def _adjudication_completeness_contract() -> Contract:
     return Contract(name="adjudication_covers_every_divergence", predicate=predicate)
 
 
+def _engine_adjudication_completeness_contract() -> Contract:
+    """Every engine divergence gets its own substantive verdict.
+
+    The same shape as the panel-adjudication contract above and for the same
+    reason: a stage that is allowed to skip the awkward divergences, or to
+    answer all of them with one sentence, is not adjudicating. The failure
+    mode here is specific — a model that finds engine output hard to reason
+    about will happily return "neutral, the engine did not rank it" for
+    everything, which is a restatement of the input.
+
+    Unlike the panel contract this one tolerates the engines being down: with
+    no divergences to judge there is nothing to cover, and `ran=False` after
+    a sidecar timeout is an ordinary review, not a contract breach.
+    """
+
+    def predicate(ctx: Ctx, value: BaseModel | None) -> str | None:
+        if not isinstance(value, EngineAdjudicationResult):
+            return "engine adjudication did not produce an EngineAdjudicationResult"
+        if not value.ran or not value.divergences:
+            return None
+
+        expected = {d.id for d in value.divergences}
+        seen = [v.divergence for v in value.verdicts]
+        missing = expected - set(seen)
+        if missing:
+            return f"no verdict for engine divergence id(s): {sorted(missing)}"
+
+        duplicated = {d for d in seen if seen.count(d) > 1}
+        if duplicated:
+            return f"more than one verdict for engine divergence id(s): {sorted(duplicated)}"
+
+        by_id = {v.divergence: v for v in value.verdicts}
+        insubstantial = sorted(
+            div_id
+            for div_id in expected
+            if len(by_id[div_id].rationale.strip()) < MIN_SUBSTANTIVE_LENGTH
+        )
+        if insubstantial:
+            return (
+                f"engine adjudication rationale too short (< {MIN_SUBSTANTIVE_LENGTH} chars "
+                f"after stripping) for divergence id(s): {insubstantial}"
+            )
+
+        rationales = [by_id[div_id].rationale.strip() for div_id in expected]
+        if len(rationales) > 1 and len(set(rationales)) == 1:
+            return (
+                "engine adjudication rationale is identical across every divergence — not a "
+                "substantive, per-divergence adjudication"
+            )
+        return None
+
+    return Contract(name="engine_adjudication_covers_every_divergence", predicate=predicate)
+
+
 def _challenge_sweep_completeness_contract() -> Contract:
     def predicate(ctx: Ctx, value: BaseModel | None) -> str | None:
         ledger = ctx.get("current_ledger")
@@ -1718,6 +1835,27 @@ def _review_relpath_and_tag(repo: DataRepo, review_date: date, *, now: datetime)
 # --------------------------------------------------------------------------
 
 
+def _default_lirical_runner(repo: DataRepo) -> LiricalRunner:
+    """The production runner, configured from settings.
+
+    Read here rather than threaded through `build_review_dag` for the same
+    reason as the PubMed client: only this node needs them, they are all
+    optional, and tests inject a runner instead.
+    """
+    from adoc.config import Settings
+
+    settings = Settings()
+    work_dir = repo.root / LIRICAL_WORK_RELDIR
+    return EcsLiricalRunner(
+        work_dir,
+        cluster=settings.lirical_cluster,
+        task_definition=settings.lirical_task_definition,
+        subnets=settings.lirical_subnet_ids(),
+        security_groups=settings.lirical_security_group_ids(),
+        container_work_dir=str(work_dir),
+    )
+
+
 def _default_pubmed_client(repo: DataRepo) -> PubMedClient:
     """A PubMed client for this repo, configured from settings.
 
@@ -1746,6 +1884,7 @@ def build_review_dag(
     resolver: SourceTextResolver | None = None,
     entailment_cache: EntailmentCache | None = None,
     pubmed: PubMedClient | None = None,
+    lirical: LiricalRunner | None = None,
     trigger_summary: str = "",
 ) -> Dag:
     """Assemble the weekly-review DAG (PLAN.md loop (c)) — see the module
@@ -1769,6 +1908,12 @@ def build_review_dag(
     source_text)` pair) when omitted; tests should always inject fakes.
     """
     results: dict[str, BaseModel] = sink if sink is not None else {}
+    # What the engine adjudication considered and deliberately did NOT act on.
+    # Kept beside `results` rather than inside the node's own artifact because
+    # the deterministic apply is what discovers them, and the report renders
+    # them: a verdict that changed nothing is a real outcome and dropping it
+    # silently would make the stage look like it did less than it did.
+    engine_notes: list[str] = []
     num_panel = len(client._bindings.get("blind_panel", []))  # noqa: SLF001
     if num_panel < 1:
         raise ValueError("role 'blind_panel' must have at least one model binding")
@@ -1794,7 +1939,14 @@ def build_review_dag(
             )
             for entry in phenotype.entries
         }
-        result = CriteriaScanResult(results=score_all(db.all_non_rejected_rows(), phenotype=lookup))
+        rows = db.all_non_rejected_rows()
+        result = CriteriaScanResult(
+            results=score_all(rows, phenotype=lookup),
+            # ICAP rides along with the criteria scan rather than taking its
+            # own node: both are pure code over the same rows, and a second
+            # node would double the DAG bookkeeping for one function call.
+            icap=scan_ana_patterns(rows),
+        )
         results["criteria_scan"] = result
         return result
 
@@ -1973,8 +2125,270 @@ def build_review_dag(
         results["test_chooser"] = tc_result
         return tc_result
 
-    def _literature_refresh_fn(ctx: Ctx) -> BaseModel:
+    def _retirement_pass_fn(ctx: Ctx) -> BaseModel:
+        """Retire hypotheses that have stopped earning their place (ADR 0035).
+
+        Deterministic, never a model call. Runs AFTER `apply_review_diff` so
+        it judges the ledger this review produced, and applies its own diff so
+        the ledger invariants still get to check it — retirement is a status
+        change like any other and does not get a private back door.
+
+        `cant-miss` and patient-origin hypotheses are excluded absolutely; see
+        `casefile.retirement`.
+        """
         ledger = ctx["apply_review_diff"]
+        assert isinstance(ledger, Ledger)
+        report = propose_retirements(ledger, today=clock().date())
+        if not report.retirements:
+            logger.info("retirement: nothing retired (%d protected)", report.protected_count)
+            results["retirement_pass"] = report
+            return report
+
+        diff = retirements_to_diff(
+            report,
+            provenance=Provenance(
+                app_version=__version__,
+                prompt_template_version="n/a-deterministic",
+                model_id="none",
+                dag_node="retirement_pass",
+                timestamp=clock(),
+            ),
+        )
+        assert diff is not None
+        try:
+            repo.apply_ledger_diff(ledger_path, repo.root / HISTORY_RELPATH, diff)
+        except Exception as exc:  # noqa: BLE001 - a failed retirement must not fail a review
+            logger.warning("retirement: could not apply: %s", exc)
+            results["retirement_pass"] = RetirementReport(protected_count=report.protected_count)
+            return results["retirement_pass"]
+
+        logger.info("retirement: %d retired, %d protected", report.count, report.protected_count)
+        results["retirement_pass"] = report
+        return report
+
+    def _lirical_divergence_fn(ctx: Ctx) -> BaseModel:
+        """Run the phenotype engine and compare it to the ledger.
+
+        Deliberately AFTER `apply_review_diff`, so it compares against the
+        ledger this review actually produced rather than the one it started
+        with — otherwise every hypothesis the review just added would read as
+        `engine_only`.
+
+        The ledger is RELOADED from disk rather than taken from the context,
+        because `retirement_pass` runs in between and writes its own diff. The
+        context still holds the pre-retirement object, and comparing against
+        that would report every just-retired hypothesis as a `ledger_only`
+        divergence — the engine disagreeing with a differential that no longer
+        exists.
+
+        Never raises. `docs/research/scoring-across-engines.md`: this is a
+        divergence report, not a fifth score to average in.
+        """
+
+        ledger = load_ledger(ledger_path)
+        try:
+            profile = load_phenotype(repo.root / Path(PHENOTYPE_RELPATH))
+            observed, negated = select_for_engine(profile, today=clock().date())
+            if not observed:
+                return LiricalComparison(ran=False, error="no current phenotype findings to run on")
+
+            runner = lirical or _default_lirical_runner(repo)
+            run = runner.run(
+                LiricalRequest(observed=observed, negated=negated, sample_id="patient")
+            )
+            if not run.ok or run.result is None:
+                logger.info("lirical: not run this review — %s", run.error)
+                return LiricalComparison(ran=False, error=run.error)
+
+            comparison = compare_to_ledger(
+                run.result,
+                ledger,
+                terms_used=run.terms_used,
+                terms_excluded=run.terms_excluded,
+                mondo=load_mondo_index(reference_path("mondo_index_path")),
+            )
+            logger.info(
+                "lirical: %d finding(s), %d divergence(s), in %.1fs",
+                len(comparison.findings),
+                comparison.divergence_count,
+                run.duration_seconds,
+            )
+        except Exception as exc:  # noqa: BLE001 - the engine must never fail a review
+            logger.warning("lirical: comparison failed: %s", exc)
+            return LiricalComparison(ran=False, error=f"{type(exc).__name__}: {exc}")
+
+        results["lirical_divergence"] = comparison
+        return comparison
+
+    def _semsim_divergence_fn(_ctx: Ctx) -> BaseModel:
+        """Rank diseases by phenotype similarity and compare to the ledger.
+
+        A second, independent engine beside LIRICAL. They answer differently —
+        one by likelihood ratio against a curated model, the other by shared
+        information content — so where both rank a disease highly that is
+        corroboration from genuinely different methods, and where they diverge
+        that is the thing worth a clinician's attention
+        (`docs/research/scoring-across-engines.md`).
+
+        Reads the ledger from disk for the same reason the LIRICAL node does:
+        `retirement_pass` runs earlier and writes its own diff, so the DAG
+        context holds a pre-retirement object.
+
+        Never raises. A missing index is the ordinary state of a local
+        checkout, not an error.
+        """
+        try:
+            index = load_index(reference_path("semsim_index_path"))
+            if index is None:
+                return LiricalComparison(ran=False, error="no similarity index in this image")
+
+            profile = load_phenotype(repo.root / Path(PHENOTYPE_RELPATH))
+            observed, _ = select_for_engine(profile, today=clock().date())
+            if not observed:
+                return LiricalComparison(ran=False, error="no current phenotype findings to run on")
+
+            ranked = index.rank(observed)
+            if not ranked.ok:
+                return LiricalComparison(ran=False, error=ranked.error)
+
+            comparison = compare_semsim_to_ledger(
+                ranked,
+                load_ledger(ledger_path),
+                mondo=load_mondo_index(reference_path("mondo_index_path")),
+            )
+            logger.info(
+                "semsim: %d finding(s), %d divergence(s) over %d diseases",
+                len(comparison.findings),
+                comparison.divergence_count,
+                index.disease_count,
+            )
+        except Exception as exc:  # noqa: BLE001 - never fail a review
+            logger.warning("semsim: comparison failed: %s", exc)
+            return LiricalComparison(ran=False, error=f"{type(exc).__name__}: {exc}")
+
+        results["semsim_divergence"] = comparison
+        return comparison
+
+    def _engine_adjudication_fn(ctx: Ctx) -> BaseModel:
+        """Decide what the engines' disagreements MEAN, and let that reach the
+        ledger (`reason/engine_adjudication.py`).
+
+        Until this node existed both engines ran, were rendered, and changed
+        nothing — the review got longer while the differential stayed exactly
+        as it was. Direction only: no score from one engine is ever compared
+        with or folded into a score from the other.
+
+        Never raises. The engines are supplementary and a review completes
+        without them.
+        """
+        lirical_comparison = ctx["lirical_divergence"]
+        semsim_comparison = ctx["semsim_divergence"]
+        assert isinstance(lirical_comparison, LiricalComparison)
+        assert isinstance(semsim_comparison, LiricalComparison)
+
+        divergences = collect_divergences(lirical_comparison, semsim_comparison)
+        if not divergences:
+            # Nothing to adjudicate is an ordinary review, not a failure — and
+            # it must not cost a model call. Agreement evidence is still
+            # written by the apply node below, which needs no adjudication.
+            result = EngineAdjudicationResult(ran=True)
+            results["engine_adjudication"] = result
+            return result
+
+        try:
+            context_pack = build_context(repo, db, include_ledger=True)
+            prompt = load_prompt("engine_adjudicator")
+            divergences_json = EngineAdjudicationResult(divergences=divergences).model_dump_json(
+                include={"divergences"}, indent=2
+            )
+            user_content = (
+                f"{context_pack.render()}\n\n## Engine Divergences To Adjudicate\n\n"
+                f"```json\n{divergences_json}\n```\n"
+            )
+            completion = client.complete(
+                "challenger",
+                system=prompt.text,
+                messages=[Message(role="user", content=user_content)],
+                schema=EngineAdjudicationPayload,
+            )
+            payload = completion.parsed
+            assert isinstance(payload, EngineAdjudicationPayload)
+            result = EngineAdjudicationResult(
+                ran=True,
+                divergences=divergences,
+                verdicts=payload.verdicts,
+                model_id=completion.model_id,
+                prompt_template_version=f"{prompt.name}@v{prompt.version}",
+            )
+            logger.info(
+                "engine adjudication: %d divergence(s) -> %s",
+                len(divergences),
+                result.by_direction,
+            )
+        except Exception as exc:  # noqa: BLE001 - the engines must never fail a review
+            logger.warning("engine adjudication failed: %s", exc)
+            result = EngineAdjudicationResult(
+                ran=False, divergences=divergences, error=f"{type(exc).__name__}: {exc}"
+            )
+
+        results["engine_adjudication"] = result
+        return result
+
+    def _apply_engine_diff_fn(ctx: Ctx) -> BaseModel:
+        """Write the adjudicated verdicts, and engine agreement, to the ledger.
+
+        Deterministic: the direction came from the model, the mapping from
+        direction to op is plain code in `reason/engine_adjudication.py`.
+
+        Applies its own diff for the same reason `retirement_pass` does — a
+        status or evidence change is a ledger mutation like any other and does
+        not get a private back door around the invariants.
+        """
+        adjudication = ctx["engine_adjudication"]
+        assert isinstance(adjudication, EngineAdjudicationResult)
+        lirical_comparison = ctx["lirical_divergence"]
+        semsim_comparison = ctx["semsim_divergence"]
+        assert isinstance(lirical_comparison, LiricalComparison)
+        assert isinstance(semsim_comparison, LiricalComparison)
+
+        # Reloaded from disk, not taken from the context: `retirement_pass`
+        # wrote its own diff after `apply_review_diff`, so the context object
+        # is stale and evidence would land on a superseded ledger.
+        ledger = load_ledger(ledger_path)
+        diff, notes = build_engine_diff(
+            adjudication,
+            lirical_comparison,
+            semsim_comparison,
+            ledger,
+            today=clock().date(),
+            provenance=Provenance(
+                app_version=__version__,
+                prompt_template_version=adjudication.prompt_template_version or "n/a-deterministic",
+                model_id=adjudication.model_id or "none",
+                dag_node="apply_engine_diff",
+                timestamp=clock(),
+            ),
+        )
+        engine_notes.extend(notes)
+        if diff is None:
+            logger.info("engine adjudication: nothing to apply")
+            results["apply_engine_diff"] = ledger
+            return ledger
+
+        try:
+            ledger = repo.apply_ledger_diff(ledger_path, repo.root / HISTORY_RELPATH, diff)
+            logger.info("engine adjudication: applied %d op(s)", len(diff.ops))
+        except Exception as exc:  # noqa: BLE001 - a failed apply must not fail a review
+            logger.warning("engine adjudication: could not apply: %s", exc)
+        results["apply_engine_diff"] = ledger
+        return ledger
+
+    def _literature_refresh_fn(ctx: Ctx) -> BaseModel:
+        # The post-engine ledger, not `apply_review_diff`: a hypothesis the
+        # engines just contributed is exactly the kind that needs a citation,
+        # and reading the earlier object would leave it uncited until the next
+        # review.
+        ledger = ctx["apply_engine_diff"]
         assert isinstance(ledger, Ledger)
         try:
             searcher = pubmed or _default_pubmed_client(repo)
@@ -2033,7 +2447,12 @@ def build_review_dag(
         review_date = clock().date()
         ledger_before = ctx["current_ledger"]
         assert isinstance(ledger_before, Ledger)
-        ledger_after = ctx["apply_review_diff"]
+        # The ledger as it FINALLY stands, after retirement and the engine
+        # adjudication both wrote their own diffs. Reading `apply_review_diff`
+        # here reported a before/after that omitted every change made by the
+        # two stages that run last.
+        raw_final = results.get("apply_engine_diff")
+        ledger_after = raw_final if isinstance(raw_final, Ledger) else ctx["apply_review_diff"]
         assert isinstance(ledger_after, Ledger)
         divergence_set = ctx["divergence_diff"]
         assert isinstance(divergence_set, DivergenceSet)
@@ -2053,10 +2472,18 @@ def build_review_dag(
         assert isinstance(trend_scan, TrendScanResult)
         criteria = results.get("criteria_scan")
 
+        raw_lirical = results.get("lirical_divergence")
+        lirical_result = raw_lirical if isinstance(raw_lirical, LiricalComparison) else None
+        raw_semsim = results.get("semsim_divergence")
+        semsim_result = raw_semsim if isinstance(raw_semsim, LiricalComparison) else None
         raw_literature = results.get("literature_refresh")
         literature_result = (
             raw_literature if isinstance(raw_literature, LiteratureRefreshResult) else None
         )
+        raw_retire = results.get("retirement_pass")
+        retirement_result = raw_retire if isinstance(raw_retire, RetirementReport) else None
+        raw_engine = results.get("engine_adjudication")
+        engine_result = raw_engine if isinstance(raw_engine, EngineAdjudicationResult) else None
         markdown = render_review_markdown(
             review_date=review_date,
             trend_findings=trend_scan.findings,
@@ -2070,7 +2497,12 @@ def build_review_dag(
             ledger_before=ledger_before,
             ledger_after=ledger_after,
             trigger_summary=trigger_summary,
+            retirements=retirement_result,
             criteria=criteria if isinstance(criteria, CriteriaScanResult) else None,
+            lirical=lirical_result,
+            semsim=semsim_result,
+            engine_adjudication=engine_result,
+            engine_notes=list(engine_notes),
             literature=literature_result,
         )
         relpath, tag_name = _review_relpath_and_tag(repo, review_date, now=clock())
@@ -2184,20 +2616,66 @@ def build_review_dag(
     )
     nodes.append(
         Node(
+            name="retirement_pass",
+            fn=_retirement_pass_fn,
+            input_model=Ledger,
+            output_model=RetirementReport,
+            depends_on="apply_review_diff",
+        )
+    )
+    nodes.append(
+        Node(
             name="test_chooser",
             fn=_test_chooser_fn,
-            input_model=Ledger,
+            input_model=RetirementReport,
             output_model=TestChooserResult,
-            depends_on="apply_review_diff",
+            depends_on="retirement_pass",
+        )
+    )
+    nodes.append(
+        Node(
+            name="lirical_divergence",
+            fn=_lirical_divergence_fn,
+            input_model=TestChooserResult,
+            output_model=LiricalComparison,
+            depends_on="test_chooser",
+        )
+    )
+    nodes.append(
+        Node(
+            name="semsim_divergence",
+            fn=_semsim_divergence_fn,
+            input_model=LiricalComparison,
+            output_model=LiricalComparison,
+            depends_on="lirical_divergence",
+        )
+    )
+    nodes.append(
+        Node(
+            name="engine_adjudication",
+            fn=_engine_adjudication_fn,
+            input_model=LiricalComparison,
+            output_model=EngineAdjudicationResult,
+            depends_on="semsim_divergence",
+            postconditions=[_engine_adjudication_completeness_contract()],
+        )
+    )
+    nodes.append(
+        Node(
+            name="apply_engine_diff",
+            fn=_apply_engine_diff_fn,
+            input_model=EngineAdjudicationResult,
+            output_model=Ledger,
+            depends_on="engine_adjudication",
         )
     )
     nodes.append(
         Node(
             name="literature_refresh",
             fn=_literature_refresh_fn,
-            input_model=TestChooserResult,
+            input_model=Ledger,
             output_model=LiteratureRefreshResult,
-            depends_on="test_chooser",
+            depends_on="apply_engine_diff",
         )
     )
     nodes.append(

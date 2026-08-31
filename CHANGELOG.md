@@ -5,6 +5,164 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.24.0] — 2026-08-30
+
+*Tagged but deliberately NOT deployed. Both engines below are latent: ICAP
+renders nothing until a positive ANA with a reported pattern arrives, and
+the similarity index is only present in an image built from this tag.*
+
+### Added
+
+- **ICAP ANA-pattern mapping.** Maps an immunofluorescence pattern
+  (AC-1 … AC-29) to the antibodies worth testing next and the conditions it
+  is associated with. Pure code over a fixed reference table.
+
+  Built knowing it renders nothing on the current case file, and shipped as
+  latent capability. Measured first: all seven ANA screens from 2017 to 2025
+  are negative — three by IFA, the method that produces patterns — every ENA
+  antibody is negative, and no pattern word appears in the document corpus.
+  A pattern is a property of a POSITIVE result. Verified against the real
+  corpus: 2,079 rows scanned, 7 ANA results found, latest read as negative,
+  zero patterns matched, zero lines rendered.
+
+  Matching is longest-phrase-first because the substring traps change the
+  clinical meaning: "homogeneous nucleolar" is AC-8 and points at systemic
+  sclerosis while plain "homogeneous" is AC-1 and points at lupus, and
+  "dense fine speckled" is AC-2, which argues AGAINST an ANA-associated
+  rheumatic disease, while "fine speckled" is AC-4, which points at
+  Sjogren's. Both pinned by test. Every rendering says a pattern is an
+  association, not a diagnosis.
+
+- **Phenotype semantic similarity**, a second independent engine beside
+  LIRICAL. The two answer different questions — likelihood ratio against a
+  curated model versus shared information content — so agreement is
+  corroboration from genuinely different methods and disagreement is the
+  finding. Not folded into a combined score: a similarity is not a
+  probability.
+
+  Resnik with symmetric best-match average, information content computed
+  over disease frequency with annotations propagated to ancestors. A new
+  build artifact from the public HPO release, baked into the image beside
+  the existing HPO index: 19,835 parent edges and 11,645 diseases in 4.9MB.
+
+  Validated against the real 2026-06-23 release. On the marfanoid triad
+  LIRICAL's own smoke test uses, the top six are thoracic-aortic-aneurysm
+  and Loeys-Dietz disorders with Marfan syndrome at 21 of 9,691, and
+  information content is properly monotonic from 0.00 at the root to 5.20
+  for "aortic root aneurysm".
+
+  A known artefact is documented rather than tuned away: rare diseases with
+  few specific annotations can outrank the obvious answer on a short query.
+  That is a property of the measure and the concrete reason this engine
+  reports divergence rather than an answer.
+
+## [0.23.0] — 2026-08-30
+
+### Added
+
+- **`rule_out` is enforced in code, not only asked for in the prompt.** ADR
+  0035 recorded the gap: a model that ignored the requirement produced an
+  empty field and nothing rejected it. A new hypothesis without a usable
+  falsification condition is now stripped from the diff before it reaches
+  the ledger.
+
+  A strip rather than a DAG contract, deliberately. A precondition runs
+  before `apply_stage` and would raise on exactly the input the strip
+  handles cleanly — failing a whole turn over one missing field, the defect
+  fixed in v0.21.0. A postcondition cannot work either: the fifty
+  hypotheses predating ADR 0035 all have an empty `rule_out`, so any check
+  over the resulting ledger would fire on all of them forever.
+
+  Stripping a hypothesis also removes every op that targets it. A verdict
+  carries `add_evidence` and `record_challenge` ops pointing at what it
+  adds, and leaving those behind produced a diff referencing an id nothing
+  creates — which the ledger invariants reject outright, turning a
+  contained strip back into the whole-payload failure it exists to avoid.
+
+  Patient-origin and `cant-miss` hypotheses are excluded, exactly as they
+  are from the retirement pass. The red-team suite caught this: a patient's
+  own theory was being stripped before the quarantine could see it.
+
+## [0.22.1] — 2026-08-30
+
+### Fixed
+
+- **The 0.22.0 deploy failed on a circular dependency and never shipped.**
+  The LIRICAL runner's IAM policy is attached to `TaskRole` and granted
+  `iam:PassRole` on `!GetAtt TaskRole.Arn` — a role referencing itself,
+  which CloudFormation rejects when it builds the change set. Both roles
+  declare an explicit `RoleName`, so the ARNs are now constructed from the
+  account id and name instead.
+
+  Production was never modified: the change set failed before any
+  resource changed, so v0.21.0 stayed live throughout.
+
+  `aws cloudformation validate-template` does not catch this — it passed
+  on the broken template. Only creating a change set does, which is now
+  how an IAM change to this stack gets verified before release.
+
+## [0.22.0] — 2026-08-30
+
+### Added
+
+- **The ledger can now end a hypothesis** (ADR 0035). Measured at ledger
+  version 12: 50 hypotheses, every one `active`, none ever retired across
+  twelve versions, zero in the `most-likely` tier, 21 with no
+  counter-evidence at all. `ruled-out` appeared in no prompt and no code —
+  reachable in the type system, unreachable in practice. One stage added
+  and no stage subtracted, so the ledger could only grow.
+
+  Four changes: a deterministic retirement pass in the review; a required
+  `rule_out` on every new hypothesis (the specific finding that would end
+  it, never "further testing"); a displacement budget on the Challenger,
+  which produced 47 of the 50; and a requirement that `most-likely` be
+  populated or its emptiness explained.
+
+  Two exclusions in the retirement pass are absolute: a `cant-miss`
+  hypothesis is never auto-retired, because the cost of missing one is
+  catastrophic and asymmetric, and a patient-origin hypothesis is never
+  auto-retired, because her theory is hers to withdraw (ADR 0032). Nothing
+  is deleted — retirement is a status change applied through a `LedgerDiff`
+  so the existing invariants still check it, and reversible by any later
+  review that finds support. Dry-run against the live ledger: 50 active
+  → 42, with 11 protected and never assessed.
+
+- **LIRICAL runs in the review and reports where it disagrees.** The
+  engine is compared against the differential rather than folded into it:
+  its composite likelihood ratio is the only genuine LR in the system,
+  while criteria scorers produce points against a threshold and the panel
+  produces uncalibrated buckets, and averaging those is the unit-blindness
+  that has already produced three wrong clinical conclusions here. Three
+  outcomes per item — the engine raises what the differential lacks, the
+  differential holds what the engine cannot support (explicitly not a
+  refutation, since LIRICAL sees only phenotype), and agreement, which is
+  recorded rather than dropped.
+
+  It runs on the phenotype QUERY, not the record (ADR 0034): eight terms
+  rather than ninety, because the composite LR declines monotonically with
+  profile size. Invoked as a sibling ECS task with narrowly scoped IAM —
+  `RunTask` on one task-definition family in one cluster, `PassRole` for
+  exactly the two roles that definition names and conditioned on
+  `ecs-tasks`.
+
+### Fixed
+
+- **A Challenger rule that fired on nothing.** Its counter-arguments had to
+  cover "every `most-likely` hypothesis", and `most-likely` was empty for
+  twelve consecutive versions — so the requirement was satisfied
+  vacuously every time. That is why 21 of 50 hypotheses carried no
+  counter-evidence: not because they were unfalsifiable, but because
+  nobody looked. Coverage now extends to the three highest-probability
+  active hypotheses regardless of tier, and the stage is asked for cited
+  `evidence_against` rather than prose alone, because a citation is what
+  the retirement pass can act on later.
+
+### Documentation
+
+- `docs/research/scoring-across-engines.md` — why scores from different
+  engines are not comparable, and why the ledger was not converging.
+- ADR 0035, ADR 0034.
+
 ## [0.21.0] — 2026-08-29
 
 ### Fixed

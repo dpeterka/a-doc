@@ -50,6 +50,28 @@ class Settings(BaseSettings):
     eutils_email: str = ""
     eutils_api_key: str = ""
 
+    # Launching the LIRICAL sidecar (ADR 0029: separate image, input and
+    # output exchanged on EFS). All optional and all empty by default: a local
+    # run has no cluster, and the review reports "the phenotype engine did not
+    # run" rather than failing. The deployed task definitions supply them.
+    #
+    # Not derived from the running task's metadata, though that would work:
+    # the review must be runnable from a laptop against a copy of the data,
+    # and configuration that only resolves inside ECS would make that
+    # impossible to test.
+    lirical_cluster: str = ""
+    lirical_task_definition: str = "a-doc-lirical"
+    lirical_subnets: str = ""
+    """Comma-separated. A string rather than a list because it arrives as one
+    environment variable."""
+    lirical_security_groups: str = ""
+
+    def lirical_subnet_ids(self) -> list[str]:
+        return [s.strip() for s in self.lirical_subnets.split(",") if s.strip()]
+
+    def lirical_security_group_ids(self) -> list[str]:
+        return [s.strip() for s in self.lirical_security_groups.split(",") if s.strip()]
+
     # SQLite journal mode for `labs.sqlite` (see `labs.db.LabsDb.__init__`'s
     # docstring for the full rationale): "WAL" is the fast local/dev/test
     # default; the deployed ECS/Fargate tasks set
@@ -64,6 +86,33 @@ class Settings(BaseSettings):
     # phenotype profile reproducible. Absent locally, phenotype matching
     # switches itself off with a warning rather than failing.
     hpo_index_path: Path = Path("/opt/hpo-index.json")
+
+    # The phenotype-similarity index (`scripts/build_semsim_index.py`), baked
+    # into the image beside the HPO index and for the same reasons: it is a
+    # build artifact of a public ontology, not patient data, and versioning it
+    # with the release is what makes a ranking reproducible. Absent locally,
+    # the similarity engine switches itself off rather than failing.
+    semsim_index_path: Path = Path("/opt/semsim-index.json")
+
+    # The Mondo cross-reference index (`scripts/build_mondo_index.py`). Gives
+    # a disease one identity across OMIM, ORPHA and free-text names, so an
+    # engine's curie and a hypothesis's name can be compared as ids rather
+    # than as strings. Absent locally, the divergence matchers fall back to
+    # name comparison — which is exactly what they did before it existed.
+    mondo_index_path: Path = Path("/opt/mondo-index.json")
+
+    # The Orphanet reference index (`scripts/build_orphadata_index.py`):
+    # curated definitions, prevalence, age of onset and inheritance, keyed by
+    # ORPHA code. Absent locally, the disease lookup falls back to the
+    # HPO-annotation view alone.
+    orphadata_index_path: Path = Path("/opt/orphadata-index.json")
+
+    # The StatPearls lead-section FTS5 index
+    # (`scripts/build_statpearls_index.py`). 41MB, from a 1.9GB archive: only
+    # the title and orienting sections are kept, because a full-text index
+    # would be 300-400MB in an image whose other reference artifacts total
+    # about 21MB. Absent locally, clinical-review lookup switches itself off.
+    statpearls_index_path: Path = Path("/opt/statpearls.sqlite")
 
     # Longest single chat message accepted. Enforced on the SERVER as well as
     # in the browser: `maxlength` is a convenience, not a control, and a
@@ -160,3 +209,29 @@ def load_model_bindings(path: Path | None = None) -> dict[str, list[ModelBinding
         else:
             bindings[role] = [ModelBinding.model_validate(value)]
     return bindings
+
+
+def reference_path(field: str) -> Path:
+    """A reference-artifact path, without requiring a configured data repo.
+
+    `Settings` has no default for `data_dir` and so RAISES when none is
+    configured. Every ontology and index path on it is an absolute build
+    artifact that has nothing to do with the patient's data — but reading one
+    through a bare `Settings()` couples it to that requirement anyway, and the
+    call sites all sit inside broad `except` blocks that must never fail a
+    review or an eval.
+
+    The result was the same silent failure three times over: with no data repo
+    the exception was swallowed and the caller reported the artifact missing.
+    A review said "the phenotype engine did not run" when the truth was an
+    unset `ADOC_DATA_DIR`, and the eval suite said "no similarity index in
+    this environment" for the same reason. Both messages named the wrong
+    cause, which is worse than the failure itself.
+
+    So: the configured path when there is a configuration, the field's own
+    default when there is not.
+    """
+    try:
+        return Path(getattr(Settings(), field))
+    except Exception:  # noqa: BLE001 - no data repo configured; the artifact is elsewhere
+        return Path(str(Settings.model_fields[field].default))

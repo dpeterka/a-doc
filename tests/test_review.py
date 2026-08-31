@@ -7,14 +7,16 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import pytest
 from git import Repo
+from pydantic import BaseModel
 
-from adoc.casefile.ledger import apply_and_save
+from adoc.casefile.ledger import apply_and_save, load_ledger
 from adoc.casefile.repo import HISTORY_RELPATH, LEDGER_RELPATH, DataRepo
 from adoc.casefile.schema import (
     AddEvidence,
@@ -38,6 +40,7 @@ from adoc.reason.client import (
 from adoc.reason.context import build_context
 from adoc.reason.dag import ContractViolation
 from adoc.reason.dag import run as dag_run
+from adoc.reason.engine_adjudication import EngineAdjudicationResult
 from adoc.reason.review import (
     FULL_REVIEW_COOLDOWN,
     FULL_REVIEW_FLOOR,
@@ -242,7 +245,17 @@ def test_full_review_happy_path(repo: DataRepo, db: LabsDb) -> None:
 
     assert report.review_date == date(2026, 8, 23)
     assert report.ledger_version_before == seeded.version
-    assert report.ledger_version_after == seeded.version + 1
+    # +2, not +1: `apply_review_diff` writes one version and `retirement_pass`
+    # writes another (this fixture retires 2 hypotheses, protects 1).
+    #
+    # This assertion said +1 until the engine-adjudication work, and it was
+    # WRONG rather than merely out of date. The report read `ledger_after`
+    # from the `apply_review_diff` node, which is the pre-retirement object,
+    # so a review that retired hypotheses reported a version it had already
+    # moved past and rendered a "what changed" ledger still containing every
+    # hypothesis it had just retired. The render node now reads the ledger as
+    # it finally stands.
+    assert report.ledger_version_after == seeded.version + 2
     assert report.tag == "review-2026-08-23"
     assert report.commit_sha
 
@@ -1844,3 +1857,201 @@ def test_criteria_are_absent_from_the_report_when_not_scored() -> None:
     )
 
     assert "## Classification criteria" not in markdown
+
+
+# --- engine adjudication end to end -------------------------------------------------------------
+#
+# The two nodes added for PLAN.md phase 3 criterion 1. The happy path above
+# already covers the case where the engines do not run (no divergences, no
+# model call, nothing applied); these cover the case where one does.
+
+
+def _seed_phenotype(repo: DataRepo) -> None:
+    from adoc.casefile.phenotype import (
+        PHENOTYPE_RELPATH,
+        PhenotypeProfile,
+        PhenotypeTerm,
+        save_phenotype,
+    )
+
+    save_phenotype(
+        repo.root / Path(PHENOTYPE_RELPATH),
+        PhenotypeProfile(
+            entries=[
+                PhenotypeTerm(
+                    term_id="HP:0002315",
+                    label="Headache",
+                    present=True,
+                    first_seen=date(2026, 8, 1),
+                    last_seen=date(2026, 8, 20),
+                    sources=["patient-report:2026-08-20"],
+                ),
+                PhenotypeTerm(
+                    term_id="HP:0012378",
+                    label="Fatigue",
+                    present=True,
+                    first_seen=date(2026, 8, 1),
+                    last_seen=date(2026, 8, 20),
+                    sources=["patient-report:2026-08-20"],
+                ),
+            ]
+        ),
+    )
+
+
+class _FakeLiricalRunner:
+    """Ranks one disease that is NOT on the ledger, so the run produces both
+    an `engine_only` divergence and `ledger_only` items for the seeded
+    hypotheses the engine never mentions."""
+
+    def run(self, request: Any) -> Any:
+        from adoc.knowledge.lirical import LiricalDisease, LiricalResult
+        from adoc.knowledge.lirical_runner import LiricalRun
+
+        return LiricalRun(
+            ok=True,
+            terms_used=list(request.observed),
+            result=LiricalResult(
+                sample_id="patient",
+                observed=list(request.observed),
+                diseases=[
+                    LiricalDisease(
+                        rank=1,
+                        name="Behcet disease",
+                        curie="OMIM:109650",
+                        pretest_probability="1/8621",
+                        posttest_probability=42.0,
+                        composite_lr=14.2,
+                    )
+                ],
+            ),
+            duration_seconds=1.0,
+        )
+
+
+def _engine_transport(
+    calls: list[TransportRequest],
+    overrides: dict[str, dict[str, Any]],
+    *,
+    answer_nothing: bool = False,
+) -> Any:
+    """Answer the engine adjudicator with a verdict for EVERY divergence it
+    was actually given, overriding specific ones by id.
+
+    The ids are read back out of the prompt rather than hardcoded. Hardcoding
+    them made the test assert against a divergence set it had guessed: the
+    seeded hypotheses the engine never ranks are `ledger_only` divergences
+    too, so a hand-written list missed them and the completeness contract
+    fired — correctly.
+    """
+    base = _happy_path_transport(calls)
+
+    def transport(request: TransportRequest) -> TransportResponse:
+        assert request.schema is not None
+        if request.schema.__name__ != "EngineAdjudicationPayload":
+            return base(request)
+        calls.append(request)
+        if answer_nothing:
+            return TransportResponse(
+                text="", tool_input={"verdicts": []}, input_tokens=10, output_tokens=10
+            )
+        content = "\n".join(m.content for m in request.messages)
+        ids = re.findall(r'"id":\s*"([^"]+)"', content)
+        verdicts = [
+            overrides.get(
+                divergence_id,
+                {
+                    "divergence": divergence_id,
+                    "direction": "neutral",
+                    "rationale": (
+                        f"Nothing specific to {divergence_id.split(':')[-1]} is recorded; "
+                        "the phenotype on file is too generic to move this either way."
+                    ),
+                },
+            )
+            for divergence_id in ids
+        ]
+        return TransportResponse(
+            text="", tool_input={"verdicts": verdicts}, input_tokens=10, output_tokens=10
+        )
+
+    return transport
+
+
+def _run_review_with_engine(
+    repo: DataRepo,
+    db: LabsDb,
+    overrides: dict[str, dict[str, Any]],
+    *,
+    answer_nothing: bool = False,
+) -> tuple[Ledger, dict[str, BaseModel], list[TransportRequest]]:
+    _seed_ledger(repo)
+    _seed_phenotype(repo)
+    calls: list[TransportRequest] = []
+    sink: dict[str, BaseModel] = {}
+    client = _build_client(_engine_transport(calls, overrides, answer_nothing=answer_nothing))
+    dag = build_review_dag(
+        client,
+        repo,
+        db,
+        repo.root / LEDGER_RELPATH,
+        clock=_fixed_clock,
+        sink=sink,
+        lirical=_FakeLiricalRunner(),
+    )
+    dag_run(
+        dag,
+        {"initial": Marker(), "blind_context_pack": build_context(repo, db, include_ledger=False)},
+    )
+    return load_ledger(repo.root / LEDGER_RELPATH), sink, calls
+
+
+def test_engine_adjudication_adopts_a_corroborated_engine_only_candidate(
+    repo: DataRepo, db: LabsDb
+) -> None:
+    """The whole point of criterion 1: a candidate LIRICAL ranked and the
+    differential missed now reaches the ledger, cited to the engine.
+
+    Before these nodes existed both engines ran, were rendered, and changed
+    nothing at all.
+    """
+    ledger, sink, _ = _run_review_with_engine(
+        repo,
+        db,
+        {
+            "lirical:engine_only:behcet-disease": {
+                "divergence": "lirical:engine_only:behcet-disease",
+                "direction": "corroborates",
+                "rationale": "Recurrent oral ulceration with headache and fatigue fits.",
+                "rule_out": "No recurrent oral ulceration over 12 months of observation.",
+            }
+        },
+    )
+
+    adopted = next((h for h in ledger.hypotheses if h.id == "behcet-disease"), None)
+    assert adopted is not None, "the engine's candidate never reached the ledger"
+    assert adopted.tier == "expanded"
+    assert adopted.rule_out
+    assert adopted.evidence_for[0].source == "engine:lirical:2026-08-23"
+    assert isinstance(sink["engine_adjudication"], EngineAdjudicationResult)
+
+
+def test_engine_adjudication_neutral_verdicts_leave_the_ledger_alone(
+    repo: DataRepo, db: LabsDb
+) -> None:
+    """`neutral` is the common and correct outcome — a phenotype-only engine
+    that never heard of a hypothesis has not refuted it."""
+    ledger, sink, _ = _run_review_with_engine(repo, db, {})
+
+    assert not any(h.id == "behcet-disease" for h in ledger.hypotheses)
+
+
+def test_a_missing_engine_verdict_fails_the_contract(repo: DataRepo, db: LabsDb) -> None:
+    """The engine node is contract-checked exactly like its panel-side
+    sibling: returning no verdicts for real divergences is not adjudicating.
+    """
+    with pytest.raises(ContractViolation) as excinfo:
+        _run_review_with_engine(repo, db, {}, answer_nothing=True)
+
+    assert excinfo.value.contract_name == "engine_adjudication_covers_every_divergence"
+    assert excinfo.value.node == "engine_adjudication"
