@@ -238,7 +238,10 @@ Numeric output has a deterministic pass too (`check_composer_numbers`), but it i
 
 *Meeting the four acceptance lines is NOT the same as finishing phase 3 — the scope below is wider than the criteria, and the "Remaining" list is the authoritative one.*
 
-*Remaining:*
+*Remaining: **none** — every item below is done. Phase 3 is complete; phase 4
+is next, and its scope is listed under "Phase 4 — Extras" below.*
+
+*Closed items, kept for the reasoning:*
 
 - ~~***LIRICAL into divergence adjudication.***~~ **Done** (ADR 0036). Both engines ran and were rendered before this; neither could change anything, because both nodes sit after `apply_review_diff`. `engine_adjudication` + `apply_engine_diff` close that: direction-only combination, evidence-only ops, a mandatory rule-out and a cap of 3 on adoptions per review, and engine agreement recorded deterministically with no model call. New `engine:<engine>:<date>` citation scheme, a closed set unlike every other slug in the grammar.
 - ~~***ICAP ANA-pattern mapping.***~~ **Done** — `knowledge/icap.py`, riding along with the `criteria_scan` node rather than taking a node of its own, and rendered in the review report.
@@ -250,7 +253,40 @@ Numeric output has a deterministic pass too (`check_composer_numbers`), but it i
 **Original scope:**  patient HPO phenotype profile; LIRICAL (phenotype-only) + Monarch sem-sim as independent differential engines rendered alongside the LLM panel in deep reviews with divergence adjudication; Monarch KG SQLite + Orphadata + phenotype.hpoa + Mondo as chat tools; ~10 hand-encoded ACR/EULAR classification scorers (SLE 2019, Sjögren 2016, SLICC, CASPAR, myositis, ANCA vasculitides…) + ICAP ANA-pattern mapping, computed deterministically from labs+phenotype, always labeled "classification, not diagnostic, criteria"; PubMed E-utilities with PMID-linked citations; StatPearls/GeneReviews local FTS5; `adoc eval` gains the rare-disease-cohort differential-recall suite and the retrospective self-case replay, enabling gated model rotation.
 *Acceptance:* reviews show LLM vs LIRICAL differentials with explicit divergence adjudication; criteria render itemized (points, threshold); every literature claim carries a PMID; `adoc eval --candidate` produces an incumbent-vs-candidate comparison report from a single command.
 
-**Phase 4 — Extras:** Apple Health Records import (patient connects portals once, "Export All Health Data" zip → Dropbox → `apple_health.py` parses `clinical-records/` FHIR → labs/encounters deduped against PDF rows; PDFs remain the richer source for autoimmune serology narratives); specialist finder via NPPES NPI registry (taxonomy + location + insurance fit); one-page appointment-prep PDF export; medication/supplement interaction flags; genetics path if sequencing ever happens (Exomiser needs a VCF; Phen2Gene works from phenotypes now); email notifications (SES); vectors only if FTS5 demonstrably misses.
+**Phase 4 — Extras.** Nothing here is started. In rough order of value to
+the patient:
+
+1. **Apple Health Records import.** She connects her portals once, exports
+   the "Export All Health Data" zip to Dropbox, and `apple_health.py` parses
+   `clinical-records/` FHIR into labs and encounters, deduped against PDF
+   rows. PDFs stay the richer source for autoimmune serology narratives —
+   this is for breadth and for results that never arrived as documents.
+2. **One-page appointment-prep export.** The review already produces "what to
+   ask your doctor"; this makes it something she can hand over.
+3. **Specialist finder** via the NPPES NPI registry — taxonomy, location and
+   insurance fit.
+4. **Medication and supplement interaction flags.** Read-only and
+   informational; the output gate in `reason/safety.py` still applies.
+5. **Email notifications** (SES) when a review lands or the confirm queue has
+   work.
+6. **Genetics beyond the curated panel**, only if sequencing ever happens —
+   Exomiser needs a VCF; Phen2Gene works from phenotypes today.
+7. **Vectors, only if FTS5 demonstrably misses something.** Not before.
+
+*Known open issues carried into phase 4:*
+
+- An intermittent `tests/test_web_*` failure, roughly 1 run in 6 under load,
+  a different file each time and always "expected content missing from HTML".
+  Test order is not randomised, so it is state or timing. Did not reproduce
+  in 10 clean runs on an idle machine.
+- `rule_out` is empty on every active hypothesis, so the retirement pass
+  cannot use its strongest rule (research note part 3a).
+- The `most-likely` tier has been empty for 15 ledger versions. The research
+  note asks that this be deliberate and stated rather than silent (part 3d).
+- PubMed returns 0 citations for the current differential; no `pmid:` ref
+  exists anywhere in the ledger.
+- `depends_on` declares one edge while nodes read many, and execution is
+  sequential — see `docs/dag-topology.md`.
 
 ## Key risks
 
