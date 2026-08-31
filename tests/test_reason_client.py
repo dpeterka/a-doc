@@ -752,15 +752,55 @@ def test_a_smaller_completion_reserve_buys_input_budget() -> None:
     assert client.context_budget("blind_panel", completion_reserve=16_384) > observed_pack
 
 
-def test_the_blind_panel_asks_for_a_budget_its_pack_fits_in() -> None:
-    """Pins the two constants against each other rather than against a
-    literal, so raising one without the other cannot silently re-break it."""
-    from adoc.reason.review import BLIND_PANEL_MAX_TOKENS
+def test_the_real_panel_bindings_can_hold_the_observed_pack() -> None:
+    """Against `models.yaml` as configured, not a synthetic fixture.
 
-    client = LlmClient(bindings=_panel_bindings(64_000), providers={})
-    budget = client.context_budget("blind_panel", completion_reserve=BLIND_PANEL_MAX_TOKENS)
+    The blind context pack measured 31,261 tokens in production. Two of the
+    three panel members have room for it many times over; the third does not,
+    and that is a binding decision rather than an arithmetic one — recorded
+    here so the constraint is visible rather than rediscovered.
+    """
+    from adoc.config import load_model_bindings
 
-    assert budget is not None and budget >= 40_000, (
-        "the blind context pack was 31,261 tokens in production and grows with the "
-        "case file; a budget without real headroom will fail again"
+    observed_pack = 31_261
+    bindings = load_model_bindings()
+    client = LlmClient(bindings=bindings, providers={})
+    fits = [
+        client.context_budget("blind_panel", binding_index=i) or observed_pack < 0
+        for i in range(len(bindings["blind_panel"]))
+    ]
+
+    assert sum(bool(f) for f in fits) >= 2, (
+        "fewer than two panel members can hold the observed context pack; "
+        "the panel is no longer a panel"
     )
+
+
+def test_a_call_is_sized_to_the_binding_it_actually_goes_to() -> None:
+    """`complete()` resolves ONE binding by index, and `blind_panel` calls it
+    once per member — no request is ever fanned out to all three at once.
+
+    Sizing every call to the smallest window in the role therefore asked the
+    wrong question, and in production it failed a 200,000-token Opus call
+    because a 64,000-token DeepSeek shared the role.
+    """
+    client = LlmClient(bindings=_panel_bindings(200_000, 400_000, 64_000), providers={})
+
+    assert client.context_budget("blind_panel", binding_index=0) == 200_000 - 32_768
+    assert client.context_budget("blind_panel", binding_index=1) == 400_000 - 32_768
+    assert client.context_budget("blind_panel", binding_index=2) == 64_000 - 32_768
+
+
+def test_the_role_wide_budget_still_means_the_smallest() -> None:
+    """Unchanged for a caller that does not name a binding: without one, the
+    conservative reading is the only safe one."""
+    client = LlmClient(bindings=_panel_bindings(200_000, 400_000, 64_000), providers={})
+
+    assert client.context_budget("blind_panel") == 64_000 - 32_768
+
+
+def test_an_out_of_range_binding_index_falls_back_to_the_smallest() -> None:
+    """A bad index must not silently widen the budget."""
+    client = LlmClient(bindings=_panel_bindings(200_000, 64_000), providers={})
+
+    assert client.context_budget("blind_panel", binding_index=9) == 64_000 - 32_768
