@@ -275,6 +275,8 @@ def lookup_conditions(repo: DataRepo, question: str) -> str:
         from adoc.config import Settings
         from adoc.knowledge.disease_lookup import lookup_diseases, render_disease_cards
         from adoc.knowledge.hpo import HpoIndex
+        from adoc.knowledge.mondo import load_mondo_index
+        from adoc.knowledge.orphadata import load_orpha_index
         from adoc.knowledge.semsim import load_index
 
         settings = Settings()
@@ -291,7 +293,15 @@ def lookup_conditions(repo: DataRepo, question: str) -> str:
             return "_The question does not name a condition from your differential._"
 
         hpo = HpoIndex.load(settings.hpo_index_path)
-        return render_disease_cards(lookup_diseases(index, hpo, named[:_MAX_CONDITION_LOOKUPS]))
+        return render_disease_cards(
+            lookup_diseases(
+                index,
+                hpo,
+                named[:_MAX_CONDITION_LOOKUPS],
+                orpha=load_orpha_index(settings.orphadata_index_path),
+                mondo=load_mondo_index(settings.mondo_index_path),
+            )
+        )
     except Exception as exc:  # noqa: BLE001 - a retrieval helper never fails a turn
         logger.warning("lookup_conditions failed: %s", exc)
         return "_Condition reference lookup unavailable this turn._"

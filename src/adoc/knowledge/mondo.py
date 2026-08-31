@@ -57,6 +57,22 @@ def normalise_label(text: str) -> str:
     return " ".join(_NON_ALNUM_RE.sub(" ", folded).split())
 
 
+def _curie_sort_key(curie: str) -> tuple[str, int, str]:
+    """Vocabulary, then NUMERIC id, then the raw string.
+
+    The numeric part matters: within one vocabulary a disease's general entry
+    usually has a lower number than its subtypes, and a string sort puts
+    `ORPHA:284963` ahead of `ORPHA:558`.
+    """
+    prefix, _, tail = curie.partition(":")
+    try:
+        return (prefix, int(tail), curie)
+    except ValueError:
+        # A non-numeric id (some vocabularies use letters) sorts last within
+        # its prefix rather than crashing the comparison.
+        return (prefix, 1 << 62, curie)
+
+
 class MondoIndex:
     """Cross-references and labels, resolved to Mondo ids."""
 
@@ -69,6 +85,13 @@ class MondoIndex:
         self._names = names
         self._xrefs = xrefs
         self._labels = labels
+        # Inverted at load rather than stored: derivable from `xrefs` in
+        # milliseconds, and a second copy in the artifact would be one more
+        # thing to keep consistent. Needed because Orphanet data is keyed by
+        # ORPHA while an engine may only give an OMIM id for the same disease.
+        self._by_mondo: dict[str, list[str]] = {}
+        for source, mondo_id in xrefs.items():
+            self._by_mondo.setdefault(mondo_id, []).append(source)
 
     @property
     def size(self) -> int:
@@ -102,6 +125,38 @@ class MondoIndex:
         if len(key) < _MIN_LABEL_CHARS:
             return None
         return self._labels.get(key)
+
+    def equivalent_curies(self, mondo_id: str, prefix: str = "") -> list[str]:
+        """Every source id mapping to `mondo_id`, optionally one vocabulary.
+
+        This is what lets an OMIM-only result reach Orphanet data: resolve the
+        OMIM id to Mondo, then ask which ORPHA code denotes the same disease.
+
+        Sorted NUMERICALLY, not lexicographically. A disease often carries
+        several codes in one vocabulary — a general entry and its subtypes —
+        and the lower number is the older, more general one. String sorting
+        returned `ORPHA:284963` for Marfan syndrome, a subtype, in preference
+        to `ORPHA:558`, the disease itself, because "2" sorts before "5".
+        """
+        found = self._by_mondo.get(mondo_id, [])
+        if prefix:
+            found = [c for c in found if c.startswith(prefix)]
+        return sorted(found, key=_curie_sort_key)
+
+    def orpha_code_for(self, *, curie: str = "", name: str = "") -> str | None:
+        """The ORPHA code for a disease identified any way at all.
+
+        An ORPHA code passes straight through, so a caller never has to branch
+        on which vocabulary it happens to hold.
+        """
+        cleaned = curie.strip()
+        if cleaned.startswith("ORPHA:"):
+            return cleaned
+        mondo_id = self.resolve(curie=cleaned, name=name)
+        if mondo_id is None:
+            return None
+        codes = self.equivalent_curies(mondo_id, prefix="ORPHA:")
+        return codes[0] if codes else None
 
     def resolve(self, *, curie: str = "", name: str = "") -> str | None:
         """Best available identity for a disease.

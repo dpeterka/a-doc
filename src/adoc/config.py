@@ -101,6 +101,12 @@ class Settings(BaseSettings):
     # name comparison — which is exactly what they did before it existed.
     mondo_index_path: Path = Path("/opt/mondo-index.json")
 
+    # The Orphanet reference index (`scripts/build_orphadata_index.py`):
+    # curated definitions, prevalence, age of onset and inheritance, keyed by
+    # ORPHA code. Absent locally, the disease lookup falls back to the
+    # HPO-annotation view alone.
+    orphadata_index_path: Path = Path("/opt/orphadata-index.json")
+
     # Longest single chat message accepted. Enforced on the SERVER as well as
     # in the browser: `maxlength` is a convenience, not a control, and a
     # paste-heavy client or a stale page can exceed it.
