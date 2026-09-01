@@ -279,8 +279,11 @@ the patient:
   a different file each time and always "expected content missing from HTML".
   Test order is not randomised, so it is state or timing. Did not reproduce
   in 10 clean runs on an idle machine.
-- `rule_out` is empty on every active hypothesis, so the retirement pass
-  cannot use its strongest rule (research note part 3a).
+- ~~`rule_out` is empty on every active hypothesis~~ — ADR 0038 makes it
+  evaluable (`rule_out_check`) and fixes `UpdateHypothesis.rule_out`, which
+  was declared and silently dropped by `apply_diff`, so existing hypotheses
+  can now acquire one. They still have to acquire one: the field is empty on
+  all 46 until a review or a human fills it.
 - The `most-likely` tier has been empty for 15 ledger versions. The research
   note asks that this be deliberate and stated rather than silent (part 3d).
 - PubMed returns 0 citations for the current differential; no `pmid:` ref
