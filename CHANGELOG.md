@@ -5,6 +5,54 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.26.1] — 2026-09-01
+
+*Nine defects found by an adversarial code review of the codebase. Each was
+verified against the real code before being fixed; five other items in that
+review were investigated and deliberately not acted on (see the PR).*
+
+### Fixed
+
+- **The S3 backup source scan was unpaginated.** `list_objects_v2` returns at
+  most 1,000 objects. Every source past the 1,000th read as "not present
+  remotely", so each backup re-uploaded it. Now paginated, matching the
+  restore path.
+
+- **SQLite had no busy timeout.** The default is 5.0s. Separate ECS tasks are
+  separate processes on one EFS file, and the in-process `RLock` does not
+  cover them. A web request during a batch write raised
+  `OperationalError: database is locked`. Now 30s.
+
+- **The upload route caught only `VisionError`.** Any other failure returned
+  HTTP 500 and left the file in `inbox/`, where every later sweep failed the
+  same way. The scheduled path already had this guard; the interactive path
+  did not.
+
+- **`pdftoppm` had no subprocess timeout.** A corrupt PDF could hang an
+  ingest task or a web worker with no limit. Now 150s.
+
+- **A truncated `<think>` block defeated JSON extraction.** An unclosed tag
+  does not match the strip pattern, so `find("{")` returned a brace inside
+  the model's reasoning. `finish_reason == "length"` is now checked before
+  any parse.
+
+- **`EntailmentCache.save()` wrote in place.** Two processes could interleave
+  and truncate the file. Now temp-file plus `os.replace`.
+
+- **Document corroboration wrote a fabricated `#p1` page ref.** That check
+  reads document dates only, never pages. The ref is now page-less.
+
+- **Two apply-failure paths in the review DAG had no visible trace.** A failed
+  `retirement_pass` or `apply_engine_diff` write read as an ordinary quiet
+  week. Added `RetirementReport.error` and
+  `EngineAdjudicationResult.apply_error`, both rendered.
+
+- **`_RA_RF` contained a literal space.** Names match against
+  `_normalize_slug` output, which strips spaces, so "Rheumatoid Factor"
+  normalizes to `rheumatoidfactor` and the pattern never matched. RA 2010's
+  rheumatoid-factor criterion was unsatisfiable from lab data since it
+  shipped. Test coverage: 0.
+
 ## [0.26.0] — 2026-08-31
 
 *Closes the loop ADR 0033 opened: a question answered in conversation now
