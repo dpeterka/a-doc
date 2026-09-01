@@ -30,6 +30,7 @@ from adoc.casefile.schema import (
     LedgerDiff,
     Provenance,
     RecordChallenge,
+    RuleOutCheck,
     UpdateHypothesis,
     validate_source_ref,
 )
@@ -687,3 +688,34 @@ def test_source_ref_slug_accepts_real_analyte_punctuation(ref: str) -> None:
     from adoc.casefile.schema import validate_source_ref
 
     assert validate_source_ref(ref) == ref
+
+
+def test_update_hypothesis_applies_rule_out_and_its_check() -> None:
+    """`UpdateHypothesis.rule_out` was declared on the op and never copied in
+    `apply_diff`, so "settable after creation" (ADR 0035) was true of the
+    schema and false of the behaviour — every such op was silently dropped.
+
+    Every hypothesis on the production ledger predates both fields, so this
+    is the only way any of them can ever acquire one (ADR 0038).
+    """
+    ledger = apply_diff(
+        empty_ledger(), diff_with([AddHypothesis(hypothesis=make_cant_miss("pe-01"))])
+    )
+
+    updated = apply_diff(
+        ledger,
+        diff_with(
+            [
+                UpdateHypothesis(
+                    id="pe-01",
+                    rule_out="a normal d-dimer",
+                    rule_out_check=RuleOutCheck(analyte="ddimer", operator="normal"),
+                )
+            ]
+        ),
+    )
+    hypothesis = next(h for h in updated.hypotheses if h.id == "pe-01")
+
+    assert hypothesis.rule_out == "a normal d-dimer"
+    assert hypothesis.rule_out_check is not None
+    assert hypothesis.rule_out_check.analyte == "ddimer"

@@ -1039,3 +1039,30 @@ body.lightbox-active {
   color: var(--color-danger);
   font-size: 0.9rem;
 }
+
+/* Patient-directed retirement (PAT-03 / ADR 0038). Deliberately quiet: a
+   control that ends a lead should be findable, not inviting. */
+.retire-control {
+  margin-top: 1rem;
+  border-top: 1px solid var(--rule, #e2e2e2);
+  padding-top: 0.75rem;
+}
+.retire-control > summary {
+  cursor: pointer;
+  font-size: 0.9rem;
+  color: var(--muted, #666);
+}
+.retire-control form {
+  margin-top: 0.75rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+.retire-control input {
+  padding: 0.4rem;
+  font: inherit;
+}
+.retire-control button {
+  align-self: flex-start;
+  margin-top: 0.5rem;
+}

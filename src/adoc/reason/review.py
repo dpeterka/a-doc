@@ -73,6 +73,8 @@ from adoc.casefile.questions import (
 )
 from adoc.casefile.repo import HISTORY_RELPATH, LEDGER_RELPATH, DataRepo
 from adoc.casefile.retirement import (
+    LabFact,
+    LabLookup,
     RetirementReport,
     propose_retirements,
     render_retirements,
@@ -1835,6 +1837,41 @@ def _review_relpath_and_tag(repo: DataRepo, review_date: date, *, now: datetime)
 # --------------------------------------------------------------------------
 
 
+def build_lab_lookup(db: LabsDb) -> LabLookup:
+    """Stored labs flattened for `casefile.retirement`'s rule-out evaluator.
+
+    Built here rather than in `casefile` because this module is the one that
+    has both — `casefile` must not import `labs`, the same one-directional
+    rule `knowledge.criteria` states about `PhenotypeLookup`.
+
+    Keyed on BOTH the canonical and raw names, normalized, so a `rule_out_check`
+    naming either spelling resolves: the stored names are `Complement C4c` and
+    `Smith (Sm) Antibody`, not the textbook ones.
+    """
+    lookup: LabLookup = {}
+    for row in db.latest_panel():
+        fact = LabFact(
+            value=row.value,
+            value_text=row.value_text or "",
+            flag=row.flag.value if row.flag is not None else "",
+            unit=row.ucum_unit or "",
+            ref=f"labs:{_lab_slug(row.name)}:{row.date.isoformat()}",
+        )
+        for name in (row.name, row.name_raw):
+            if name:
+                lookup.setdefault(_normalize_analyte(name), fact)
+    return lookup
+
+
+def _normalize_analyte(text: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", text.lower())
+
+
+def _lab_slug(name: str) -> str:
+    out = "".join(c if c.isalnum() else "-" for c in name.lower())
+    return "-".join(part for part in out.split("-") if part)
+
+
 def _default_lirical_runner(repo: DataRepo) -> LiricalRunner:
     """The production runner, configured from settings.
 
@@ -2138,7 +2175,7 @@ def build_review_dag(
         """
         ledger = ctx["apply_review_diff"]
         assert isinstance(ledger, Ledger)
-        report = propose_retirements(ledger, today=clock().date())
+        report = propose_retirements(ledger, today=clock().date(), labs=build_lab_lookup(db))
         if not report.retirements:
             logger.info("retirement: nothing retired (%d protected)", report.protected_count)
             results["retirement_pass"] = report

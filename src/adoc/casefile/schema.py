@@ -30,7 +30,17 @@ HypothesisStatus = Literal[
     "parked",
 ]
 Origin = Literal["model", "patient", "doctor", "challenger"]
-EvidenceStrength = Literal["strong", "moderate", "weak"]
+EvidenceStrength = Literal["strong", "moderate", "weak", "definitive-exclusion"]
+"""`definitive-exclusion` is not "very strong" — it is a different kind of
+claim (ADR 0038). One such item in `evidence_against` ends the hypothesis
+outright, without the summation `casefile.retirement._outweighed` performs,
+because clinical exclusion is not additive: a negative serum metanephrines
+excludes pheochromocytoma however many non-specific symptoms point at it.
+
+Which SOURCES may carry it is restricted in code
+(`casefile.retirement.DEFINITIVE_EXCLUSION_SOURCES`), never left to a prompt:
+a model that could assert it freely would have a one-word route to retiring a
+can't-miss lead."""
 
 # --- source-ref grammar (PLAN.md "Key schemas") -----------------------------------
 #
@@ -165,6 +175,38 @@ class Evidence(BaseModel):
         return validate_source_ref(value)
 
 
+class RuleOutCheck(BaseModel):
+    """The machine-checkable half of a hypothesis's rule-out (ADR 0038).
+
+    `Hypothesis.rule_out` stays prose — it is what the patient reads. This
+    says the same thing in terms a deterministic evaluator can answer against
+    stored lab rows, so a rule-out that has actually been MET can end the
+    hypothesis instead of sitting unread from the day it was written.
+
+    Deliberately four operators, not a grammar. They cover every rule-out
+    stated in the current ledger; a DSL can come when one of them is not
+    enough.
+    """
+
+    analyte: str
+    """Matched against stored lab names the same way `knowledge.criteria`
+    matches them — a regex over the normalized name, because the stored
+    spellings are `Complement C4c` and `Smith (Sm) Antibody`, not the
+    textbook names."""
+    operator: Literal["negative", "normal", "below", "above"]
+    threshold: float | None = None
+    unit: str = ""
+    """Carried so a threshold is never compared across incomparable units —
+    the bug `knowledge.criteria._count_threshold_item` exists to prevent
+    (eosinophils stored both as `4.5 %` and `320 cells/uL`)."""
+
+    @model_validator(mode="after")
+    def _threshold_required_for_comparisons(self) -> RuleOutCheck:
+        if self.operator in ("below", "above") and self.threshold is None:
+            raise ValueError(f"operator {self.operator!r} requires a threshold")
+        return self
+
+
 class Hypothesis(BaseModel):
     """One differential-ledger entry.
 
@@ -265,6 +307,13 @@ class Hypothesis(BaseModel):
     `plain_language` was.
     """
 
+    rule_out_check: RuleOutCheck | None = None
+    """The same rule-out, in terms a deterministic evaluator can answer
+    (ADR 0038). Optional: `rule_out`'s prose is what the patient reads, and a
+    rule-out that no lab can settle — "a negative cartilage biopsy" — has no
+    check to write. Absent means the rule-out is never evaluated
+    automatically, which is the prior behaviour for every hypothesis."""
+
     challenger_notes: str = ""
     last_challenged: date | None = None
     last_challenged_version: int | None = None
@@ -316,6 +365,9 @@ class UpdateHypothesis(BaseModel):
     rule_out: str | None = None
     """Settable after creation so a later review can supply the falsification
     condition for a hypothesis that predates the field (ADR 0035)."""
+    rule_out_check: RuleOutCheck | None = None
+    """Settable after creation for the same reason (ADR 0038): every
+    hypothesis on the ledger today predates this field."""
 
 
 class AddEvidence(BaseModel):

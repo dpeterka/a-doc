@@ -30,17 +30,27 @@ written before some future redaction fix is still covered here too.
 
 from __future__ import annotations
 
+import logging
 import re
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, Request
-from starlette.responses import Response
+from fastapi import APIRouter, Depends, Form, Request
+from starlette.responses import RedirectResponse, Response
 
+from adoc import __version__
 from adoc.casefile.ledger import load_ledger
-from adoc.casefile.repo import LEDGER_RELPATH, DataRepo
-from adoc.casefile.schema import Ledger
+from adoc.casefile.repo import HISTORY_RELPATH, LEDGER_RELPATH, DataRepo
+from adoc.casefile.schema import (
+    AddEvidence,
+    Evidence,
+    Ledger,
+    LedgerDiff,
+    Provenance,
+    UpdateHypothesis,
+)
 from adoc.labs.db import LabsDb
 from adoc.labs.models import LabDocument
 from adoc.reason.review import FULL_REVIEW_COOLDOWN, FULL_REVIEW_FLOOR
@@ -48,6 +58,8 @@ from adoc.reason.tools import redact_gated_text
 from adoc.web.casefile_helpers import find_document_by_filename, page_image_url
 from adoc.web.deps import get_db, get_repo
 from adoc.web.templating import templates
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/ledger")
 
@@ -166,3 +178,68 @@ def ledger_view(
             "review_trigger_phrase": REVIEW_TRIGGER_PHRASE,
         },
     )
+
+
+@router.post("/hypotheses/{hypothesis_id}/retire")
+def retire_hypothesis(
+    request: Request,
+    hypothesis_id: str,
+    reason: str = Form(...),
+    clinician: str = Form(""),
+    repo: DataRepo = Depends(get_repo),
+) -> Response:
+    """Record that a human ended a lead (PAT-03 / ADR 0038).
+
+    The only path by which a `cant-miss` or patient-origin hypothesis can
+    leave the list, short of a lab result settling it: `is_protected` blocks
+    every automatic rule, and until this route existed `/ledger` was a single
+    GET — so a lead her doctor had definitively excluded stayed "worth
+    discussing now" forever.
+
+    Written as ONE `definitive-exclusion` evidence item plus a status change,
+    through `apply_ledger_diff` — the same invariant-checked path everything
+    else uses. No private back door (ADR 0035's rule, kept).
+
+    Reversible: status is a field and the hypothesis stays on file.
+    """
+    ledger_path = repo.root / LEDGER_RELPATH
+    ledger = load_ledger(ledger_path)
+    if not any(h.id == hypothesis_id for h in ledger.hypotheses):
+        return RedirectResponse(url="/ledger", status_code=303)
+
+    reason_text = reason.strip()
+    if not reason_text:
+        return RedirectResponse(url="/ledger", status_code=303)
+
+    today = datetime.now(UTC).date()
+    attributed = f"{reason_text} (per {clinician.strip()})" if clinician.strip() else reason_text
+    diff = LedgerDiff(
+        provenance=Provenance(
+            app_version=__version__,
+            prompt_template_version="n/a-patient-directed",
+            model_id="none",
+            dag_node="retire_hypothesis",
+            timestamp=datetime.now(UTC),
+        ),
+        rationale=f"Patient-directed retirement of {hypothesis_id!r}: {attributed}",
+        ops=[
+            AddEvidence(
+                id=hypothesis_id,
+                for_or_against="against",
+                evidence=Evidence(
+                    claim=attributed,
+                    # Her own report of what her doctor said. A permitted
+                    # source for a definitive exclusion (ADR 0038) precisely
+                    # because a person, not a model, is asserting it.
+                    source=f"patient-report:{today.isoformat()}",
+                    strength="definitive-exclusion",
+                ),
+            ),
+            UpdateHypothesis(id=hypothesis_id, status="ruled-out"),
+        ],
+    )
+    try:
+        repo.apply_ledger_diff(ledger_path, repo.root / HISTORY_RELPATH, diff)
+    except Exception as exc:  # noqa: BLE001 - a failed write must not 500 the page
+        logger.warning("retire_hypothesis: could not apply %s: %s", hypothesis_id, exc)
+    return RedirectResponse(url="/ledger", status_code=303)

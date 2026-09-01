@@ -244,6 +244,15 @@ def apply_diff(ledger: Ledger, diff: LedgerDiff) -> Ledger:
                 hyp.discriminators = list(op.discriminators)
             if op.plain_language is not None:
                 hyp.plain_language = op.plain_language.strip()
+            # `rule_out`/`rule_out_check` were declared on the op and never
+            # copied here, so "settable after creation" (ADR 0035) was true of
+            # the schema and false of the behaviour: every such op was
+            # silently dropped. Every hypothesis on the ledger predates both
+            # fields, so this is the only way any of them can ever acquire one.
+            if op.rule_out is not None:
+                hyp.rule_out = op.rule_out.strip()
+            if op.rule_out_check is not None:
+                hyp.rule_out_check = op.rule_out_check
 
         elif isinstance(op, AddEvidence):
             hyp = _find(working, op.id)

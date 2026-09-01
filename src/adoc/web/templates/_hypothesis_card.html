@@ -94,4 +94,34 @@
             </details>
           {% endif %}
         {% endif %}
+
+        {# PAT-03 / ADR 0038: the only way a can't-miss or your-own-idea lead
+           can leave the list. Shown only while it is still being tracked. #}
+        {% if h.status in ("active", "patient-proposed", "challenged") %}
+          <details class="retire-control">
+            <summary>My doctor ruled this out</summary>
+            <form method="post" action="/ledger/hypotheses/{{ h.id | urlencode }}/retire">
+              <label for="retire-reason-{{ h.id }}">What did they say?</label>
+              <input
+                id="retire-reason-{{ h.id }}"
+                name="reason"
+                type="text"
+                required
+                placeholder="e.g. Biopsy came back clear on 12 August"
+              />
+              <label for="retire-clinician-{{ h.id }}">Which doctor? (optional)</label>
+              <input
+                id="retire-clinician-{{ h.id }}"
+                name="clinician"
+                type="text"
+                placeholder="e.g. Dr Alvarez, rheumatology"
+              />
+              <p class="muted">
+                This moves it off the working list. Nothing is deleted — it stays on
+                file and comes back if new evidence turns up.
+              </p>
+              <button type="submit">Rule this out</button>
+            </form>
+          </details>
+        {% endif %}
       </article>
