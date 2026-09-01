@@ -110,6 +110,11 @@ def test_pdftoppm_renderer_times_out_rather_than_hanging_forever(
     def _hangs(*_args: object, **_kwargs: object) -> None:
         raise subprocess.TimeoutExpired(cmd="pdftoppm", timeout=_PDFTOPPM_TIMEOUT_SECONDS)
 
+    # Independent of whether poppler-utils happens to be installed in
+    # whatever environment runs this test (it is on a dev box, it is NOT on
+    # the CI runner - a real, environment-dependent gap the first version of
+    # this test missed and failed on in CI while passing locally twice).
+    monkeypatch.setattr(shutil, "which", lambda _name: "/usr/bin/pdftoppm")
     monkeypatch.setattr(subprocess, "run", _hangs)
 
     with pytest.raises(ArchiveError, match="did not finish"):
