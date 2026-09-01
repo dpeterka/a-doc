@@ -432,6 +432,37 @@ def test_the_report_says_what_was_considered_and_not_acted_on() -> None:
     assert "Behcet Disease" in rendered
 
 
+def test_an_apply_failure_is_shown_alongside_the_verdicts_that_could_not_land() -> None:
+    """`apply_error` is distinct from `error`: adjudication itself succeeded
+    (the verdicts are real, computed decisions) and only the WRITE to the
+    ledger failed. Before this field existed, an apply failure had no
+    visible trace anywhere — the report showed the verdicts as if they had
+    landed, with nothing saying the write never happened.
+    """
+    divergences = _engine_only("Behcet Disease")
+    result = EngineAdjudicationResult(
+        ran=True,
+        divergences=divergences,
+        verdicts=[
+            EngineVerdictPayload(
+                divergence=divergences[0].id,
+                direction="corroborates",
+                rationale="Ulceration and uveitis are recorded.",
+                rule_out="No recurrent ulceration in 12 months.",
+            )
+        ],
+        apply_error="OSError: disk full",
+    )
+
+    rendered = "\n".join(render_engine_adjudication(result, []))
+
+    assert "could not be saved" in rendered
+    assert "disk full" in rendered
+    # The verdict summary must still be there — apply_error augments it,
+    # never replaces it the way `.error` (adjudication never ran) does.
+    assert "corroborating" in rendered
+
+
 # -- the DAG contract -------------------------------------------------------
 #
 # The node's postcondition, exercised directly. Its sibling

@@ -717,7 +717,7 @@ def _ingest_genomic(
     )
 
 
-def _apply_inbox_hygiene(
+def apply_inbox_hygiene(
     path: Path,
     outcome: FileOutcome,
     *,
@@ -729,7 +729,12 @@ def _apply_inbox_hygiene(
     `inbox_root` is given AND `path` actually falls under it - `ingest_file`
     and `ingest_directory` default `inbox_root=None`, so nothing happens
     for them unless a caller opts in, and `ingest_directory` never opts in
-    (the `adoc backfill <external dir>` invariant)."""
+    (the `adoc backfill <external dir>` invariant).
+
+    Public (no leading underscore) because `web.routes.upload` needs it too,
+    for the exact same reason `ingest_inbox` does: an unexpected exception
+    that escapes `ingest_file` must still route the failing file through
+    hygiene rather than leave it orphaned in `inbox/`."""
     if inbox_root is None:
         return
     try:
@@ -868,7 +873,7 @@ def _ingest_zip(
     nested zip, corrupt/unreadable document, ...) - CONFIRMED bug fix: a
     member failing through its own `_ingest_one` used to be recorded only
     as that member's own `FileOutcome`, which left `zip_error` `None` and
-    the zip's own outcome `"ingested"` - so `_apply_inbox_hygiene` deleted
+    the zip's own outcome `"ingested"` - so `apply_inbox_hygiene` deleted
     the zip from `inbox/` as if everything in it had succeeded, and the
     failed member never reached `work/failed/failures.jsonl` at all (no
     operator-visible record, and if the source had already been removed
@@ -949,7 +954,7 @@ def _ingest_one(
             outcome="error" if zip_error else "ingested",
             issues=[zip_error] if zip_error else [],
         )
-        _apply_inbox_hygiene(path, zip_outcome, repo=repo, inbox_root=inbox_root, clock=clock)
+        apply_inbox_hygiene(path, zip_outcome, repo=repo, inbox_root=inbox_root, clock=clock)
         # The zip container itself is never a "document" in the report
         # (module docstring) - its own outcome only needs surfacing when
         # it failed; a clean expansion just reports its members.
@@ -957,19 +962,19 @@ def _ingest_one(
 
     if kind == "genomic":
         outcome = _ingest_genomic(path, repo=repo, db=db, clock=clock)
-        _apply_inbox_hygiene(path, outcome, repo=repo, inbox_root=inbox_root, clock=clock)
+        apply_inbox_hygiene(path, outcome, repo=repo, inbox_root=inbox_root, clock=clock)
         return [outcome]
 
     try:
         archived = archive_document(repo.root, path, db=db, renderer=renderer)
     except ArchiveError as exc:
         outcome = FileOutcome(path=str(path), outcome="error", issues=[str(exc)])
-        _apply_inbox_hygiene(path, outcome, repo=repo, inbox_root=inbox_root, clock=clock)
+        apply_inbox_hygiene(path, outcome, repo=repo, inbox_root=inbox_root, clock=clock)
         return [outcome]
 
     if archived.already_ingested:
         outcome = FileOutcome(path=str(path), sha256=archived.sha256, outcome="duplicate")
-        _apply_inbox_hygiene(path, outcome, repo=repo, inbox_root=inbox_root, clock=clock)
+        apply_inbox_hygiene(path, outcome, repo=repo, inbox_root=inbox_root, clock=clock)
         return [outcome]
 
     # Document-TEXT layer (docs/adr/0015): each of these three branches
@@ -1012,7 +1017,7 @@ def _ingest_one(
             issues=[f"{type(exc).__name__}: {exc}"],
         )
 
-    _apply_inbox_hygiene(path, outcome, repo=repo, inbox_root=inbox_root, clock=clock)
+    apply_inbox_hygiene(path, outcome, repo=repo, inbox_root=inbox_root, clock=clock)
     return [outcome]
 
 
@@ -1130,7 +1135,7 @@ def ingest_inbox(
                 "ingest_inbox: unexpected error ingesting %s; continuing with remaining files", p
             )
             outcome = FileOutcome(path=str(p), outcome="error", issues=[f"unexpected error: {exc}"])
-            _apply_inbox_hygiene(p, outcome, repo=repo, inbox_root=inbox, clock=clock)
+            apply_inbox_hygiene(p, outcome, repo=repo, inbox_root=inbox, clock=clock)
             outcomes.append(outcome)
     report = IngestReport(files=outcomes)
     _mark_review_wanted_for_report(repo, report, clock=clock)

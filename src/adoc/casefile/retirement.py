@@ -62,6 +62,13 @@ class RetirementReport(BaseModel):
     """Active hypotheses excluded from consideration entirely because they are
     can't-miss or patient-origin. Counted so the report can say what was left
     alone rather than implying everything was assessed."""
+    error: str = ""
+    """Set only when a retirement was PROPOSED but the write to disk failed —
+    never for the ordinary case of nothing needing retirement. Distinct from
+    an empty `retirements` list on purpose: `render_retirements` used to
+    print "nothing was retired" identically whether nothing was proposed or
+    a proposal existed and the apply failed (a lock, an IO error), which
+    reported a real operational failure as an ordinary clean week."""
 
     @property
     def count(self) -> int:
@@ -198,6 +205,12 @@ def retirements_to_diff(report: RetirementReport, *, provenance: Provenance) -> 
 
 def render_retirements(report: RetirementReport) -> list[str]:
     """The report section. Says what was left alone as well as what was cut."""
+    if report.error:
+        # A retirement was PROPOSED and the write failed - distinct from, and
+        # printed instead of, the ordinary "nothing was retired" line, which
+        # used to cover this case too and read a real operational failure
+        # (a lock, an IO error) as an unremarkable quiet week.
+        return [f"_Retirement was proposed this week but could not be saved: {report.error}._", ""]
     if not report.retirements:
         return ["_Nothing was retired from the differential this week._", ""]
 

@@ -423,6 +423,14 @@ def _fts_query_any(text: str) -> str:
 # duplicating them here is simpler than restructuring either module.
 _REF_RANGE_RE = re.compile(r"^\s*([0-9]*\.?[0-9]+)\s*[-–]\s*([0-9]*\.?[0-9]+)\s*$")
 
+# How long a caller waits for a lock already held by another process/thread
+# before sqlite3 gives up and raises `OperationalError: database is locked`.
+# The default is 5.0s, which real cross-process contention on EFS (a batch
+# ingest or review writing while a web request reads) can exceed - waiting
+# longer is strictly better than an ingest or review task racing a web
+# request to fail one of them outright.
+_BUSY_TIMEOUT_SECONDS = 30.0
+
 
 def _parse_ref_range(ref_range_raw: str | None) -> tuple[float | None, float | None]:
     if not ref_range_raw:
@@ -562,9 +570,22 @@ class LabsDb:
             # `check_same_thread=False` merely disables sqlite3's own
             # (weaker, same-thread-only) guard so that sharing is allowed
             # to happen at all - the RLock is what actually makes it safe.
-            self._conn = sqlite3.connect(str(path), check_same_thread=False)
+            # `timeout` (and the matching PRAGMA) is the cross-PROCESS half of
+            # the concurrency story above; the RLock only covers threads
+            # sharing one Python process. Separate ECS tasks (the always-on
+            # web service and the scheduled ingest/review/backup jobs) are
+            # separate processes sharing this same file over EFS, and
+            # sqlite3's default connect timeout is 5.0s — short enough that a
+            # web request landing mid-way through a batch ingest's write
+            # transaction would raise `sqlite3.OperationalError: database is
+            # locked` rather than simply waiting the extra few seconds for
+            # the writer already holding the lock to finish.
+            self._conn = sqlite3.connect(
+                str(path), check_same_thread=False, timeout=_BUSY_TIMEOUT_SECONDS
+            )
             self._conn.row_factory = sqlite3.Row
             self._conn.execute(f"PRAGMA journal_mode={journal_mode}")
+            self._conn.execute(f"PRAGMA busy_timeout={int(_BUSY_TIMEOUT_SECONDS * 1000)}")
             self._conn.execute("PRAGMA foreign_keys=ON")
         self._migrate()
 

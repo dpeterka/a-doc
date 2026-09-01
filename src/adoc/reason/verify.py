@@ -74,7 +74,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import tempfile
 from collections.abc import Sequence
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -152,8 +154,29 @@ class EntailmentCache:
         return data if isinstance(data, dict) else {}
 
     def save(self, entries: dict[str, dict[str, str]]) -> None:
+        """Write via temp-file-then-`os.replace`, never in place.
+
+        A direct `write_text` can interleave with another writer's: a
+        diagnostic chat turn and the weekly review's deferred-claim sweep can
+        both call `verify_claims` (load/mutate/save this same file) around
+        the same time, and two overlapping `write_text` calls can leave a
+        truncated or interleaved JSON blob on disk. `load()` already treats
+        that as an empty cache rather than crashing, so the cost was only
+        ever silent eviction (re-paying for verifications that were free a
+        moment ago) — but `os.replace` is atomic on the same filesystem and
+        removes that cost for free.
+        """
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(entries, sort_keys=True), encoding="utf-8")
+        fd, tmp_name = tempfile.mkstemp(
+            dir=self.path.parent, prefix=f".{self.path.name}.", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps(entries, sort_keys=True))
+            os.replace(tmp_name, self.path)
+        except BaseException:
+            Path(tmp_name).unlink(missing_ok=True)
+            raise
 
 
 # --------------------------------------------------------------------------

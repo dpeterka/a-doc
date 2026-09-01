@@ -2007,6 +2007,43 @@ def _run_review_with_engine(
     return load_ledger(repo.root / LEDGER_RELPATH), sink, calls
 
 
+def test_an_apply_engine_diff_failure_is_visible_in_the_report(
+    repo: DataRepo, db: LabsDb, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Before `apply_error` existed, a write failure at `apply_engine_diff`
+    had no visible trace anywhere: the node caught the exception, reloaded
+    the ledger, and returned it as if nothing had happened — the report
+    showed the earlier node's computed verdicts as though they had landed.
+    """
+    real_apply = DataRepo.apply_ledger_diff
+
+    def _fail_only_for_engine_diff(self: DataRepo, ledger_path, history_path, diff, **kwargs):  # type: ignore[no-untyped-def]
+        if diff.provenance.dag_node == "apply_engine_diff":
+            raise OSError("disk full")
+        return real_apply(self, ledger_path, history_path, diff, **kwargs)
+
+    monkeypatch.setattr(DataRepo, "apply_ledger_diff", _fail_only_for_engine_diff)
+
+    _, sink, _ = _run_review_with_engine(
+        repo,
+        db,
+        {
+            "lirical:engine_only:behcet-disease": {
+                "divergence": "lirical:engine_only:behcet-disease",
+                "direction": "corroborates",
+                "rationale": "Ulceration and uveitis are recorded.",
+                "rule_out": "No recurrent ulceration in 12 months.",
+            }
+        },
+    )
+
+    adjudication = sink["engine_adjudication"]
+    assert isinstance(adjudication, EngineAdjudicationResult)
+    assert "disk full" in adjudication.apply_error
+    # the underlying verdicts must still be there for the report to show
+    assert adjudication.verdicts
+
+
 def test_engine_adjudication_adopts_a_corroborated_engine_only_candidate(
     repo: DataRepo, db: LabsDb
 ) -> None:

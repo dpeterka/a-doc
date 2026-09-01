@@ -380,8 +380,26 @@ class OpenAIProvider:
                 "likely consumed the completion budget; raise max_tokens"
             )
 
+        finish_reason = getattr(choice, "finish_reason", None)
         tool_input: dict[str, Any] | None = None
         if request.schema is not None:
+            if finish_reason == "length":
+                # Checked BEFORE attempting to parse, not after. A reasoning
+                # model (DeepSeek-R1 via Featherless) truncated mid-`<think>`
+                # block leaves an UNCLOSED tag, so `_extract_json_object`'s
+                # `<think>.*?</think>` strip does not match and the whole
+                # scratchpad stays in `cleaned` - `cleaned.find("{")` then
+                # finds a brace inside the model's own reasoning rather than
+                # the payload, either parsing successfully as the wrong JSON
+                # or raising an opaque "not valid JSON" that hides the real
+                # cause. `complete()`'s own `response.truncated` check runs
+                # AFTER this transport already returned, so on this path it
+                # never got the chance to fire at all.
+                raise LlmError(
+                    f"model {request.model!r}: output hit the max_tokens budget before "
+                    "completing (finish_reason='length') - the response is truncated, not "
+                    "malformed; raise max_tokens rather than trusting anything parsed from it"
+                )
             try:
                 tool_input = json.loads(_extract_json_object(text))
             except (json.JSONDecodeError, ValueError) as exc:
@@ -389,7 +407,7 @@ class OpenAIProvider:
 
         usage = response.usage
         return TransportResponse(
-            truncated=getattr(choice, "finish_reason", None) == "length",
+            truncated=finish_reason == "length",
             text=text,
             tool_input=tool_input,
             input_tokens=usage.prompt_tokens if usage else 0,
