@@ -149,8 +149,17 @@ def _dated_documents(db: LabsDb) -> list[_DatedSource]:
         doc = overview.document
         if doc.doc_type == GENOMIC_DOC_TYPE or doc.doc_date is None:
             continue
+        # `doc:{filename}`, page-LESS. This module only checks whether a
+        # document exists dated near the reported timing (module docstring:
+        # "period corroboration only — content entailment is Phase 2") — it
+        # never looks at what page anything is on. A fabricated `#p1` used to
+        # be printed here regardless of the document's real length, which
+        # both claims a specificity this check never had and, for a document
+        # where the actual finding sits on page 9, points a reader at the
+        # wrong page. `casefile.schema`'s grammar already treats a page-less
+        # `doc:` ref as "this document", which is the honest claim.
         sources.append(
-            _DatedSource(ref=f"doc:{doc.filename}#p1", when=doc.doc_date, doc_type=doc.doc_type)
+            _DatedSource(ref=f"doc:{doc.filename}", when=doc.doc_date, doc_type=doc.doc_type)
         )
     return sources
 

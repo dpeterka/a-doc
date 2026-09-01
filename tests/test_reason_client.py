@@ -6,6 +6,7 @@ import json
 import sys
 import types
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from pydantic import BaseModel, ValidationError
@@ -514,6 +515,92 @@ def test_structured_output_unwraps_single_key_nesting() -> None:
     assert _unwrap_tool_input({"parameters": {"a": 1}}) == {"a": 1}
     assert _unwrap_tool_input({"a": 1, "b": 2}) == {"a": 1, "b": 2}
     assert _unwrap_tool_input({"a": 1}) == {"a": 1}
+
+
+class _FakeOpenAIResponse:
+    def __init__(self, *, content: str, finish_reason: str) -> None:
+        message = SimpleNamespace(content=content)
+        self.choices = [SimpleNamespace(message=message, finish_reason=finish_reason)]
+        self.usage = SimpleNamespace(prompt_tokens=10, completion_tokens=10)
+
+
+class _FakeOpenAIClient:
+    """Mimics the real SDK client's shape one level below the injectable
+    `transport=` seam — `OpenAIProvider._default_transport` constructs a
+    real `openai.OpenAI(...)` itself, so `transport=` bypasses the exact
+    code path (`finish_reason` -> `_extract_json_object`) this exercises."""
+
+    def __init__(self, response: _FakeOpenAIResponse) -> None:
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=lambda **_kwargs: response))
+
+
+def test_a_reasoning_model_truncated_mid_think_block_raises_a_named_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The live failure this guards against: DeepSeek-R1 (via Featherless)
+    hits the completion budget mid-`<think>`, leaving the tag UNCLOSED.
+
+    `_extract_json_object`'s `<think>.*?</think>` strip does not match an
+    unclosed tag, so the whole scratchpad stayed in `cleaned` and
+    `cleaned.find("{")` found a brace inside the model's own reasoning
+    rather than the real payload — parsing successfully as the WRONG JSON,
+    or raising an opaque "not valid JSON" that named nothing about the real
+    cause. `finish_reason == "length"` is now checked before parsing is
+    ever attempted, so this raises a specific, named error instead.
+    """
+    import openai as openai_module
+
+    unclosed = "<think>reasoning that ran out of room, and inside it a { brace"
+    monkeypatch.setattr(
+        openai_module,
+        "OpenAI",
+        lambda **_kwargs: _FakeOpenAIClient(
+            _FakeOpenAIResponse(content=unclosed, finish_reason="length")
+        ),
+    )
+    provider = OpenAIProvider(api_key=None, base_url=FEATHERLESS_BASE_URL)
+
+    with pytest.raises(LlmError, match="max_tokens budget"):
+        provider.complete(
+            TransportRequest(
+                model="deepseek-ai/DeepSeek-R1-0528",
+                system="s",
+                messages=[],
+                schema=Diagnosis,
+                params={},
+                max_tokens=16384,
+            )
+        )
+
+
+def test_an_untruncated_openai_response_still_parses_normally(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The truncation check must not fire on an ordinary, complete reply."""
+    import openai as openai_module
+
+    monkeypatch.setattr(
+        openai_module,
+        "OpenAI",
+        lambda **_kwargs: _FakeOpenAIClient(
+            _FakeOpenAIResponse(content='{"name": "x", "confidence": 1}', finish_reason="stop")
+        ),
+    )
+    provider = OpenAIProvider(api_key=None, base_url=FEATHERLESS_BASE_URL)
+
+    response = provider.complete(
+        TransportRequest(
+            model="deepseek-ai/DeepSeek-R1-0528",
+            system="s",
+            messages=[],
+            schema=Diagnosis,
+            params={},
+            max_tokens=16384,
+        )
+    )
+
+    assert response.tool_input == {"name": "x", "confidence": 1}
+    assert response.truncated is False
 
 
 def test_openai_strict_schema_rejects_no_oneof_or_discriminator() -> None:

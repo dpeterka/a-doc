@@ -2159,7 +2159,10 @@ def build_review_dag(
             repo.apply_ledger_diff(ledger_path, repo.root / HISTORY_RELPATH, diff)
         except Exception as exc:  # noqa: BLE001 - a failed retirement must not fail a review
             logger.warning("retirement: could not apply: %s", exc)
-            results["retirement_pass"] = RetirementReport(protected_count=report.protected_count)
+            results["retirement_pass"] = RetirementReport(
+                protected_count=report.protected_count,
+                error=f"{type(exc).__name__}: {exc}",
+            )
             return results["retirement_pass"]
 
         logger.info("retirement: %d retired, %d protected", report.count, report.protected_count)
@@ -2422,6 +2425,15 @@ def build_review_dag(
         except Exception as exc:  # noqa: BLE001 - the engines must never fail a review
             logger.warning("engine adjudication: could not apply: %s", exc)
             ledger = load_ledger(ledger_path)
+            # Adjudication itself succeeded (the verdicts in `adjudication`
+            # are real) - only the WRITE failed. Recorded back into `results`
+            # under the same key `render_report` already reads, distinctly
+            # from `.error` (which means adjudication never ran at all), so
+            # the report says the write failed instead of silently showing
+            # verdicts that were never actually saved.
+            results["engine_adjudication"] = adjudication.model_copy(
+                update={"apply_error": f"{type(exc).__name__}: {exc}"}
+            )
 
         results["apply_engine_diff"] = ledger
         return ledger

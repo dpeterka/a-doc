@@ -87,7 +87,35 @@ def test_event_exact_date_within_14_days_corroborates(tmp_path: Path) -> None:
 
     assert len(updates) == 1
     assert updates[0].corroboration == "corroborated"
-    assert updates[0].corroboration_source == "doc:doc.pdf#p1"
+    # Page-LESS. This module only checks whether a document exists dated
+    # near the reported timing (module docstring: "period corroboration
+    # only") — it never looks at what page anything is on, so a fabricated
+    # `#p1` used to be printed regardless of the document's real length,
+    # both overclaiming a specificity this check never had and, for a
+    # document where the finding sits on page 9, pointing at the wrong page.
+    assert updates[0].corroboration_source == "doc:doc.pdf"
+
+
+def test_the_corroboration_ref_is_a_valid_citeable_source(tmp_path: Path) -> None:
+    """A page-less `doc:<filename>` ref must still pass
+    `casefile.schema.validate_source_ref` — it is the grammar's documented
+    form for "this document", not merely an internal string this module
+    happens to produce."""
+    from adoc.casefile.schema import validate_source_ref
+
+    repo = DataRepo.init_at(tmp_path / "data")
+    db = LabsDb(":memory:")
+    db.upsert_document(_doc("a" * 64, date(2024, 3, 10)))
+    fact = _fact(
+        kind="event",
+        statement="ER visit for chest pain.",
+        date_approx="2024-03-02",
+        precision="exact",
+    )
+
+    updates = corroborate_facts([fact], db, repo, today=TODAY)
+
+    assert validate_source_ref(updates[0].corroboration_source) == updates[0].corroboration_source
 
 
 def test_event_exact_date_beyond_14_days_stays_unverified(tmp_path: Path) -> None:

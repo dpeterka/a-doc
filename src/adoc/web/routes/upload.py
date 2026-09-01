@@ -17,6 +17,8 @@ logged on error — see that module's docstring).
 
 from __future__ import annotations
 
+import logging
+from datetime import datetime
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, Request, UploadFile
@@ -26,11 +28,13 @@ from adoc.casefile.repo import DataRepo
 from adoc.config import Settings
 from adoc.ingest.archive import PageRenderer
 from adoc.ingest.filetypes import detect_intake_kind
-from adoc.ingest.pipeline import ingest_file
+from adoc.ingest.pipeline import FileOutcome, apply_inbox_hygiene, ingest_file
 from adoc.ingest.vision import VisionClient, VisionError
 from adoc.labs.db import LabsDb
 from adoc.web.deps import get_db, get_renderer, get_repo, get_settings, get_vision
 from adoc.web.templating import templates
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/upload")
 
@@ -145,6 +149,30 @@ async def upload_submit(
         )
     except VisionError as exc:
         error = f"Could not read that document: {exc}"
+    except Exception as exc:  # noqa: BLE001 - an unexpected failure must still clean up
+        # `VisionError` is the one failure `ingest_file`'s own internals
+        # already route through hygiene (archive/docx/git-lock errors are
+        # caught inside `_ingest_one` and turned into an `outcome="error"`
+        # result before this call ever returns). Anything ELSE - a poppler
+        # crash, a database error, a malformed-metadata ValidationError - was
+        # genuinely unexpected and propagated straight out of `ingest_file`,
+        # so this file never got the outcome="error"/hygiene treatment at
+        # all: it was still sitting in `inbox/`, primed to fail the same way
+        # on every future scheduled sweep. `ingest_inbox` (the scheduled
+        # path) was given exactly this guard already; the interactive upload
+        # route had not been.
+        logger.exception("upload: unexpected error ingesting %s", dest)
+        apply_inbox_hygiene(
+            dest,
+            FileOutcome(path=str(dest), outcome="error", issues=[f"unexpected error: {exc}"]),
+            repo=repo,
+            inbox_root=inbox_dir,
+            clock=datetime.now,
+        )
+        error = (
+            "Something went wrong reading that document. It has been moved aside; "
+            "please try uploading it again or contact support."
+        )
 
     return templates.TemplateResponse(
         request,

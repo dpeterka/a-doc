@@ -794,7 +794,15 @@ def score_sjogren_2016(
 
 
 _RA_ACPA = (r"ccp", r"citrullinat")
-_RA_RF = (r"rheumatoid factor",)
+# `r"rheumatoid factor"` — a literal space — never matched anything: names
+# are matched against `_normalize_slug`'s output, which strips ALL
+# non-alphanumerics INCLUDING spaces, so the target string never contains
+# one. "Rheumatoid Factor" normalizes to "rheumatoidfactor". This criterion
+# could never be satisfied from lab data at all, silently, since RA 2010
+# shipped - caught with zero test coverage on this specific match. `^rf$`
+# added too: real lab panels report the bare abbreviation as often as the
+# full name.
+_RA_RF = (r"rheumatoidfactor", r"^rf$")
 _RA_ACUTE = (r"^crp$", r"hs-?crp", r"^esr$", r"sedimentation")
 
 

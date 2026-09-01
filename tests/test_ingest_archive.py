@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import shutil
+import subprocess
 import zipfile
 from datetime import date, datetime
 from pathlib import Path
@@ -11,7 +12,13 @@ import pytest
 from conftest import TINY_PDF_BYTES, fake_page_renderer
 from docx import Document
 
-from adoc.ingest.archive import ArchiveError, archive_document, sha256_file
+from adoc.ingest.archive import (
+    _PDFTOPPM_TIMEOUT_SECONDS,
+    ArchiveError,
+    archive_document,
+    pdftoppm_renderer,
+    sha256_file,
+)
 from adoc.labs.db import LabsDb
 from adoc.labs.models import DocumentStatus, LabDocument
 
@@ -90,6 +97,28 @@ def test_pdftoppm_renderer_raises_clear_error_when_binary_missing(
     db = LabsDb(tmp_path / "labs.sqlite")
     with pytest.raises(ArchiveError, match="pdftoppm"):
         archive_document(tmp_path / "data-repo", tiny_pdf_path, db=db)
+
+
+def test_pdftoppm_renderer_times_out_rather_than_hanging_forever(
+    tmp_path: Path, tiny_pdf_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No `timeout` used to be passed to `subprocess.run` at all. A
+    corrupted vector stream or a deliberately hostile PDF can make
+    `pdftoppm` spin rather than fail cleanly, tying up an ingest task or a
+    web-upload worker indefinitely."""
+
+    def _hangs(*_args: object, **_kwargs: object) -> None:
+        raise subprocess.TimeoutExpired(cmd="pdftoppm", timeout=_PDFTOPPM_TIMEOUT_SECONDS)
+
+    # Independent of whether poppler-utils happens to be installed in
+    # whatever environment runs this test (it is on a dev box, it is NOT on
+    # the CI runner - a real, environment-dependent gap the first version of
+    # this test missed and failed on in CI while passing locally twice).
+    monkeypatch.setattr(shutil, "which", lambda _name: "/usr/bin/pdftoppm")
+    monkeypatch.setattr(subprocess, "run", _hangs)
+
+    with pytest.raises(ArchiveError, match="did not finish"):
+        pdftoppm_renderer(tiny_pdf_path, tmp_path / "out")
 
 
 def test_archive_rejects_non_pdf_files(tmp_path: Path) -> None:

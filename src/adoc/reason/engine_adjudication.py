@@ -141,6 +141,14 @@ class EngineAdjudicationResult(BaseModel):
     verdicts: list[EngineVerdictPayload] = Field(default_factory=list)
     model_id: str = ""
     prompt_template_version: str = ""
+    apply_error: str = ""
+    """Set only when adjudication itself succeeded but WRITING its verdicts
+    to the ledger then failed. Distinct from `error` (adjudication never
+    happened at all): the two read very differently to someone checking
+    whether the ledger reflects what the model actually decided, and
+    conflating them used to mean an apply failure had NO visible trace
+    anywhere — the report showed the earlier node's verdicts as if they had
+    landed, with nothing saying the write never happened."""
 
     @property
     def by_direction(self) -> dict[str, int]:
@@ -441,6 +449,11 @@ def render_engine_adjudication(result: EngineAdjudicationResult, notes: list[str
         f"{counts['corroborates']} corroborating, {counts['opposes']} opposing, "
         f"{counts['neutral']} neutral."
     )
+    if result.apply_error:
+        lines.append(
+            f"_These verdicts could not be saved to the ledger this review: "
+            f"{result.apply_error}. They will be re-adjudicated next time._"
+        )
     lines.append("")
     by_id = {d.id: d for d in result.divergences}
     for verdict in result.verdicts:
