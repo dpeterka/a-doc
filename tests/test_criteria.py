@@ -357,6 +357,27 @@ def test_ra_serology_scores_low_positive_not_high() -> None:
     assert "LOW-positive" in serology.basis
 
 
+def test_rheumatoid_factor_by_full_name_is_matched() -> None:
+    """`_RA_RF` used to be `r"rheumatoid factor"` — a literal space, which
+    never matches a normalized key (`_normalize_slug` strips ALL
+    non-alphanumerics including spaces). "Rheumatoid Factor" normalizes to
+    "rheumatoidfactor"; the regex could never match it. This criterion has
+    been unsatisfiable from lab data since RA 2010 shipped, with zero test
+    coverage catching it."""
+    result = score_ra_2010([_row("Rheumatoid Factor", value_text="Positive")])
+    serology = next(i for i in result.items if i.domain == "Serology")
+
+    assert serology.state == "met"
+
+
+def test_rheumatoid_factor_by_bare_abbreviation_is_matched() -> None:
+    """Real lab panels report the bare "RF" as often as the full name."""
+    result = score_ra_2010([_row("RF", value_text="Positive")])
+    serology = next(i for i in result.items if i.domain == "Serology")
+
+    assert serology.state == "met"
+
+
 def test_a_unit_bearing_threshold_ignores_an_incomparable_unit() -> None:
     """The bug this helper exists for.
 

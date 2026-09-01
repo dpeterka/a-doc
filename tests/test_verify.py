@@ -429,6 +429,47 @@ def test_entailment_cache_round_trips_through_disk(tmp_path: Path) -> None:
     assert reloaded.load() == {key: {"judgment": "entailed", "rationale": "matches"}}
 
 
+def test_save_leaves_no_temp_file_behind(tmp_path: Path) -> None:
+    """`save()` writes via a temp file + `os.replace`, never in place — a
+    direct `write_text` could interleave with another writer's (a diagnostic
+    chat turn and the weekly review's deferred-claim sweep can both call
+    `verify_claims`, which loads/mutates/saves this same file, around the
+    same time), leaving a truncated or interleaved JSON blob on disk."""
+    cache = EntailmentCache(tmp_path / "entailment-cache.json")
+
+    cache.save({"k": {"judgment": "entailed", "rationale": "x"}})
+
+    leftovers = [p for p in tmp_path.iterdir() if p.name != "entailment-cache.json"]
+    assert leftovers == [], f"temp file(s) left behind: {leftovers}"
+
+
+def test_a_failed_replace_does_not_corrupt_the_existing_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If the final `os.replace` step itself fails (disk full, permissions),
+    the pre-existing cache must be left exactly as it was — never partially
+    overwritten — and the dangling temp file must not survive either."""
+    import os
+
+    path = tmp_path / "entailment-cache.json"
+    cache = EntailmentCache(path)
+    cache.save({"original": {"judgment": "entailed", "rationale": "first"}})
+
+    real_replace = os.replace
+    monkeypatch.setattr(
+        os,
+        "replace",
+        lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")),
+    )
+    with pytest.raises(OSError, match="disk full"):
+        cache.save({"new": {"judgment": "entailed", "rationale": "second"}})
+    monkeypatch.setattr(os, "replace", real_replace)
+
+    assert cache.load() == {"original": {"judgment": "entailed", "rationale": "first"}}
+    leftovers = [p for p in tmp_path.iterdir() if p.name != "entailment-cache.json"]
+    assert leftovers == [], f"temp file(s) left behind after a failed replace: {leftovers}"
+
+
 def test_verify_claims_cache_hit_skips_the_model_call(db: LabsDb, repo: DataRepo) -> None:
     """The genuine latency win: a claim whose `(claim, resolved source
     text)` pair is already in the cache is scored WITHOUT ever calling the

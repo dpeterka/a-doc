@@ -91,6 +91,21 @@ def test_journal_mode_truncate_for_nfs_efs(tmp_path: Path) -> None:
     assert store._conn.execute("PRAGMA journal_mode").fetchone()[0] == "truncate"
 
 
+def test_busy_timeout_is_set_so_cross_process_contention_waits_not_fails(
+    tmp_path: Path,
+) -> None:
+    """`sqlite3.connect()`'s default timeout is 5.0s. On EFS, separate ECS
+    tasks (the always-on web service and the scheduled ingest/review/backup
+    jobs) are separate PROCESSES sharing this one file — the in-process
+    `RLock` (see `LabsDb.__init__`'s docstring) does not help across them at
+    all. A web request landing mid-way through a batch write used to raise
+    `sqlite3.OperationalError: database is locked` after 5s rather than
+    simply waiting the extra few seconds for the writer to finish."""
+    store = LabsDb(tmp_path / "labs.sqlite")
+
+    assert store._conn.execute("PRAGMA busy_timeout").fetchone()[0] >= 30_000
+
+
 def test_insert_results_returns_ids(db: LabsDb) -> None:
     ids = db.insert_results([_lab(), _lab(name="sodium", value=140.0, ucum_unit="mmol/L")])
     assert all(isinstance(i, int) for i in ids)

@@ -45,8 +45,9 @@ class FakeS3Client:
         self.downloads: list[tuple[str, str, str]] = []  # (bucket, key, local_path)
         self._contents: dict[str, bytes] = {}
         # When set, `list_objects_v2` paginates at this many keys per call
-        # (a small number in tests) to exercise restore's pagination loop
-        # instead of the single "not paginated" call `run_backup` makes.
+        # (a small number in tests) to exercise the pagination loop both
+        # `_remote_source_sizes` (run_backup) and `_list_source_keys`
+        # (restore) now use.
         self._page_size = page_size
 
     def upload_file(self, Filename: str, Bucket: str, Key: str) -> None:
@@ -325,6 +326,32 @@ def test_restore_warns_on_jsonl_mismatch_but_prefers_the_git_copy(tmp_path: Path
     assert "labs-export.jsonl" in report.warnings[0]
     # the committed (git) copy won, not the corrupted S3 one
     assert report.lab_rows_rebuilt == 2
+
+
+def test_backup_paginates_the_remote_size_scan(tmp_path: Path) -> None:
+    """`_remote_source_sizes` used a single unpaginated `list_objects_v2`
+    call, which returns at most 1,000 objects. Anything past the first page
+    silently read as "not present remotely", so a corpus that outgrew one
+    page re-uploaded every source document past the 1,000th on EVERY future
+    backup, forever.
+
+    Three source files (`sources/.gitkeep` plus the two seeded documents)
+    with `page_size=1` forces multiple pages. If the scan only saw page one,
+    the second backup run would re-upload whichever file fell on a later
+    page, since its size would never have been recorded there.
+    """
+    src = tmp_path / "src-data"
+    DataRepo.init_at(src)
+    _seed_with_labs(src)
+
+    s3 = FakeS3Client(page_size=1)
+    first = run_backup(src, "bucket", s3)
+    assert first.sources_uploaded == 3
+
+    second = run_backup(src, "bucket", s3)
+
+    assert second.sources_uploaded == 0
+    assert second.sources_skipped == 3
 
 
 def test_restore_paginates_the_sources_listing(tmp_path: Path) -> None:

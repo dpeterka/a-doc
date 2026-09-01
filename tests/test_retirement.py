@@ -14,6 +14,7 @@ from datetime import UTC, date, datetime, timedelta
 
 from adoc.casefile.retirement import (
     STALE_DAYS,
+    RetirementReport,
     is_protected,
     propose_retirements,
     render_retirements,
@@ -242,3 +243,18 @@ def test_an_empty_pass_renders_plainly() -> None:
     assert "Nothing was retired" in "\n".join(
         render_retirements(propose_retirements(_ledger(), today=_TODAY))
     )
+
+
+def test_a_failed_apply_reads_as_a_failure_not_a_quiet_week() -> None:
+    """`RetirementReport.error` is set ONLY when a retirement was proposed
+    but the write to disk failed — the report used to render "nothing was
+    retired" identically whether nothing was ever proposed or a proposal
+    existed and the apply genuinely failed (a lock, an IO error), reading a
+    real operational failure as an unremarkable clean week."""
+    failed = RetirementReport(protected_count=1, error="OSError: disk full")
+
+    text = "\n".join(render_retirements(failed))
+
+    assert "could not be saved" in text
+    assert "disk full" in text
+    assert "Nothing was retired" not in text

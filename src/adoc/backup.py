@@ -103,11 +103,28 @@ def _bundle_data_repo(data_dir: Path, bundle_path: Path) -> None:
 
 
 def _remote_source_sizes(s3: S3Client, bucket: str) -> dict[str, int]:
+    """Every remote source key and its size, paginated.
+
+    A single unpaginated `list_objects_v2` call returns at most 1,000
+    objects. Past that point every key beyond the first page silently read
+    as "not present remotely" here, so `_sync_sources` re-uploaded every
+    source document past the 1,000th on every single backup run forever —
+    real network cost and non-current S3 object versions that never stop
+    accumulating once the corpus crosses that line. Mirrors
+    `_list_source_keys`'s own `NextContinuationToken` loop below.
+    """
     sizes: dict[str, int] = {}
-    response = s3.list_objects_v2(Bucket=bucket, Prefix=SOURCES_PREFIX)
-    for obj in response.get("Contents", []):
-        sizes[obj["Key"]] = obj["Size"]
-    return sizes
+    token: str | None = None
+    while True:
+        kwargs: dict[str, str] = {"Bucket": bucket, "Prefix": SOURCES_PREFIX}
+        if token is not None:
+            kwargs["ContinuationToken"] = token
+        response = s3.list_objects_v2(**kwargs)
+        for obj in response.get("Contents", []):
+            sizes[obj["Key"]] = obj["Size"]
+        if not response.get("IsTruncated"):
+            return sizes
+        token = response["NextContinuationToken"]
 
 
 def _sync_sources(s3: S3Client, bucket: str, sources_dir: Path) -> tuple[int, int]:
@@ -207,11 +224,9 @@ def _object_exists(s3: S3Client, bucket: str, key: str) -> bool:
 
 def _list_source_keys(s3: S3Client, bucket: str) -> list[str]:
     """Every object key under `SOURCES_PREFIX`, following
-    `NextContinuationToken` until `IsTruncated` is false — unlike
-    `run_backup`'s `_remote_source_sizes` (a single, unpaginated call,
-    fine for this single-patient corpus today), restore is the one path
-    the task spec asks to paginate explicitly, so a corpus that outgrows
-    one `list_objects_v2` page still restores completely.
+    `NextContinuationToken` until `IsTruncated` is false — the restore path,
+    same pagination `_remote_source_sizes` above now also uses (it did not
+    used to; see that function's docstring).
     """
     keys: list[str] = []
     token: str | None = None

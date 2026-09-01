@@ -45,6 +45,13 @@ from typing import Literal
 from adoc.ingest.filetypes import detect_intake_kind
 from adoc.labs.db import LabsDb
 
+# A hung pdftoppm ties up an ingest task or a web-upload worker indefinitely.
+# 150s is generous for a single document at 150 DPI - real multi-hundred-page
+# discharge summaries in this corpus render in well under a minute - and short
+# enough that a genuinely stuck process fails the one file rather than the
+# whole task.
+_PDFTOPPM_TIMEOUT_SECONDS = 150.0
+
 DocKind = Literal["pdf", "docx", "text"]
 """The kinds `archive_document` actually archives - a subset of
 `ingest.filetypes.IntakeKind` (which also has `"genomic"`/`"zip"`, handled
@@ -105,10 +112,19 @@ def pdftoppm_renderer(pdf_path: Path, out_dir: Path) -> list[Path]:
             ["pdftoppm", "-png", "-r", "150", str(pdf_path), str(prefix)],
             check=True,
             capture_output=True,
+            timeout=_PDFTOPPM_TIMEOUT_SECONDS,
         )
     except subprocess.CalledProcessError as exc:
         stderr = exc.stderr.decode("utf-8", errors="replace") if exc.stderr else ""
         raise ArchiveError(f"pdftoppm failed on {pdf_path}: {stderr}") from exc
+    except subprocess.TimeoutExpired as exc:
+        # A corrupted vector stream or a deliberately hostile PDF can make
+        # pdftoppm spin rather than fail cleanly. With no timeout that hangs
+        # the ingest task (or a web-upload worker) indefinitely rather than
+        # failing this one file.
+        raise ArchiveError(
+            f"pdftoppm did not finish within {_PDFTOPPM_TIMEOUT_SECONDS:.0f}s on {pdf_path}"
+        ) from exc
     return sorted(out_dir.glob("p-*.png"))
 
 
