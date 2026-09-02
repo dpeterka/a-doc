@@ -62,6 +62,7 @@ from adoc.intake.facts import IntakeFactsStore
 from adoc.labs.db import LabsDb
 from adoc.reason.client import LlmClient, LlmError, LlmResult
 from adoc.reason.dag import ContractViolation
+from adoc.reason.progress import TRACKER
 from adoc.reason.stages import PatientReply, route_turn, run_diagnostic_turn, run_informational_turn
 from adoc.web.casefile_helpers import append_chat_entry, last_chat_at, read_recent_chat
 from adoc.web.deps import get_client, get_db, get_repo, get_settings
@@ -263,6 +264,23 @@ def chat_page(
             "is_latest_page": page == 1,
         },
     )
+
+
+@router.get("/progress")
+def chat_progress(request: Request) -> Response:
+    """The in-flight turn's stage, as an HTML fragment (ADR 0046).
+
+    Polled by the waiting page every two seconds while the composer is
+    disabled. Returns the honest "a few minutes" line plus which of the four
+    stages is running — `chat.html` already told her the wait was long; this
+    tells her it is moving.
+
+    Publishes stage LABELS only, never any part of the turn, so a poll can
+    carry no patient content even if the response were cached or logged.
+    """
+    progress = TRACKER.read()
+    html = templates.get_template("_chat_progress.html").render(request=request, progress=progress)
+    return HTMLResponse(html)
 
 
 @router.get("/transcript")

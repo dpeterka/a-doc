@@ -1106,3 +1106,16 @@ body.lightbox-active {
   font-size: 0.85rem;
   color: var(--muted, #555);
 }
+
+/* ADR 0046: which stage a slow turn is on. Sits inside the existing pending
+   indicator rather than replacing it — the honest "a few minutes" line is
+   what sets the expectation; this only says it is moving. */
+.chat-stage {
+  display: block;
+  margin-top: 0.25rem;
+  font-variant-numeric: tabular-nums;
+}
+.chat-stage-count {
+  margin-left: 0.4rem;
+  opacity: 0.7;
+}

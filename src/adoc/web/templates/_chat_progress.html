@@ -1,0 +1,12 @@
+{# ADR 0046: the in-flight stage, polled every 2s while a turn runs.
+
+   Deliberately additive to the existing indicator rather than a replacement:
+   `chat.html`'s line already sets the right expectation ("can take a few
+   minutes — you can leave this page open"), and that honesty is the thing
+   PAT-06 misread as a bare spinner. This says which minute. #}
+{% if progress.visible %}
+  <span class="chat-stage">
+    {{ progress.label }}
+    {% if progress.total %}<span class="chat-stage-count">step {{ progress.step }} of {{ progress.total }}</span>{% endif %}
+  </span>
+{% endif %}

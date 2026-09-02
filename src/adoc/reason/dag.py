@@ -389,7 +389,18 @@ def _finish(node: Node, ctx: Ctx, output: BaseModel, run_id: str, clock: float) 
     return validated_output
 
 
-def run(dag: Dag, initial: dict[str, BaseModel]) -> DagRun:
+ProgressHook = Callable[[str, int, int], None]
+"""`(node_name, step, total)`, called as each node STARTS (ADR 0046).
+
+Called before the node runs, not after, because the point is to say what is
+happening now. Exceptions from a hook are swallowed and logged: a status
+line must never be able to fail a reasoning run.
+"""
+
+
+def run(
+    dag: Dag, initial: dict[str, BaseModel], *, on_node_start: ProgressHook | None = None
+) -> DagRun:
     """Execute `dag` in its derived topological order over `initial` context.
 
     For each node: resolve and validate its primary edge against
@@ -457,6 +468,11 @@ def run(dag: Dag, initial: dict[str, BaseModel]) -> DagRun:
                 node.name,
                 f" (parallel group {node.parallel_group!r})" if node.parallel_group else "",
             )
+            if on_node_start is not None:
+                try:
+                    on_node_start(node.name, len(node_records) + 1, total)
+                except Exception:  # noqa: BLE001 - a status line cannot fail a run
+                    logger.warning("dag %s: progress hook raised for %r", run_id[:8], node.name)
             validated_input = _prepare(node, snapshot, run_id)
             output = node.fn(snapshot)
             validated_output = _finish(node, snapshot, output, run_id, node_clock)
