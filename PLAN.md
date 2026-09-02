@@ -266,16 +266,26 @@ contract:
 |---|---|---|---|
 | 0038 | How a hypothesis ends | CLN-05, CLN-01, PAT-03 | shipped (v0.27.0) |
 | 0039 | How a review reads | PAT-01, PAT-02, PAT-04 | this branch |
-| 0040 | What the composer sounds like | PAT-08 | next |
+| 0040 | What the composer sounds like | PAT-08 | this branch |
 | 0041 | The appointment agenda | PAT-07 | queued |
 | 0042 | Longitudinal lab positivity | CLN-03 | queued |
 
-Two findings were rejected on review rather than adopted, and the ADRs say
+Three findings were rejected on review rather than adopted, and the ADRs say
 why: PAT-01's proposed `patient_summary` LLM node (a fourth frontier call
-that could contradict the report beneath it — ADR 0039) and averaging engine
-scores across LIRICAL and sem-sim (not commensurable — ADR 0036). PAT-01's
-premise that the report opens with operational metrics is also simply false;
-it opens with `## What changed this week`.
+that could contradict the report beneath it — ADR 0039), averaging engine
+scores across LIRICAL and sem-sim (not commensurable — ADR 0036), and
+PAT-08's "Your Case Co-Pilot" persona (PLAN.md risk 3 — a co-pilot claims
+shared authority over a decision this system must never appear to share;
+ADR 0040).
+
+Several premises turned out to be false on measurement, which is why each
+item gets its own review before adoption: PAT-01 says the report opens with
+operational metrics — it opens with `## What changed this week`. PAT-08 asks
+for a persistent footer disclaimer, which `base.html` has rendered on every
+page since the web UI shipped, and calls the composer prompt sterile when it
+already mandates "plain, compassionate language". Measuring PAT-08 anyway
+found two real things it did not mention: the classification disclaimer said
+seven times per report, and `CriteriaResult.citation` rendered nowhere.
 
 **Phase 4 — Extras.** Nothing here is started. In rough order of value to
 the patient:

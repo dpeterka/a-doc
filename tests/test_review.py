@@ -2312,3 +2312,72 @@ def test_the_engine_scales_are_named_as_different_questions(repo: DataRepo, db: 
 
     assert "not a percent chance" in markdown
     assert "Higher means more overlap, not more likely" in markdown
+
+
+# --- ADR 0040: what the composer sounds like -----------------------------------------------------
+
+
+def _criteria_section() -> str:
+    from adoc.knowledge.criteria import SCORERS, score_all
+    from adoc.reason.review import _render_criteria
+
+    rows = [
+        _lab_row("ANA", value_text="1:640"),
+        _lab_row("anti-dsDNA", value_text="Positive"),
+        _lab_row("CRP", value=8.5),
+        _lab_row("Rheumatoid factor", value=42.0),
+    ]
+    scan = CriteriaScanResult(results=score_all(rows, keys=list(SCORERS)))
+    return "\n".join(_render_criteria(scan))
+
+
+def test_the_classification_disclaimer_is_said_once_not_once_per_set() -> None:
+    """Seven sets rendered the same 160 characters seven times — 17.7% of the
+    section, in the one position a reader has learned to skip. The property is
+    "said once": seven times must fail this as surely as never would."""
+    text = _criteria_section()
+
+    assert text.count("exist to define comparable groups for research") == 1
+    assert text.index("exist to define comparable groups") < text.index("###")
+
+
+def test_the_disclaimer_is_never_dropped_entirely() -> None:
+    """The other half of "said once". A renderer that stopped saying it would
+    pass the count test above only if the count were not also floored."""
+    text = _criteria_section()
+
+    assert "classification* criteria, not diagnostic criteria" in text
+    assert "meeting one is not a diagnosis" in text
+
+
+def test_every_set_still_marks_itself_as_classification_only() -> None:
+    """A reader jumping to one `###` from the table of contents would
+    otherwise see a point total with nothing qualifying it."""
+    from adoc.knowledge.criteria import SCORERS
+
+    text = _criteria_section()
+
+    assert text.count("not diagnostic._") == len(SCORERS)
+
+
+def test_each_criteria_set_shows_the_published_citation() -> None:
+    """`CriteriaResult.citation` exists "so a doctor can look it up" and was
+    rendered nowhere — 461 characters dead on the model."""
+    from adoc.knowledge.criteria import SCORERS, score_all
+
+    text = _criteria_section()
+    results = score_all([], keys=list(SCORERS))
+
+    assert results
+    for result in results:
+        assert result.citation in text, f"{result.key} citation missing from the report"
+
+
+def test_the_disclaimer_lives_on_the_model_not_only_in_the_renderer() -> None:
+    """ADR 0040 changes the renderer alone. Every other consumer of a
+    `CriteriaResult` — the web view, an eval, a future export — still gets
+    the disclaimer per result."""
+    from adoc.knowledge.criteria import SCORERS, score_all
+
+    for result in score_all([], keys=list(SCORERS)):
+        assert "not diagnostic criteria" in result.disclaimer

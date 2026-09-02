@@ -1333,6 +1333,16 @@ def _sorted_for_reading(ledger: Ledger) -> list[Hypothesis]:
     )
 
 
+_CRITERIA_PREAMBLE = (
+    "**About every set below.** These are *classification* criteria, not "
+    "diagnostic criteria. They exist to define comparable groups for research, "
+    "and a person can have the condition without meeting them. Not meeting a "
+    "set is not a negative result, and meeting one is not a diagnosis — it "
+    "means this case would count in a study of that condition, which is a "
+    "different question from whether you have it."
+)
+
+
 def _render_criteria(scan: CriteriaScanResult) -> list[str]:
     """Itemised: every criterion, its weight, and what the record says.
 
@@ -1342,10 +1352,18 @@ def _render_criteria(scan: CriteriaScanResult) -> list[str]:
     waiting on an attribution judgement only they can make.
     """
     out: list[str] = []
+    if scan.results:
+        # ADR 0040: once, in prose, before the first set — not once per set.
+        # Rendered per set it was 7 identical lines, 1,120 characters,
+        # 23.6% of this section, in the one position a reader has learned
+        # to skip. `CriteriaResult.disclaimer` stays on the model: this is
+        # a renderer change, and every other consumer still gets it.
+        out.append(_CRITERIA_PREAMBLE)
+        out.append("")
     for result in scan.results:
         out.append(f"### {result.name}")
         out.append("")
-        out.append(f"_{result.disclaimer}_")
+        out.append(f"_Classification criteria ({result.citation}), not diagnostic._")
         out.append("")
         if result.entry_met is False:
             # Reported, not hidden: knowing a set was checked and ruled out is
