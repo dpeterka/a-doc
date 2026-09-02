@@ -43,8 +43,16 @@
        same number, because a maxlength attribute is a convenience and not a
        control. The counter is only shown as the limit approaches — a running
        tally on every message would nag. #}
+    {# ADR 0045: `seeded_ask` arrives from an "Ask about this" link. Rendered
+       as the textarea's CONTENT, so Jinja escapes it and it is visible and
+       editable before anything is sent. #}
     <textarea id="chat-text" name="text" rows="3" placeholder="Type a message..."
-              maxlength="{{ max_message_chars }}" required></textarea>
+              maxlength="{{ max_message_chars }}" required>{{ seeded_ask or "" }}</textarea>
+    {% if seeded_ask %}
+    <p class="seeded-note">
+      This question came from a link — edit it however you like, then press Send.
+    </p>
+    {% endif %}
     <p id="chat-remaining" class="chat-remaining" aria-live="polite" hidden></p>
     <div class="button-row">
       <button type="submit">Send</button>

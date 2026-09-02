@@ -58,7 +58,7 @@
       <a href="/reviews/{{ latest_review.filename }}">its own permalink</a>.
     </p>
     <article class="card md-body">
-      {{ latest_review.content | markdown_lite | safe }}
+      {{ latest_review.content | markdown_lite_asks | safe }}
     </article>
   {% else %}
     <section class="card">

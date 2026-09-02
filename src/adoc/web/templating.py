@@ -116,6 +116,13 @@ templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 templates.env.globals["disclaimer_text"] = DISCLAIMER_TEXT
 templates.env.globals["has_intake_facts"] = has_intake_facts
 templates.env.filters["markdown_lite"] = render_markdown_lite
+# ADR 0045: the same renderer, with an "Ask about this" link on every `##`
+# heading. A separate filter rather than a parameter at the call site, so
+# only the surfaces that should carry the links get them — a chat reply
+# offering to explain itself in chat would be a loop.
+templates.env.filters["markdown_lite_asks"] = lambda text: render_markdown_lite(
+    text, ask_sections=True
+)
 templates.env.filters["tier_label"] = tier_label
 templates.env.filters["safety_status"] = safety_status
 templates.env.globals["SAFETY_CHECKLIST_NOTE"] = SAFETY_CHECKLIST_NOTE
