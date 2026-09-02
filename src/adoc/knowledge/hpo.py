@@ -151,6 +151,25 @@ class HpoIndex:
         """Whether `term_id` exists in the published ontology."""
         return term_id in self._terms
 
+    def term_id_for(self, phrase: str) -> str | None:
+        """The term id for an exact label or synonym, or `None` (ADR 0044).
+
+        A direct lookup, not phrase matching. `find_terms` cannot be used to
+        resolve a known label: its word token must begin with a letter
+        (`_WORD_TOKEN_RE`), so a standalone digit is dropped and
+        `Anti-beta-2-Glycoprotein I IgG antibody positivity` tokenises
+        without its `2` and matches nothing. That is the right behaviour for
+        scanning narrative text — where the alternative is matching "beta
+        glycoprotein" in prose that never said 2 — and the wrong tool for
+        asking "does the ontology have this exact term".
+
+        Normalisation is `_NON_ALNUM` lowercased and stripped — character
+        for character what `scripts/build_hpo_index.py::normalize` applies
+        when it builds these keys, and a test pins a label containing a
+        standalone digit so the two cannot drift apart silently.
+        """
+        return self._lookup.get(_NON_ALNUM.sub(" ", phrase.lower()).strip())
+
     def find_terms(self, text: str) -> list[HpoMatch]:
         """Every HPO term named in `text`, longest match first.
 

@@ -265,10 +265,12 @@ contract:
 | ADR | Theme | Findings it closes | Status |
 |---|---|---|---|
 | 0038 | How a hypothesis ends | CLN-05, CLN-01, PAT-03 | shipped (v0.27.0) |
-| 0039 | How a review reads | PAT-01, PAT-02, PAT-04 | merged to develop |
-| 0040 | What the composer sounds like | PAT-08 | merged to develop |
-| 0041 | The appointment agenda | PAT-07 | in review (#294) |
-| 0042 | Criteria read the whole record | CLN-03 | this branch |
+| 0039 | How a review reads | PAT-01, PAT-02, PAT-04 | shipped (v0.28.0) |
+| 0040 | What the composer sounds like | PAT-08 | shipped (v0.28.0) |
+| 0041 | The appointment agenda | PAT-07 | shipped (v0.28.0) |
+| 0042 | Criteria read the whole record | CLN-03 | shipped (v0.28.0) |
+| 0043 | The declared graph is the real graph | DEV-01 | in review (#299) |
+| 0044 | The engines can see the serology | CLN-02 | this branch |
 
 Three findings were rejected on review rather than adopted, and the ADRs say
 why: PAT-01's proposed `patient_summary` LLM node (a fourth frontier call
@@ -333,6 +335,11 @@ the patient:
   rendering an empty heading, but the underlying emptiness is unchanged.
 - PubMed returns 0 citations for the current differential; no `pmid:` ref
   exists anywhere in the ledger.
+- **ADR 0044 is unmeasured.** The engines now receive lab-derived HPO terms,
+  but whether that turns `66/66 neutral` into anything is an empirical
+  question. The number to check on the next real review is the count of
+  non-neutral engine verdicts. Shipping it and assuming it worked would
+  repeat the LIRICAL mistake exactly.
 - ~~`depends_on` declares one edge while nodes read many, and execution is
   sequential~~ — **closed by ADR 0043**: `depends_on` takes a list, `after`
   carries the filesystem-mediated orderings that were being smuggled through
