@@ -2381,3 +2381,145 @@ def test_the_disclaimer_lives_on_the_model_not_only_in_the_renderer() -> None:
 
     for result in score_all([], keys=list(SCORERS)):
         assert "not diagnostic criteria" in result.disclaimer
+
+
+# --- ADR 0043: the declared graph is the real graph ----------------------------------------------
+
+# The order the review DAG executed in before ADR 0043, when `dag.run`
+# iterated the declaration list. Frozen here as a literal, because the whole
+# safety argument for deriving the order is that it does not change one:
+# a stable topological sort reproduces a declaration order that was already
+# valid, and this is what "already valid" was.
+_PRE_0043_ORDER = [
+    "trend_scan",
+    "criteria_scan",
+    # panel members are spliced in here — `models.yaml` sets how many
+    "current_ledger",
+    "divergence_diff",
+    "adjudication",
+    "challenge_sweep",
+    "apply_review_diff",
+    "retirement_pass",
+    "test_chooser",
+    "lirical_divergence",
+    "semsim_divergence",
+    "engine_adjudication",
+    "apply_engine_diff",
+    "literature_refresh",
+    "staleness_scan",
+    "deferred_entailment_sweep",
+    "ops_metrics",
+    "render_report",
+]
+
+
+def _review_dag(repo: DataRepo, db: LabsDb) -> Any:
+    calls: list[TransportRequest] = []
+    client = _build_client(_happy_path_transport(calls))
+    return build_review_dag(client, repo, db, repo.root / LEDGER_RELPATH, clock=_fixed_clock)
+
+
+def test_deriving_the_order_does_not_change_it(repo: DataRepo, db: LabsDb) -> None:
+    """CLAUDE.md rule 3 makes stage order a safety property, so the licence
+    to derive it rests entirely on the derived order matching the one that
+    shipped. It does — node for node."""
+    dag = _review_dag(repo, db)
+    order = [n.name for n in dag.execution_order]
+    panel = [n.name for n in dag.nodes if n.name.startswith("blind_panel_")]
+    expected = _PRE_0043_ORDER[:2] + panel + _PRE_0043_ORDER[2:]
+
+    assert order == expected
+
+
+def test_every_node_declares_what_it_actually_reads(repo: DataRepo, db: LabsDb) -> None:
+    """Eight of twenty nodes read context entries they never declared, so
+    the graph could not be trusted as documentation of data flow. This test
+    reads the builder's source and compares it against the declarations, so
+    it keeps being true rather than being true once."""
+    import ast
+    import inspect
+
+    from adoc.reason import review as review_module
+
+    tree = ast.parse(inspect.getsource(review_module))
+    reads_by_fn: dict[str, set[str]] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        found = {
+            sub.slice.value
+            for sub in ast.walk(node)
+            if isinstance(sub, ast.Subscript)
+            and isinstance(sub.value, ast.Name)
+            and sub.value.id in {"ctx", "_ctx"}
+            and isinstance(sub.slice, ast.Constant)
+            and isinstance(sub.slice.value, str)
+        }
+        if found:
+            reads_by_fn[node.name] = found
+
+    undeclared: list[str] = []
+    for dag_node in _review_dag(repo, db).nodes:
+        stem = dag_node.name.rstrip("0123456789").rstrip("_")
+        fn_name = f"_{stem}_fn" if stem != "blind_panel" else "_make_blind_panel_fn"
+        for key in reads_by_fn.get(fn_name, set()):
+            if key not in dag_node.depends_on:
+                undeclared.append(f"{dag_node.name} reads {key!r} without declaring it")
+
+    assert undeclared == []
+
+
+def test_a_sequencing_requirement_is_declared_as_one(repo: DataRepo, db: LabsDb) -> None:
+    """`staleness_scan` reads `ledger-history.jsonl`, which `retirement_pass`
+    appends to: a real ordering with no data edge to carry it. It used to be
+    expressed as a fake read of `literature_refresh`, which is what made
+    `docs/dag-topology.md` call the edge decorative. It is not decorative,
+    and dropping it would have changed what the scan sees."""
+    by_name = {n.name: n for n in _review_dag(repo, db).nodes}
+
+    staleness = by_name["staleness_scan"]
+    assert staleness.depends_on == ("apply_review_diff",)
+    assert "retirement_pass" in staleness.after
+    assert "apply_engine_diff" in staleness.after
+
+    # And the engines, which only ever needed the ledger on disk.
+    lirical = by_name["lirical_divergence"]
+    assert lirical.depends_on == ("initial",)
+    assert "retirement_pass" in lirical.after
+
+
+def test_current_ledger_follows_the_whole_panel_not_its_last_member(
+    repo: DataRepo, db: LabsDb
+) -> None:
+    """It declared the last blind-panel member, so the graph's shape depended
+    on how many members `models.yaml` configures."""
+    by_name = {n.name: n for n in _review_dag(repo, db).nodes}
+    current = by_name["current_ledger"]
+    panel = [n for n in by_name if n.startswith("blind_panel_")]
+
+    assert len(panel) > 1
+    assert current.depends_on == ("initial",)
+    assert set(current.after) == set(panel)
+
+
+def test_the_report_reaches_criteria_through_the_graph(repo: DataRepo, db: LabsDb) -> None:
+    """Reached via the `results` sink, `criteria_scan` was a node the report
+    depends on with no edge saying so — and nothing to stop a reordering
+    running the report first."""
+    by_name = {n.name: n for n in _review_dag(repo, db).nodes}
+
+    assert "criteria_scan" in by_name["render_report"].depends_on
+
+
+def test_the_blind_panel_and_the_engines_are_declared_parallel(repo: DataRepo, db: LabsDb) -> None:
+    """Three xhigh frontier calls, then LIRICAL at 76.9s and sem-sim, all
+    ran one after another because the runner iterated a list."""
+    by_name = {n.name: n for n in _review_dag(repo, db).nodes}
+
+    panel = {n for n in by_name if n.startswith("blind_panel_")}
+    assert len(panel) > 1
+    assert {n for n in by_name if by_name[n].parallel_group == "blind_panel"} == panel
+    assert {n for n in by_name if by_name[n].parallel_group == "engines"} == {
+        "lirical_divergence",
+        "semsim_divergence",
+    }

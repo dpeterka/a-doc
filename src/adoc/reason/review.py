@@ -2764,7 +2764,13 @@ def build_review_dag(
         assert isinstance(metrics, OpsMetrics)
         trend_scan = ctx["trend_scan"]
         assert isinstance(trend_scan, TrendScanResult)
-        criteria = results.get("criteria_scan")
+        # ADR 0043: through the graph, not the `results` sink. Reached via
+        # the sink, `criteria_scan` was invisible to the declared
+        # dependencies — a node whose output the report depends on, with no
+        # edge saying so, and nothing to stop a future reordering running
+        # the report first.
+        criteria = ctx["criteria_scan"]
+        assert isinstance(criteria, CriteriaScanResult)
 
         raw_lirical = results.get("lirical_divergence")
         lirical_result = raw_lirical if isinstance(raw_lirical, LiricalComparison) else None
@@ -2842,7 +2848,6 @@ def build_review_dag(
             depends_on="initial",
         ),
     ]
-    prior_name = "trend_scan"
     for index in range(num_panel):
         node_name = f"blind_panel_{index}"
         nodes.append(
@@ -2852,21 +2857,31 @@ def build_review_dag(
                 input_model=ContextPack,
                 output_model=BlindDifferential,
                 depends_on="blind_context_pack",
+                # ADR 0043. The members share one input and write nothing
+                # in common; three xhigh frontier calls ran one after
+                # another purely because the runner iterated a list.
+                parallel_group="blind_panel",
                 preconditions=[
                     forbid_context_key("ledger"),
                     edge_payload_lacks_section("ledger"),
                 ],
             )
         )
-        prior_name = node_name
 
     nodes.append(
         Node(
             name="current_ledger",
             fn=_current_ledger_fn,
-            input_model=BlindDifferential,
+            input_model=Marker,
             output_model=Ledger,
-            depends_on=prior_name,
+            # Reads nothing from the context — it loads the ledger from
+            # disk. It declared the LAST panel member, which made the
+            # graph's shape depend on how many members are configured and
+            # claimed a read that never happens. What is real is the
+            # ordering: no panel member may run once the ledger is in
+            # context (ADR 0043).
+            depends_on="initial",
+            after=tuple(panel_node_names),
         )
     )
     nodes.append(
@@ -2892,9 +2907,10 @@ def build_review_dag(
         Node(
             name="challenge_sweep",
             fn=_challenge_sweep_fn,
-            input_model=AdjudicationResult,
+            input_model=Ledger,
             output_model=ChallengeSweepResult,
-            depends_on="adjudication",
+            depends_on="current_ledger",
+            after=("adjudication",),
             postconditions=[_challenge_sweep_completeness_contract()],
         )
     )
@@ -2904,7 +2920,12 @@ def build_review_dag(
             fn=_apply_review_diff_fn,
             input_model=ChallengeSweepResult,
             output_model=Ledger,
-            depends_on="challenge_sweep",
+            depends_on=(
+                "challenge_sweep",
+                "adjudication",
+                "current_ledger",
+                "divergence_diff",
+            ),
             postconditions=[_review_version_incremented_contract()],
         )
     )
@@ -2921,27 +2942,39 @@ def build_review_dag(
         Node(
             name="test_chooser",
             fn=_test_chooser_fn,
-            input_model=RetirementReport,
+            input_model=Ledger,
             output_model=TestChooserResult,
-            depends_on="retirement_pass",
+            depends_on="apply_review_diff",
+            # `retirement_pass` writes the ledger; choosing tests before it
+            # would pick tests for leads that are about to be parked.
+            after=("retirement_pass",),
         )
     )
     nodes.append(
         Node(
             name="lirical_divergence",
             fn=_lirical_divergence_fn,
-            input_model=TestChooserResult,
+            input_model=Marker,
             output_model=LiricalComparison,
-            depends_on="test_chooser",
+            # Both engines read the ledger from DISK and neither writes, so
+            # they are independent of each other and of `test_chooser` —
+            # which they declared only to be placed in the sequence. What
+            # is real is that they must follow the two nodes that write the
+            # ledger (ADR 0043).
+            depends_on="initial",
+            after=("retirement_pass", "test_chooser"),
+            parallel_group="engines",
         )
     )
     nodes.append(
         Node(
             name="semsim_divergence",
             fn=_semsim_divergence_fn,
-            input_model=LiricalComparison,
+            input_model=Marker,
             output_model=LiricalComparison,
-            depends_on="lirical_divergence",
+            depends_on="initial",
+            after=("retirement_pass", "test_chooser"),
+            parallel_group="engines",
         )
     )
     nodes.append(
@@ -2950,7 +2983,7 @@ def build_review_dag(
             fn=_engine_adjudication_fn,
             input_model=LiricalComparison,
             output_model=EngineAdjudicationResult,
-            depends_on="semsim_divergence",
+            depends_on=("semsim_divergence", "lirical_divergence"),
             postconditions=[_engine_adjudication_completeness_contract()],
         )
     )
@@ -2960,7 +2993,7 @@ def build_review_dag(
             fn=_apply_engine_diff_fn,
             input_model=EngineAdjudicationResult,
             output_model=Ledger,
-            depends_on="engine_adjudication",
+            depends_on=("engine_adjudication", "lirical_divergence", "semsim_divergence"),
         )
     )
     nodes.append(
@@ -2976,27 +3009,34 @@ def build_review_dag(
         Node(
             name="staleness_scan",
             fn=_staleness_scan_fn,
-            input_model=LiteratureRefreshResult,
+            input_model=Ledger,
             output_model=StalenessReport,
-            depends_on="literature_refresh",
+            # Reads `ledger-history.jsonl`, which `retirement_pass` and
+            # `apply_engine_diff` append to — a real ordering through the
+            # filesystem, with no data edge to carry it. `docs/dag-topology.
+            # md` called this edge decorative; it was not (ADR 0043).
+            depends_on="apply_review_diff",
+            after=("literature_refresh", "retirement_pass", "apply_engine_diff"),
         )
     )
     nodes.append(
         Node(
             name="deferred_entailment_sweep",
             fn=_deferred_entailment_sweep_fn,
-            input_model=StalenessReport,
+            input_model=Marker,
             output_model=DeferredVerificationSweepResult,
-            depends_on="staleness_scan",
+            depends_on="initial",
+            after=("staleness_scan",),
         )
     )
     nodes.append(
         Node(
             name="ops_metrics",
             fn=_ops_metrics_fn,
-            input_model=DeferredVerificationSweepResult,
+            input_model=Ledger,
             output_model=OpsMetrics,
-            depends_on="deferred_entailment_sweep",
+            depends_on=("apply_review_diff", "divergence_diff", "staleness_scan"),
+            after=("deferred_entailment_sweep",),
         )
     )
     nodes.append(
@@ -3005,7 +3045,19 @@ def build_review_dag(
             fn=_render_report_fn,
             input_model=OpsMetrics,
             output_model=ReviewReport,
-            depends_on="ops_metrics",
+            depends_on=(
+                "ops_metrics",
+                "trend_scan",
+                "criteria_scan",
+                "current_ledger",
+                "divergence_diff",
+                "adjudication",
+                "challenge_sweep",
+                "apply_review_diff",
+                "test_chooser",
+                "staleness_scan",
+                "deferred_entailment_sweep",
+            ),
         )
     )
 
