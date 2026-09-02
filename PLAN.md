@@ -178,6 +178,9 @@ hypotheses:
     name: "Systemic lupus erythematosus"
     mondo: "MONDO:0007915"            # phase 2
     tier: most-likely                  # most-likely | expanded | cant-miss
+                                       # `cant-miss` renders as "Safety
+                                       # checklist" — ADR 0039. The schema
+                                       # value never changes.
     probability: moderate              # buckets: high|moderate|low|minimal (+ prior_probability for movement)
     status: active                     # active|patient-proposed|challenged|ruled-out|confirmed-by-doctor|parked
     origin: patient                    # model|patient|doctor|challenger
@@ -253,6 +256,27 @@ is next, and its scope is listed under "Phase 4 — Extras" below.*
 **Original scope:**  patient HPO phenotype profile; LIRICAL (phenotype-only) + Monarch sem-sim as independent differential engines rendered alongside the LLM panel in deep reviews with divergence adjudication; Monarch KG SQLite + Orphadata + phenotype.hpoa + Mondo as chat tools; ~10 hand-encoded ACR/EULAR classification scorers (SLE 2019, Sjögren 2016, SLICC, CASPAR, myositis, ANCA vasculitides…) + ICAP ANA-pattern mapping, computed deterministically from labs+phenotype, always labeled "classification, not diagnostic, criteria"; PubMed E-utilities with PMID-linked citations; StatPearls/GeneReviews local FTS5; `adoc eval` gains the rare-disease-cohort differential-recall suite and the retrospective self-case replay, enabling gated model rotation.
 *Acceptance:* reviews show LLM vs LIRICAL differentials with explicit divergence adjudication; criteria render itemized (points, threshold); every literature claim carries a PMID; `adoc eval --candidate` produces an incumbent-vs-candidate comparison report from a single command.
 
+**Between phases 3 and 4 — the adversarial-review adoption track.** An
+external adversarial review (2026-09-01) produced 20-odd findings across
+patient experience and clinical logic. Regrouped by what actually shares
+code, and accepted in this order — each one ADR'd, because each changes a
+contract:
+
+| ADR | Theme | Findings it closes | Status |
+|---|---|---|---|
+| 0038 | How a hypothesis ends | CLN-05, CLN-01, PAT-03 | shipped (v0.27.0) |
+| 0039 | How a review reads | PAT-01, PAT-02, PAT-04 | this branch |
+| 0040 | What the composer sounds like | PAT-08 | next |
+| 0041 | The appointment agenda | PAT-07 | queued |
+| 0042 | Longitudinal lab positivity | CLN-03 | queued |
+
+Two findings were rejected on review rather than adopted, and the ADRs say
+why: PAT-01's proposed `patient_summary` LLM node (a fourth frontier call
+that could contradict the report beneath it — ADR 0039) and averaging engine
+scores across LIRICAL and sem-sim (not commensurable — ADR 0036). PAT-01's
+premise that the report opens with operational metrics is also simply false;
+it opens with `## What changed this week`.
+
 **Phase 4 — Extras.** Nothing here is started. In rough order of value to
 the patient:
 
@@ -286,6 +310,9 @@ the patient:
   all 46 until a review or a human fills it.
 - The `most-likely` tier has been empty for 15 ledger versions. The research
   note asks that this be deliberate and stated rather than silent (part 3d).
+  ADR 0039's `## The short version` now states it in words when it happens
+  ("no lead is currently rated likely enough to lead with") rather than
+  rendering an empty heading, but the underlying emptiness is unchanged.
 - PubMed returns 0 citations for the current differential; no `pmid:` ref
   exists anywhere in the ledger.
 - `depends_on` declares one edge while nodes read many, and execution is

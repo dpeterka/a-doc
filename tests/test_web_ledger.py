@@ -640,3 +640,57 @@ def test_the_retire_control_is_offered_on_an_active_lead(tmp_path: Path) -> None
 
     assert "My doctor ruled this out" in body
     assert "/ledger/hypotheses/pheochromocytoma/retire" in body
+
+
+# --- ADR 0039: a can't-miss lead reads as a checklist, not a prediction --------------------------
+
+
+def test_the_cant_miss_tier_is_labelled_as_a_safety_checklist(tmp_path: Path) -> None:
+    """`Can't-Miss` names the clinician's reason for the list, not the
+    patient's situation. The list held a hereditary cancer syndrome with no
+    citation behind it; the label read as a verdict."""
+    app, repo, _db, _calls = build_app(tmp_path)
+    _seed_one(repo)
+    client = TestClient(app)
+    login(client)
+
+    body = client.get("/ledger").text
+
+    assert "Safety checklist" in body
+    assert "Can&#39;t-Miss" not in body and "Can't-Miss" not in body
+    assert "it means it is worth ruling out" in body
+
+
+def test_a_safety_lead_says_what_would_settle_it(tmp_path: Path) -> None:
+    """A tier is a category. A patient's question is "what happens next",
+    and ADR 0038's `rule_out_check` is the answer already on the record."""
+    from adoc.casefile.schema import RuleOutCheck
+    from adoc.web.templating import safety_status
+
+    tracked = _hypothesis("h", tier="cant-miss", probability="low")
+    assert safety_status(tracked) == "Being tracked"
+
+    with_prose = tracked.model_copy(update={"rule_out": "a normal MRI would settle this"})
+    assert safety_status(with_prose) == "Needs a specific finding"
+
+    with_check = tracked.model_copy(
+        update={
+            "rule_out_check": RuleOutCheck(analyte="metanephrines", operator="normal"),
+        }
+    )
+    assert safety_status(with_check) == "One test would settle this"
+
+    retired = tracked.model_copy(update={"status": "ruled-out"})
+    assert safety_status(retired) == "Ruled out"
+
+
+def test_the_safety_status_reaches_the_rendered_card(tmp_path: Path) -> None:
+    app, repo, _db, _calls = build_app(tmp_path)
+    _seed_one(repo)
+    client = TestClient(app)
+    login(client)
+
+    body = client.get("/ledger").text
+
+    assert "chip-safety" in body
+    assert "Being tracked" in body
