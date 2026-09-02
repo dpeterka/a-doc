@@ -71,6 +71,7 @@ from adoc.casefile.questions import (
     question_id,
     save_questions,
 )
+from adoc.casefile.regimen import REGIMEN_RELPATH, load_regimen
 from adoc.casefile.repo import HISTORY_RELPATH, LEDGER_RELPATH, DataRepo
 from adoc.casefile.retirement import (
     LabFact,
@@ -1414,6 +1415,26 @@ def _render_criteria(scan: CriteriaScanResult) -> list[str]:
                         f"| {item.weight} | {basis} |"
                     )
                 out.append("")
+            # ADR 0042: a criterion met by a historical value, whose latest
+            # draw no longer meets it. Rendered OUTSIDE the collapsed table
+            # because it is the pair of facts a reader most needs and the
+            # least likely to guess: positive then, normal now, and what was
+            # being taken at the time.
+            historical = [i for i in result.items if i.met_ever and i.superseded]
+            if historical:
+                out.append("**Met earlier, not on the most recent draw:**")
+                out.append("")
+                for item in historical:
+                    note = redact_gated_text(item.superseded)
+                    out.append(f"- _{item.name}_ — {note}")
+                out.append("")
+                out.append(
+                    "_These still count. Classification criteria are cumulative — the "
+                    "2019 EULAR/ACR set states they need not occur simultaneously — and a "
+                    "marker that normalises on treatment is an expected treatment effect, "
+                    "not evidence the finding never happened._"
+                )
+                out.append("")
             if unanswered:
                 out.append(
                     f"_{len(unanswered)} further criteria could not be assessed from the "
@@ -2152,8 +2173,14 @@ def build_review_dag(
             for entry in phenotype.entries
         }
         rows = db.all_non_rejected_rows()
+        # ADR 0042: a criterion met historically whose latest draw is normal
+        # says which immunosuppressant was in force when that draw was
+        # taken. Absent `regimen.yaml` the note is simply omitted — it only
+        # ever adds context, never a scored point.
+        regimen_path = repo.root / Path(REGIMEN_RELPATH)
+        regimen = load_regimen(regimen_path) if regimen_path.exists() else None
         result = CriteriaScanResult(
-            results=score_all(rows, phenotype=lookup),
+            results=score_all(rows, phenotype=lookup, regimen=regimen),
             # ICAP rides along with the criteria scan rather than taking its
             # own node: both are pure code over the same rows, and a second
             # node would double the DAG bookkeeping for one function call.
