@@ -2590,3 +2590,68 @@ def test_a_vocabulary_gap_is_named_in_the_report() -> None:
 
     assert "no term in the published phenotype ontology" in text
     assert "Anti-Smith antibody positivity" in text
+
+
+def test_a_panel_definitive_exclusion_is_not_downgraded() -> None:
+    """Observed in production on 2026-09-02, the first review run after
+    v0.29.0:
+
+        WARNING review: panel used an unknown evidence strength
+        'definitive-exclusion'; recording as 'moderate'
+
+    `_EVIDENCE_STRENGTHS` was a hardcoded `{"strong", "moderate", "weak"}`
+    and ADR 0038 added a fourth member to the schema without updating it. A
+    panel asserting the schema's own literal had it silently flattened into
+    the additive scale — precisely the summation ADR 0038 exists to prevent.
+
+    Letting it through is safe on a different axis:
+    `retirement.DEFINITIVE_EXCLUSION_SOURCES` restricts which SOURCES may
+    assert an exclusion, so a panel item only excludes anything if its
+    citation is a lab, document, encounter or patient report.
+    """
+    from adoc.reason.review import BlindEvidenceItem
+
+    item = BlindEvidenceItem(
+        claim="Serum metanephrines were normal",
+        source="labs:metanephrines:2026-05-02",
+        strength="definitive-exclusion",
+    )
+
+    assert item.strength == "definitive-exclusion"
+
+
+def test_the_accepted_strengths_are_derived_from_the_schema() -> None:
+    """The bug was a duplicated list drifting from its source of truth.
+    Deriving it means the next `EvidenceStrength` member cannot be silently
+    downgraded the way this one was."""
+    from typing import get_args
+
+    from adoc.casefile.schema import EvidenceStrength
+    from adoc.reason.review import _EVIDENCE_STRENGTHS
+
+    assert frozenset(get_args(EvidenceStrength)) == _EVIDENCE_STRENGTHS
+
+
+def test_an_actually_unknown_strength_still_falls_back(caplog: Any) -> None:
+    """The fallback is still load-bearing — panels do reach for words the
+    schema has never had, which is why the synonym map exists."""
+    from adoc.reason.review import BlindEvidenceItem
+
+    item = BlindEvidenceItem(
+        claim="x", source="labs:crp:2026-05-02", strength="extremely compelling"
+    )
+
+    assert item.strength == "moderate"
+
+
+def test_a_synonym_still_maps_rather_than_flattening() -> None:
+    from adoc.reason.review import BlindEvidenceItem
+
+    assert (
+        BlindEvidenceItem(claim="x", source="labs:crp:2026-05-02", strength="supporting").strength
+        == "moderate"
+    )
+    assert (
+        BlindEvidenceItem(claim="x", source="labs:crp:2026-05-02", strength="conclusive").strength
+        == "strong"
+    )

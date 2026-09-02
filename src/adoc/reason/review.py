@@ -56,7 +56,7 @@ from collections import defaultdict
 from collections.abc import Callable, Iterable, Sequence
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, get_args
 
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
@@ -176,7 +176,20 @@ class TrendScanResult(BaseModel):
     findings: list[TrendFinding] = Field(default_factory=list)
 
 
-_EVIDENCE_STRENGTHS = frozenset({"strong", "moderate", "weak"})
+# Derived from the schema, never restated. This was a hardcoded
+# `{"strong", "moderate", "weak"}` and ADR 0038 added a fourth member —
+# so a panel proposing the schema's own `definitive-exclusion` had it
+# SILENTLY DOWNGRADED to `moderate`, which is precisely the summation ADR
+# 0038 exists to prevent. Observed in production on 2026-09-02:
+#
+#   WARNING review: panel used an unknown evidence strength
+#   'definitive-exclusion'; recording as 'moderate'
+#
+# Letting it through is safe because force is gated elsewhere and on a
+# different axis: `retirement.DEFINITIVE_EXCLUSION_SOURCES` restricts WHICH
+# SOURCES may assert an exclusion, so a panel item only excludes anything if
+# its citation is a lab, document, encounter or patient report.
+_EVIDENCE_STRENGTHS = frozenset(get_args(EvidenceStrength))
 
 _EVIDENCE_STRENGTH_SYNONYMS = {
     "supporting": "moderate",
@@ -189,7 +202,7 @@ _EVIDENCE_STRENGTH_SYNONYMS = {
     "medium": "moderate",
     "low": "weak",
 }
-"""Words panel members reach for instead of the three the schema allows.
+"""Words panel members reach for instead of the ones the schema allows.
 `supporting` is the one observed in production; the rest are the obvious
 neighbours, mapped so a near-miss keeps its meaning rather than flattening
 to the default."""
