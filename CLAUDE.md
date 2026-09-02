@@ -16,7 +16,7 @@ a-doc is a single-patient, longitudinal medical-diagnostic assistant (Python). R
 
 - Use asd-ste100.standard when possible
 
-- Do not exceed 1-3 sentence or fragments in resopnses
+- Do not exceed 1-3 sentences or fragments in responses
 
 - No adjective without its number. "Much faster" is a claim I can't check; "3.2x (16.7% vs 5.2%)" is shorter and I can. Every evaluative word carries its measurement or gets cut.
 
