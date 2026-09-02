@@ -87,10 +87,19 @@ them would ship a half-renamed tier.*
   facts, cites both draws, and names any immunosuppressant in force when the
   later draw was taken.
 
-  **Scores go up, and one set now classifies where it did not.** That is the
-  correction. ADR 0040's sentence frames it: meeting a set says this case
-  would count in a study of the condition, which is a different question from
-  whether you have it.
+  **Scores go up.** Measured in production on release day, over 2079 stored
+  rows and 7 sets: **4 criterion items are now met by a historical value the
+  latest draw does not meet**, where they previously read `not_met`. No set
+  crosses its threshold on this record either way — the "a set now
+  classifies" outcome is real on the test timeline and has not happened here.
+  ADR 0040's sentence frames the case where it does: meeting a set says this
+  case would count in a study of the condition, which is a different question
+  from whether you have it.
+
+  The regimen-suppression annotation is built and **unexercised** — none of
+  the 7 current regimen entries is an immunosuppressant active on a superseded
+  draw, which is the right answer for an untreated patient and means that half
+  of CLN-03 has never actually run.
 
 ### Fixed
 
