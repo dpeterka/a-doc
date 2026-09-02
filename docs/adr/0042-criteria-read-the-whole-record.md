@@ -137,10 +137,29 @@ like a criterion that fires and finds nothing.
   pinned the property this ADR reverses. CLAUDE.md rule 2 requires an ADR for
   exactly that, and the replacement test carries the measurement in its
   docstring so the reversal is not silently re-reversed later.
-- **Scores will go up, and one set now classifies where it did not.** That is
-  the correction, not a side effect. ADR 0040's sentence already frames it:
-  meeting a set "says this case would count in a study of the condition,
-  which is a different question from whether you have it."
+- **Scores go up.** **Measured in production the day this shipped** (2079
+  stored rows, 7 registered sets): **4 criterion items are now met by a
+  historical value the latest draw does not meet** — 4 items that read
+  `not_met` before. `sets_meeting_threshold` is **0**, unchanged: no set
+  crosses its threshold on this record either way.
+
+  So the "one set now classifies where it did not" outcome is real on the
+  test timeline and **has not happened on this patient's record**. Stated
+  precisely because the first draft of this line, and the 0.28.0 changelog
+  entry taken from it, said "one set now classifies" without saying which
+  record — which reads as a production claim it does not support. ADR 0040's
+  sentence still frames the case where it does happen: meeting a set "says
+  this case would count in a study of the condition, which is a different
+  question from whether you have it."
+
+- **The suppression annotation does not fire on this record yet.**
+  `regimen.yaml` holds 7 current entries and none matched
+  `IMMUNOSUPPRESSANT_PATTERNS` as active on a superseded draw's date, so
+  `with_suppression_note` is 0. For an undiagnosed and untreated patient that
+  is the correct answer rather than a gap — but it means the second half of
+  CLN-03 is **built and unexercised**, and it will stay that way until she is
+  actually treated. Worth re-measuring then, because an unexercised path is
+  indistinguishable from a working one.
 - `case/regimen.yaml` becomes a second consumer of the file ADR 0041 already
   gave a row in `docs/deployment-dependencies.md`.
 - `score_all` and all seven scorers take a third optional `regimen`
