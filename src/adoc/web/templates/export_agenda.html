@@ -1,0 +1,90 @@
+{% extends "base.html" %}
+{% block title %}Appointment agenda{% endblock %}
+{% block content %}
+<style>
+  /* The one-page bound in `casefile.export` is arithmetic from these exact
+     numbers — 9.5pt over 1.25 line-height on US Letter at 0.5in margins.
+     Changing them without re-deriving AGENDA_LINE_BUDGET breaks the bound
+     silently, which is the failure mode this whole module is built against. */
+  @page { size: letter; margin: 0.5in; }
+  .agenda { font-size: 9.5pt; line-height: 1.25; max-width: 7.5in; }
+  .agenda h1 { font-size: 13pt; margin: 0 0 0.35em; }
+  .agenda h2 { font-size: 10.5pt; margin: 0.7em 0 0.25em; }
+  .agenda table { width: 100%; border-collapse: collapse; }
+  .agenda th, .agenda td { padding: 1pt 4pt; text-align: left; border-bottom: 1px solid #ccc; }
+  .agenda .identity { border-bottom: 1px solid #333; display: inline-block; min-width: 2.4in; }
+  .agenda .lead-support { margin: 0.1em 0 0.4em 1.1em; }
+  .agenda .note { color: #555; }
+  .print-actions { margin-bottom: 1em; }
+  @media print { .print-actions, nav, footer, .no-print { display: none !important; } }
+</style>
+
+<div class="print-actions no-print">
+  <button type="button" onclick="window.print()">🖨️ Print this page</button>
+  <a href="/export/agenda.md">Get it as text</a>
+  <a href="/ledger">Back to the case file</a>
+</div>
+
+{% if refused %}
+  <p class="note">{{ refused }}</p>
+{% else %}
+<div class="agenda">
+  <h1>Appointment agenda</h1>
+  <p>
+    Name / date of birth: <span class="identity">&nbsp;</span>
+    &nbsp;·&nbsp; prepared {{ agenda.generated.isoformat() }} from a patient-maintained
+    case file. Leads and questions only — not a diagnosis, and not produced by a clinician.
+  </p>
+
+  <h2>What is abnormal</h2>
+  {% if agenda.labs %}
+  <table>
+    <tr><th>Result</th><th>Value</th><th>Flag</th><th>Date</th></tr>
+    {% for row in agenda.labs %}
+    <tr>
+      <td>{{ row.analyte }}</td>
+      <td>{{ row.value }} {{ row.unit }}</td>
+      <td>{{ row.flag }}</td>
+      <td>{{ row.on.isoformat() }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}<p class="note">Nothing flagged abnormal in the record.</p>{% endif %}
+
+  <h2>Leads with cited evidence</h2>
+  {% if agenda.leads %}
+    {% for lead in agenda.leads %}
+      <div><strong>{{ lead.name }}</strong> — {{ lead.probability }} probability,
+        {{ lead.tier | tier_label }}</div>
+      <ul class="lead-support">
+        {% for claim in lead.support %}<li>{{ claim }}</li>{% endfor %}
+        {% if lead.would_settle %}<li><em>Would be settled by:</em> {{ lead.would_settle }}</li>{% endif %}
+      </ul>
+    {% endfor %}
+  {% else %}<p class="note">No lead currently carries cited evidence.</p>{% endif %}
+
+  {% if agenda.regimen %}
+  <h2>Current medications and supplements (patient-reported)</h2>
+  <table>
+    <tr><th>Name</th><th>Dose</th><th>Frequency</th><th>Since</th></tr>
+    {% for entry in agenda.regimen %}
+    <tr>
+      <td>{{ entry.name }}</td><td>{{ entry.dose }}</td>
+      <td>{{ entry.frequency }}</td><td>{{ entry.since }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% endif %}
+
+  <h2>What I am asking for</h2>
+  {% if agenda.asks %}
+  <ul>{% for ask in agenda.asks %}<li>{{ ask }}</li>{% endfor %}</ul>
+  {% else %}<p class="note">Nothing specific is being requested.</p>{% endif %}
+
+  {% if agenda.omitted %}
+  <h2>Not shown on this page</h2>
+  <ul class="note">{% for note in agenda.omitted %}<li>{{ note }}</li>{% endfor %}</ul>
+  {% endif %}
+</div>
+{% endif %}
+{% endblock %}
