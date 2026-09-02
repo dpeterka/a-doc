@@ -39,3 +39,9 @@ uv.lock.bak
 
 # Claude Code agent worktrees (local only)
 .claude/
+
+# External review documents kept locally as working input, not project record
+# (gemini-review.md is also markdown that `ruff format --check .` scans for
+# python code blocks, and its blocks are not ruff-formatted — it broke CI once
+# after a `git add -A` swept it in).
+gemini-review.md
