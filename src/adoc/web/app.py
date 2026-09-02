@@ -39,6 +39,7 @@ from adoc.web.routes import (
     chat,
     confirm,
     documents,
+    export,
     failed,
     files,
     home,
@@ -106,5 +107,6 @@ def create_app(
     app.include_router(labs.router)
     app.include_router(ledger.router)
     app.include_router(reviews.router)
+    app.include_router(export.router)
 
     return app

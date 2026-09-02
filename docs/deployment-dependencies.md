@@ -86,7 +86,25 @@ Separate image, separate ECR repository, separate task definition.
   `!GetAtt` here is a circular dependency that `validate-template` does not
   catch. Only a change set does.
 
-## 5. CloudFormation stacks, in order
+## 5. Case-file files the runtime reads (in `ADOC_DATA_DIR`)
+
+Not infrastructure, but the same failure shape, so they belong in the same
+table: each is optional, absent by default on a new data repo, and absence
+degrades a feature rather than raising.
+
+| Path | Absent ⇒ | Says so? |
+|---|---|---|
+| `case/differential-ledger.yaml` | `load_ledger` raises — the loud one | n/a |
+| `case/regimen.yaml` | agenda export shows no medication table | **yes** — the agenda prints "No medication or supplement list is on file… this is not a statement that nothing is being taken" (ADR 0041) |
+| `case/identifiers.yaml` | scrubber falls back to its default patterns (ADR 0017) | in `adoc identifiers show` |
+
+`regimen.yaml` earns its row because the agenda is *printed and handed to a
+clinician*. A missing medication table on that page does not read as
+"unknown", it reads as "takes nothing", and whether a thyroid or antibody
+result is real can depend on the answer (see `regimen.py`'s docstring). It is
+the recurring failure mode below, on paper, in a consultation.
+
+## 6. CloudFormation stacks, in order
 
 `ci` → `network` → `backup` → `alb` → `ecs`. All deployed by
 `.github/workflows/deploy.yml` on push to `main`.

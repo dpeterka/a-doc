@@ -265,9 +265,9 @@ contract:
 | ADR | Theme | Findings it closes | Status |
 |---|---|---|---|
 | 0038 | How a hypothesis ends | CLN-05, CLN-01, PAT-03 | shipped (v0.27.0) |
-| 0039 | How a review reads | PAT-01, PAT-02, PAT-04 | this branch |
-| 0040 | What the composer sounds like | PAT-08 | this branch |
-| 0041 | The appointment agenda | PAT-07 | queued |
+| 0039 | How a review reads | PAT-01, PAT-02, PAT-04 | merged to develop |
+| 0040 | What the composer sounds like | PAT-08 | in review (#293) |
+| 0041 | The appointment agenda | PAT-07 | this branch |
 | 0042 | Longitudinal lab positivity | CLN-03 | queued |
 
 Three findings were rejected on review rather than adopted, and the ADRs say
@@ -297,6 +297,8 @@ the patient:
    this is for breadth and for results that never arrived as documents.
 2. **One-page appointment-prep export.** The review already produces "what to
    ask your doctor"; this makes it something she can hand over.
+   **Delivered early, ADR 0041** — `casefile/export.py` and
+   `GET /export/agenda`, one page with a code-enforced line budget.
 3. **Specialist finder** via the NPPES NPI registry — taxonomy, location and
    insurance fit.
 4. **Medication and supplement interaction flags.** Read-only and
