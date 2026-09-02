@@ -65,6 +65,13 @@
         <span class="chat-pending-dot" aria-hidden="true"></span>
         Thinking. A question about your differential works through your whole case
         file and can take a few minutes — you can leave this page open.
+        {# ADR 0046: which minute. Polls only while this indicator is
+           showing, and renders nothing at all when no turn is running, so a
+           quiet page makes no requests it can see the results of. #}
+        <span id="chat-stage"
+              hx-get="/chat/progress"
+              hx-trigger="load, every 2s"
+              hx-swap="innerHTML"></span>
       </span>
     </div>
   </form>
