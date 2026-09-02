@@ -1066,3 +1066,11 @@ body.lightbox-active {
   align-self: flex-start;
   margin-top: 0.5rem;
 }
+
+/* Safety-checklist status chip (PAT-02 / ADR 0039). Neutral on purpose: the
+   point of the rename is that this list is routine, not alarming. */
+.chip-safety {
+  background: var(--chip-neutral-bg, #eef2f6);
+  color: var(--chip-neutral-fg, #33475b);
+  cursor: help;
+}

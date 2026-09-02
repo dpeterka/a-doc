@@ -219,7 +219,9 @@ def test_home_complete_shows_ledger_summary_counts_and_link(tmp_path: Path) -> N
     assert "Version 3" in body
     assert "Most Likely: 1" in body
     assert "Expanded: 1" in body
-    assert "Can" in body and "Miss: 1" in body
+    # ADR 0039 renamed this tier: `Can't-Miss` named the clinician's reason
+    # for the list, not the patient's situation.
+    assert "Safety checklist: 1" in body
     assert 'href="/ledger"' in body
     # The home dashboard shows a summary, not the full per-hypothesis
     # listing (that's what `/ledger` is for).
