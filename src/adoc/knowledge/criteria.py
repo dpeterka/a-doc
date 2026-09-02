@@ -27,10 +27,13 @@ from __future__ import annotations
 import re
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
+from datetime import date
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from adoc.labs.models import LabResult
+from adoc.casefile.regimen import Regimen
+from adoc.labs.models import LabResult, flag_is_high, flag_is_low
 from adoc.labs.validate import convert_value
 
 CLASSIFICATION_DISCLAIMER = (
@@ -95,6 +98,17 @@ class CriterionItem(BaseModel):
     sources: list[str] = Field(default_factory=list)
     """`labs:<slug>:<date>` refs the state was decided from."""
 
+    met_ever: bool = False
+    """Met by a HISTORICAL value while the most recent one does not meet it
+    (ADR 0042). Classification criteria are cumulative — the 2019 EULAR/ACR
+    set states that criteria need not occur simultaneously — so this is a
+    genuine met, not a weaker one. It is flagged because the pair of facts is
+    what a clinician needs: positive then, normal now."""
+
+    superseded: str = ""
+    """The later value, and the regimen context for it if any is on file.
+    Empty unless `met_ever`."""
+
 
 class CriteriaResult(BaseModel):
     """A whole criteria set applied to this patient's stored data."""
@@ -139,23 +153,134 @@ class CriteriaResult(BaseModel):
 # --- reading the labs -------------------------------------------------------------------
 
 
+Lookback = Literal["ever", "current"]
+"""Whether a criterion reads the whole record or only the latest draw.
+
+`ever` is the default for every laboratory criterion here, because every set
+encoded in this module is a *classification* set and classification sets are
+cumulative by construction. `current` exists so a criterion that genuinely
+describes a present state can say so explicitly rather than by omission.
+"""
+
+# Drugs that suppress the markers these criteria read. Deliberately a short,
+# named list rather than a drug database: its only job is to add context to a
+# criterion already met historically, so a miss costs a sentence of
+# explanation and never a scored point. Not exhaustive, and documented as
+# such — a name not here simply produces no note (ADR 0042).
+IMMUNOSUPPRESSANT_PATTERNS: tuple[str, ...] = (
+    r"prednis(one|olone)",
+    r"methylprednisolone",
+    r"dexamethasone",
+    r"hydroxychloroquine",
+    r"chloroquine",
+    r"methotrexate",
+    r"azathioprine",
+    r"mycophenolat",
+    r"leflunomide",
+    r"cyclophosphamide",
+    r"ciclosporin|cyclosporin",
+    r"tacrolimus",
+    r"sirolimus",
+    r"rituximab",
+    r"belimumab",
+    r"anifrolumab",
+    r"abatacept",
+    r"tocilizumab",
+    r"(inflix|adalim|golim|certoliz)umab",
+    r"etanercept",
+    r"(tofa|bari|upada)citinib",
+    r"ivig|immunoglobulin",
+)
+
+_IMMUNOSUPPRESSANT_RE = re.compile("|".join(IMMUNOSUPPRESSANT_PATTERNS), re.IGNORECASE)
+
+
+def suppressants_active_on(regimen: Regimen | None, when: date) -> list[str]:
+    """Immunosuppressant names in force on `when`, per `case/regimen.yaml`.
+
+    Uses `Regimen.active_on`, which reports `unknown` rather than guessing for
+    an undated entry — so an entry that cannot be placed in time contributes
+    nothing here instead of a confident wrong answer.
+    """
+    if regimen is None:
+        return []
+    return sorted(
+        {e.name.strip() for e in regimen.active_on(when) if _IMMUNOSUPPRESSANT_RE.search(e.name)}
+    )
+
+
+def _superseded_note(*, met_row: LabResult, latest: LabResult, regimen: Regimen | None) -> str:
+    """The two facts a clinician needs when a criterion is met historically.
+
+    CLN-03's second half: a normalised marker under active immunosuppression
+    is an expected treatment effect, not evidence against the diagnosis. The
+    note says which drug and leaves the inference to the reader — this module
+    never claims causation.
+    """
+    shown_met = met_row.value if met_row.value is not None else met_row.value_text
+    shown_now = latest.value if latest.value is not None else latest.value_text
+    note = (
+        f"Met by {shown_met} on {met_row.date.isoformat()}; the most recent value is "
+        f"{shown_now} on {latest.date.isoformat()}."
+    )
+    active = suppressants_active_on(regimen, latest.date)
+    if active:
+        note += (
+            f" On {latest.date.isoformat()} the record has {', '.join(active)} in use, which "
+            "can suppress this marker."
+        )
+    return note
+
+
 @dataclass
 class LabView:
     """The stored rows, indexed for criteria lookup.
 
-    Criteria ask "is this analyte abnormal", not "what was it on the 4th", so
-    the view keeps the MOST RECENT row per analyte. A criteria set describes a
-    patient's current classifiable state; an abnormality from four years ago
-    that has since resolved should not keep scoring points forever.
+    Keeps BOTH the most recent row per analyte and the full history, because
+    the two answer different questions and criteria need the second one.
+
+    This class used to keep only the latest row, on the reasoning that "a
+    criteria set describes a patient's current classifiable state; an
+    abnormality from four years ago that has since resolved should not keep
+    scoring points forever." That reasoning is wrong for a *classification*
+    set and it produced a measurable false negative (ADR 0042). The 2019
+    EULAR/ACR SLE criteria state that criteria need not occur simultaneously,
+    and `score_sle_2019`'s own docstring says the entry criterion is
+    "ANA ≥1:80 **ever**" while the code read the latest ANA.
+
+    Measured on a suppressed-disease timeline — ANA 1:640, anti-dsDNA
+    positive and C3 48 in 2024, all normal in 2026:
+
+        history only   entry_met=True   6/10 points
+        with follow-up entry_met=False  0/10 points, "criteria do not apply"
+
+    Adding a later NORMAL result erased the entire historical basis. Under
+    treatment that is the expected trajectory, so the old behaviour scored
+    successful suppression as evidence the disease was never there.
     """
 
     rows: Sequence[LabResult]
     _latest: dict[str, LabResult] = field(default_factory=dict, init=False)
+    _history: dict[str, list[LabResult]] = field(default_factory=dict, init=False)
 
     def __post_init__(self) -> None:
         for row in sorted(self.rows, key=lambda r: r.date):
             for key in self._keys(row):
                 self._latest[key] = row
+                self._history.setdefault(key, []).append(row)
+
+    def history(self, *patterns: str) -> list[LabResult]:
+        """Every matching row over all time, most recent first.
+
+        Unlike `find_all`, which returns one row per analyte, this returns
+        every DRAW — the sequence a cumulative criterion has to read.
+        """
+        seen: dict[int, LabResult] = {}
+        for key, rows in self._history.items():
+            if any(re.search(pattern, key) for pattern in patterns):
+                for row in rows:
+                    seen[id(row)] = row
+        return sorted(seen.values(), key=lambda r: r.date, reverse=True)
 
     @staticmethod
     def _keys(row: LabResult) -> set[str]:
@@ -228,8 +353,7 @@ def _below_reference(row: LabResult) -> bool:
     reference range is a better authority than any constant this file could
     hardcode.
     """
-    flag = (getattr(row.flag, "value", row.flag) or "") if row.flag else ""
-    return str(flag).lower() in {"low", "l", "abnormal-low"}
+    return flag_is_low(row.flag)
 
 
 def _numeric_below(row: LabResult, threshold: float) -> bool:
@@ -321,7 +445,9 @@ def _clinical_item(
 
 
 def score_sle_2019(
-    rows: Sequence[LabResult], phenotype: PhenotypeLookup | None = None
+    rows: Sequence[LabResult],
+    phenotype: PhenotypeLookup | None = None,
+    regimen: Regimen | None = None,
 ) -> CriteriaResult:
     """2019 EULAR/ACR classification criteria for SLE.
 
@@ -343,19 +469,43 @@ def score_sle_2019(
     view = LabView(rows)
     items: list[CriterionItem] = []
 
-    ana = view.find(*_SLE_ANA_NAMES)
-    if ana is None:
+    # "ANA ≥1:80 EVER" — the docstring above has said so since this scorer
+    # was written, while the code read only the latest draw (ADR 0042). A
+    # patient whose ANA was 1:640 in 2024 and negative in 2026 had the whole
+    # set switched off by the later, better result.
+    ana_history = view.history(*_SLE_ANA_NAMES)
+    ana_ever = next((row for row in ana_history if _ana_titer_at_least_1_80(row)), None)
+    ana_latest = ana_history[0] if ana_history else None
+    if ana_latest is None:
         entry_met = None
         entry_note = "No ANA result on file, so the entry criterion cannot be evaluated."
-    elif _ana_titer_at_least_1_80(ana):
+    elif ana_ever is not None:
         entry_met = True
-        entry_note = f"ANA {ana.value_text or ana.value} meets the ≥1:80 entry criterion."
+        shown = ana_ever.value_text or ana_ever.value
+        entry_note = f"ANA {shown} meets the ≥1:80 entry criterion."
+        if ana_ever is not ana_latest:
+            entry_note += (
+                f" That was on {ana_ever.date.isoformat()}; the most recent ANA is "
+                f"{ana_latest.value_text or ana_latest.value} on "
+                f"{ana_latest.date.isoformat()}. The published criterion is met EVER, so "
+                "the later result does not withdraw it."
+            )
+            active = suppressants_active_on(regimen, ana_latest.date)
+            if active:
+                entry_note += (
+                    f" {', '.join(active)} was in use on that date, which can suppress it."
+                )
     else:
         entry_met = False
-        entry_note = (
-            f"ANA {ana.value_text or ana.value} does not reach 1:80; "
-            "the 2019 criteria do not apply without it."
+        shown = ana_latest.value_text or ana_latest.value
+        measured = (
+            f"ANA {shown}"
+            if len(ana_history) == 1
+            else (
+                f"No ANA on file reaches 1:80 across {len(ana_history)} draws (most recent {shown})"
+            )
         )
+        entry_note = f"{measured} does not reach 1:80; the 2019 criteria do not apply without it."
 
     # --- clinical domains, answered from the phenotype profile when it can --
     for domain, name, weight in _SLE_CLINICAL_ITEMS:
@@ -370,6 +520,7 @@ def score_sle_2019(
             weight=3,
             names=_SLE_WBC_NAMES,
             predicate=lambda row: _numeric_below(row, 4.0),
+            regimen=regimen,
         )
     )
     items.append(
@@ -380,6 +531,7 @@ def score_sle_2019(
             weight=4,
             names=_SLE_PLATELET_NAMES,
             predicate=lambda row: _numeric_below(row, 100.0),
+            regimen=regimen,
         )
     )
 
@@ -391,11 +543,12 @@ def score_sle_2019(
             name="Anti-cardiolipin, anti-β2GP1, or lupus anticoagulant",
             weight=2,
             names=_SLE_APL_NAMES,
+            regimen=regimen,
         )
     )
 
     # --- complement ----------------------------------------------------------
-    items.extend(_sle_complement_items(view))
+    items.extend(_sle_complement_items(view, regimen))
 
     # --- SLE-specific antibodies ---------------------------------------------
     items.append(
@@ -405,6 +558,7 @@ def score_sle_2019(
             name="Anti-dsDNA or anti-Smith",
             weight=6,
             names=_SLE_DSDNA_NAMES + _SLE_SMITH_NAMES,
+            regimen=regimen,
         )
     )
 
@@ -496,9 +650,20 @@ def _threshold_item(
     weight: int,
     names: tuple[str, ...],
     predicate: Callable[[LabResult], bool],
+    lookback: Lookback = "ever",
+    regimen: Regimen | None = None,
 ) -> CriterionItem:
-    row = view.find(*names)
-    if row is None:
+    """One threshold criterion, read over the whole record by default.
+
+    `lookback="ever"` scans every draw and is met if ANY satisfies the
+    predicate (ADR 0042). When the value that met it is not the latest one,
+    the item carries both — `met_ever` plus a `superseded` note naming the
+    later value and any immunosuppressant in force when it was drawn.
+    """
+    timeline = (
+        view.history(*names) if lookback == "ever" else ([r] if (r := view.find(*names)) else [])
+    )
+    if not timeline:
         return CriterionItem(
             domain=domain,
             name=name,
@@ -506,30 +671,77 @@ def _threshold_item(
             state="not_assessed",
             basis="No result on file.",
         )
-    met = predicate(row)
-    shown = row.value if row.value is not None else row.value_text
+
+    latest = timeline[0]
+    meeting = [row for row in timeline if predicate(row)]
+    if not meeting:
+        shown = latest.value if latest.value is not None else latest.value_text
+        measured = (
+            f"Most recent value {shown} on {latest.date.isoformat()}"
+            if len(timeline) == 1
+            else f"{len(timeline)} draws on file, none meeting it; most recent {shown} "
+            f"on {latest.date.isoformat()}"
+        )
+        return CriterionItem(
+            domain=domain,
+            name=name,
+            weight=weight,
+            state="not_met",
+            basis=f"{measured}.",
+            sources=[LabView.ref(latest)],
+        )
+
+    # Newest first, so the first match is the most recent one that met it.
+    met_row = meeting[0]
+    shown = met_row.value if met_row.value is not None else met_row.value_text
+    if met_row is latest:
+        return CriterionItem(
+            domain=domain,
+            name=name,
+            weight=weight,
+            state="met",
+            basis=f"Most recent value {shown} on {met_row.date.isoformat()}.",
+            sources=[LabView.ref(met_row)],
+        )
     return CriterionItem(
         domain=domain,
         name=name,
         weight=weight,
-        state="met" if met else "not_met",
-        basis=f"Most recent value {shown} on {row.date.isoformat()}.",
-        sources=[LabView.ref(row)],
+        state="met",
+        basis=f"Met on {met_row.date.isoformat()} ({shown}); not by the most recent draw.",
+        sources=[LabView.ref(met_row), LabView.ref(latest)],
+        met_ever=True,
+        superseded=_superseded_note(met_row=met_row, latest=latest, regimen=regimen),
     )
 
 
 def _any_positive_item(
-    view: LabView, *, domain: str, name: str, weight: int, names: tuple[str, ...]
+    view: LabView,
+    *,
+    domain: str,
+    name: str,
+    weight: int,
+    names: tuple[str, ...],
+    lookback: Lookback = "ever",
+    regimen: Regimen | None = None,
 ) -> CriterionItem:
-    """Met when ANY of `names` reads positive; `not_met` only when at least
-    one was actually measured and none were positive."""
-    found = view.find_all(*names)
+    """Met when ANY of `names` reads positive at ANY point on the record;
+    `not_met` only when at least one was actually measured and none were
+    positive.
+
+    Autoantibody criteria are the clearest case for `ever` (ADR 0042): a
+    seroconversion to negative under treatment does not un-happen the
+    positive result the published criteria count.
+    """
+    found = view.history(*names) if lookback == "ever" else view.find_all(*names)
     if not found:
         return CriterionItem(
             domain=domain, name=name, weight=weight, state="not_assessed", basis="None on file."
         )
     positives = [row for row in found if _is_positive(row) or _numeric_above_ref(row)]
     if positives:
+        latest = found[0]
+        met_ever = latest not in positives
         return CriterionItem(
             domain=domain,
             name=name,
@@ -537,9 +749,15 @@ def _any_positive_item(
             state="met",
             basis="; ".join(
                 f"{row.name} {row.value_text or row.value} ({row.date.isoformat()})"
-                for row in positives
+                for row in positives[:4]
             ),
             sources=[LabView.ref(row) for row in positives],
+            met_ever=met_ever,
+            superseded=(
+                _superseded_note(met_row=positives[0], latest=latest, regimen=regimen)
+                if met_ever
+                else ""
+            ),
         )
     return CriterionItem(
         domain=domain,
@@ -552,17 +770,44 @@ def _any_positive_item(
 
 
 def _numeric_above_ref(row: LabResult) -> bool:
-    flag = (getattr(row.flag, "value", row.flag) or "") if row.flag else ""
-    return str(flag).lower() in {"high", "h", "abnormal-high", "abnormal"}
+    return flag_is_high(row.flag)
 
 
-def _sle_complement_items(view: LabView) -> list[CriterionItem]:
+def _lowest_on_record(view: LabView, names: tuple[str, ...]) -> LabResult | None:
+    """The lowest recorded value for an analyte, or the latest if none has a
+    number (ADR 0042).
+
+    "Lowest" and not "first below reference": reference ranges differ between
+    labs, so the comparison that decides `_below_reference` has to happen on
+    the row that carries its own range. Picking the numeric minimum keeps that
+    property and answers the criterion — was complement EVER consumed.
+    """
+    rows = view.history(*names)
+    if not rows:
+        return None
+    numeric = [row for row in rows if row.value is not None]
+    if not numeric:
+        return rows[0]
+    below = [row for row in numeric if _below_reference(row)]
+    pool = below or numeric
+    return min(pool, key=lambda r: r.value if r.value is not None else float("inf"))
+
+
+def _sle_complement_items(view: LabView, regimen: Regimen | None = None) -> list[CriterionItem]:
     """The complement domain, whose two items are mutually exclusive by
     construction: low C3 *or* low C4 scores 3, low C3 *and* low C4 scores 4.
     Domain de-duplication would keep only the 4 anyway, but scoring both as
-    `met` when only one complement is low would misreport WHY."""
-    c3 = view.find(*_SLE_C3_NAMES)
-    c4 = view.find(*_SLE_C4_NAMES)
+    `met` when only one complement is low would misreport WHY.
+
+    Read over the whole record (ADR 0042). Consumed complement is the
+    textbook example of a marker that normalises on treatment: it is what
+    CLN-03 named first, and reading only the latest draw scored successful
+    suppression as evidence against the diagnosis.
+    """
+    c3 = _lowest_on_record(view, _SLE_C3_NAMES)
+    c4 = _lowest_on_record(view, _SLE_C4_NAMES)
+    c3_latest = view.find(*_SLE_C3_NAMES)
+    c4_latest = view.find(*_SLE_C4_NAMES)
     measured = [row for row in (c3, c4) if row is not None]
     if not measured:
         return [
@@ -584,6 +829,24 @@ def _sle_complement_items(view: LabView) -> list[CriterionItem]:
     c3_low = c3 is not None and _below_reference(c3)
     c4_low = c4 is not None and _below_reference(c4)
     sources = [LabView.ref(row) for row in measured]
+    historical = [
+        (low, row, latest)
+        for low, row, latest in ((c3_low, c3, c3_latest), (c4_low, c4, c4_latest))
+        if low and row is not None and latest is not None and row is not latest
+    ]
+    met_ever = bool(historical)
+    superseded = (
+        "; ".join(
+            _superseded_note(met_row=row, latest=latest, regimen=regimen)
+            for _low, row, latest in historical
+        )
+        if met_ever
+        else ""
+    )
+    if met_ever:
+        sources = sources + [
+            LabView.ref(latest) for _low, _row, latest in historical if latest not in measured
+        ]
     both_state = "met" if (c3_low and c4_low) else "not_met"
     # "Either" is recorded as met only when it is the HIGHEST met item — when
     # both are low the 4-point item supersedes it, and marking both met would
@@ -599,6 +862,8 @@ def _sle_complement_items(view: LabView) -> list[CriterionItem]:
             state=either_state,
             basis=_complement_basis(c3, c4, c3_low, c4_low),
             sources=sources,
+            met_ever=met_ever and either_state == "met",
+            superseded=superseded if either_state == "met" else "",
         ),
         CriterionItem(
             domain="Complement",
@@ -607,6 +872,8 @@ def _sle_complement_items(view: LabView) -> list[CriterionItem]:
             state=both_state,
             basis=_complement_basis(c3, c4, c3_low, c4_low),
             sources=sources,
+            met_ever=met_ever and both_state == "met",
+            superseded=superseded if both_state == "met" else "",
         ),
     ]
 
@@ -715,7 +982,9 @@ _SJOGREN_SSA = (r"^ss-?a", r"\bro\b", r"ro52", r"ro60", r"sjogren.*a\b")
 
 
 def score_sjogren_2016(
-    rows: Sequence[LabResult], phenotype: PhenotypeLookup | None = None
+    rows: Sequence[LabResult],
+    phenotype: PhenotypeLookup | None = None,
+    regimen: Regimen | None = None,
 ) -> CriteriaResult:
     """2016 ACR/EULAR classification criteria for primary Sjögren's syndrome.
 
@@ -751,6 +1020,7 @@ def score_sjogren_2016(
             name="Anti-SSA/Ro positive",
             weight=3,
             names=_SJOGREN_SSA,
+            regimen=regimen,
         )
     )
     items.append(
@@ -807,7 +1077,9 @@ _RA_ACUTE = (r"^crp$", r"hs-?crp", r"^esr$", r"sedimentation")
 
 
 def score_ra_2010(
-    rows: Sequence[LabResult], phenotype: PhenotypeLookup | None = None
+    rows: Sequence[LabResult],
+    phenotype: PhenotypeLookup | None = None,
+    regimen: Regimen | None = None,
 ) -> CriteriaResult:
     """2010 ACR/EULAR classification criteria for rheumatoid arthritis.
 
@@ -844,7 +1116,12 @@ def score_ra_2010(
     )
 
     serology = _any_positive_item(
-        view, domain="Serology", name="RF or ACPA positive", weight=2, names=_RA_ACPA + _RA_RF
+        view,
+        domain="Serology",
+        name="RF or ACPA positive",
+        weight=2,
+        names=_RA_ACPA + _RA_RF,
+        regimen=regimen,
     )
     if serology.state == "met":
         serology.basis += (
@@ -860,6 +1137,7 @@ def score_ra_2010(
             name="Abnormal CRP or ESR",
             weight=1,
             names=_RA_ACUTE,
+            regimen=regimen,
         )
     )
     items.append(
@@ -897,7 +1175,9 @@ _ANCA_EOS = (r"eosinophil",)
 
 
 def score_gpa_2022(
-    rows: Sequence[LabResult], phenotype: PhenotypeLookup | None = None
+    rows: Sequence[LabResult],
+    phenotype: PhenotypeLookup | None = None,
+    regimen: Regimen | None = None,
 ) -> CriteriaResult:
     """2022 ACR/EULAR classification criteria for granulomatosis with
     polyangiitis. Threshold 5.
@@ -912,7 +1192,12 @@ def score_gpa_2022(
 
     items.append(
         _any_positive_item(
-            view, domain="Serology", name="PR3-ANCA or c-ANCA positive", weight=5, names=_ANCA_PR3
+            view,
+            domain="Serology",
+            name="PR3-ANCA or c-ANCA positive",
+            weight=5,
+            names=_ANCA_PR3,
+            regimen=regimen,
         )
     )
     items.append(
@@ -983,6 +1268,7 @@ def score_gpa_2022(
         name="MPO-ANCA or p-ANCA positive",
         weight=-1,
         names=_ANCA_MPO,
+        regimen=regimen,
     )
     if mpo.state == "met":
         penalty -= 1
@@ -997,6 +1283,7 @@ def score_gpa_2022(
         # use, so the conversion is visible rather than implied.
         threshold=1000.0,
         unit="cells/ul",
+        regimen=regimen,
     )
     if eos.state == "met":
         penalty -= 4
@@ -1016,6 +1303,8 @@ def _count_threshold_item(
     names: tuple[str, ...],
     threshold: float,
     unit: str,
+    lookback: Lookback = "ever",
+    regimen: Regimen | None = None,
 ) -> CriterionItem:
     """A numeric criterion whose threshold carries a UNIT.
 
@@ -1032,7 +1321,7 @@ def _count_threshold_item(
     the criterion's unit are EXCLUDED rather than compared — a percentage is
     not a concentration, and treating it as one is how the bug happened.
     """
-    found = view.find_all(*names)
+    found = view.history(*names) if lookback == "ever" else view.find_all(*names)
     comparable: list[tuple[LabResult, float]] = []
     for row in found:
         if row.value is None or not row.ucum_unit:
@@ -1053,18 +1342,56 @@ def _count_threshold_item(
             ),
         )
 
-    row, value = max(comparable, key=lambda pair: pair[0].date)
-    met = value >= threshold
+    latest_row, latest_value = max(comparable, key=lambda pair: pair[0].date)
+    # The published EGPA criterion is a blood eosinophil count ≥1×10⁹/L, which
+    # in practice means the highest recorded count — a patient on steroids has
+    # a normal one today and had 4.2 before treatment (ADR 0042).
+    meeting = [pair for pair in comparable if pair[1] >= threshold]
+    if not meeting:
+        return CriterionItem(
+            domain=domain,
+            name=name,
+            weight=weight,
+            state="not_met",
+            basis=(
+                f"Most recent {latest_row.name} is {latest_row.value} "
+                f"{latest_row.ucum_unit} = {latest_value:g} {unit} on "
+                f"{latest_row.date.isoformat()}."
+                + (
+                    f" {len(comparable)} comparable draws on file, none reaching "
+                    f"{threshold:g} {unit}."
+                    if len(comparable) > 1
+                    else ""
+                )
+            ),
+            sources=[LabView.ref(latest_row)],
+        )
+
+    row, value = max(meeting, key=lambda pair: pair[1])
+    if row is latest_row:
+        return CriterionItem(
+            domain=domain,
+            name=name,
+            weight=weight,
+            state="met",
+            basis=(
+                f"Most recent {row.name} is {row.value} {row.ucum_unit} "
+                f"= {value:g} {unit} on {row.date.isoformat()}."
+            ),
+            sources=[LabView.ref(row)],
+        )
     return CriterionItem(
         domain=domain,
         name=name,
         weight=weight,
-        state="met" if met else "not_met",
+        state="met",
         basis=(
-            f"Most recent {row.name} is {row.value} {row.ucum_unit} "
-            f"= {value:g} {unit} on {row.date.isoformat()}."
+            f"Peak {row.name} was {row.value} {row.ucum_unit} = {value:g} {unit} on "
+            f"{row.date.isoformat()}; not the most recent draw."
         ),
-        sources=[LabView.ref(row)],
+        sources=[LabView.ref(row), LabView.ref(latest_row)],
+        met_ever=True,
+        superseded=_superseded_note(met_row=row, latest=latest_row, regimen=regimen),
     )
 
 
@@ -1116,23 +1443,38 @@ def _clinical_item_for(
 
 
 def _threshold_item_any(
-    view: LabView, *, domain: str, name: str, weight: int, names: tuple[str, ...]
+    view: LabView,
+    *,
+    domain: str,
+    name: str,
+    weight: int,
+    names: tuple[str, ...],
+    lookback: Lookback = "ever",
+    regimen: Regimen | None = None,
 ) -> CriterionItem:
-    """Met when ANY matching analyte is flagged abnormal."""
-    found = view.find_all(*names)
+    """Met when ANY matching analyte is flagged abnormal, at any point."""
+    found = view.history(*names) if lookback == "ever" else view.find_all(*names)
     if not found:
         return CriterionItem(
             domain=domain, name=name, weight=weight, state="not_assessed", basis="None on file."
         )
     abnormal = [row for row in found if _numeric_above_ref(row)]
     if abnormal:
+        latest = found[0]
+        met_ever = latest not in abnormal
         return CriterionItem(
             domain=domain,
             name=name,
             weight=weight,
             state="met",
-            basis="; ".join(f"{r.name} {r.value} ({r.date.isoformat()})" for r in abnormal),
+            basis="; ".join(f"{r.name} {r.value} ({r.date.isoformat()})" for r in abnormal[:4]),
             sources=[LabView.ref(r) for r in abnormal],
+            met_ever=met_ever,
+            superseded=(
+                _superseded_note(met_row=abnormal[0], latest=latest, regimen=regimen)
+                if met_ever
+                else ""
+            ),
         )
     return CriterionItem(
         domain=domain,
@@ -1175,7 +1517,9 @@ def _negative_penalty(result: CriteriaResult, items: list[CriterionItem]) -> Non
 
 
 def score_egpa_2022(
-    rows: Sequence[LabResult], phenotype: PhenotypeLookup | None = None
+    rows: Sequence[LabResult],
+    phenotype: PhenotypeLookup | None = None,
+    regimen: Regimen | None = None,
 ) -> CriteriaResult:
     """2022 ACR/EULAR criteria for eosinophilic granulomatosis with
     polyangiitis (Churg-Strauss). Threshold 6.
@@ -1219,6 +1563,7 @@ def score_egpa_2022(
             names=_ANCA_EOS,
             threshold=1000.0,
             unit="cells/ul",
+            regimen=regimen,
         ),
         CriterionItem(
             domain="Biopsy",
@@ -1252,6 +1597,7 @@ def score_egpa_2022(
                 name="PR3-ANCA or c-ANCA positive",
                 weight=-3,
                 names=_ANCA_PR3,
+                regimen=regimen,
             ),
             _clinical_item_for(
                 "Haematuria",
@@ -1267,7 +1613,9 @@ def score_egpa_2022(
 
 
 def score_mpa_2022(
-    rows: Sequence[LabResult], phenotype: PhenotypeLookup | None = None
+    rows: Sequence[LabResult],
+    phenotype: PhenotypeLookup | None = None,
+    regimen: Regimen | None = None,
 ) -> CriteriaResult:
     """2022 ACR/EULAR criteria for microscopic polyangiitis. Threshold 5.
 
@@ -1283,6 +1631,7 @@ def score_mpa_2022(
             name="MPO-ANCA or p-ANCA positive",
             weight=6,
             names=_ANCA_MPO,
+            regimen=regimen,
         ),
         _clinical_item_for(
             "Pulmonary fibrosis or interstitial lung disease",
@@ -1325,6 +1674,7 @@ def score_mpa_2022(
                 name="PR3-ANCA or c-ANCA positive",
                 weight=-1,
                 names=_ANCA_PR3,
+                regimen=regimen,
             ),
             _count_threshold_item(
                 view,
@@ -1334,6 +1684,7 @@ def score_mpa_2022(
                 names=_ANCA_EOS,
                 threshold=1000.0,
                 unit="cells/ul",
+                regimen=regimen,
             ),
         ],
     )
@@ -1344,7 +1695,9 @@ def score_mpa_2022(
 
 
 def score_behcet_icbd_2014(
-    rows: Sequence[LabResult], phenotype: PhenotypeLookup | None = None
+    rows: Sequence[LabResult],
+    phenotype: PhenotypeLookup | None = None,
+    regimen: Regimen | None = None,
 ) -> CriteriaResult:
     """International Criteria for Behçet's Disease (2014). Threshold 4.
 
@@ -1455,7 +1808,15 @@ def score_all(
     rows: Sequence[LabResult],
     keys: Iterable[str] | None = None,
     phenotype: PhenotypeLookup | None = None,
+    regimen: Regimen | None = None,
 ) -> list[CriteriaResult]:
-    """Every registered scorer (or the named subset) against `rows`."""
+    """Every registered scorer (or the named subset) against `rows`.
+
+    `regimen` is optional and only ever ADDS context (ADR 0042): a criterion
+    met historically whose latest draw is normal says which
+    immunosuppressant was in force when that draw was taken. Passing nothing
+    costs a sentence of explanation, never a scored point, so a caller with
+    no regimen on file is degraded rather than wrong.
+    """
     selected = list(SCORERS) if keys is None else [k for k in keys if k in SCORERS]
-    return [SCORERS[key](rows, phenotype) for key in selected]
+    return [SCORERS[key](rows, phenotype, regimen) for key in selected]

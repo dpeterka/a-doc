@@ -10,10 +10,12 @@ import json
 import re
 from datetime import date
 
+from adoc.casefile.regimen import Regimen, RegimenEntry
 from adoc.knowledge.criteria import (
     CLASSIFICATION_DISCLAIMER,
     SCORERS,
     score_all,
+    score_egpa_2022,
     score_gpa_2022,
     score_ra_2010,
     score_sjogren_2016,
@@ -177,9 +179,20 @@ def test_every_met_item_carries_a_checkable_source_ref() -> None:
             assert source.endswith(":2026-05-02")
 
 
-def test_the_most_recent_value_decides() -> None:
-    """A criteria set describes a patient's current classifiable state. An
-    abnormality that has since resolved must not keep scoring forever."""
+def test_a_resolved_abnormality_still_counts_and_says_it_resolved() -> None:
+    """This test replaces `test_the_most_recent_value_decides`, which pinned
+    the opposite property. ADR 0042 changed it deliberately.
+
+    The old reasoning — "a criteria set describes a patient's current
+    classifiable state" — is wrong for a *classification* set. The 2019
+    EULAR/ACR criteria state that criteria need not occur simultaneously, and
+    `score_sle_2019`'s own docstring said the entry criterion was "ANA ≥1:80
+    ever" while the code read the latest ANA. Measured, the old behaviour took
+    a suppressed-lupus timeline from 6/10 with the criteria applying to 0/10
+    and "the criteria do not apply", purely by ADDING a later normal result.
+
+    What must not happen is the resolution being hidden. Both facts render.
+    """
     result = score_sle_2019(
         [
             _row("ANA", value_text="1:320"),
@@ -187,8 +200,46 @@ def test_the_most_recent_value_decides() -> None:
             _row("WBC", value=6.2, when=date(2026, 5, 2)),
         ]
     )
+    item = next(i for i in result.items if i.name.startswith("Leukopenia"))
 
-    assert next(i for i in result.items if i.name.startswith("Leukopenia")).state == "not_met"
+    assert item.state == "met"
+    assert item.met_ever is True
+    assert "2024-01-01" in item.superseded
+    assert "6.2" in item.superseded
+    # Both draws are cited, so the reader can check either.
+    assert any("2024-01-01" in ref for ref in item.sources)
+    assert any("2026-05-02" in ref for ref in item.sources)
+
+
+def test_a_criterion_met_by_the_latest_draw_is_not_flagged_as_historical() -> None:
+    """The other half: `met_ever` must distinguish, or it means nothing."""
+    result = score_sle_2019(
+        [
+            _row("ANA", value_text="1:320"),
+            _row("WBC", value=6.2, when=date(2024, 1, 1)),
+            _row("WBC", value=2.9, when=date(2026, 5, 2)),
+        ]
+    )
+    item = next(i for i in result.items if i.name.startswith("Leukopenia"))
+
+    assert item.state == "met"
+    assert item.met_ever is False
+    assert item.superseded == ""
+
+
+def test_a_criterion_never_met_stays_not_met() -> None:
+    """`ever` must not become "met if measured". The floor is still a floor."""
+    result = score_sle_2019(
+        [
+            _row("ANA", value_text="1:320"),
+            _row("WBC", value=6.2, when=date(2024, 1, 1)),
+            _row("WBC", value=7.1, when=date(2026, 5, 2)),
+        ]
+    )
+    item = next(i for i in result.items if i.name.startswith("Leukopenia"))
+
+    assert item.state == "not_met"
+    assert "2 draws on file, none meeting it" in item.basis
 
 
 def test_every_result_carries_the_classification_disclaimer() -> None:
@@ -532,3 +583,168 @@ def test_every_registered_scorer_survives_an_empty_record() -> None:
 
     assert len(results) == len(SCORERS)
     assert all(r.citation for r in results), "every set must be traceable to its publication"
+
+
+# --- ADR 0042: criteria read the whole record ---------------------------------------------------
+
+
+def _suppressed_lupus_timeline() -> list[LabResult]:
+    """Seropositive and complement-consumed in 2024; all normal in 2026 —
+    the trajectory CLN-03 describes for a treated patient."""
+    return [
+        _row("ANA", value_text="1:640", when=date(2024, 3, 1)),
+        _row("anti-dsDNA", value_text="Positive", when=date(2024, 3, 1)),
+        _row("Complement C3", value=48.0, flag=LabFlag.CRITICAL_LOW, when=date(2024, 3, 1)),
+        _row("Complement C4", value=6.0, flag=LabFlag.LOW, when=date(2024, 3, 1)),
+        _row("WBC", value=2.9, when=date(2024, 3, 1)),
+        _row("ANA", value_text="Negative", when=date(2026, 7, 1)),
+        _row("anti-dsDNA", value_text="Negative", when=date(2026, 7, 1)),
+        _row("Complement C3", value=110.0, when=date(2026, 7, 1)),
+        _row("Complement C4", value=22.0, when=date(2026, 7, 1)),
+        _row("WBC", value=6.4, when=date(2026, 7, 1)),
+    ]
+
+
+def test_a_later_normal_result_does_not_erase_the_historical_basis() -> None:
+    """The measurement that motivated ADR 0042. On these exact records the
+    old latest-only reading gave `entry_met=False, 0/10, "the criteria do not
+    apply"` — a patient scored as if the disease had been excluded, because
+    treatment worked."""
+    result = score_sle_2019(_suppressed_lupus_timeline())
+
+    assert result.entry_met is True
+    assert result.points == 13
+    assert result.meets_threshold is True
+
+
+def test_the_entry_criterion_is_met_ever_as_its_docstring_always_said() -> None:
+    """`score_sle_2019`'s docstring said "ANA ≥1:80 ever" from the day it was
+    written; the code read the latest ANA."""
+    result = score_sle_2019(
+        [
+            _row("ANA", value_text="1:640", when=date(2024, 3, 1)),
+            _row("ANA", value_text="Negative", when=date(2026, 7, 1)),
+        ]
+    )
+
+    assert result.entry_met is True
+    assert "met EVER" in result.entry_note
+    assert "2024-03-01" in result.entry_note
+    assert "Negative" in result.entry_note
+
+
+def test_an_ana_never_reaching_the_titre_still_fails_the_entry_criterion() -> None:
+    """`ever` must not become "positive if measured"."""
+    result = score_sle_2019(
+        [
+            _row("ANA", value_text="1:40", when=date(2024, 3, 1)),
+            _row("ANA", value_text="Negative", when=date(2026, 7, 1)),
+        ]
+    )
+
+    assert result.entry_met is False
+    assert "2 draws" in result.entry_note
+
+
+def test_the_regimen_names_what_could_have_suppressed_the_marker() -> None:
+    """CLN-03's second half. The note says which drug and leaves the
+    inference to the reader — this module never claims causation."""
+    regimen = Regimen(
+        entries=[RegimenEntry(name="Prednisone", dose="10 mg", started=date(2024, 6, 1))]
+    )
+    result = score_sle_2019(_suppressed_lupus_timeline(), regimen=regimen)
+    historical = [i for i in result.items if i.met_ever]
+
+    assert historical
+    assert all("Prednisone" in i.superseded for i in historical)
+    assert all("can suppress" in i.superseded for i in historical)
+
+
+def test_a_drug_stopped_before_the_draw_is_not_named() -> None:
+    """`Regimen.active_on` is interval-aware, and a restart is a separate
+    entry. A drug she was off when the blood was taken explains nothing."""
+    regimen = Regimen(
+        entries=[
+            RegimenEntry(name="Prednisone", started=date(2024, 1, 1), stopped=date(2024, 12, 31))
+        ]
+    )
+    result = score_sle_2019(_suppressed_lupus_timeline(), regimen=regimen)
+
+    assert all("Prednisone" not in i.superseded for i in result.items)
+
+
+def test_an_undated_regimen_entry_is_never_assumed_active() -> None:
+    """`Regimen.active_on` reports `unknown` rather than guessing, and a
+    confident wrong answer here would put a drug name against a lab it had
+    nothing to do with."""
+    regimen = Regimen(entries=[RegimenEntry(name="Prednisone")])
+    result = score_sle_2019(_suppressed_lupus_timeline(), regimen=regimen)
+
+    assert all("Prednisone" not in i.superseded for i in result.items)
+
+
+def test_no_regimen_on_file_costs_a_sentence_not_a_point() -> None:
+    """The optional dependency degrades, never changes the score."""
+    with_none = score_sle_2019(_suppressed_lupus_timeline())
+    with_some = score_sle_2019(
+        _suppressed_lupus_timeline(),
+        regimen=Regimen(entries=[RegimenEntry(name="Prednisone", started=date(2024, 6, 1))]),
+    )
+
+    assert with_none.points == with_some.points
+    assert with_none.meets_threshold == with_some.meets_threshold
+    assert "Prednisone" not in " ".join(i.superseded for i in with_none.items)
+
+
+def test_a_peak_count_meets_a_count_threshold_even_if_todays_is_normal() -> None:
+    """The published EGPA criterion is a blood eosinophil count ≥1×10⁹/L,
+    which in practice means the highest recorded one. A patient on steroids
+    has a normal count today and had 4.2 before treatment."""
+    rows = [
+        _row("Eosinophils", value=4.2, unit="10*9/L", when=date(2024, 3, 1)),
+        _row("Eosinophils", value=0.2, unit="10*9/L", when=date(2026, 7, 1)),
+    ]
+    result = score_egpa_2022(rows)
+    item = next(i for i in result.items if i.name.startswith("Eosinophil count"))
+
+    assert item.state == "met"
+    assert item.met_ever is True
+    assert "Peak" in item.basis
+    assert "4.2" in item.basis
+
+
+# --- the flag-enum bug this uncovered -----------------------------------------------------------
+
+
+def test_a_critically_low_flag_counts_as_low() -> None:
+    """`LabFlag` has five members and the string set at this call site
+    covered `L` but not `LL`: a critically low complement — the most
+    clinically significant value the analyte can carry — registered as
+    normal everywhere in the criteria scorers."""
+    result = score_sle_2019(
+        [
+            _row("ANA", value_text="1:320"),
+            _row("Complement C3", value=20.0, flag=LabFlag.CRITICAL_LOW),
+            _row("Complement C4", value=4.0, flag=LabFlag.CRITICAL_LOW),
+        ]
+    )
+    item = next(i for i in result.items if i.name == "Low C3 and low C4")
+
+    assert item.state == "met"
+
+
+def test_every_flag_member_has_a_defined_direction() -> None:
+    """The bug above existed because three of five members matched nothing.
+    `A` is deliberately neither: it records that a value is out of range
+    without saying which way, and guessing would invent a finding."""
+    from adoc.labs.models import flag_is_high, flag_is_low
+
+    assert (flag_is_low(LabFlag.LOW), flag_is_high(LabFlag.LOW)) == (True, False)
+    assert (flag_is_low(LabFlag.CRITICAL_LOW), flag_is_high(LabFlag.CRITICAL_LOW)) == (True, False)
+    assert (flag_is_low(LabFlag.HIGH), flag_is_high(LabFlag.HIGH)) == (False, True)
+    assert (flag_is_low(LabFlag.CRITICAL_HIGH), flag_is_high(LabFlag.CRITICAL_HIGH)) == (
+        False,
+        True,
+    )
+    assert (flag_is_low(LabFlag.ABNORMAL), flag_is_high(LabFlag.ABNORMAL)) == (False, False)
+    assert (flag_is_low(None), flag_is_high(None)) == (False, False)

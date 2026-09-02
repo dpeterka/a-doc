@@ -266,9 +266,9 @@ contract:
 |---|---|---|---|
 | 0038 | How a hypothesis ends | CLN-05, CLN-01, PAT-03 | shipped (v0.27.0) |
 | 0039 | How a review reads | PAT-01, PAT-02, PAT-04 | merged to develop |
-| 0040 | What the composer sounds like | PAT-08 | in review (#293) |
-| 0041 | The appointment agenda | PAT-07 | this branch |
-| 0042 | Longitudinal lab positivity | CLN-03 | queued |
+| 0040 | What the composer sounds like | PAT-08 | merged to develop |
+| 0041 | The appointment agenda | PAT-07 | in review (#294) |
+| 0042 | Criteria read the whole record | CLN-03 | this branch |
 
 Three findings were rejected on review rather than adopted, and the ADRs say
 why: PAT-01's proposed `patient_summary` LLM node (a fourth frontier call
@@ -277,6 +277,12 @@ scores across LIRICAL and sem-sim (not commensurable — ADR 0036), and
 PAT-08's "Your Case Co-Pilot" persona (PLAN.md risk 3 — a co-pilot claims
 shared authority over a decision this system must never appear to share;
 ADR 0040).
+
+The track is complete with 0042. Two of the five ADRs found a bug the review
+did not mention: 0040 found `CriteriaResult.citation` rendered nowhere, and
+0042 found that three of `LabFlag`'s five members matched no direction
+predicate, so a *critically* low complement registered as normal in every
+criteria scorer.
 
 Several premises turned out to be false on measurement, which is why each
 item gets its own review before adoption: PAT-01 says the report opens with
