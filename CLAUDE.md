@@ -10,6 +10,18 @@ a-doc is a single-patient, longitudinal medical-diagnostic assistant (Python). R
 - Types: `uv run mypy src`
 - App CLI: `uv run adoc <subcommand>` — `adoc --help` is the authoritative list. Nested: `user` (`add`/`list`/`remove`), `identifiers` (`show`/`add`/`remove`).
 
+## Response style
+
+- Be concise
+
+- Use asd-ste100.standard when possible
+
+- Do not exceed 1-3 sentences or fragments in responses
+
+- No adjective without its number. "Much faster" is a claim I can't check; "3.2x (16.7% vs 5.2%)" is shorter and I can. Every evaluative word carries its measurement or gets cut.
+
+- State the point, don't frame it.
+
 ## Hard rules
 
 1. **PHI boundary**: patient data lives ONLY in the separate data repo (`ADOC_DATA_DIR`, no git remote). Never read real patient data into context, never commit it here, never add it to fixtures. Tests and CI use synthetic fixtures under `tests/fixtures/` only.

@@ -12,14 +12,18 @@ from __future__ import annotations
 
 from datetime import UTC, date, datetime, timedelta
 
+import pytest
+
 from adoc.casefile.retirement import (
     STALE_DAYS,
+    LabFact,
     RetirementReport,
+    evaluate_rule_out,
     is_protected,
     propose_retirements,
     render_retirements,
 )
-from adoc.casefile.schema import Evidence, Hypothesis, Ledger
+from adoc.casefile.schema import Evidence, Hypothesis, Ledger, RuleOutCheck
 
 _TODAY = date(2026, 8, 30)
 
@@ -258,3 +262,155 @@ def test_a_failed_apply_reads_as_a_failure_not_a_quiet_week() -> None:
     assert "could not be saved" in text
     assert "disk full" in text
     assert "Nothing was retired" not in text
+
+
+# -- ADR 0038: how a hypothesis ends ----------------------------------------
+
+
+def _lab(**kw: object) -> LabFact:
+    return LabFact(**kw)  # type: ignore[arg-type]
+
+
+def _excluded(source: str, claim: str = "Serum metanephrines normal") -> Evidence:
+    return Evidence(claim=claim, source=source, strength="definitive-exclusion")
+
+
+def test_a_definitive_exclusion_ends_a_cant_miss_lead() -> None:
+    """The narrowing ADR 0038 makes to ADR 0035's absolute protection.
+
+    Pheochromocytoma is a can't-miss lead AND the textbook case of a
+    diagnosis one negative test excludes. A protection that cannot tell those
+    apart guarantees the bloat it was meant to be worth paying for: 10
+    can't-miss leads in production, none ever retired.
+    """
+    hypothesis = _h("pheochromocytoma", tier="cant-miss")
+    hypothesis.evidence_against = [_excluded("labs:metanephrines:2026-08-01")]
+
+    report = propose_retirements(_ledger(hypothesis), today=_TODAY)
+
+    assert [r.to_status for r in report.retirements] == ["ruled-out"]
+    assert report.protected_count == 0
+
+
+def test_a_definitive_exclusion_ends_a_patient_origin_lead() -> None:
+    """Same narrowing, other protected class. Her own theory is still hers —
+    but an objective result settles it the same way it settles any other."""
+    hypothesis = _h("her-theory", origin="patient")
+    hypothesis.evidence_against = [_excluded("encounter:2026-08-01--rheum.md")]
+
+    report = propose_retirements(_ledger(hypothesis), today=_TODAY)
+
+    assert [r.hypothesis_id for r in report.retirements] == ["her-theory"]
+
+
+@pytest.mark.parametrize("source", ["pmid:12345", "engine:lirical:2026-08-31"])
+def test_a_definitive_exclusion_from_a_refused_source_ends_nothing(source: str) -> None:
+    """The restriction IS the safety property.
+
+    The Challenger writes `evidence_against`; without this it would have a
+    one-word route to retiring a can't-miss lead. Literature knows nothing
+    about this patient, and a phenotype engine that never ranked something has
+    not refuted it — ADR 0036's entire `neutral` argument.
+    """
+    hypothesis = _h("aortic-dissection", tier="cant-miss")
+    hypothesis.evidence_against = [_excluded(source, claim="not ranked")]
+
+    report = propose_retirements(_ledger(hypothesis), today=_TODAY)
+
+    assert report.retirements == []
+    assert report.protected_count == 1
+    assert report.refused_exclusions, "a refused exclusion must be reported, not swallowed"
+
+
+def test_a_refused_exclusion_is_visible_in_the_report() -> None:
+    """A model reaching for the one strength that bypasses the balance scale
+    is worth seeing."""
+    hypothesis = _h("aortic-dissection", tier="cant-miss")
+    hypothesis.evidence_against = [_excluded("pmid:12345", claim="a paper says otherwise")]
+
+    text = "\n".join(render_retirements(propose_retirements(_ledger(hypothesis), today=_TODAY)))
+
+    assert "cannot settle it" in text
+    assert "a paper says otherwise" in text
+
+
+def test_a_met_rule_out_ends_the_hypothesis_that_stated_it() -> None:
+    """`rule_out` was required at creation and never read again: 46 active
+    hypotheses in production, 0 rule-outs ever evaluated. This is the stage
+    that checks."""
+    hypothesis = _h("pulmonary-embolism", tier="cant-miss")
+    hypothesis.rule_out = "a normal d-dimer"
+    hypothesis.rule_out_check = RuleOutCheck(analyte="ddimer", operator="normal")
+
+    report = propose_retirements(
+        _ledger(hypothesis), today=_TODAY, labs={"ddimer": _lab(value=0.3, unit="mg/L")}
+    )
+
+    assert [r.to_status for r in report.retirements] == ["ruled-out"]
+    assert "rule-out condition is now met" in report.retirements[0].reason
+
+
+def test_an_unmeasured_analyte_never_ends_a_hypothesis() -> None:
+    """Cannot-tell is not met. Absence of a test is the ordinary state of
+    every differential and reads nothing like a negative result; conflating
+    them is the one failure this evaluator must not have."""
+    hypothesis = _h("pulmonary-embolism", tier="cant-miss")
+    hypothesis.rule_out_check = RuleOutCheck(analyte="ddimer", operator="normal")
+
+    report = propose_retirements(_ledger(hypothesis), today=_TODAY, labs={})
+
+    assert report.retirements == []
+    assert report.protected_count == 1
+
+
+def test_a_flagged_result_does_not_satisfy_a_normal_rule_out() -> None:
+    # Given supporting evidence so `_no_supporting_evidence` cannot fire and
+    # retire it for an unrelated reason — this test is about the rule-out.
+    hypothesis = _h("pulmonary-embolism", evidence_for=[_ev()])
+    hypothesis.rule_out_check = RuleOutCheck(analyte="ddimer", operator="normal")
+
+    report = propose_retirements(
+        _ledger(hypothesis), today=_TODAY, labs={"ddimer": _lab(value=4.0, flag="H")}
+    )
+
+    assert report.retirements == []
+
+
+def test_negation_is_read_before_the_positive_substring() -> None:
+    """ "Not detected" contains "detected". The substring order is the whole
+    correctness of the qualitative operator."""
+    met, _ = evaluate_rule_out(
+        RuleOutCheck(analyte="ana", operator="negative"), {"ana": _lab(value_text="Not Detected")}
+    )
+    positive, _ = evaluate_rule_out(
+        RuleOutCheck(analyte="ana", operator="negative"), {"ana": _lab(value_text="Detected")}
+    )
+
+    assert met is True
+    assert positive is False
+
+
+def test_a_threshold_is_never_compared_across_units() -> None:
+    """Eosinophils are stored both as `4.5 %` and `320 cells/uL`. The same
+    analyte, incomparable numbers — the bug
+    `knowledge.criteria._count_threshold_item` exists to prevent."""
+    met, why = evaluate_rule_out(
+        RuleOutCheck(analyte="eos", operator="below", threshold=1000.0, unit="cells/uL"),
+        {"eos": _lab(value=4.5, unit="%")},
+    )
+
+    assert met is False
+    assert "not the" in why
+
+
+def test_an_unevaluatable_rule_out_leaves_the_old_rules_in_charge() -> None:
+    """A rule-out no lab can settle — "a negative cartilage biopsy" — has no
+    check to write. Absent means never evaluated automatically, which is the
+    prior behaviour for every hypothesis on the ledger."""
+    hypothesis = _h("relapsing-polychondritis", tier="cant-miss")
+    hypothesis.rule_out = "a negative cartilage biopsy"
+
+    report = propose_retirements(_ledger(hypothesis), today=_TODAY)
+
+    assert report.retirements == []
+    assert report.protected_count == 1

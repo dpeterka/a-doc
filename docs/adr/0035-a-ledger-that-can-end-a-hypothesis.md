@@ -1,6 +1,7 @@
 # ADR 0035 — A ledger that can end a hypothesis
 
-Status: accepted (2026-08-30)
+Status: accepted (2026-08-30) — protection narrowed by
+[ADR 0038](0038-how-a-hypothesis-ends.md)
 
 ## Context
 

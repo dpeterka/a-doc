@@ -19,8 +19,8 @@ import pytest
 from fastapi.testclient import TestClient
 from web_support import build_app, login
 
-from adoc.casefile.ledger import save_ledger
-from adoc.casefile.repo import LEDGER_RELPATH
+from adoc.casefile.ledger import load_ledger, save_ledger
+from adoc.casefile.repo import LEDGER_RELPATH, DataRepo
 from adoc.casefile.schema import Evidence, Hypothesis, Ledger
 from adoc.labs.models import LabDocument
 from adoc.web.casefile_helpers import group_hypotheses
@@ -524,3 +524,119 @@ def test_an_uncited_cant_miss_placeholder_does_not_lead_the_page() -> None:
     assert placeholder.name in leading, "a can't-miss lead must never be hidden"
     assert leading[-1] == placeholder.name, "the uncited placeholder is still leading the page"
     assert leading[0] == supported.name
+
+
+# --- PAT-03 / ADR 0038: patient-directed retirement -----------------------------------
+
+
+def _seed_one(repo: DataRepo, hid: str = "pheochromocytoma", *, tier: str = "cant-miss") -> None:
+    from adoc.casefile.ledger import apply_and_save
+    from adoc.casefile.repo import HISTORY_RELPATH
+    from adoc.casefile.schema import AddHypothesis, LedgerDiff, Provenance
+
+    apply_and_save(
+        repo.root / LEDGER_RELPATH,
+        repo.root / HISTORY_RELPATH,
+        LedgerDiff(
+            provenance=Provenance(
+                app_version="test",
+                prompt_template_version="t@v1",
+                model_id="m",
+                dag_node="seed",
+                timestamp=datetime(2026, 1, 1, tzinfo=UTC),
+            ),
+            rationale="seed",
+            ops=[AddHypothesis(hypothesis=_hypothesis(hid, tier=tier, probability="low"))],
+        ),
+    )
+
+
+def test_a_patient_can_retire_a_cant_miss_lead(tmp_path: Path) -> None:
+    """The only path by which a protected lead can leave the list short of a
+    lab settling it. Until this route existed `/ledger` was a single GET, so a
+    lead her doctor had definitively excluded stayed "worth discussing now"
+    forever."""
+    app, repo, _db, _calls = build_app(tmp_path)
+    _seed_one(repo)
+    client = TestClient(app)
+    login(client)
+
+    response = client.post(
+        "/ledger/hypotheses/pheochromocytoma/retire",
+        data={"reason": "Metanephrines came back clear on 12 August", "clinician": "Dr Alvarez"},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    ledger = load_ledger(repo.root / LEDGER_RELPATH)
+    hypothesis = next(h for h in ledger.hypotheses if h.id == "pheochromocytoma")
+    assert hypothesis.status == "ruled-out"
+    evidence = hypothesis.evidence_against[-1]
+    assert evidence.strength == "definitive-exclusion"
+    assert evidence.source.startswith("patient-report:")
+    assert "Dr Alvarez" in evidence.claim
+
+
+def test_retiring_writes_through_the_invariant_checked_path(tmp_path: Path) -> None:
+    """No private back door (ADR 0035's rule, kept): the change lands as a
+    diff in `ledger-history.jsonl`, not as a direct write."""
+    from adoc.casefile.repo import HISTORY_RELPATH
+
+    app, repo, _db, _calls = build_app(tmp_path)
+    _seed_one(repo)
+    client = TestClient(app)
+    login(client)
+    before = (repo.root / HISTORY_RELPATH).read_text(encoding="utf-8").count("\n")
+
+    client.post(
+        "/ledger/hypotheses/pheochromocytoma/retire",
+        data={"reason": "Biopsy clear"},
+        follow_redirects=False,
+    )
+
+    after = (repo.root / HISTORY_RELPATH).read_text(encoding="utf-8").count("\n")
+    assert after == before + 1
+
+
+def test_an_empty_reason_changes_nothing(tmp_path: Path) -> None:
+    """A retirement with no stated reason is not an audit trail."""
+    app, repo, _db, _calls = build_app(tmp_path)
+    _seed_one(repo)
+    client = TestClient(app)
+    login(client)
+
+    client.post(
+        "/ledger/hypotheses/pheochromocytoma/retire",
+        data={"reason": "   "},
+        follow_redirects=False,
+    )
+
+    ledger = load_ledger(repo.root / LEDGER_RELPATH)
+    assert next(h for h in ledger.hypotheses if h.id == "pheochromocytoma").status == "active"
+
+
+def test_retiring_an_unknown_hypothesis_is_a_redirect_not_a_500(tmp_path: Path) -> None:
+    app, repo, _db, _calls = build_app(tmp_path)
+    _seed_one(repo)
+    client = TestClient(app)
+    login(client)
+
+    response = client.post(
+        "/ledger/hypotheses/not-a-real-id/retire",
+        data={"reason": "x"},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+
+
+def test_the_retire_control_is_offered_on_an_active_lead(tmp_path: Path) -> None:
+    app, repo, _db, _calls = build_app(tmp_path)
+    _seed_one(repo)
+    client = TestClient(app)
+    login(client)
+
+    body = client.get("/ledger").text
+
+    assert "My doctor ruled this out" in body
+    assert "/ledger/hypotheses/pheochromocytoma/retire" in body
