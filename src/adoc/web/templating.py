@@ -32,11 +32,39 @@ DISCLAIMER_TEXT = (
     "medical emergency, call 911 (or your local emergency number) now."
 )
 
+# `cant-miss` is the SCHEMA value and does not change (ADR 0039); this is
+# only what a person sees. Named "Can't-Miss", a tier holding a hereditary
+# cancer syndrome and a hereditary angio-oedema read to the patient whose case
+# file it is as a list of catastrophes she might have. It is in fact the list
+# a clinician systematically excludes, which is what it now says.
 _TIER_LABELS = {
     "most-likely": "Most Likely",
     "expanded": "Expanded",
-    "cant-miss": "Can't-Miss",
+    "cant-miss": "Safety checklist",
 }
+
+SAFETY_CHECKLIST_NOTE = (
+    "Conditions a doctor checks and excludes as a matter of routine. Being on "
+    "this list does not mean you have it — it means it is worth ruling out."
+)
+
+
+def safety_status(hypothesis: object) -> str:
+    """Where a safety-checklist entry stands (ADR 0039).
+
+    "One test would settle this" is only sayable because ADR 0038 made
+    rule-outs machine-checkable; without `rule_out_check` every entry would
+    carry the same chip and the chip would say nothing.
+    """
+    status = getattr(hypothesis, "status", "")
+    if status == "ruled-out":
+        return "Ruled out"
+    if getattr(hypothesis, "rule_out_check", None) is not None:
+        return "One test would settle this"
+    if str(getattr(hypothesis, "rule_out", "") or "").strip():
+        return "Needs a specific finding"
+    return "Being tracked"
+
 
 _STATUS_LABELS = {
     "active": "Active",
@@ -89,6 +117,8 @@ templates.env.globals["disclaimer_text"] = DISCLAIMER_TEXT
 templates.env.globals["has_intake_facts"] = has_intake_facts
 templates.env.filters["markdown_lite"] = render_markdown_lite
 templates.env.filters["tier_label"] = tier_label
+templates.env.filters["safety_status"] = safety_status
+templates.env.globals["SAFETY_CHECKLIST_NOTE"] = SAFETY_CHECKLIST_NOTE
 templates.env.filters["status_label"] = status_label
 templates.env.filters["group_hypotheses"] = group_hypotheses
 templates.env.filters["sort_hypotheses"] = sort_hypotheses

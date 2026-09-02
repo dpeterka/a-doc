@@ -5,6 +5,151 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.28.0] — 2026-09-02
+
+*ADRs 0039–0042 — the rest of the adversarial-review adoption track. Four
+ADRs, one release: they touch the same reader-facing surfaces and splitting
+them would ship a half-renamed tier.*
+
+### Added
+
+- **Every review opens with `## The short version`** (ADR 0039) — what
+  changed, what is being looked at now, what to raise first. The last real
+  report was 52,969 characters with no summary at any point, for a reader
+  with brain fog and fatigue.
+
+  Derived from artifacts earlier DAG nodes already produced, so it cannot
+  disagree with the sections beneath it. The review's proposed
+  `patient_summary` LLM node was rejected: a fourth frontier call in a
+  17-minute review, able to contradict the report it sits above.
+
+- **A one-page printable appointment agenda** (ADR 0041) — new
+  `casefile/export.py`, `GET /export/agenda`, and `/export/agenda.md`.
+  Deterministic: every field is copied from the ledger, the labs database or
+  `regimen.yaml`, and a test pins that the route makes zero model calls.
+
+  One page is a bound, not an aspiration. The budget is derived from the
+  print stylesheet — Letter at 0.5in margins, 9.5pt over 1.25 line-height =
+  60 lines, less ~3 for table padding = 57 — and the worst case measures 54.
+  It had to be a test: the first caps rendered 57 lines against a 46-line
+  budget, and counting newlines instead of *wrapped* lines hid another 10.
+
+  The medication table exists only because of `treatment_gate`'s
+  `recording_only` scribe mode (ADR 0020): the full gate blocks every
+  phrasing of a medication list, including a names-only one. `safety.py` is
+  unmodified.
+
+- **Each criteria set now shows its published citation** (ADR 0040).
+  `CriteriaResult.citation` exists "so a doctor can look it up" per its own
+  docstring and was rendered nowhere — 461 characters dead on the model.
+
+### Changed
+
+- **`cant-miss` renders as "Safety checklist"** (ADR 0039), with a note that
+  being on the list is not a claim about the patient, plus a per-lead chip
+  derived from ADR 0038's machinery: Ruled out / One test would settle this /
+  Needs a specific finding / Being tracked.
+
+  The schema value `cant-miss` is unchanged and no ledger on disk is touched.
+  `prompts/composer.md` goes to version 3, because its own words for the tier
+  were the last place the old label survived in patient-facing output.
+
+- **Criteria lead with meaning, not arithmetic** (ADR 0039). Each set opens
+  with a sentence saying in words that `points` is a floor; the point table
+  moves inside a `<details>` block titled for a clinician. Collapsed, never
+  removed. `LR` and `similarity` each gain a clause naming what kind of
+  number they are — ADR 0036 forbids combining them in code, and a reader
+  handed two bare numbers will combine them anyway.
+
+- **The classification disclaimer is said once, in prose, before the first
+  set** (ADR 0040) instead of once per set — 7 times, 17.7% of the section,
+  in the position a reader has learned to skip.
+
+- **Classification criteria read the whole record** (ADR 0042). `LabView`
+  kept only the most recent row per analyte; `score_sle_2019`'s own docstring
+  has said since it was written that the entry criterion is "ANA ≥1:80
+  **ever**", and the 2019 EULAR/ACR criteria state that criteria need not
+  occur simultaneously.
+
+  Measured on one timeline — seropositive, complement-consumed and leukopenic
+  in 2024, every value normal in 2026, which is what successful treatment
+  looks like:
+
+  ```
+  before:  entry_met=False  0/10   "the 2019 criteria do not apply"
+  after:   entry_met=True   13/10  threshold met
+  ```
+
+  Adding a later *normal* result erased the entire historical basis. The old
+  behaviour scored successful suppression as evidence the disease had never
+  been there. Complement now reads the lowest recorded value and
+  counts-with-units read the peak; a criterion met historically carries both
+  facts, cites both draws, and names any immunosuppressant in force when the
+  later draw was taken.
+
+  **Scores go up, and one set now classifies where it did not.** That is the
+  correction. ADR 0040's sentence frames it: meeting a set says this case
+  would count in a study of the condition, which is a different question from
+  whether you have it.
+
+### Fixed
+
+- **A critically low or high lab flag registered as neither** (ADR 0042).
+  `LabFlag` has five members and both criteria predicates matched them by
+  hand-written string sets covering `L` and `H` but not `LL`, `HH` or `A`.
+  A critically low complement — the most clinically significant value the
+  analyte can carry — read as normal in every criteria scorer, and so did
+  every critically high value. Three of five members matched nothing.
+
+  Now `labs.models.flag_is_low` / `flag_is_high`, derived from the enum and
+  shared by all three call sites (`reported_corroborate.py` had the same
+  holes plus two spellings the enum never produces). `A` is deliberately
+  neither: it records that a value is out of range without saying which way,
+  and guessing a direction would invent a finding.
+
+  Same shape as the `_RA_RF` regex that could never match — a criterion
+  silently unable to fire, indistinguishable from one that fires and finds
+  nothing.
+
+- **`UpdateHypothesis.rule_out` reached the ledger.** Shipped in 0.27.0
+  (ADR 0038) and repeated here because the agenda now reads it.
+
+- **A vacuous citation filter in the agenda's evidence selection.**
+  `_support_lines` filtered on a truthy `Evidence.source`, which the schema
+  validates non-empty — it read as a citation check and could never exclude
+  anything. "Uncited" is an empty `evidence_for`, the definition
+  `web.casefile_helpers` already uses.
+
+### Rejected, and recorded so they are not re-proposed
+
+- **PAT-01's `patient_summary` LLM node** — ADR 0039.
+- **PAT-08's "Your Case Co-Pilot" persona** — ADR 0040. PLAN.md names
+  over-trust and framing drift as risk 3. A co-pilot flies the same aircraft;
+  the name claims shared authority over a decision this system must never
+  appear to share. Warmth is already in the prompt; borrowed authority is not
+  warmth.
+- **PAT-07's patient-demographics header** — ADR 0041.
+  `case/identifiers.yaml` exists to define what gets *scrubbed* (ADR 0017),
+  and reading it to render PII would invert the one file whose purpose is
+  removal.
+
+Three of PAT-08's four claims were already false when measured: the composer
+prompt already mandates "plain, compassionate language", `base.html` has
+rendered a persistent footer disclaimer on every page since the web UI
+shipped, and the report already had a "What to ask your doctor" section.
+
+### Notes
+
+- `case/regimen.yaml` gains a row in `docs/deployment-dependencies.md`. It is
+  optional and absent by default, and the agenda now says so explicitly
+  rather than rendering no medication table — which reads to a clinician as
+  "takes nothing", not "unknown".
+- `tests/test_criteria.py::test_the_most_recent_value_decides` is
+  **deliberately replaced**: it pinned the property ADR 0042 reverses.
+  CLAUDE.md rule 2 requires an ADR for exactly that, and the replacement
+  carries the measurement in its docstring.
+- 43 new tests, each negative-controlled.
+
 ## [0.27.0] — 2026-09-02
 
 *ADR 0038 — how a hypothesis ends. Three gaps in ADR 0035's retirement pass,

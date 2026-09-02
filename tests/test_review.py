@@ -28,7 +28,7 @@ from adoc.casefile.schema import (
     Provenance,
 )
 from adoc.config import ModelBinding
-from adoc.knowledge.lirical_divergence import LiricalComparison
+from adoc.knowledge.lirical_divergence import LiricalComparison, LiricalFinding
 from adoc.labs.db import LabsDb
 from adoc.labs.models import DocumentStatus, LabDocument, LabResult
 from adoc.reason.client import (
@@ -2147,3 +2147,237 @@ def test_an_engine_that_did_not_run_is_still_reported(repo: DataRepo, db: LabsDb
 
     report = (repo.root / "case" / "reviews" / "2026-08-23-review.md").read_text(encoding="utf-8")
     assert "did not run" in report, "the report is silent about an engine that never ran"
+
+
+def _lab_row(name: str, **kw: Any) -> LabResult:
+    return LabResult(
+        date=date(2026, 5, 2),
+        name=name,
+        name_raw=name,
+        source_doc="a" * 64,
+        raw_json=json.dumps({"name_raw": name}),
+        **kw,
+    )
+
+
+# --- ADR 0039: how a review reads ---------------------------------------------------------------
+
+
+def test_the_short_version_leads_the_report(repo: DataRepo, db: LabsDb) -> None:
+    """The last real review was 52,969 characters with no summary at any
+    point, for a reader with brain fog and fatigue."""
+    seeded = _seed_ledger(repo)
+    markdown = render_review_markdown(
+        review_date=date(2026, 9, 2),
+        trend_findings=[],
+        divergence_set=DivergenceSet(divergences=[]),
+        adjudication=AdjudicationResult(decisions=[]),
+        challenge_sweep=ChallengeSweepResult(notes=[]),
+        test_chooser=TestChooserResult(items=[]),
+        staleness=StalenessReport(),
+        deferred_verification=DeferredVerificationSweepResult(),
+        metrics=OpsMetrics(),
+        ledger_before=seeded,
+        ledger_after=seeded,
+    )
+
+    assert "## The short version" in markdown
+    assert markdown.index("## The short version") < markdown.index("## What changed this week")
+
+
+def test_the_short_version_is_derived_never_generated(repo: DataRepo, db: LabsDb) -> None:
+    """PAT-01 proposed an LLM node. This is plain code over artifacts earlier
+    nodes already produced, so the summary cannot disagree with the report
+    beneath it — and costs no fourth frontier call in a 17-minute review."""
+    from adoc.casefile.retirement import Retirement, RetirementReport
+    from adoc.reason.review import render_short_version
+
+    ledger = _seed_ledger(repo)
+    retired = RetirementReport(
+        retirements=[
+            Retirement(
+                hypothesis_id="x",
+                hypothesis_name="Something",
+                to_status="parked",
+                reason="nothing supports it",
+            )
+        ]
+    )
+
+    lines = render_short_version(
+        accepted_count=2,
+        retirements=retired,
+        trend_findings=[],
+        ledger_after=ledger,
+        test_chooser=TestChooserResult(
+            items=[TestChooserItem(panel="Complement C3/C4 panel", hypothesis_ids=[SLE_ID])]
+        ),
+    )
+    text = "\n".join(lines)
+
+    assert "2 lead(s) changed" in text
+    assert "1 stopped being tracked" in text
+    assert "Complement C3/C4 panel" in text
+
+
+def test_the_short_version_says_so_when_nothing_changed(repo: DataRepo, db: LabsDb) -> None:
+    """A quiet week must read as a quiet week, not as an empty section."""
+    from adoc.reason.review import render_short_version
+
+    text = "\n".join(
+        render_short_version(
+            accepted_count=0,
+            retirements=None,
+            trend_findings=[],
+            ledger_after=_seed_ledger(repo),
+            test_chooser=TestChooserResult(items=[]),
+        )
+    )
+
+    assert "nothing changed in the leads this week" in text
+    assert "nothing new to raise this week" in text
+
+
+def test_criteria_lead_with_meaning_and_tuck_the_arithmetic_away() -> None:
+    """`6 of 10 points` beside an `LR 12.4` and a `similarity 3.81` gives a
+    reader three numbers on three incommensurable scales, none of them a
+    probability and all of them reading like one. It also hides that `points`
+    is a floor."""
+    from adoc.knowledge.criteria import score_all
+    from adoc.reason.review import _render_criteria
+
+    scan = CriteriaScanResult(
+        results=score_all(
+            [
+                _lab_row("ANA", value_text="1:640"),
+                _lab_row("anti-dsDNA", value_text="Positive"),
+            ],
+            keys=["sle-2019"],
+        )
+    )
+
+    text = "\n".join(_render_criteria(scan))
+
+    assert "floor rather than an estimate" in text
+    assert "<details>" in text
+    # The arithmetic is collapsed, never removed.
+    assert "points**" in text
+    assert text.index("floor rather than an estimate") < text.index("<details>")
+
+
+def test_a_met_criteria_set_says_classification_is_not_diagnosis() -> None:
+    from adoc.knowledge.criteria import CriteriaResult, CriterionItem
+    from adoc.reason.review import _criteria_plain_sentence
+
+    met = CriteriaResult(
+        key="k",
+        name="n",
+        citation="c",
+        threshold=4,
+        points=6,
+        points_not_assessed=0,
+        meets_threshold=True,
+        items=[CriterionItem(domain="d", name="ANA", weight=6, state="met")],
+    )
+
+    sentence = _criteria_plain_sentence(met)
+
+    assert "not a diagnosis" in sentence
+
+
+def test_the_engine_scales_are_named_as_different_questions(repo: DataRepo, db: LabsDb) -> None:
+    """ADR 0036 forbids combining an LR with a similarity. A reader given two
+    bare numbers will combine them anyway."""
+    seeded = _seed_ledger(repo)
+    markdown = render_review_markdown(
+        review_date=date(2026, 9, 2),
+        trend_findings=[],
+        divergence_set=DivergenceSet(divergences=[]),
+        adjudication=AdjudicationResult(decisions=[]),
+        challenge_sweep=ChallengeSweepResult(notes=[]),
+        test_chooser=TestChooserResult(items=[]),
+        staleness=StalenessReport(),
+        deferred_verification=DeferredVerificationSweepResult(),
+        metrics=OpsMetrics(),
+        ledger_before=seeded,
+        ledger_after=seeded,
+        lirical=LiricalComparison(ran=True, findings=[], error="down this week"),
+        semsim=LiricalComparison(
+            ran=True,
+            findings=[
+                LiricalFinding(kind="engine_only", disease_name="Behcet", rank=1, composite_lr=3.8)
+            ],
+        ),
+    )
+
+    assert "not a percent chance" in markdown
+    assert "Higher means more overlap, not more likely" in markdown
+
+
+# --- ADR 0040: what the composer sounds like -----------------------------------------------------
+
+
+def _criteria_section() -> str:
+    from adoc.knowledge.criteria import SCORERS, score_all
+    from adoc.reason.review import _render_criteria
+
+    rows = [
+        _lab_row("ANA", value_text="1:640"),
+        _lab_row("anti-dsDNA", value_text="Positive"),
+        _lab_row("CRP", value=8.5),
+        _lab_row("Rheumatoid factor", value=42.0),
+    ]
+    scan = CriteriaScanResult(results=score_all(rows, keys=list(SCORERS)))
+    return "\n".join(_render_criteria(scan))
+
+
+def test_the_classification_disclaimer_is_said_once_not_once_per_set() -> None:
+    """Seven sets rendered the same 160 characters seven times — 17.7% of the
+    section, in the one position a reader has learned to skip. The property is
+    "said once": seven times must fail this as surely as never would."""
+    text = _criteria_section()
+
+    assert text.count("exist to define comparable groups for research") == 1
+    assert text.index("exist to define comparable groups") < text.index("###")
+
+
+def test_the_disclaimer_is_never_dropped_entirely() -> None:
+    """The other half of "said once". A renderer that stopped saying it would
+    pass the count test above only if the count were not also floored."""
+    text = _criteria_section()
+
+    assert "classification* criteria, not diagnostic criteria" in text
+    assert "meeting one is not a diagnosis" in text
+
+
+def test_every_set_still_marks_itself_as_classification_only() -> None:
+    """A reader jumping to one `###` from the table of contents would
+    otherwise see a point total with nothing qualifying it."""
+    from adoc.knowledge.criteria import SCORERS
+
+    text = _criteria_section()
+
+    assert text.count("not diagnostic._") == len(SCORERS)
+
+
+def test_each_criteria_set_shows_the_published_citation() -> None:
+    """`CriteriaResult.citation` exists "so a doctor can look it up" and was
+    rendered nowhere — 461 characters dead on the model."""
+    from adoc.knowledge.criteria import SCORERS, score_all
+
+    text = _criteria_section()
+    results = score_all([], keys=list(SCORERS))
+
+    assert results
+    for result in results:
+        assert result.citation in text, f"{result.key} citation missing from the report"
+
+
+def test_the_disclaimer_lives_on_the_model_not_only_in_the_renderer() -> None:
+    """ADR 0040 changes the renderer alone. Every other consumer of a
+    `CriteriaResult` — the web view, an eval, a future export — still gets
+    the disclaimer per result."""
+    from adoc.knowledge.criteria import SCORERS, score_all
+
+    for result in score_all([], keys=list(SCORERS)):
+        assert "not diagnostic criteria" in result.disclaimer

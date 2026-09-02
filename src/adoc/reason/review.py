@@ -71,6 +71,7 @@ from adoc.casefile.questions import (
     question_id,
     save_questions,
 )
+from adoc.casefile.regimen import REGIMEN_RELPATH, load_regimen
 from adoc.casefile.repo import HISTORY_RELPATH, LEDGER_RELPATH, DataRepo
 from adoc.casefile.retirement import (
     LabFact,
@@ -1254,6 +1255,95 @@ def compute_ops_metrics(
     )
 
 
+# How many leads and next-steps the short version names before it stops.
+# A summary that lists everything is the report again.
+SHORT_VERSION_LEADS = 3
+SHORT_VERSION_STEPS = 2
+
+
+def render_short_version(
+    *,
+    accepted_count: int,
+    retirements: RetirementReport | None,
+    trend_findings: list[TrendFinding],
+    ledger_after: Ledger,
+    test_chooser: TestChooserResult,
+) -> list[str]:
+    """Three bullets at the top of the review (ADR 0039). DERIVED, not generated.
+
+    Every line here restates something a later section already says, from the
+    same artifact that section renders. That is the property worth having: it
+    is a view, not a second opinion, and it cannot disagree with the report
+    beneath it.
+
+    PAT-01 proposed an LLM node for this. A fourth frontier call in a
+    17-minute review, able to contradict the sections it sits above, to
+    summarise numbers already computed — CLAUDE.md's rule that deterministic
+    logic is plain code covers exactly this.
+    """
+    changed: list[str] = []
+    if accepted_count:
+        changed.append(f"{accepted_count} lead(s) changed after an independent second read")
+    if retirements is not None and retirements.retirements:
+        changed.append(f"{len(retirements.retirements)} stopped being tracked")
+    if trend_findings:
+        changed.append(f"{len(trend_findings)} lab trend(s) worth a look")
+    what_changed = "; ".join(changed) if changed else "nothing changed in the leads this week"
+
+    leading = [
+        h
+        for h in _sorted_for_reading(ledger_after)
+        if h.status in ACTIVE_STATUSES
+        and (h.tier == "cant-miss" or h.probability in ("high", "moderate"))
+    ][:SHORT_VERSION_LEADS]
+    if leading:
+        looked_at = ", ".join(f"**{redact_gated_text(h.name)}**" for h in leading)
+    else:
+        looked_at = "no lead is currently rated likely enough to lead with"
+
+    steps = [i for i in test_chooser.items if (i.panel or i.text).strip()][:SHORT_VERSION_STEPS]
+    raise_first = (
+        "; ".join(redact_gated_text(i.panel or i.text).strip() for i in steps)
+        if steps
+        else "nothing new to raise this week"
+    )
+
+    return [
+        "## The short version",
+        "",
+        "_Three lines. Everything below says the same things at length._",
+        "",
+        f"- **What changed:** {what_changed}.",
+        f"- **What is being looked at now:** {looked_at}.",
+        f"- **What to raise first:** {raise_first}.",
+        "",
+    ]
+
+
+def _sorted_for_reading(ledger: Ledger) -> list[Hypothesis]:
+    """Tier then probability then name — mirrors `web.casefile_helpers.
+    sort_hypotheses`, duplicated for the same reason `_LIT_TIER_RANK` is."""
+    probability_rank = {"high": 0, "moderate": 1, "low": 2, "minimal": 3}
+    return sorted(
+        ledger.hypotheses,
+        key=lambda h: (
+            _LIT_TIER_RANK.get(h.tier, 99),
+            probability_rank.get(h.probability, 99),
+            h.name.lower(),
+        ),
+    )
+
+
+_CRITERIA_PREAMBLE = (
+    "**About every set below.** These are *classification* criteria, not "
+    "diagnostic criteria. They exist to define comparable groups for research, "
+    "and a person can have the condition without meeting them. Not meeting a "
+    "set is not a negative result, and meeting one is not a diagnosis — it "
+    "means this case would count in a study of that condition, which is a "
+    "different question from whether you have it."
+)
+
+
 def _render_criteria(scan: CriteriaScanResult) -> list[str]:
     """Itemised: every criterion, its weight, and what the record says.
 
@@ -1263,10 +1353,18 @@ def _render_criteria(scan: CriteriaScanResult) -> list[str]:
     waiting on an attribution judgement only they can make.
     """
     out: list[str] = []
+    if scan.results:
+        # ADR 0040: once, in prose, before the first set — not once per set.
+        # Rendered per set it was 7 identical lines, 1,120 characters,
+        # 23.6% of this section, in the one position a reader has learned
+        # to skip. `CriteriaResult.disclaimer` stays on the model: this is
+        # a renderer change, and every other consumer still gets it.
+        out.append(_CRITERIA_PREAMBLE)
+        out.append("")
     for result in scan.results:
         out.append(f"### {result.name}")
         out.append("")
-        out.append(f"_{result.disclaimer}_")
+        out.append(f"_Classification criteria ({result.citation}), not diagnostic._")
         out.append("")
         if result.entry_met is False:
             # Reported, not hidden: knowing a set was checked and ruled out is
@@ -1277,44 +1375,115 @@ def _render_criteria(scan: CriteriaScanResult) -> list[str]:
             out.append(result.entry_note)
             out.append("")
 
-        out.append(
-            f"**{result.points} of {result.threshold} points**"
-            + (
-                f", plus {result.points_possible} more if the possible items below are"
-                " attributed to this condition by a clinician"
-                if result.points_possible
-                else ""
-            )
-            + (
-                f". {result.points_not_assessed} points sit in items nothing on file can answer."
-                if result.points_not_assessed
-                else "."
-            )
-        )
+        # Meaning first (ADR 0039). `6 of 10 points` beside an `LR 12.4` and
+        # a `similarity 3.81` gives a reader three numbers on three
+        # incommensurable scales, none of them a probability and all of them
+        # reading like one. It also hides that `points` is a FLOOR.
+        out.append(_criteria_plain_sentence(result))
         out.append("")
 
         shown = [i for i in result.items if i.state in {"met", "possible", "not_met"}]
-        if shown:
-            out.append("| | Criterion | Points | Basis |")
-            out.append("|---|---|---|---|")
-            marks = {"met": "✓", "possible": "?", "not_met": "·"}
-            for item in shown:
-                basis = redact_gated_text(item.basis).replace("|", "\\|")
-                out.append(
-                    f"| {marks[item.state]} | {item.domain} — {item.name} "
-                    f"| {item.weight} | {basis} |"
-                )
-            out.append("")
         unanswered = [i for i in result.items if i.state == "not_assessed"]
-        if unanswered:
+        if shown or unanswered:
+            out.append("<details>")
+            out.append("<summary>The point-by-point scoring (for a clinician)</summary>")
+            out.append("")
             out.append(
-                f"_{len(unanswered)} further criteria could not be assessed from the "
-                "record: "
-                + ", ".join(i.name for i in unanswered[:8])
-                + ("…_" if len(unanswered) > 8 else "._")
+                f"**{result.points} of {result.threshold} points**"
+                + (
+                    f", plus {result.points_possible} more if the possible items below are"
+                    " attributed to this condition by a clinician"
+                    if result.points_possible
+                    else ""
+                )
+                + (
+                    f". {result.points_not_assessed} points sit in items nothing on file "
+                    "can answer."
+                    if result.points_not_assessed
+                    else "."
+                )
             )
             out.append("")
+            if shown:
+                out.append("| | Criterion | Points | Basis |")
+                out.append("|---|---|---|---|")
+                marks = {"met": "✓", "possible": "?", "not_met": "·"}
+                for item in shown:
+                    basis = redact_gated_text(item.basis).replace("|", "\\|")
+                    out.append(
+                        f"| {marks[item.state]} | {item.domain} — {item.name} "
+                        f"| {item.weight} | {basis} |"
+                    )
+                out.append("")
+            # ADR 0042: a criterion met by a historical value, whose latest
+            # draw no longer meets it. Rendered OUTSIDE the collapsed table
+            # because it is the pair of facts a reader most needs and the
+            # least likely to guess: positive then, normal now, and what was
+            # being taken at the time.
+            historical = [i for i in result.items if i.met_ever and i.superseded]
+            if historical:
+                out.append("**Met earlier, not on the most recent draw:**")
+                out.append("")
+                for item in historical:
+                    note = redact_gated_text(item.superseded)
+                    out.append(f"- _{item.name}_ — {note}")
+                out.append("")
+                out.append(
+                    "_These still count. Classification criteria are cumulative — the "
+                    "2019 EULAR/ACR set states they need not occur simultaneously — and a "
+                    "marker that normalises on treatment is an expected treatment effect, "
+                    "not evidence the finding never happened._"
+                )
+                out.append("")
+            if unanswered:
+                out.append(
+                    f"_{len(unanswered)} further criteria could not be assessed from the "
+                    "record: "
+                    + ", ".join(i.name for i in unanswered[:8])
+                    + ("…_" if len(unanswered) > 8 else "._")
+                )
+                out.append("")
+            out.append("</details>")
+            out.append("")
     return out
+
+
+def _criteria_plain_sentence(result: CriteriaResult) -> str:
+    """What this criteria set found, in words, before any arithmetic.
+
+    Says the two things the numbers alone do not: that `points` is a FLOOR
+    (what the record can prove, not an estimate), and that meeting a
+    classification set is not a diagnosis.
+    """
+    if not result.assessable:
+        return (
+            "Nothing on file can answer any part of this set yet, so it has not been "
+            "scored either way."
+        )
+    if result.meets_threshold:
+        return (
+            "On the records held here, this set's threshold is **met**. That is a "
+            "research classification, not a diagnosis — it says this case would count "
+            "in a study of the condition, which is a different question from whether "
+            "you have it."
+        )
+    short_by = max(result.threshold - result.points, 0)
+    sentence = (
+        f"On the records held here this set is **not met** — {short_by} point(s) short, "
+        "and that total is a floor rather than an estimate: it counts only what the "
+        "record can prove."
+    )
+    if result.points_possible:
+        sentence += (
+            f" A clinician attributing the uncertain items to this condition would add "
+            f"{result.points_possible}."
+        )
+    if result.points_not_assessed:
+        sentence += (
+            f" A further {result.points_not_assessed} point(s) sit in items nothing on "
+            "file can answer — usually an examination finding."
+        )
+    return sentence
 
 
 LITERATURE_RELPATH = "case/literature.yaml"
@@ -1493,6 +1662,17 @@ def render_review_markdown(
         lines.append(f"_Why this review ran: {redact_gated_text(trigger_summary)}_")
         lines.append("")
 
+    # ADR 0039: before anything else. The last real report was 52,969
+    # characters with no summary at any point, for a reader with brain fog
+    # and fatigue.
+    lines += render_short_version(
+        accepted_count=len(accepted),
+        retirements=retirements,
+        trend_findings=trend_findings,
+        ledger_after=ledger_after,
+        test_chooser=test_chooser,
+    )
+
     lines.append("## What changed this week")
     lines.append("")
     if not accepted:
@@ -1587,10 +1767,26 @@ def render_review_markdown(
     if lirical is not None and (lirical.findings or lirical.error):
         lines.append("## A second opinion from the phenotype engine")
         lines.append("")
+        # ADR 0039: name what kind of number an LR is. It is not a
+        # probability and not comparable with the similarity score below —
+        # ADR 0036 forbids combining them, and a reader given two bare
+        # numbers will combine them anyway.
+        lines.append(
+            "_The number below is a likelihood ratio: how much more expected your "
+            "findings are under that condition than not. It is not a percent chance, "
+            "and it is not comparable with the similarity score further down._"
+        )
+        lines.append("")
         lines += render_comparison(lirical)
 
     if semsim is not None and semsim.findings:
         lines.append("## A third opinion: phenotype similarity")
+        lines.append("")
+        lines.append(
+            "_A different question, on its own scale: how much of the information in "
+            "your findings is shared with each condition. Higher means more overlap, "
+            "not more likely._"
+        )
         lines.append("")
         lines += render_semsim_comparison(semsim)
 
@@ -1977,8 +2173,14 @@ def build_review_dag(
             for entry in phenotype.entries
         }
         rows = db.all_non_rejected_rows()
+        # ADR 0042: a criterion met historically whose latest draw is normal
+        # says which immunosuppressant was in force when that draw was
+        # taken. Absent `regimen.yaml` the note is simply omitted — it only
+        # ever adds context, never a scored point.
+        regimen_path = repo.root / Path(REGIMEN_RELPATH)
+        regimen = load_regimen(regimen_path) if regimen_path.exists() else None
         result = CriteriaScanResult(
-            results=score_all(rows, phenotype=lookup),
+            results=score_all(rows, phenotype=lookup, regimen=regimen),
             # ICAP rides along with the criteria scan rather than taking its
             # own node: both are pure code over the same rows, and a second
             # node would double the DAG bookkeeping for one function call.

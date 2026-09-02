@@ -72,6 +72,46 @@ class LabFlag(StrEnum):
     ABNORMAL = "A"
 
 
+_LOW_FLAGS = frozenset({LabFlag.LOW, LabFlag.CRITICAL_LOW})
+_HIGH_FLAGS = frozenset({LabFlag.HIGH, LabFlag.CRITICAL_HIGH})
+
+# Free-text spellings seen in extracted rows before normalisation to the
+# enum. Kept beside the enum so a reader sees both, and so the three call
+# sites that used to carry their own guessed sets cannot drift apart again.
+_LOW_WORDS = frozenset({"low", "l", "ll", "abnormal-low", "critical-low"})
+_HIGH_WORDS = frozenset({"high", "h", "hh", "abnormal-high", "critical-high"})
+
+
+def _flag_text(flag: object) -> str:
+    if not flag:
+        return ""
+    return str(getattr(flag, "value", flag)).strip().lower()
+
+
+def flag_is_low(flag: object) -> bool:
+    """Whether a lab flag means "below reference", INCLUDING critically low.
+
+    `LabFlag` has five members and the string sets that used to be written
+    out at each call site covered `L` but not `LL`: a critically low
+    complement — the most clinically significant value the analyte can carry
+    — did not register as low anywhere in the criteria scorers. `A`
+    (ABNORMAL) is deliberately neither low nor high: it records that a value
+    is out of range without saying which way, and guessing a direction from
+    it would invent a finding.
+    """
+    text = _flag_text(flag)
+    return text in _LOW_WORDS or text in {f.value.lower() for f in _LOW_FLAGS}
+
+
+def flag_is_high(flag: object) -> bool:
+    """Whether a lab flag means "above reference", INCLUDING critically high.
+
+    See `flag_is_low` — same fix, same reason, and `A` is likewise neither.
+    """
+    text = _flag_text(flag)
+    return text in _HIGH_WORDS or text in {f.value.lower() for f in _HIGH_FLAGS}
+
+
 class LabDocument(BaseModel):
     """One ingested source document, mirrors the `documents` table."""
 

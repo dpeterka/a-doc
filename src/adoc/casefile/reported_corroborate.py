@@ -22,7 +22,7 @@ from datetime import timedelta
 
 from adoc.casefile.reported import ReportedResult, ReportedResults
 from adoc.labs.db import LabsDb
-from adoc.labs.models import LabResult
+from adoc.labs.models import LabResult, flag_is_high, flag_is_low
 from adoc.labs.validate import canonicalize
 
 logger = logging.getLogger(__name__)
@@ -43,14 +43,14 @@ def _normalize(text: str) -> str:
 
 
 def _direction_of(row: LabResult) -> str:
-    flag = (getattr(row.flag, "value", row.flag) or "") if row.flag else ""
-    lowered = str(flag).lower()
-    if lowered in {"high", "h", "abnormal-high", "critical-high"}:
+    if flag_is_high(row.flag):
         return "high"
-    if lowered in {"low", "l", "abnormal-low", "critical-low"}:
+    if flag_is_low(row.flag):
         return "low"
-    if not lowered:
+    if not row.flag:
         return "normal"
+    # `A` (abnormal, direction unrecorded) lands here rather than being
+    # guessed into a direction — see `labs.models.flag_is_low`.
     return "unknown"
 
 
