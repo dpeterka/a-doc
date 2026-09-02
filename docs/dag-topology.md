@@ -39,29 +39,60 @@ flowchart TD
         BCP --> BPN[blind_panel_N<br/>▣ pre]
     end
 
-    BPN --> CL[current_ledger]
+    BP0 -.->|after| CL
+    BP1 -.->|after| CL
+    BPN -.->|after| CL
+    INIT --> CL[current_ledger]
     CL --> DD[divergence_diff]
     DD --> AD[adjudication<br/>▢ post]
-    AD --> CSW[challenge_sweep<br/>▢ post]
+    CL --> CSW[challenge_sweep<br/>▢ post]
+    AD -.->|after| CSW
     CSW --> ARD[(apply_review_diff<br/>▢ post<br/><b>writes ledger</b>)]
+    AD --> ARD
+    CL --> ARD
+    DD --> ARD
     ARD --> RP[(retirement_pass<br/><b>writes ledger</b>)]
-    RP --> TC[test_chooser]
-    TC --> LD[lirical_divergence]
-    LD --> SD[semsim_divergence]
-    SD --> EA[engine_adjudication<br/>▢ post]
+    ARD --> TC[test_chooser]
+    RP -.->|after| TC
+    INIT --> LD[lirical_divergence]
+    INIT --> SD[semsim_divergence]
+    RP -.->|after| LD
+    RP -.->|after| SD
+    TC -.->|after| LD
+    TC -.->|after| SD
+    LD --> EA[engine_adjudication<br/>▢ post]
+    SD --> EA
     EA --> AED[(apply_engine_diff<br/><b>writes ledger</b>)]
+    LD --> AED
+    SD --> AED
     AED --> LR[literature_refresh]
-    LR --> SS[staleness_scan]
-    SS --> DES[deferred_entailment_sweep]
-    DES --> OM[ops_metrics]
+    ARD --> SS[staleness_scan]
+    LR -.->|after| SS
+    RP -.->|after| SS
+    AED -.->|after| SS
+    INIT --> DES[deferred_entailment_sweep]
+    SS -.->|after| DES
+    ARD --> OM[ops_metrics]
+    DD --> OM
+    SS --> OM
+    DES -.->|after| OM
     OM --> RR[render_report]
-    CS -.->|via the results sink,<br/>not a graph edge| RR
+    TS --> RR
+    CS --> RR
+    CL --> RR
+    TC --> RR
+    DES --> RR
 
     style ARD fill:#f9e79f,stroke:#b7950b
     style RP fill:#f9e79f,stroke:#b7950b
     style AED fill:#f9e79f,stroke:#b7950b
-    style CS stroke-dasharray: 5 5
 ```
+
+Solid edges are **reads** (`depends_on`); dotted `after` edges are orderings
+with no data flow — mostly the ledger and its history file on disk. Two
+dotted clusters are also **parallel batches**: the panel members, and the two
+engines. `render_report`'s eleven incoming edges are not clutter; that is how
+many artifacts it reads, and only one of them used to be declared.
 
 The blind panel's preconditions (`forbid_context_key("ledger")` and
 `edge_payload_lacks_section("ledger")`) are the anchoring defence: no panel
@@ -70,19 +101,19 @@ member may see the differential it is meant to independently reproduce.
 Three nodes write the ledger, each applying its own diff so the invariants get
 to check it. Nothing gets a private back door.
 
-## What drawing this revealed
+## What drawing this revealed — and what was done about it
 
-Three structural problems that are hard to see in a 2,700-line builder and
-obvious in a diagram.
+Three structural problems, hard to see in a 2,700-line builder and obvious
+in a diagram. **All three are closed by [ADR 0043](adr/0043-the-declared-graph-is-the-real-graph.md).**
+Kept here because the measurements are the reason the ADR exists.
 
-### 1. `depends_on` is one edge, but nodes read many
+### 1. `depends_on` was one edge, but nodes read many — fixed
 
-A node declares a single upstream, and that edge is what gets validated
-against `input_model`. But `fn` receives the **whole context** and may read
-anything in it. So the declared graph understates the real dependencies —
-measured across the review DAG:
+A node declared a single upstream, and that edge was what got validated
+against `input_model`. But `fn` receives the whole context and may read
+anything in it, so the declared graph understated the real dependencies:
 
-| node | declares | actually reads |
+| node | declared | actually read |
 |---|---|---|
 | `apply_review_diff` | `challenge_sweep` | 4 nodes |
 | `render_report` | `ops_metrics` | 10 nodes |
@@ -91,49 +122,49 @@ measured across the review DAG:
 | `apply_engine_diff` | `engine_adjudication` | 3 nodes |
 | `staleness_scan` | `literature_refresh` | `apply_review_diff` only |
 
-Eight of the twenty nodes read something they do not declare. `staleness_scan`
-is the clearest case: it declares `literature_refresh` and does not read it at
-all — the edge exists purely to place the node in the sequence.
+Eight of twenty read something they did not declare.
 
-The consequence is not a runtime bug. It is that **the graph cannot be
-trusted as documentation of data flow**, and a reordering that looks safe
-against the declared edges can break an undeclared read.
+`depends_on` now takes a list and every entry is checked. A test parses this
+builder's own source with `ast` and asserts no node reads a context key it
+has not declared, so the table above cannot come back.
 
-### 2. Execution is sequential, so the parallelism in the graph is decorative
+### 2. Execution was sequential, so the branching was decorative — fixed
 
-`dag.run` iterates `dag.nodes` in list order. The N blind-panel members depend
-only on `blind_context_pack` and are genuinely independent — they are the one
-place the graph branches — and they still run one after another. With the three
-configured panel members at `xhigh` effort, that is three serial frontier
-calls at the front of every review.
+`dag.run` iterated `dag.nodes` in list order. The N blind-panel members
+depend only on `blind_context_pack` and are genuinely independent — three
+serial `xhigh` frontier calls at the front of every review. The two engines
+were the same story: LIRICAL at 76.9s, then sem-sim, neither reading the
+other.
 
-`trend_scan` and `criteria_scan` are likewise independent of everything until
-`render_report`.
+Order is now derived by topological sort, and `parallel_group` batches the
+panel and the engines. The derived order is verified **identical** to the
+order that shipped, which is what made deriving it safe: stage order is a
+safety property (CLAUDE.md rule 3), so the change had to be provably
+order-preserving before it could add anything.
 
-### 3. A chain of twenty where the dependencies are a much shallower graph
+### 3. A chain of twenty over a much shallower graph — fixed, with a correction
 
-`current_ledger` depends on the *last* blind-panel node. That is not a data
-dependency — it is a sequencing device, and which panel member it names
-depends on how many are configured. Similarly `test_chooser` → 
-`lirical_divergence` → `semsim_divergence` is a straight line between three
-stages that share no data at all; the engines only need the ledger on disk.
+`current_ledger` depended on the *last* blind-panel node, so the graph's
+shape depended on how many members `models.yaml` configures. It now declares
+`initial` and `after=(every panel member)`.
 
-The honest shape of the review is roughly: a fan of independent scans and
-panel members, a serial ledger-mutation spine (`divergence_diff` →
-`adjudication` → `challenge_sweep` → `apply` → `retirement` → engines →
-`apply_engine_diff`) that genuinely must be ordered because each step reads
-the ledger the previous one wrote, and a final reporting node that reads
-everything.
+**This document was wrong about the rest of it.** It called
+`test_chooser → lirical_divergence → semsim_divergence` and
+`literature_refresh → staleness_scan` "sequencing devices" between "stages
+that share no data at all", and proposed deleting them. They share no data
+and they are not deletable: `staleness_scan` reads
+`ledger-history.jsonl`, which `retirement_pass` and `apply_engine_diff`
+append to. Dropping the edge would have moved the scan earlier and silently
+changed what it reads.
 
-### What would fix it
+The orderings were real constraints expressed in the only vocabulary
+available. `after` is that vocabulary, and each use of it carries a comment
+naming the file that makes it real.
 
-Not urgent — the review is a weekly batch and correctness does not depend on
-it — but recorded so the next person does not have to rediscover it:
+### The honest shape
 
-- Let `depends_on` take a **list**, and validate every declared edge. The
-  single-edge design is what forces the false sequencing edges.
-- Derive execution order by topological sort rather than list position; then
-  independent nodes are visibly independent and the blind panel *could* be
-  parallelised without reordering anything by hand.
-- Make `criteria_scan` reach `render_report` through the graph rather than the
-  `results` sink, so it stops being invisible to it.
+A fan of independent scans and panel members; a serial ledger-mutation spine
+(`divergence_diff` → `adjudication` → `challenge_sweep` → `apply` →
+`retirement` → engines → `apply_engine_diff`) that genuinely must be ordered
+because each step reads what the previous one wrote; and a reporting node
+that reads everything. That is now what the declarations say.

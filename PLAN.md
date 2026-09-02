@@ -333,8 +333,12 @@ the patient:
   rendering an empty heading, but the underlying emptiness is unchanged.
 - PubMed returns 0 citations for the current differential; no `pmid:` ref
   exists anywhere in the ledger.
-- `depends_on` declares one edge while nodes read many, and execution is
-  sequential — see `docs/dag-topology.md`.
+- ~~`depends_on` declares one edge while nodes read many, and execution is
+  sequential~~ — **closed by ADR 0043**: `depends_on` takes a list, `after`
+  carries the filesystem-mediated orderings that were being smuggled through
+  fake read edges, order is derived by a stable topological sort (verified
+  identical to the order that shipped), and the blind panel and the two
+  engines run as parallel batches.
 
 ## Key risks
 
