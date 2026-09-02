@@ -323,10 +323,33 @@ the patient:
 
 *Known open issues carried into phase 4:*
 
-- An intermittent `tests/test_web_*` failure, roughly 1 run in 6 under load,
-  a different file each time and always "expected content missing from HTML".
-  Test order is not randomised, so it is state or timing. Did not reproduce
-  in 10 clean runs on an idle machine.
+- An intermittent `tests/test_web_*` failure, a different file each time and
+  always "expected content missing from HTML". Test order is not randomised,
+  so it is state or timing.
+
+  **Narrowed 2026-09-02 by a 2x2 over the two variables** (21 runs total):
+
+  | configuration | runs | failures |
+  |---|---|---|
+  | `test_web_*` alone, under CPU load | 12 | 0 |
+  | `test_web_*` alone, with coverage | 4 | 0 |
+  | full suite, no coverage | 3 | 0 |
+  | **full suite + coverage** | 3 | **1** |
+
+  Neither variable alone reproduced it in 19 runs; the combination did once
+  (`test_web_confirm.py::test_disagreement_row_shows_use_reading_a_and_b_buttons`).
+  Coverage adds roughly 20% wall-clock, so the leading hypothesis is a
+  timing sensitivity that only the slowest configuration exposes — not
+  cross-test state, which would have shown up in the no-coverage full run.
+
+  Two things ruled out: it is **not** the in-memory SQLite (`LabsDb` holds
+  one `check_same_thread=False` connection behind an `RLock`, so there is no
+  second empty `:memory:` database to race), and it is **not** parallelism
+  (no xdist; the suite is sequential).
+
+  Caveat on the reproduction: the working tree was being edited while those
+  runs executed, so the collected-test count drifted. Suggestive, not clean.
+  The next step is a 20-run loop in configuration C against a frozen tree.
 - ~~`rule_out` is empty on every active hypothesis~~ — ADR 0038 makes it
   evaluable (`rule_out_check`) and fixes `UpdateHypothesis.rule_out`, which
   was declared and silently dropped by `apply_diff`, so existing hypotheses
