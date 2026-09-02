@@ -14,6 +14,12 @@
          hypothesis it answers. #}
       <article class="card hypothesis-full" id="{{ h.id }}">
         <h3 class="hypothesis-name">{{ h.name }}</h3>
+        {# ADR 0045: the patient's real questions are about a specific lead,
+           and re-typing its name from memory is the friction. Pre-fills the
+           chat box; never sends — see `routes.chat.chat_page`. #}
+        <p class="lead-ask">
+          <a href="/chat?ask={{ ("Can you explain " ~ h.name ~ " in plain terms - what it is, and why it is on my list?") | urlencode }}">Ask about this lead</a>
+        </p>
         {% if h.plain_language %}
           {# The name alone is not communication. "Primary ovarian
              insufficiency / menopausal-range hypogonadism" is precise and

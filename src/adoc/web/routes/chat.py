@@ -214,9 +214,20 @@ _CHAT_HISTORY_TURNS = 100_000
 def chat_page(
     request: Request,
     page: int = 1,
+    ask: str = "",
     repo: DataRepo = Depends(get_repo),
     settings: Settings = Depends(get_settings),
 ) -> Response:
+    """The chat page. `ask` PRE-FILLS the composer and never sends (ADR 0045).
+
+    The "explain this" links on the review and the case file arrive here with
+    a question already written. They stop at pre-filling on purpose: a
+    diagnostic turn runs the whole DAG, `apply` commits the ledger diff
+    before the composer speaks, and the wait is minutes. A link that did all
+    that from one click would be a mutation disguised as navigation — and
+    the question is what decides the answer, so she should see it and be able
+    to change it.
+    """
     transcript = read_recent_chat(
         repo, max_files=_CHAT_HISTORY_FILES, max_turns=_CHAT_HISTORY_TURNS
     )
@@ -241,6 +252,10 @@ def chat_page(
             "transcript": newest_first[start : start + CHAT_PAGE_SIZE],
             "intake_incomplete": intake_incomplete,
             "max_message_chars": settings.max_message_chars,
+            # Truncated to the same limit `chat_send` enforces, so a seeded
+            # question can never arrive pre-rejected. A URL is user input
+            # like any other.
+            "seeded_ask": " ".join(ask.split())[: settings.max_message_chars],
             "page": page,
             "page_count": page_count,
             # Sending only makes sense against the live end of the
