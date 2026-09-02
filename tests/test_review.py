@@ -2523,3 +2523,70 @@ def test_the_blind_panel_and_the_engines_are_declared_parallel(repo: DataRepo, d
         "lirical_divergence",
         "semsim_divergence",
     }
+
+
+# --- ADR 0044: the engines are told about the labs -----------------------------------------------
+
+
+def test_the_engine_query_renders_what_the_labs_contributed() -> None:
+    """An invisible improvement is this repository's recurring failure mode.
+    The engines returned 66 of 66 neutral verdicts and a reader had no way to
+    tell whether that was disagreement or the wrong question."""
+    from adoc.knowledge.lab_phenotype import DerivedTerm, LabPhenotypeResult
+    from adoc.reason.review import render_engine_query
+
+    text = "\n".join(
+        render_engine_query(
+            LabPhenotypeResult(
+                terms=[
+                    DerivedTerm(
+                        term_id="HP:0003493",
+                        label="Antinuclear antibody positivity",
+                        source="labs:ana:2024-03-01",
+                        basis="ANA 1:640 on 2024-03-01",
+                    )
+                ],
+                rows_considered=40,
+            )
+        )
+    )
+
+    assert "1 finding(s) from your labs" in text
+    assert "Antinuclear antibody positivity" in text
+    assert "ANA 1:640 on 2024-03-01" in text
+
+
+def test_an_unavailable_phenotype_index_says_so_in_the_report() -> None:
+    """The index is a build artifact. Absence must not look like "your labs
+    said nothing"."""
+    from adoc.knowledge.lab_phenotype import LabPhenotypeResult
+    from adoc.reason.review import render_engine_query
+
+    text = "\n".join(render_engine_query(LabPhenotypeResult(index_available=False)))
+
+    assert "phenotype index is not available" in text
+
+
+def test_no_mappable_lab_finding_is_distinguished_from_no_labs() -> None:
+    from adoc.knowledge.lab_phenotype import LabPhenotypeResult
+    from adoc.reason.review import render_engine_query
+
+    text = "\n".join(render_engine_query(LabPhenotypeResult(rows_considered=40)))
+
+    assert "asked about symptoms alone" in text
+
+
+def test_a_vocabulary_gap_is_named_in_the_report() -> None:
+    """HPO has no anti-Smith term. Saying so beats a reader assuming the
+    engine considered it."""
+    from adoc.knowledge.lab_phenotype import LabPhenotypeResult
+    from adoc.reason.review import render_engine_query
+
+    text = "\n".join(
+        render_engine_query(
+            LabPhenotypeResult(unresolved=["Anti-Smith antibody positivity"], rows_considered=1)
+        )
+    )
+
+    assert "no term in the published phenotype ontology" in text
+    assert "Anti-Smith antibody positivity" in text

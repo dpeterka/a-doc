@@ -99,7 +99,9 @@ from adoc.casefile.schema import (
 )
 from adoc.config import reference_path
 from adoc.knowledge.criteria import CriteriaResult, score_all
+from adoc.knowledge.hpo import HpoIndex
 from adoc.knowledge.icap import IcapReport, render_icap, scan_ana_patterns
+from adoc.knowledge.lab_phenotype import LabPhenotypeResult, derive_lab_phenotype
 from adoc.knowledge.lirical import LiricalRequest
 from adoc.knowledge.lirical_divergence import (
     LiricalComparison,
@@ -1344,6 +1346,55 @@ _CRITERIA_PREAMBLE = (
 )
 
 
+def render_engine_query(derived: LabPhenotypeResult | None) -> list[str]:
+    """What the labs contributed to the engine's question (ADR 0044).
+
+    Rendered because the alternative is an invisible improvement. The
+    engines previously saw only text-matched symptoms, ranked rare
+    paediatric dysplasias, and returned 66 of 66 neutral verdicts; a reader
+    had no way to tell whether that was the engine disagreeing or the engine
+    being asked the wrong question.
+    """
+    if derived is None:
+        return []
+    out: list[str] = []
+    if not derived.index_available:
+        out += [
+            "_The phenotype index is not available, so no lab findings were added to the "
+            "engine's question this week._",
+            "",
+        ]
+        return out
+    if derived.terms:
+        out.append(
+            f"_The engine was also told about {len(derived.terms)} finding(s) from your "
+            "labs, not just your symptoms:_"
+        )
+        out.append("")
+        for term in derived.terms:
+            out.append(f"- **{term.label}** — {redact_gated_text(term.basis)}")
+        out.append("")
+    else:
+        out += [
+            "_No lab finding on file mapped to a phenotype term this week, so the engine "
+            "was asked about symptoms alone._",
+            "",
+        ]
+    if derived.dropped_over_limit:
+        out.append(
+            f"_{derived.dropped_over_limit} further lab-derived term(s) were left out to "
+            "keep the question focused._"
+        )
+        out.append("")
+    if derived.unresolved:
+        out.append(
+            "_These findings have no term in the published phenotype ontology, so the "
+            "engine could not be told about them: " + ", ".join(derived.unresolved) + "._"
+        )
+        out.append("")
+    return out
+
+
 def _render_criteria(scan: CriteriaScanResult) -> list[str]:
     """Itemised: every criterion, its weight, and what the record says.
 
@@ -1623,6 +1674,7 @@ def render_review_markdown(
     semsim: LiricalComparison | None = None,
     engine_adjudication: EngineAdjudicationResult | None = None,
     engine_notes: list[str] | None = None,
+    engine_query: LabPhenotypeResult | None = None,
     literature: LiteratureRefreshResult | None = None,
     trigger_summary: str = "",
 ) -> str:
@@ -1767,6 +1819,7 @@ def render_review_markdown(
     if lirical is not None and (lirical.findings or lirical.error):
         lines.append("## A second opinion from the phenotype engine")
         lines.append("")
+        lines += render_engine_query(engine_query)
         # ADR 0039: name what kind of number an LR is. It is not a
         # probability and not comparable with the similarity score below —
         # ADR 0036 forbids combining them, and a reader given two bare
@@ -2425,6 +2478,34 @@ def build_review_dag(
         results[name] = comparison
         return comparison
 
+    def _engine_query() -> tuple[list[str], list[str], LabPhenotypeResult]:
+        """`(observed, negated, derived)` HPO terms for a phenotype engine.
+
+        ADR 0044: the observed list is the human phenotype record PLUS terms
+        derived from the labs. Without the second half the engines saw
+        *arthralgia*, *fatigue* and *dry eyes* and never an ANA, which is
+        why `engine_adjudication` returned 66 of 66 neutral and changed
+        nothing after LIRICAL had run for 76.9 seconds.
+
+        Derived terms are added to the QUERY only — never written back to
+        `case/phenotype.yaml`, which stays the text-matched human record.
+        `select_for_engine`'s own docstring already draws that line: "the
+        full profile is the RECORD; this is the QUERY."
+        """
+        profile = load_phenotype(repo.root / Path(PHENOTYPE_RELPATH))
+        observed, negated = select_for_engine(profile, today=clock().date())
+        derived = derive_lab_phenotype(
+            db.all_non_rejected_rows(), index=HpoIndex.load(reference_path("hpo_index_path"))
+        )
+        # Human terms first: when a downstream limit bites, the record
+        # outranks an inference.
+        merged = list(observed)
+        for term_id in derived.term_ids:
+            if term_id not in merged:
+                merged.append(term_id)
+        results["engine_query"] = derived
+        return merged, negated, derived
+
     def _lirical_divergence_fn(ctx: Ctx) -> BaseModel:
         """Run the phenotype engine and compare it to the ledger.
 
@@ -2446,8 +2527,7 @@ def build_review_dag(
 
         ledger = load_ledger(ledger_path)
         try:
-            profile = load_phenotype(repo.root / Path(PHENOTYPE_RELPATH))
-            observed, negated = select_for_engine(profile, today=clock().date())
+            observed, negated, _derived = _engine_query()
             if not observed:
                 return _record_engine(
                     "lirical_divergence",
@@ -2511,8 +2591,7 @@ def build_review_dag(
                     LiricalComparison(ran=False, error="no similarity index in this image"),
                 )
 
-            profile = load_phenotype(repo.root / Path(PHENOTYPE_RELPATH))
-            observed, _ = select_for_engine(profile, today=clock().date())
+            observed, _negated, _derived = _engine_query()
             if not observed:
                 return _record_engine(
                     "semsim_divergence",
@@ -2803,6 +2882,11 @@ def build_review_dag(
             semsim=semsim_result,
             engine_adjudication=engine_result,
             engine_notes=list(engine_notes),
+            engine_query=(
+                raw_query
+                if isinstance(raw_query := results.get("engine_query"), LabPhenotypeResult)
+                else None
+            ),
             literature=literature_result,
         )
         relpath, tag_name = _review_relpath_and_tag(repo, review_date, now=clock())
