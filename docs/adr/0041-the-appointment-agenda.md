@@ -148,9 +148,18 @@ not in doubt.
 - A new route surface. It sits behind the same session auth as everything
   else, and a test pins that both paths redirect to `/login` unauthenticated.
 - The one-page bound is a **line-count** bound verified by test plus an
-  arithmetic derivation from the stylesheet. What is *not* verified is a
-  physically printed page. That is the honest residual: the first time
-  someone prints this, the numbers should be checked against paper.
+  arithmetic derivation from the stylesheet. **Measured against the real case
+  file on release day: 54 lines against the 57 budget, 6 of 32 abnormal
+  results shown, 3 leads, 7 regimen rows, 5 omitted notes, 0 gate failures.**
+  What is *not* verified is a physically printed page. That is the honest
+  residual: the first time someone prints this, the numbers should be checked
+  against paper.
+- **`asks` is empty on the real record.** No test-chooser items are supplied
+  on this path and no hypothesis carries a `rule_out_check` yet — ADR 0038
+  shipped the field and PLAN.md records that it is empty on all 46 leads until
+  a review or a human fills one in. The page says so rather than showing a
+  blank section, and the section becomes useful the first time a review
+  writes a rule-out.
 - `AGENDA_MAX_CLAIM_CHARS = 96` elides long evidence claims. A doctor
   scanning a page needs a scannable line and the full claim is in the case
   file, but it does mean the agenda is not a substitute for the report.

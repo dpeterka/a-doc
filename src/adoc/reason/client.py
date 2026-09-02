@@ -37,6 +37,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -646,6 +647,7 @@ class LlmClient:
         # caller opts out explicitly.
         self._scrubber = scrubber if scrubber is not None else Scrubber.noop()
         self._audit_log_path = audit_log_path
+        self._audit_lock = threading.Lock()
         self._max_retries = max_retries
         self._backoff_base_seconds = backoff_base_seconds
 
@@ -785,10 +787,21 @@ class LlmClient:
         ) from last_exc
 
     def _audit(self, record: _AuditRecord) -> None:
+        """Append one audit line.
+
+        Serialised across threads (ADR 0043). The blind panel and the two
+        phenotype engines now run as parallel DAG batches, so two calls can
+        reach this at once; an audit record is routinely longer than the
+        4096 bytes a write is atomic within, so two concurrent appends can
+        interleave and produce a line that parses as neither record. An
+        audit trail that silently loses a call is worse than a slow one, and
+        this lock costs a file write's worth of contention on three calls a
+        week.
+        """
         if self._audit_log_path is None:
             return
         self._audit_log_path.parent.mkdir(parents=True, exist_ok=True)
-        with self._audit_log_path.open("a", encoding="utf-8") as fh:
+        with self._audit_lock, self._audit_log_path.open("a", encoding="utf-8") as fh:
             fh.write(record.to_json_line() + "\n")
 
     def complete(

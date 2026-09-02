@@ -62,6 +62,7 @@ from adoc.intake.facts import IntakeFactsStore
 from adoc.labs.db import LabsDb
 from adoc.reason.client import LlmClient, LlmError, LlmResult
 from adoc.reason.dag import ContractViolation
+from adoc.reason.progress import TRACKER
 from adoc.reason.stages import PatientReply, route_turn, run_diagnostic_turn, run_informational_turn
 from adoc.web.casefile_helpers import append_chat_entry, last_chat_at, read_recent_chat
 from adoc.web.deps import get_client, get_db, get_repo, get_settings
@@ -214,9 +215,20 @@ _CHAT_HISTORY_TURNS = 100_000
 def chat_page(
     request: Request,
     page: int = 1,
+    ask: str = "",
     repo: DataRepo = Depends(get_repo),
     settings: Settings = Depends(get_settings),
 ) -> Response:
+    """The chat page. `ask` PRE-FILLS the composer and never sends (ADR 0045).
+
+    The "explain this" links on the review and the case file arrive here with
+    a question already written. They stop at pre-filling on purpose: a
+    diagnostic turn runs the whole DAG, `apply` commits the ledger diff
+    before the composer speaks, and the wait is minutes. A link that did all
+    that from one click would be a mutation disguised as navigation — and
+    the question is what decides the answer, so she should see it and be able
+    to change it.
+    """
     transcript = read_recent_chat(
         repo, max_files=_CHAT_HISTORY_FILES, max_turns=_CHAT_HISTORY_TURNS
     )
@@ -241,6 +253,10 @@ def chat_page(
             "transcript": newest_first[start : start + CHAT_PAGE_SIZE],
             "intake_incomplete": intake_incomplete,
             "max_message_chars": settings.max_message_chars,
+            # Truncated to the same limit `chat_send` enforces, so a seeded
+            # question can never arrive pre-rejected. A URL is user input
+            # like any other.
+            "seeded_ask": " ".join(ask.split())[: settings.max_message_chars],
             "page": page,
             "page_count": page_count,
             # Sending only makes sense against the live end of the
@@ -248,6 +264,23 @@ def chat_page(
             "is_latest_page": page == 1,
         },
     )
+
+
+@router.get("/progress")
+def chat_progress(request: Request) -> Response:
+    """The in-flight turn's stage, as an HTML fragment (ADR 0046).
+
+    Polled by the waiting page every two seconds while the composer is
+    disabled. Returns the honest "a few minutes" line plus which of the four
+    stages is running — `chat.html` already told her the wait was long; this
+    tells her it is moving.
+
+    Publishes stage LABELS only, never any part of the turn, so a poll can
+    carry no patient content even if the response were cached or logged.
+    """
+    progress = TRACKER.read()
+    html = templates.get_template("_chat_progress.html").render(request=request, progress=progress)
+    return HTMLResponse(html)
 
 
 @router.get("/transcript")

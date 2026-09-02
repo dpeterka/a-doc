@@ -20,6 +20,7 @@ import logging
 import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -69,12 +70,31 @@ class Contract:
 class Node:
     """One stage of a `Dag`.
 
-    `depends_on` names the single upstream context entry (a prior node's
-    name, or a key in the `initial` dict passed to `run`) that supplies this
-    node's input payload; it is validated against `input_model` before `fn`
-    runs. `fn` receives the *full* context (not just its own input) so a
-    stage can reference multiple upstream artifacts when it needs to, but
-    only `depends_on`'s entry is contract-checked as this node's edge.
+    Three separate things a node can declare about its place in the graph
+    (ADR 0043), because collapsing them into one string is what made the
+    declared graph disagree with the real one:
+
+    `depends_on` — the context entries this node **reads**. The FIRST is the
+    primary edge: it supplies the input payload validated against
+    `input_model` and handed to preconditions, which is the pre-ADR-0043
+    behaviour of the single string this used to be. The rest are declared
+    reads: they must exist in the context before `fn` runs, and they are
+    recorded in the audit trail. `fn` still receives the *whole* context —
+    see `forbid_context_key` for why that is deliberate and not an
+    oversight.
+
+    `after` — nodes this one must run **after** without reading anything
+    from them. Not a formality: `staleness_scan` reads
+    `ledger-history.jsonl`, which `retirement_pass` appends to, so the
+    ordering is real while the data dependency is not. Expressing that as a
+    fake `depends_on` was what made eight of the review's twenty nodes look
+    like they read things they never touch.
+
+    `parallel_group` — an opt-in label. Nodes sharing a group that become
+    ready at the same point run concurrently, all against ONE context
+    snapshot, so the group's outcome cannot depend on completion order. A
+    group member may not declare `after`, and every member must declare the
+    same reads; both are refused at construction.
     """
 
     def __init__(
@@ -84,46 +104,146 @@ class Node:
         *,
         input_model: type[BaseModel],
         output_model: type[BaseModel],
-        depends_on: str,
+        depends_on: str | Sequence[str],
+        after: Sequence[str] = (),
+        parallel_group: str | None = None,
         preconditions: Sequence[Contract] = (),
         postconditions: Sequence[Contract] = (),
     ) -> None:
+        declared = (depends_on,) if isinstance(depends_on, str) else tuple(depends_on)
+        if not declared:
+            raise ValueError(f"node {name!r} declares no dependency")
+        seen: set[str] = set()
+        for dep in declared:
+            if dep in seen:
+                raise ValueError(f"node {name!r} declares {dep!r} twice")
+            seen.add(dep)
         self.name = name
         self.fn = fn
         self.input_model = input_model
         self.output_model = output_model
-        self.depends_on = depends_on
+        self.depends_on: tuple[str, ...] = declared
+        self.after: tuple[str, ...] = tuple(after)
+        self.parallel_group = parallel_group
         self.preconditions = tuple(preconditions)
         self.postconditions = tuple(postconditions)
 
+    @property
+    def primary_dependency(self) -> str:
+        """The edge validated against `input_model` and passed to
+        preconditions. First-declared wins, so adding a declared read never
+        silently moves which payload a contract inspects."""
+        return self.depends_on[0]
+
+    @property
+    def prerequisites(self) -> tuple[str, ...]:
+        """Everything that must have run first — reads and orderings alike."""
+        return self.depends_on + self.after
+
 
 class Dag:
-    """An ordered, explicit list of `Node`s.
+    """An explicit graph of `Node`s, executed in a derived order.
 
-    Ordering is the execution order. A node whose `depends_on` names another
-    node in this `Dag` must come after it — that dependency is validated at
-    construction time. A `depends_on` that isn't any node's name is assumed
-    to be a key the caller will supply in `run`'s `initial` dict, and is
-    checked at run time instead.
+    Execution order comes from a **stable topological sort** (ADR 0043), not
+    from list position: prerequisites first, and among nodes that are equally
+    ready, declaration order decides. For a list that was already a valid
+    topological order — every `Dag` in this codebase — that reproduces the
+    previous order exactly, which is the property that made this change safe
+    to make at all. `execution_order` is pinned by a test for both real DAGs.
+
+    Deriving the order buys three things the list could not give:
+
+    - **Cycles are refused at construction** instead of deadlocking or
+      silently reading a stale entry.
+    - **Every declared prerequisite is checked**, not just the first, so a
+      node cannot claim a read it does not have.
+    - **Independent nodes are visibly independent**, which is what makes
+      `parallel_group` expressible without hand-reordering anything.
+
+    A prerequisite that is not any node's name is assumed to be a key the
+    caller supplies in `run`'s `initial` dict, and is checked at run time.
     """
 
     def __init__(self, nodes: Sequence[Node]) -> None:
-        all_names = {n.name for n in nodes}
         seen: set[str] = set()
         for node in nodes:
             if node.name in seen:
                 raise ValueError(f"duplicate node name {node.name!r}")
-            # If `depends_on` names another node in this dag, it must appear
-            # earlier in the sequence. If it isn't any node's name at all,
-            # it's assumed to be an `initial` key supplied to `run` — that
-            # can only be checked at run time.
-            if node.depends_on in all_names and node.depends_on not in seen:
-                raise ValueError(
-                    f"node {node.name!r} depends on {node.depends_on!r}, "
-                    "which has not run yet at that point in the sequence"
-                )
             seen.add(node.name)
         self.nodes: tuple[Node, ...] = tuple(nodes)
+        self._by_name = {n.name: n for n in nodes}
+        self._check_parallel_groups()
+        self.execution_order: tuple[Node, ...] = self._topological_order()
+
+    def _check_parallel_groups(self) -> None:
+        """Refuse a parallel group that cannot be run deterministically.
+
+        A group whose members declare different reads is not a group — the
+        members are at different depths and would not have been ready
+        together anyway. A member with an `after` edge is asserting an
+        ordering against something, and running it beside a sibling
+        discards that assertion. Both are construction-time errors rather
+        than a runtime surprise in the one part of the system where order is
+        a safety property (CLAUDE.md rule 3).
+        """
+        groups: dict[str, list[Node]] = {}
+        for node in self.nodes:
+            if node.parallel_group is not None:
+                groups.setdefault(node.parallel_group, []).append(node)
+        for label, members in groups.items():
+            # Most specific first, so the error names the actual mistake
+            # rather than the symptom it produces.
+            names = {m.name for m in members}
+            for member in members:
+                inside = names & set(member.prerequisites)
+                if inside:
+                    raise ValueError(
+                        f"parallel group {label!r}: {member.name!r} depends on "
+                        f"{sorted(inside)}, which is in the same group — that is a "
+                        "sequence, not a group"
+                    )
+            shapes = {(frozenset(m.depends_on), frozenset(m.after)) for m in members}
+            if len(shapes) > 1:
+                raise ValueError(
+                    f"parallel group {label!r} has members with different prerequisites "
+                    f"({sorted(sorted(reads | after) for reads, after in shapes)}); they "
+                    "would not become ready together, so running them together would "
+                    "discard an ordering one of them declared"
+                )
+
+    def _topological_order(self) -> tuple[Node, ...]:
+        """Topological order, taking the EARLIEST-DECLARED ready node each
+        step.
+
+        One node at a time, not a wave of all currently-ready nodes. That
+        distinction is the whole safety argument: taking waves emits
+        `A, C, B` for `[A, B(depends on A), C]`, reordering a list that was
+        already a valid topological order. Taking the first ready node
+        reproduces the declaration order exactly whenever the declaration
+        order is itself valid — at each step the earliest remaining node has
+        all its prerequisites among nodes already emitted, so it is ready and
+        is chosen.
+
+        Only prerequisites naming a node in THIS dag constrain the order;
+        anything else is an `initial` key, already present before the first
+        node runs.
+        """
+        pending = {n.name: {d for d in n.prerequisites if d in self._by_name} for n in self.nodes}
+        remaining = list(self.nodes)
+        done: set[str] = set()
+        ordered: list[Node] = []
+        while remaining:
+            nxt = next((n for n in remaining if pending[n.name] <= done), None)
+            if nxt is None:
+                stuck = sorted(n.name for n in remaining)
+                raise ValueError(
+                    "dag has a dependency cycle (or a prerequisite naming a node that "
+                    f"cannot run): {stuck}"
+                )
+            ordered.append(nxt)
+            done.add(nxt.name)
+            remaining.remove(nxt)
+        return tuple(ordered)
 
 
 def _validate_edge(payload: Any, model: type[BaseModel]) -> BaseModel:
@@ -170,6 +290,11 @@ class NodeRecord(BaseModel):
     output_hash: str
     preconditions_checked: list[str]
     postconditions_checked: list[str]
+    depends_on: list[str] = []
+    """Every context entry this node declared it reads (ADR 0043), not only
+    the primary edge — so a replay can see the graph the run actually had."""
+    after: list[str] = []
+    parallel_group: str | None = None
 
 
 class DagRun(BaseModel):
@@ -193,17 +318,126 @@ class DagRun(BaseModel):
             fh.write(self.model_dump_json() + "\n")
 
 
-def run(dag: Dag, initial: dict[str, BaseModel]) -> DagRun:
-    """Execute `dag` sequentially over `initial` context.
+def _batches(order: Sequence[Node]) -> list[list[Node]]:
+    """Split an execution order into units of work.
 
-    For each node: resolve and validate its edge payload against
-    `input_model`, evaluate preconditions, call `fn`, validate the result
-    against `output_model`, evaluate postconditions, then commit the output
-    into the context under the node's name. Any contract violation raises
+    A maximal *contiguous* run of nodes sharing a `parallel_group` becomes
+    one batch; everything else is a batch of one. Contiguity is the whole
+    rule: a group whose members are separated in the order by an unrelated
+    node runs as two batches, which is correct and merely less parallel. No
+    node is ever moved to make a batch bigger — that would be reordering the
+    graph to chase throughput, in the one system where order is a safety
+    property.
+    """
+    batches: list[list[Node]] = []
+    for node in order:
+        if (
+            node.parallel_group is not None
+            and batches
+            and batches[-1][-1].parallel_group == node.parallel_group
+        ):
+            batches[-1].append(node)
+        else:
+            batches.append([node])
+    return batches
+
+
+def _prepare(node: Node, ctx: Ctx, run_id: str) -> BaseModel:
+    """Resolve, validate and precondition-check one node's input.
+
+    Split out from `run` so a parallel batch's members are prepared against
+    exactly the same context object every sequential node is.
+    """
+    # `run` has already proved every prerequisite is satisfiable, and the
+    # topological order guarantees each has been committed by now — so
+    # within a `run` this cannot fire. It is the local invariant for a
+    # helper that takes someone else's `ctx`, and it is covered by its own
+    # test rather than left as a check nothing exercises.
+    for dep in node.prerequisites:
+        if dep not in ctx:
+            raise KeyError(
+                f"node {node.name!r} depends on {dep!r}, which is missing from the run context"
+            )
+    validated_input = _validate_edge(ctx[node.primary_dependency], node.input_model)
+    for contract in node.preconditions:
+        violation = contract.check(ctx, validated_input)
+        if violation is not None:
+            # The contract NAME is logged, never `violation` — a violation
+            # message can quote the offending span of a patient-facing
+            # reply (see `web.routes.chat`'s note on the same rule).
+            logger.warning(
+                "dag %s: node %r stopped by precondition %r", run_id[:8], node.name, contract.name
+            )
+            raise ContractViolation(node.name, contract.name, violation)
+    return validated_input
+
+
+def _finish(node: Node, ctx: Ctx, output: BaseModel, run_id: str, clock: float) -> BaseModel:
+    """Validate a node's output and run its postconditions."""
+    validated_output = _validate_edge(output, node.output_model)
+    for contract in node.postconditions:
+        violation = contract.check(ctx, validated_output)
+        if violation is not None:
+            logger.warning(
+                "dag %s: node %r stopped by postcondition %r after %.1fs",
+                run_id[:8],
+                node.name,
+                contract.name,
+                time.monotonic() - clock,
+            )
+            raise ContractViolation(node.name, contract.name, violation)
+    return validated_output
+
+
+ProgressHook = Callable[[str, int, int], None]
+"""`(node_name, step, total)`, called as each node STARTS (ADR 0046).
+
+Called before the node runs, not after, because the point is to say what is
+happening now. Exceptions from a hook are swallowed and logged: a status
+line must never be able to fail a reasoning run.
+"""
+
+
+def run(
+    dag: Dag, initial: dict[str, BaseModel], *, on_node_start: ProgressHook | None = None
+) -> DagRun:
+    """Execute `dag` in its derived topological order over `initial` context.
+
+    For each node: resolve and validate its primary edge against
+    `input_model`, check that every declared prerequisite is present,
+    evaluate preconditions, call `fn`, validate the result against
+    `output_model`, evaluate postconditions, then commit the output into the
+    context under the node's name. Any contract violation raises
     `ContractViolation` immediately — the run stops and nothing downstream
     executes.
+
+    A contiguous batch of nodes sharing a `parallel_group` runs concurrently
+    (ADR 0043). Every member is prepared and executed against **one context
+    snapshot** taken before the batch starts, and outputs are committed only
+    once the whole batch has finished, so a batch's result cannot depend on
+    which member completed first. Postconditions likewise see the snapshot,
+    not siblings' outputs. If any member raises, the others are allowed to
+    finish and the first exception in DECLARATION order is re-raised — so a
+    failing batch reports the same violation every time, rather than
+    whichever thread happened to lose the race.
     """
     ctx: dict[str, BaseModel] = dict(initial)
+
+    # Every prerequisite must be satisfiable before anything executes.
+    # Previously an unresolvable name surfaced as a `KeyError` from
+    # whichever node reached it first — after the nodes before it had
+    # already run, and in this DAG those nodes write the ledger and cost
+    # frontier calls. A typo should not cost a partial review (ADR 0043).
+    known = {n.name for n in dag.nodes} | set(ctx)
+    missing = {
+        f"{n.name} -> {dep}" for n in dag.nodes for dep in n.prerequisites if dep not in known
+    }
+    if missing:
+        raise KeyError(
+            "dag cannot run: prerequisite(s) name neither a node nor an initial key: "
+            + ", ".join(sorted(missing))
+        )
+
     node_records: list[NodeRecord] = []
     run_started = _now_iso()
     # Generated up front rather than at `DagRun` construction so every log
@@ -213,71 +447,90 @@ def run(dag: Dag, initial: dict[str, BaseModel]) -> DagRun:
     logger.info("dag %s: starting, %d node(s): %s", run_id[:8], total, [n.name for n in dag.nodes])
     run_clock = time.monotonic()
 
-    for index, node in enumerate(dag.nodes, start=1):
-        started = _now_iso()
-        node_clock = time.monotonic()
-        logger.info("dag %s: node %d/%d %r starting", run_id[:8], index, total, node.name)
+    index = 0
+    for batch in _batches(dag.execution_order):
+        # Batch isolation — no member may observe a sibling — rests on TWO
+        # independent mechanisms, and either one alone is sufficient:
+        # outputs are committed only after the batch (the commit loop
+        # below), and members read a snapshot rather than the live context.
+        # Measured: removing either alone breaks no test; removing both
+        # fails the isolation tests every time. Kept deliberately, because
+        # the one that survives a future refactor is not knowable now.
+        snapshot: Ctx = dict(ctx)
+        committed: list[tuple[Node, NodeRecord, BaseModel]] = []
 
-        if node.depends_on not in ctx:
-            raise KeyError(
-                f"node {node.name!r} depends on {node.depends_on!r}, "
-                "which is missing from the run context"
+        def _execute(node: Node, snapshot: Ctx = snapshot) -> tuple[NodeRecord, BaseModel]:
+            started = _now_iso()
+            node_clock = time.monotonic()
+            logger.info(
+                "dag %s: node %r starting%s",
+                run_id[:8],
+                node.name,
+                f" (parallel group {node.parallel_group!r})" if node.parallel_group else "",
             )
-        edge_payload = ctx[node.depends_on]
-        validated_input = _validate_edge(edge_payload, node.input_model)
-        input_hash = _hash_model(validated_input)
-
-        for contract in node.preconditions:
-            violation = contract.check(ctx, validated_input)
-            if violation is not None:
-                # The contract NAME is logged, never `violation` — a
-                # violation message can quote the offending span of a
-                # patient-facing reply (see `web.routes.chat`'s note on the
-                # same rule).
-                logger.warning(
-                    "dag %s: node %r stopped by precondition %r",
-                    run_id[:8],
-                    node.name,
-                    contract.name,
-                )
-                raise ContractViolation(node.name, contract.name, violation)
-
-        output = node.fn(ctx)
-        validated_output = _validate_edge(output, node.output_model)
-        output_hash = _hash_model(validated_output)
-
-        for contract in node.postconditions:
-            violation = contract.check(ctx, validated_output)
-            if violation is not None:
-                logger.warning(
-                    "dag %s: node %r stopped by postcondition %r after %.1fs",
-                    run_id[:8],
-                    node.name,
-                    contract.name,
-                    time.monotonic() - node_clock,
-                )
-                raise ContractViolation(node.name, contract.name, violation)
-
-        logger.info(
-            "dag %s: node %d/%d %r ok in %.1fs",
-            run_id[:8],
-            index,
-            total,
-            node.name,
-            time.monotonic() - node_clock,
-        )
-        ctx[node.name] = validated_output
-        node_records.append(
-            NodeRecord(
+            if on_node_start is not None:
+                try:
+                    on_node_start(node.name, len(node_records) + 1, total)
+                except Exception:  # noqa: BLE001 - a status line cannot fail a run
+                    logger.warning("dag %s: progress hook raised for %r", run_id[:8], node.name)
+            validated_input = _prepare(node, snapshot, run_id)
+            output = node.fn(snapshot)
+            validated_output = _finish(node, snapshot, output, run_id, node_clock)
+            logger.info(
+                "dag %s: node %r ok in %.1fs",
+                run_id[:8],
+                node.name,
+                time.monotonic() - node_clock,
+            )
+            record = NodeRecord(
                 name=node.name,
                 started_at=started,
                 finished_at=_now_iso(),
-                input_hash=input_hash,
-                output_hash=output_hash,
+                input_hash=_hash_model(validated_input),
+                output_hash=_hash_model(validated_output),
                 preconditions_checked=[c.name for c in node.preconditions],
                 postconditions_checked=[c.name for c in node.postconditions],
+                depends_on=list(node.depends_on),
+                after=list(node.after),
+                parallel_group=node.parallel_group,
             )
-        )
+            return record, validated_output
+
+        if len(batch) == 1:
+            record, value = _execute(batch[0])
+            committed.append((batch[0], record, value))
+        else:
+            logger.info(
+                "dag %s: running %d nodes concurrently in group %r",
+                run_id[:8],
+                len(batch),
+                batch[0].parallel_group,
+            )
+            results_by_name: dict[str, tuple[NodeRecord, BaseModel]] = {}
+            errors: dict[str, BaseException] = {}
+            with ThreadPoolExecutor(max_workers=len(batch)) as pool:
+                futures = {pool.submit(_execute, node): node for node in batch}
+                for future, node in futures.items():
+                    try:
+                        results_by_name[node.name] = future.result()
+                    except BaseException as exc:  # noqa: BLE001 - re-raised below
+                        errors[node.name] = exc
+            if errors:
+                # Declaration order, not completion order, so a failing
+                # batch reports the same violation on every run instead of
+                # whichever thread happened to lose the race.
+                first = next(n.name for n in batch if n.name in errors)
+                raise errors[first]
+            for node in batch:
+                record, value = results_by_name[node.name]
+                committed.append((node, record, value))
+
+        # Committed only once the whole batch has finished, so no member can
+        # see a sibling's output — not through `fn`, not through a contract.
+        for node, record, value in committed:
+            index += 1
+            ctx[node.name] = value
+            node_records.append(record)
 
     logger.info("dag %s: complete in %.1fs", run_id[:8], time.monotonic() - run_clock)
     return DagRun(

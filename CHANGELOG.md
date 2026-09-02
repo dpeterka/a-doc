@@ -5,6 +5,116 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.29.0] — 2026-09-02
+
+*ADRs 0043–0046 — the last four findings of the adversarial-review adoption
+track. Three of the four had a premise that did not survive checking, and
+each correction is recorded rather than quietly worked around.*
+
+### Added
+
+- **The phenotype engines can see the serology** (ADR 0044). LIRICAL and
+  sem-sim take HPO term ids and nothing else, and the terms reaching them
+  came only from `case/phenotype.yaml` — matched from narrative text. So
+  *arthralgia*, *fatigue* and *dry eyes* reached the engines and an ANA of
+  1:640 did not. Measured consequence: `engine_adjudication` returned
+  **66 of 66 neutral** verdicts and changed nothing, after LIRICAL had run
+  for 76.9 seconds.
+
+  New `knowledge/lab_phenotype.py`: 26 deterministic rules deriving HPO
+  terms from stored labs. HPO already had the vocabulary — nothing needed
+  inventing.
+
+  Every rule names a published **label**, resolved through the real index at
+  runtime, because a hardcoded id typed wrong is silently wrong forever.
+  That mechanism found the gaps rather than guessing them: searching all
+  19,119 terms showed **HPO has no anti-Smith antibody term at all**, so the
+  SLE criteria's `anti-dsDNA or anti-Sm` item contributes only its dsDNA
+  half. Recorded, not approximated with a neighbour.
+
+  Nothing is derived from a normal result: LIRICAL treats negated phenotypes
+  as evidence *against* a disease, and ADR 0042 established that a normal
+  draw is frequently a treatment effect.
+
+- **"Ask about this" links** on every review section and hypothesis card
+  (ADR 0045), pre-filling the chat composer.
+
+- **A stage ticker** for slow chat turns (ADR 0046) — `GET /chat/progress`,
+  polled every 2s while a turn runs, showing which of the four stages is
+  executing.
+
+- **`HpoIndex.term_id_for`** — an exact label lookup. `find_terms` cannot
+  resolve a known label: its word token must begin with a letter, so
+  `Anti-beta-2-Glycoprotein I IgG antibody positivity` tokenises **without
+  its `2`** and matches nothing.
+
+### Changed
+
+- **The declared DAG is now the real DAG** (ADR 0043). `depends_on` takes a
+  list and every entry is checked; a new `after` carries orderings that are
+  real but carry no data; execution order is derived by topological sort;
+  and the blind panel and the two phenotype engines run as parallel batches.
+
+  Eight of the review's twenty nodes read context they never declared. A
+  test now parses the builder's own source with `ast` and asserts nothing is
+  read undeclared.
+
+  The derived order is verified **identical, node for node**, to the order
+  that shipped. Stage order is a safety property (CLAUDE.md rule 3), so that
+  equality is the only basis on which it could be handed to a sort.
+
+- `criteria_scan` reaches `render_report` through the graph instead of the
+  `results` sink, where it was a node the report depends on with no edge
+  saying so.
+
+- `LlmClient._audit` serialises its appends. An audit record exceeds the
+  4096 bytes a write is atomic within, and the parallel batches above mean
+  two calls can now reach it at once.
+
+### Fixed
+
+- **A cycle in a DAG is refused at construction**, and an unsatisfiable
+  prerequisite fails before **any** node runs — previously a typo surfaced
+  as a `KeyError` from whichever node reached it first, after the ones that
+  write the ledger and cost frontier calls had already executed.
+
+### Corrected
+
+- **`docs/dag-topology.md` was wrong** and is fixed, diagram included. It
+  called the sequencing-only edges "decorative" and proposed deleting them.
+  `staleness_scan` reads `ledger-history.jsonl`, which `retirement_pass` and
+  `apply_engine_diff` append to — deleting the edge would have moved the
+  scan earlier and silently changed what it reads. The orderings were real
+  constraints in the only vocabulary available; `after` is that vocabulary.
+
+### Declined, with reasons recorded in the ADRs
+
+- **Typed per-node inputs instead of the shared context** (part of DEV-01).
+  `forbid_context_key` — the blind panel's anchoring defence — is a contract
+  over the *whole run context*. Narrowing what a node sees narrows what its
+  contracts can assert, and ADR 0002 designed it that way.
+- **Auto-sending the "explain this" excerpt** (PAT-05 as written). A
+  diagnostic turn commits its ledger diff before the composer speaks, so
+  that click would be a mutation disguised as navigation. It pre-fills
+  instead; a test pins that the click makes no model call.
+- **Server-Sent Events for progress** (PAT-06 as written), and replacing the
+  existing wait indicator. PAT-06 calls it "a static loading spinner"; it is
+  a labelled `aria-live` line saying the wait takes minutes, written in
+  response to this same complaint being made once already. The ticker is
+  additive and a test asserts the wording stays.
+
+### Notes
+
+- **ADR 0044 is unmeasured.** Whether lab-derived terms turn `66/66 neutral`
+  into anything is an empirical question. The number to check on the next
+  real review is the count of non-neutral engine verdicts, and it is in
+  PLAN.md's open issues. Shipping it and assuming it worked would repeat the
+  LIRICAL mistake exactly.
+- 56 new tests. 28 negative controls across the four ADRs, each verified to
+  actually break its test — several only after a methodology fix: rapid
+  write-run-restore cycles left stale `__pycache__` serving the previous
+  module, which made two real controls look vacuous.
+
 ## [0.28.0] — 2026-09-02
 
 *ADRs 0039–0042 — the rest of the adversarial-review adoption track. Four
@@ -87,10 +197,19 @@ them would ship a half-renamed tier.*
   facts, cites both draws, and names any immunosuppressant in force when the
   later draw was taken.
 
-  **Scores go up, and one set now classifies where it did not.** That is the
-  correction. ADR 0040's sentence frames it: meeting a set says this case
-  would count in a study of the condition, which is a different question from
-  whether you have it.
+  **Scores go up.** Measured in production on release day, over 2079 stored
+  rows and 7 sets: **4 criterion items are now met by a historical value the
+  latest draw does not meet**, where they previously read `not_met`. No set
+  crosses its threshold on this record either way — the "a set now
+  classifies" outcome is real on the test timeline and has not happened here.
+  ADR 0040's sentence frames the case where it does: meeting a set says this
+  case would count in a study of the condition, which is a different question
+  from whether you have it.
+
+  The regimen-suppression annotation is built and **unexercised** — none of
+  the 7 current regimen entries is an immunosuppressant active on a superseded
+  draw, which is the right answer for an untreated patient and means that half
+  of CLN-03 has never actually run.
 
 ### Fixed
 

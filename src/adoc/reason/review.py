@@ -99,7 +99,9 @@ from adoc.casefile.schema import (
 )
 from adoc.config import reference_path
 from adoc.knowledge.criteria import CriteriaResult, score_all
+from adoc.knowledge.hpo import HpoIndex
 from adoc.knowledge.icap import IcapReport, render_icap, scan_ana_patterns
+from adoc.knowledge.lab_phenotype import LabPhenotypeResult, derive_lab_phenotype
 from adoc.knowledge.lirical import LiricalRequest
 from adoc.knowledge.lirical_divergence import (
     LiricalComparison,
@@ -1344,6 +1346,55 @@ _CRITERIA_PREAMBLE = (
 )
 
 
+def render_engine_query(derived: LabPhenotypeResult | None) -> list[str]:
+    """What the labs contributed to the engine's question (ADR 0044).
+
+    Rendered because the alternative is an invisible improvement. The
+    engines previously saw only text-matched symptoms, ranked rare
+    paediatric dysplasias, and returned 66 of 66 neutral verdicts; a reader
+    had no way to tell whether that was the engine disagreeing or the engine
+    being asked the wrong question.
+    """
+    if derived is None:
+        return []
+    out: list[str] = []
+    if not derived.index_available:
+        out += [
+            "_The phenotype index is not available, so no lab findings were added to the "
+            "engine's question this week._",
+            "",
+        ]
+        return out
+    if derived.terms:
+        out.append(
+            f"_The engine was also told about {len(derived.terms)} finding(s) from your "
+            "labs, not just your symptoms:_"
+        )
+        out.append("")
+        for term in derived.terms:
+            out.append(f"- **{term.label}** — {redact_gated_text(term.basis)}")
+        out.append("")
+    else:
+        out += [
+            "_No lab finding on file mapped to a phenotype term this week, so the engine "
+            "was asked about symptoms alone._",
+            "",
+        ]
+    if derived.dropped_over_limit:
+        out.append(
+            f"_{derived.dropped_over_limit} further lab-derived term(s) were left out to "
+            "keep the question focused._"
+        )
+        out.append("")
+    if derived.unresolved:
+        out.append(
+            "_These findings have no term in the published phenotype ontology, so the "
+            "engine could not be told about them: " + ", ".join(derived.unresolved) + "._"
+        )
+        out.append("")
+    return out
+
+
 def _render_criteria(scan: CriteriaScanResult) -> list[str]:
     """Itemised: every criterion, its weight, and what the record says.
 
@@ -1623,6 +1674,7 @@ def render_review_markdown(
     semsim: LiricalComparison | None = None,
     engine_adjudication: EngineAdjudicationResult | None = None,
     engine_notes: list[str] | None = None,
+    engine_query: LabPhenotypeResult | None = None,
     literature: LiteratureRefreshResult | None = None,
     trigger_summary: str = "",
 ) -> str:
@@ -1767,6 +1819,7 @@ def render_review_markdown(
     if lirical is not None and (lirical.findings or lirical.error):
         lines.append("## A second opinion from the phenotype engine")
         lines.append("")
+        lines += render_engine_query(engine_query)
         # ADR 0039: name what kind of number an LR is. It is not a
         # probability and not comparable with the similarity score below —
         # ADR 0036 forbids combining them, and a reader given two bare
@@ -2425,6 +2478,34 @@ def build_review_dag(
         results[name] = comparison
         return comparison
 
+    def _engine_query() -> tuple[list[str], list[str], LabPhenotypeResult]:
+        """`(observed, negated, derived)` HPO terms for a phenotype engine.
+
+        ADR 0044: the observed list is the human phenotype record PLUS terms
+        derived from the labs. Without the second half the engines saw
+        *arthralgia*, *fatigue* and *dry eyes* and never an ANA, which is
+        why `engine_adjudication` returned 66 of 66 neutral and changed
+        nothing after LIRICAL had run for 76.9 seconds.
+
+        Derived terms are added to the QUERY only — never written back to
+        `case/phenotype.yaml`, which stays the text-matched human record.
+        `select_for_engine`'s own docstring already draws that line: "the
+        full profile is the RECORD; this is the QUERY."
+        """
+        profile = load_phenotype(repo.root / Path(PHENOTYPE_RELPATH))
+        observed, negated = select_for_engine(profile, today=clock().date())
+        derived = derive_lab_phenotype(
+            db.all_non_rejected_rows(), index=HpoIndex.load(reference_path("hpo_index_path"))
+        )
+        # Human terms first: when a downstream limit bites, the record
+        # outranks an inference.
+        merged = list(observed)
+        for term_id in derived.term_ids:
+            if term_id not in merged:
+                merged.append(term_id)
+        results["engine_query"] = derived
+        return merged, negated, derived
+
     def _lirical_divergence_fn(ctx: Ctx) -> BaseModel:
         """Run the phenotype engine and compare it to the ledger.
 
@@ -2446,8 +2527,7 @@ def build_review_dag(
 
         ledger = load_ledger(ledger_path)
         try:
-            profile = load_phenotype(repo.root / Path(PHENOTYPE_RELPATH))
-            observed, negated = select_for_engine(profile, today=clock().date())
+            observed, negated, _derived = _engine_query()
             if not observed:
                 return _record_engine(
                     "lirical_divergence",
@@ -2511,8 +2591,7 @@ def build_review_dag(
                     LiricalComparison(ran=False, error="no similarity index in this image"),
                 )
 
-            profile = load_phenotype(repo.root / Path(PHENOTYPE_RELPATH))
-            observed, _ = select_for_engine(profile, today=clock().date())
+            observed, _negated, _derived = _engine_query()
             if not observed:
                 return _record_engine(
                     "semsim_divergence",
@@ -2764,7 +2843,13 @@ def build_review_dag(
         assert isinstance(metrics, OpsMetrics)
         trend_scan = ctx["trend_scan"]
         assert isinstance(trend_scan, TrendScanResult)
-        criteria = results.get("criteria_scan")
+        # ADR 0043: through the graph, not the `results` sink. Reached via
+        # the sink, `criteria_scan` was invisible to the declared
+        # dependencies — a node whose output the report depends on, with no
+        # edge saying so, and nothing to stop a future reordering running
+        # the report first.
+        criteria = ctx["criteria_scan"]
+        assert isinstance(criteria, CriteriaScanResult)
 
         raw_lirical = results.get("lirical_divergence")
         lirical_result = raw_lirical if isinstance(raw_lirical, LiricalComparison) else None
@@ -2797,6 +2882,11 @@ def build_review_dag(
             semsim=semsim_result,
             engine_adjudication=engine_result,
             engine_notes=list(engine_notes),
+            engine_query=(
+                raw_query
+                if isinstance(raw_query := results.get("engine_query"), LabPhenotypeResult)
+                else None
+            ),
             literature=literature_result,
         )
         relpath, tag_name = _review_relpath_and_tag(repo, review_date, now=clock())
@@ -2842,7 +2932,6 @@ def build_review_dag(
             depends_on="initial",
         ),
     ]
-    prior_name = "trend_scan"
     for index in range(num_panel):
         node_name = f"blind_panel_{index}"
         nodes.append(
@@ -2852,21 +2941,31 @@ def build_review_dag(
                 input_model=ContextPack,
                 output_model=BlindDifferential,
                 depends_on="blind_context_pack",
+                # ADR 0043. The members share one input and write nothing
+                # in common; three xhigh frontier calls ran one after
+                # another purely because the runner iterated a list.
+                parallel_group="blind_panel",
                 preconditions=[
                     forbid_context_key("ledger"),
                     edge_payload_lacks_section("ledger"),
                 ],
             )
         )
-        prior_name = node_name
 
     nodes.append(
         Node(
             name="current_ledger",
             fn=_current_ledger_fn,
-            input_model=BlindDifferential,
+            input_model=Marker,
             output_model=Ledger,
-            depends_on=prior_name,
+            # Reads nothing from the context — it loads the ledger from
+            # disk. It declared the LAST panel member, which made the
+            # graph's shape depend on how many members are configured and
+            # claimed a read that never happens. What is real is the
+            # ordering: no panel member may run once the ledger is in
+            # context (ADR 0043).
+            depends_on="initial",
+            after=tuple(panel_node_names),
         )
     )
     nodes.append(
@@ -2892,9 +2991,10 @@ def build_review_dag(
         Node(
             name="challenge_sweep",
             fn=_challenge_sweep_fn,
-            input_model=AdjudicationResult,
+            input_model=Ledger,
             output_model=ChallengeSweepResult,
-            depends_on="adjudication",
+            depends_on="current_ledger",
+            after=("adjudication",),
             postconditions=[_challenge_sweep_completeness_contract()],
         )
     )
@@ -2904,7 +3004,12 @@ def build_review_dag(
             fn=_apply_review_diff_fn,
             input_model=ChallengeSweepResult,
             output_model=Ledger,
-            depends_on="challenge_sweep",
+            depends_on=(
+                "challenge_sweep",
+                "adjudication",
+                "current_ledger",
+                "divergence_diff",
+            ),
             postconditions=[_review_version_incremented_contract()],
         )
     )
@@ -2921,27 +3026,39 @@ def build_review_dag(
         Node(
             name="test_chooser",
             fn=_test_chooser_fn,
-            input_model=RetirementReport,
+            input_model=Ledger,
             output_model=TestChooserResult,
-            depends_on="retirement_pass",
+            depends_on="apply_review_diff",
+            # `retirement_pass` writes the ledger; choosing tests before it
+            # would pick tests for leads that are about to be parked.
+            after=("retirement_pass",),
         )
     )
     nodes.append(
         Node(
             name="lirical_divergence",
             fn=_lirical_divergence_fn,
-            input_model=TestChooserResult,
+            input_model=Marker,
             output_model=LiricalComparison,
-            depends_on="test_chooser",
+            # Both engines read the ledger from DISK and neither writes, so
+            # they are independent of each other and of `test_chooser` —
+            # which they declared only to be placed in the sequence. What
+            # is real is that they must follow the two nodes that write the
+            # ledger (ADR 0043).
+            depends_on="initial",
+            after=("retirement_pass", "test_chooser"),
+            parallel_group="engines",
         )
     )
     nodes.append(
         Node(
             name="semsim_divergence",
             fn=_semsim_divergence_fn,
-            input_model=LiricalComparison,
+            input_model=Marker,
             output_model=LiricalComparison,
-            depends_on="lirical_divergence",
+            depends_on="initial",
+            after=("retirement_pass", "test_chooser"),
+            parallel_group="engines",
         )
     )
     nodes.append(
@@ -2950,7 +3067,7 @@ def build_review_dag(
             fn=_engine_adjudication_fn,
             input_model=LiricalComparison,
             output_model=EngineAdjudicationResult,
-            depends_on="semsim_divergence",
+            depends_on=("semsim_divergence", "lirical_divergence"),
             postconditions=[_engine_adjudication_completeness_contract()],
         )
     )
@@ -2960,7 +3077,7 @@ def build_review_dag(
             fn=_apply_engine_diff_fn,
             input_model=EngineAdjudicationResult,
             output_model=Ledger,
-            depends_on="engine_adjudication",
+            depends_on=("engine_adjudication", "lirical_divergence", "semsim_divergence"),
         )
     )
     nodes.append(
@@ -2976,27 +3093,34 @@ def build_review_dag(
         Node(
             name="staleness_scan",
             fn=_staleness_scan_fn,
-            input_model=LiteratureRefreshResult,
+            input_model=Ledger,
             output_model=StalenessReport,
-            depends_on="literature_refresh",
+            # Reads `ledger-history.jsonl`, which `retirement_pass` and
+            # `apply_engine_diff` append to — a real ordering through the
+            # filesystem, with no data edge to carry it. `docs/dag-topology.
+            # md` called this edge decorative; it was not (ADR 0043).
+            depends_on="apply_review_diff",
+            after=("literature_refresh", "retirement_pass", "apply_engine_diff"),
         )
     )
     nodes.append(
         Node(
             name="deferred_entailment_sweep",
             fn=_deferred_entailment_sweep_fn,
-            input_model=StalenessReport,
+            input_model=Marker,
             output_model=DeferredVerificationSweepResult,
-            depends_on="staleness_scan",
+            depends_on="initial",
+            after=("staleness_scan",),
         )
     )
     nodes.append(
         Node(
             name="ops_metrics",
             fn=_ops_metrics_fn,
-            input_model=DeferredVerificationSweepResult,
+            input_model=Ledger,
             output_model=OpsMetrics,
-            depends_on="deferred_entailment_sweep",
+            depends_on=("apply_review_diff", "divergence_diff", "staleness_scan"),
+            after=("deferred_entailment_sweep",),
         )
     )
     nodes.append(
@@ -3005,7 +3129,19 @@ def build_review_dag(
             fn=_render_report_fn,
             input_model=OpsMetrics,
             output_model=ReviewReport,
-            depends_on="ops_metrics",
+            depends_on=(
+                "ops_metrics",
+                "trend_scan",
+                "criteria_scan",
+                "current_ledger",
+                "divergence_diff",
+                "adjudication",
+                "challenge_sweep",
+                "apply_review_diff",
+                "test_chooser",
+                "staleness_scan",
+                "deferred_entailment_sweep",
+            ),
         )
     )
 

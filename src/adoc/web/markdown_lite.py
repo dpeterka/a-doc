@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import html
 import re
+from urllib.parse import quote_plus
 
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
 _BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
@@ -91,8 +92,26 @@ def _inline(text: str) -> str:
     return out
 
 
-def render_markdown_lite(text: str) -> str:
-    """Render a small markdown subset to HTML. Input is escaped first."""
+ASK_PROMPT_TEMPLATE = 'Can you explain the "{section}" part of my review in plain terms?'
+"""What the section link seeds into the chat box (ADR 0045).
+
+Phrased as the patient's own question because that is what she will send. A
+"payload" written in the system's voice reads to the model as an instruction
+and to her as something she did not say."""
+
+ASK_SECTION_LABEL = "Ask about this"
+
+
+def render_markdown_lite(text: str, *, ask_sections: bool = False) -> str:
+    """Render a small markdown subset to HTML. Input is escaped first.
+
+    With `ask_sections`, every `##` heading gains a link that PRE-FILLS the
+    chat box with a question about that section (ADR 0045). It pre-fills and
+    does not send: a diagnostic turn runs the whole DAG, writes the ledger
+    before the composer ever speaks, and costs minutes — a single click must
+    not do that silently, and the question is the thing that decides the
+    answer, so she should see it first.
+    """
     escaped = html.escape(text, quote=False)
     lines = escaped.splitlines()
 
@@ -183,7 +202,15 @@ def render_markdown_lite(text: str) -> str:
             flush_paragraph()
             close_list()
             level = len(heading.group(1))
-            html_parts.append(f"<h{level}>{_inline(heading.group(2))}</h{level}>")
+            title = heading.group(2)
+            rendered = f"<h{level}>{_inline(title)}</h{level}>"
+            if ask_sections and level == 2:
+                # `title` is already HTML-escaped by the module-level
+                # `html.escape`; `quote_plus` handles the URL layer.
+                seeded = ASK_PROMPT_TEMPLATE.format(section=html.unescape(title).strip())
+                href = f"/chat?ask={quote_plus(seeded)}"
+                rendered += f'<p class="section-ask"><a href="{href}">{ASK_SECTION_LABEL}</a></p>'
+            html_parts.append(rendered)
             continue
 
         item = _LIST_ITEM_RE.match(stripped)

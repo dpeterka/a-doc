@@ -52,6 +52,7 @@ from adoc.reason.citations import (
 from adoc.reason.client import LlmClient, LlmResult, Message
 from adoc.reason.context import ContextPack, build_context
 from adoc.reason.dag import Contract, Ctx, Dag, Node, require_prior_node, run
+from adoc.reason.progress import TRACKER
 from adoc.reason.prompts import Prompt, load_prompt
 from adoc.reason.review_trigger import mark_review_wanted
 from adoc.reason.safety import GateResult, treatment_gate
@@ -1279,6 +1280,9 @@ def run_diagnostic_turn(
     sink: dict[str, BaseModel] = {}
     dag = build_diagnostic_dag(client, repo, ledger_path, db, sink)
 
+    # ADR 0046: the page waiting on this turn polls for the stage name. Only
+    # stage labels are published — never any part of the turn.
+    TRACKER.start(len(dag.nodes))
     try:
         run(
             dag,
@@ -1287,8 +1291,10 @@ def run_diagnostic_turn(
                 "patient_turn": PatientTurn(text=text),
                 "ledger": prior_ledger,
             },
+            on_node_start=lambda name, step, _total: TRACKER.note(name, step),
         )
     finally:
+        TRACKER.finish()
         # docs/adr/0019-event-triggered-review.md: gated on `sink["apply"]`
         # being populated, NOT on `run()` completing without error.
         # `apply`'s own preconditions (citation/entailment/abstention) can

@@ -43,8 +43,16 @@
        same number, because a maxlength attribute is a convenience and not a
        control. The counter is only shown as the limit approaches — a running
        tally on every message would nag. #}
+    {# ADR 0045: `seeded_ask` arrives from an "Ask about this" link. Rendered
+       as the textarea's CONTENT, so Jinja escapes it and it is visible and
+       editable before anything is sent. #}
     <textarea id="chat-text" name="text" rows="3" placeholder="Type a message..."
-              maxlength="{{ max_message_chars }}" required></textarea>
+              maxlength="{{ max_message_chars }}" required>{{ seeded_ask or "" }}</textarea>
+    {% if seeded_ask %}
+    <p class="seeded-note">
+      This question came from a link — edit it however you like, then press Send.
+    </p>
+    {% endif %}
     <p id="chat-remaining" class="chat-remaining" aria-live="polite" hidden></p>
     <div class="button-row">
       <button type="submit">Send</button>
@@ -57,6 +65,13 @@
         <span class="chat-pending-dot" aria-hidden="true"></span>
         Thinking. A question about your differential works through your whole case
         file and can take a few minutes — you can leave this page open.
+        {# ADR 0046: which minute. Polls only while this indicator is
+           showing, and renders nothing at all when no turn is running, so a
+           quiet page makes no requests it can see the results of. #}
+        <span id="chat-stage"
+              hx-get="/chat/progress"
+              hx-trigger="load, every 2s"
+              hx-swap="innerHTML"></span>
       </span>
     </div>
   </form>
