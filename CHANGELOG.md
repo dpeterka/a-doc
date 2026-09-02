@@ -5,6 +5,60 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.27.0] — 2026-09-02
+
+*ADR 0038 — how a hypothesis ends. Three gaps in ADR 0035's retirement pass,
+which are one mechanism, so they ship together.*
+
+### Added
+
+- **A rule-out can now be evaluated, not only recorded.** `rule_out` was
+  required at creation and never read again: 46 active hypotheses in
+  production, 0 rule-outs ever evaluated. `RuleOutCheck` gives it a
+  machine-checkable sibling — an analyte plus one of four operators
+  (`negative`, `normal`, `below`, `above`) — and the retirement pass answers
+  it against stored labs each review.
+
+  Cannot-tell is **not** met. An analyte nobody measured never ends a
+  hypothesis: absence of a test is the ordinary state of every differential.
+
+- **`strength="definitive-exclusion"` ends a hypothesis without summation.**
+  Clinical exclusion is not additive — a negative serum metanephrines
+  excludes pheochromocytoma however many non-specific symptoms point at it,
+  and `_outweighed`'s balance scale could not express that.
+
+  Which sources may assert it is restricted in code, never left to a prompt:
+  `labs:`, `doc:`, `encounter:` and `patient-report:` may; `pmid:` and
+  `engine:` may not. Literature knows nothing about this patient, and a
+  phenotype engine that never ranked something has not refuted it (ADR 0036).
+  A refused claim is reported in the review rather than dropped.
+
+- **`POST /ledger/hypotheses/{id}/retire`** — the first way a human can end a
+  lead. `/ledger` was a single GET route and `is_protected` blocks every
+  automatic rule, so a lead her doctor had definitively excluded stayed
+  "worth discussing now" indefinitely: 10 can't-miss leads, none ever
+  retired. Records reason and clinician, writes one `definitive-exclusion`
+  evidence item plus a status change, through `apply_ledger_diff`. Reversible.
+
+### Changed
+
+- **Retirement protection is narrowed, not removed.** `cant-miss` and
+  patient-origin hypotheses are still never retired by accumulated model
+  opinion. The two new rules run before the protection check because both
+  rest on something objective. Pheochromocytoma is a can't-miss lead *and*
+  the textbook case of a diagnosis one negative test excludes.
+
+- `ledger_maintainer` prompt v4 → v5: how to write a `rule_out_check`, and
+  what may not be marked a definitive exclusion.
+
+### Fixed
+
+- **`UpdateHypothesis.rule_out` was declared and never applied.**
+  `apply_diff` dropped it silently, so "settable after creation" (ADR 0035)
+  was true of the schema and false of the behaviour. Every hypothesis on the
+  ledger predates the field, so this was the only route by which any of them
+  could acquire one.
+
 ## [0.26.1] — 2026-09-01
 
 *Nine defects found by an adversarial code review of the codebase. Each was
