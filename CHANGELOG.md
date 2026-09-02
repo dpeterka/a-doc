@@ -5,6 +5,40 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.29.1] — 2026-09-02
+
+*Hotfix. A model-facing instruction was reaching the patient.*
+
+### Fixed
+
+- **A withheld informational answer showed the patient an instruction
+  addressed to a model.** `_GATE_BLOCKED_MESSAGE` interpolated
+  `GateResult.rewrite_instruction` — *"Rewrite this response to remove any
+  specific drug name, dose, or instruction to start/stop/increase/decrease/
+  taper a medication or supplement"* — directly into her transcript, in the
+  middle of a conversation about her ears, with no way to tell what it meant
+  or what to do about it.
+
+  ADR 0040 asserted that string "is an instruction to the *model*, never
+  shown to anyone". That was checked against `reason/stages.py`, where it is
+  true, and not against `reason/tools.py`, where it was not.
+
+  The replacement says three things she can act on: what was withheld, what
+  usually works instead (ask again without the dose, or take it to the
+  doctor as one of the review's questions), and that nothing was lost. The
+  offending spans and the rewrite instruction stay model-facing — fed back
+  into the rewrite loop and now logged by reason, never rendered.
+
+### Not changed
+
+The gate itself. The blocked answer was genuinely blocked; only the message
+about it was wrong. Relaxing the informational path to the `recording_only`
+scribe mode was measured and **rejected for now**: two red-team strings —
+`"Take 5 mL twice daily."` and `"The recommended dose is 5 mL twice daily."`
+— pass `recording_only`, because the imperative rule needs a drug-like token
+and neither names a drug. Closing that hole is a prerequisite, not a
+follow-on.
+
 ## [0.29.0] — 2026-09-02
 
 *ADRs 0043–0046 — the last four findings of the adversarial-review adoption

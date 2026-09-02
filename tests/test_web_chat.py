@@ -345,7 +345,10 @@ def test_informational_dosing_reply_is_withheld_not_shown(tmp_path: Path) -> Non
 
     assert response.status_code == 200
     assert "20 mg prednisone" not in response.text
-    assert "withholding" in response.text.lower()
+    # Wording changed in 0.29.1; the property is that the reply identifies
+    # itself as withheld and carries no model-facing instruction.
+    assert "holding it back" in response.text.lower()
+    assert "Rewrite this response" not in response.text
 
 
 _ACTIVE_NO_CANT_MISS_OP = {
