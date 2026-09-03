@@ -53,11 +53,13 @@ from adoc.backup import (
     run_backup,
 )
 from adoc.casefile.encounter_text import sync_encounter_text
+from adoc.casefile.ledger import apply_and_save, load_ledger
 from adoc.casefile.phenotype import PHENOTYPE_RELPATH, load_phenotype, save_phenotype
 from adoc.casefile.phenotype_backfill import backfill_phenotype
 from adoc.casefile.regimen import REGIMEN_RELPATH, load_regimen, save_regimen
 from adoc.casefile.regimen_backfill import backfill_from_encounters
-from adoc.casefile.repo import LEDGER_RELPATH, DataRepo
+from adoc.casefile.repo import HISTORY_RELPATH, LEDGER_RELPATH, DataRepo
+from adoc.casefile.rule_out_backfill import backfill_diff, needs_rule_out, propose_rule_outs
 from adoc.config import Settings, load_model_bindings
 from adoc.evals.report import write_comparison_report, write_report
 from adoc.evals.runner import known_suites, run_suite
@@ -991,6 +993,96 @@ def _cmd_regimen_backfill(_args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_rule_out_backfill(args: argparse.Namespace) -> int:
+    """Give the leads already on the board a way to end (ADR 0047).
+
+    ADR 0035 required every new hypothesis to state what would rule it out;
+    the review path never enforced it, and 43 of the ledger's 46 active
+    hypotheses were created there. The retirement pass has been evaluating a
+    field nothing writes.
+
+    `--dry-run` proposes without writing, which is the honest default for a
+    first look at what a model wants to put on the record.
+    """
+    try:
+        settings = Settings()
+    except Exception as exc:  # noqa: BLE001 - surface any config error to the user
+        print(f"rule-out-backfill: configuration error: {exc}", file=sys.stderr)
+        return 1
+
+    repo = DataRepo(settings.data_dir)
+    if not repo.is_initialized:
+        print(
+            f"rule-out-backfill: data repo not initialized at {settings.data_dir} "
+            "- run `adoc init` first",
+            file=sys.stderr,
+        )
+        return 1
+
+    ledger_path = repo.root / LEDGER_RELPATH
+    ledger = load_ledger(ledger_path)
+    targets = needs_rule_out(ledger)
+    if not targets:
+        # Said out loud: "0 written" with exit 0 is indistinguishable from a
+        # working run that had nothing to do.
+        print("rule-out-backfill: every active lead already states how it ends - nothing to do")
+        return 0
+
+    print(f"rule-out-backfill: {len(targets)} active lead(s) with no way to end")
+    client = _build_llm_client(settings)
+    # The analytes actually on file, so a proposed check can be evaluated
+    # rather than naming a textbook analyte nobody has measured.
+    with LabsDb(settings.data_dir / "labs.sqlite", journal_mode=settings.sqlite_journal_mode) as db:
+        analytes = sorted({row.name for row in db.all_non_rejected_rows()})
+    ops, report = propose_rule_outs(client, ledger, analytes=analytes)
+
+    print(f"rule-out-backfill: {len(analytes)} analyte(s) on file")
+    print(f"rule-out-backfill: proposed {report.proposed} ", end="")
+    print(f"({report.checkable} machine-checkable), ", end="")
+    print(f"declined {report.declined}, vacuous {report.unusable}", end="")
+    if report.unknown_analytes:
+        print(f", {len(report.unknown_analytes)} unevaluable analyte(s)", end="")
+    if report.unknown_ids:
+        print(f", {len(report.unknown_ids)} unknown id(s)", end="")
+    print()
+
+    if args.dry_run:
+        for op in ops:
+            check = op.rule_out_check
+            if check is None:
+                mark = "prose only - cannot retire on its own"
+            else:
+                bound = ""
+                if check.threshold is not None:
+                    bound = f" {check.threshold:g}"
+                    if check.unit:
+                        bound += f" {check.unit}"
+                mark = f"{check.analyte} {check.operator}{bound}"
+            print(f"  {op.id}: {op.rule_out}")
+            print(f"      [{mark}]")
+        print("rule-out-backfill: dry run - nothing written")
+        return 0
+
+    if not ops:
+        print("rule-out-backfill: nothing usable to write")
+        return 0
+
+    diff = backfill_diff(ops, model_id="challenger")
+    apply_and_save(ledger_path, repo.root / HISTORY_RELPATH, diff)
+    repo.commit(
+        f"casefile: backfilled {len(ops)} rule-out(s) (ADR 0047)",
+        paths=["case"],
+    )
+    after = load_ledger(ledger_path)
+    remaining = len(needs_rule_out(after))
+    checkable = sum(1 for h in after.hypotheses if h.rule_out_check is not None)
+    print(f"rule-out-backfill: wrote {len(ops)}; {remaining} lead(s) still have no way to end")
+    # The number that decides whether anything can ever retire: prose alone
+    # satisfies ADR 0035 and `retirement._rule_out_met` never reads it.
+    print(f"rule-out-backfill: {checkable} lead(s) now machine-checkable by the retirement pass")
+    return 0
+
+
 def _cmd_review(args: argparse.Namespace) -> int:
     """The entry point both the frequent scheduled tick
     (`deploy/cfn/ecs.yaml`'s `ReviewRule`) and a human at a terminal call —
@@ -1195,6 +1287,20 @@ def build_parser() -> argparse.ArgumentParser:
         "regimen-backfill",
         help=("seed case/regimen.yaml from regimen encounters on disk (no LLM calls; idempotent)"),
     ).set_defaults(func=_cmd_regimen_backfill)
+    rule_out_parser = subparsers.add_parser(
+        "rule-out-backfill",
+        help=(
+            "give active leads that state no way to end one (ADR 0047) — the review "
+            "path created them before it enforced ADR 0035, so the retirement pass "
+            "has nothing to evaluate"
+        ),
+    )
+    rule_out_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="propose without writing — print what would be recorded and stop",
+    )
+    rule_out_parser.set_defaults(func=_cmd_rule_out_backfill)
     subparsers.add_parser(
         "backfill-doc-text",
         help=(

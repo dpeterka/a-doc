@@ -81,6 +81,7 @@ from adoc.casefile.retirement import (
     render_retirements,
     retirements_to_diff,
 )
+from adoc.casefile.rule_out import strip_ops_missing_rule_out
 from adoc.casefile.schema import (
     AddEvidence,
     AddHypothesis,
@@ -473,6 +474,15 @@ class DivergenceDecisionPayload(BaseModel):
     divergence: str
     decision: Literal["accept", "reject"]
     rationale: str
+    rule_out: str = ""
+    """What single result would take this lead off the board (ADR 0047).
+
+    Required in practice for an accepted `panel_only`, but defaulted rather
+    than required by the schema: ADR 0028 — no single field of one item may
+    fail a whole payload. An accepted divergence that arrives without one is
+    DROPPED by `strip_ops_missing_rule_out`, loudly, which is ADR 0016's
+    strip-don't-reject rule and the same handling the diagnostic chat path
+    has always applied."""
 
 
 logger = logging.getLogger(__name__)
@@ -932,6 +942,7 @@ def build_review_ledger_diff(
                         status="active",
                         origin="challenger",
                         first_proposed=today,
+                        rule_out=decision.rule_out.strip(),
                         evidence_for=(
                             _resolvable_evidence(divergence, db, repo)
                             if db is not None and repo is not None
@@ -1015,6 +1026,31 @@ def build_review_ledger_diff(
         dag_node="apply_review_diff",
         timestamp=datetime.now(UTC),
     )
+    # ADR 0047: the same enforcement the diagnostic chat path has applied
+    # since ADR 0035 — and which this path never did. 43 of the ledger's 46
+    # active hypotheses were created here, and every one of them has an empty
+    # `rule_out`, so nothing in the retirement pass could ever evaluate them.
+    # An evaluator with no writer is not a feature.
+    #
+    # Strip rather than reject, for ADR 0016/0028's reasons: one missing
+    # field must never discard a whole adjudication. Dropping the lead is a
+    # real cost and the right one — a hypothesis nobody will state a
+    # falsification condition for is exactly what fills a board that only
+    # ever grows.
+    ops, dropped_no_rule_out = strip_ops_missing_rule_out(ops)
+    for hypothesis_id, name in dropped_no_rule_out:
+        logger.warning(
+            "review: dropped add_hypothesis %r (%s): no usable rule_out (ADR 0035/0047)",
+            hypothesis_id,
+            name,
+        )
+    if dropped_no_rule_out:
+        rationale = (
+            f"{rationale}\n\n{len(dropped_no_rule_out)} accepted lead(s) were not added: "
+            "the adjudicator gave no result that would rule them out, and a lead with no "
+            "stated way to end does not go on the board (ADR 0047)."
+        )
+
     return LedgerDiff(provenance=provenance, rationale=rationale, ops=ops)
 
 

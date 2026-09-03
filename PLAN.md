@@ -264,15 +264,16 @@ contract:
 
 | ADR | Theme | Findings it closes | Status |
 |---|---|---|---|
-| 0038 | How a hypothesis ends | CLN-05, CLN-01, PAT-03 | shipped (v0.27.0) |
+| 0038 | How a hypothesis ends | CLN-05, PAT-03 (**not** CLN-01 — see 0047) | shipped (v0.27.0) |
 | 0039 | How a review reads | PAT-01, PAT-02, PAT-04 | shipped (v0.28.0) |
 | 0040 | What the composer sounds like | PAT-08 | shipped (v0.28.0) |
 | 0041 | The appointment agenda | PAT-07 | shipped (v0.28.0) |
 | 0042 | Criteria read the whole record | CLN-03 | shipped (v0.28.0) |
-| 0043 | The declared graph is the real graph | DEV-01 | merged to develop |
-| 0044 | The engines can see the serology | CLN-02 | in review (#300) |
-| 0045 | Ask about this | PAT-05 | this branch |
-| 0046 | Which minute | PAT-06 | this branch |
+| 0043 | The declared graph is the real graph | DEV-01 | shipped (v0.29.0) |
+| 0044 | The engines can see the serology | CLN-02 | shipped (v0.29.0) |
+| 0045 | Ask about this | PAT-05 | shipped (v0.29.0) |
+| 0046 | Which minute | PAT-06 | shipped (v0.29.0) |
+| 0047 | A lead states how it ends | CLN-01 (reopened) | this branch |
 
 Three findings were rejected on review rather than adopted, and the ADRs say
 why: PAT-01's proposed `patient_summary` LLM node (a fourth frontier call
@@ -282,7 +283,13 @@ PAT-08's "Your Case Co-Pilot" persona (PLAN.md risk 3 — a co-pilot claims
 shared authority over a decision this system must never appear to share;
 ADR 0040).
 
-**The track is complete with 0046** — every finding in the review is now
+**CLN-01 is reopened.** ADR 0038 was recorded as closing it; measured on
+2026-09-02 the case file holds 46 active leads, **none ever retired**, and
+**0 of 54 state what would rule them out** — the review path never enforced
+ADR 0035's requirement and ADR 0038 shipped an evaluator with no writer.
+ADR 0047 closes the writer.
+
+**The rest of the track is complete with 0046** — every finding in the review is now
 either shipped, declined with a recorded reason, or measured as already
 done. Two of the five ADRs found a bug the review
 did not mention: 0040 found `CriteriaResult.citation` rendered nowhere, and
