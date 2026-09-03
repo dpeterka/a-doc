@@ -67,7 +67,32 @@ The field is defaulted rather than required on the payload, deliberately: a
 `Literal`-style hard requirement would fail the whole adjudication over one
 item, which is the v0.21.0 defect ADR 0028 exists to prevent.
 
-### 2. The 46 already there get one too
+### 2. Both halves, or the exercise is decorative
+
+`retirement._rule_out_met` returns immediately unless `rule_out_check` is
+set. **It never reads the prose.** A backfill writing only `rule_out` would
+satisfy ADR 0035's requirement and retire nothing — the same
+evaluator-with-no-writer shape it was written to fix, one level down.
+
+So the backfill proposes both: the prose a patient reads, and the
+`RuleOutCheck` a deterministic evaluator can answer. The second is
+**refused rather than approximated** when it cannot be made evaluable:
+
+- The analyte must appear in the labs actually on file. The prompt is given
+  that list and the code validates against it, because `evaluate_rule_out`
+  treats an analyte with no result as *not met* — so a check naming an
+  invented analyte is indistinguishable from a working one and can never
+  fire.
+- `below`/`above` without a threshold is refused, keeping a
+  `RuleOutCheck` validation failure a counted outcome rather than an
+  exception mid-batch.
+- Imaging, biopsies and examination findings are real rule-outs no lab
+  lookup can answer. They keep their prose and get no check, deliberately.
+
+`checkable` is reported separately from `proposed` for exactly this reason:
+it is the number that decides whether anything can retire.
+
+### 3. The 46 already there get one too
 
 New enforcement does nothing for leads that already exist, and they are the
 entire problem. `adoc rule-out-backfill` (`casefile/rule_out_backfill.py`)
@@ -86,7 +111,7 @@ Three properties make it safe to point at a real case file:
 - **A failing batch costs only that batch.** One bad response must not cost
   the other five.
 
-### 3. What this does not fix, said plainly
+### 4. What this does not fix, said plainly
 
 - **`_outweighed` is decorative at 618:43.** It stays as a floor, but it is
   not the convergence mechanism and this ADR does not pretend otherwise. The

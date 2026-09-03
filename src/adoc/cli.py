@@ -1030,17 +1030,36 @@ def _cmd_rule_out_backfill(args: argparse.Namespace) -> int:
 
     print(f"rule-out-backfill: {len(targets)} active lead(s) with no way to end")
     client = _build_llm_client(settings)
-    ops, report = propose_rule_outs(client, ledger)
+    # The analytes actually on file, so a proposed check can be evaluated
+    # rather than naming a textbook analyte nobody has measured.
+    with LabsDb(settings.data_dir / "labs.sqlite", journal_mode=settings.sqlite_journal_mode) as db:
+        analytes = sorted({row.name for row in db.all_non_rejected_rows()})
+    ops, report = propose_rule_outs(client, ledger, analytes=analytes)
 
-    print(f"rule-out-backfill: proposed {report.proposed}, ", end="")
+    print(f"rule-out-backfill: {len(analytes)} analyte(s) on file")
+    print(f"rule-out-backfill: proposed {report.proposed} ", end="")
+    print(f"({report.checkable} machine-checkable), ", end="")
     print(f"declined {report.declined}, vacuous {report.unusable}", end="")
+    if report.unknown_analytes:
+        print(f", {len(report.unknown_analytes)} unevaluable analyte(s)", end="")
     if report.unknown_ids:
         print(f", {len(report.unknown_ids)} unknown id(s)", end="")
     print()
 
     if args.dry_run:
         for op in ops:
+            check = op.rule_out_check
+            if check is None:
+                mark = "prose only - cannot retire on its own"
+            else:
+                bound = ""
+                if check.threshold is not None:
+                    bound = f" {check.threshold:g}"
+                    if check.unit:
+                        bound += f" {check.unit}"
+                mark = f"{check.analyte} {check.operator}{bound}"
             print(f"  {op.id}: {op.rule_out}")
+            print(f"      [{mark}]")
         print("rule-out-backfill: dry run - nothing written")
         return 0
 
@@ -1056,7 +1075,11 @@ def _cmd_rule_out_backfill(args: argparse.Namespace) -> int:
     )
     after = load_ledger(ledger_path)
     remaining = len(needs_rule_out(after))
+    checkable = sum(1 for h in after.hypotheses if h.rule_out_check is not None)
     print(f"rule-out-backfill: wrote {len(ops)}; {remaining} lead(s) still have no way to end")
+    # The number that decides whether anything can ever retire: prose alone
+    # satisfies ADR 0035 and `retirement._rule_out_met` never reads it.
+    print(f"rule-out-backfill: {checkable} lead(s) now machine-checkable by the retirement pass")
     return 0
 
 

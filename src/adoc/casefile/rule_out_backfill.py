@@ -28,14 +28,22 @@ retire a live lead.
 from __future__ import annotations
 
 import logging
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from datetime import UTC, datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
 from adoc import __version__
 from adoc.casefile.rule_out import is_usable_rule_out
-from adoc.casefile.schema import Hypothesis, Ledger, LedgerDiff, Provenance, UpdateHypothesis
+from adoc.casefile.schema import (
+    Hypothesis,
+    Ledger,
+    LedgerDiff,
+    Provenance,
+    RuleOutCheck,
+    UpdateHypothesis,
+)
 from adoc.reason.client import LlmClient, Message
 
 logger = logging.getLogger(__name__)
@@ -58,15 +66,40 @@ _SYSTEM = (
     "is not a requirement.\n\n"
     "If you cannot honestly name one for a lead, return an empty string for "
     "it. That is a real answer and it is better than a wrong one — a wrong "
-    "rule-out retires a live lead."
+    "rule-out retires a live lead.\n\n"
+    "SECOND, and separately: when — and only when — that result is one of "
+    "the lab analytes listed below, also give the machine-checkable form: "
+    "`analyte` copied EXACTLY from the list, and `operator` as one of "
+    "`negative` (a qualitative result reading negative), `normal` (within "
+    "the lab's own reference range), `below` or `above` (with a numeric "
+    "`threshold` and its `unit`).\n\n"
+    "Leave `analyte` empty when the rule-out is imaging, a biopsy, an "
+    "examination finding, or anything else not in that list. Do not "
+    "approximate a name to make it fit: an analyte nobody has measured "
+    "cannot be evaluated, and an invented one is silently useless."
 )
 
 
 class RuleOutProposal(BaseModel):
-    """One lead's proposed falsification condition."""
+    """One lead's proposed falsification condition, in both halves.
+
+    Prose alone does not retire anything. `retirement._rule_out_met` returns
+    immediately unless `rule_out_check` is set — it never reads the prose —
+    so a backfill that wrote only `rule_out` would satisfy ADR 0035 and
+    still retire nothing. Both halves or the exercise is decorative.
+    """
 
     id: str
     rule_out: str = ""
+    analyte: str = ""
+    """The stored lab name this turns on, or empty when the rule-out is not
+    a lab at all (imaging, biopsy, an examination finding). Validated
+    against the analytes actually on file: an analyte nobody has measured
+    makes the check unevaluable, and `evaluate_rule_out` treats
+    cannot-tell as not-met, so an invented name is silently inert."""
+    operator: Literal["negative", "normal", "below", "above", ""] = ""
+    threshold: float | None = None
+    unit: str = ""
 
 
 class RuleOutProposals(BaseModel):
@@ -82,6 +115,13 @@ class BackfillReport(BaseModel):
     """Returned, but vacuous — `further testing` and friends."""
     declined: int = 0
     """The model returned nothing for this lead, deliberately."""
+    checkable: int = 0
+    """Of the proposed, how many also carry a `rule_out_check`. This is the
+    number that decides whether anything can ever retire: prose alone
+    satisfies ADR 0035 and `retirement._rule_out_met` never reads it."""
+    unknown_analytes: list[str] = Field(default_factory=list)
+    """Analytes named that are not on file — an unevaluable check, recorded
+    rather than written."""
     unknown_ids: list[str] = Field(default_factory=list)
     applied: int = 0
 
@@ -95,6 +135,18 @@ def needs_rule_out(ledger: Ledger) -> list[Hypothesis]:
         and not (h.rule_out or "").strip()
         and h.rule_out_check is None
     ]
+
+
+def _render_analytes(analytes: Sequence[str]) -> str:
+    """The analytes actually on file, so a proposed check can be evaluated.
+
+    Without this the model names textbook analytes and `evaluate_rule_out`
+    answers "no X result on file" forever — not-met, safe, and inert."""
+    if not analytes:
+        return "## Lab analytes on file\n\n(none — leave `analyte` empty for every lead)\n"
+    return "## Lab analytes on file (copy exactly)\n\n" + "\n".join(
+        f"- {name}" for name in analytes
+    )
 
 
 def _render(batch: Sequence[Hypothesis]) -> str:
@@ -113,8 +165,38 @@ def _render(batch: Sequence[Hypothesis]) -> str:
     return "\n".join(lines)
 
 
+def _checkable(proposal: RuleOutProposal, known: dict[str, str]) -> RuleOutCheck | None:
+    """The machine-checkable half, or `None` if it cannot be made evaluable.
+
+    Refuses rather than approximates. `evaluate_rule_out` treats an analyte
+    with no result on file as not-met, so a check naming an invented analyte
+    is indistinguishable from a working one and will never fire — exactly
+    the silent-absence shape this repository keeps hitting.
+    """
+    analyte = proposal.analyte.strip()
+    if not analyte or not proposal.operator:
+        return None
+    stored = known.get(analyte.lower())
+    if stored is None:
+        return None
+    if proposal.operator in {"below", "above"} and proposal.threshold is None:
+        # `RuleOutCheck`'s own validator requires it; refusing here keeps the
+        # failure a counted outcome rather than an exception mid-batch.
+        return None
+    return RuleOutCheck(
+        analyte=stored,
+        operator=proposal.operator,
+        threshold=proposal.threshold,
+        unit=proposal.unit.strip(),
+    )
+
+
 def propose_rule_outs(
-    client: LlmClient, ledger: Ledger, *, batch_size: int = BATCH_SIZE
+    client: LlmClient,
+    ledger: Ledger,
+    *,
+    batch_size: int = BATCH_SIZE,
+    analytes: Iterable[str] = (),
 ) -> tuple[list[UpdateHypothesis], BackfillReport]:
     """Ops setting `rule_out` on every lead that has none, plus a report.
 
@@ -122,6 +204,8 @@ def propose_rule_outs(
     other five batches, the same posture every other stage here takes.
     """
     targets = needs_rule_out(ledger)
+    known_analytes = sorted({a.strip() for a in analytes if a.strip()})
+    lowered = {a.lower(): a for a in known_analytes}
     report = BackfillReport(considered=len(targets))
     by_id = {h.id: h for h in targets}
     ops: list[UpdateHypothesis] = []
@@ -133,7 +217,12 @@ def propose_rule_outs(
             result = client.complete(
                 "challenger",
                 system=_SYSTEM,
-                messages=[Message(role="user", content=_render(batch))],
+                messages=[
+                    Message(
+                        role="user",
+                        content=f"{_render_analytes(known_analytes)}\n\n{_render(batch)}",
+                    )
+                ],
                 schema=RuleOutProposals,
             )
             payload = result.parsed
@@ -159,7 +248,16 @@ def propose_rule_outs(
                 report.unusable += 1
                 continue
             report.proposed += 1
-            ops.append(UpdateHypothesis(id=proposal.id, rule_out=text))
+            check = _checkable(proposal, lowered)
+            if check is not None:
+                report.checkable += 1
+            elif proposal.analyte.strip():
+                # Named an analyte that is not on file. Recorded rather than
+                # accepted: `evaluate_rule_out` would answer "no result on
+                # file" forever, which is not-met, safe, and inert — a check
+                # that looks like a check and can never fire.
+                report.unknown_analytes.append(proposal.analyte.strip())
+            ops.append(UpdateHypothesis(id=proposal.id, rule_out=text, rule_out_check=check))
 
     return ops, report
 

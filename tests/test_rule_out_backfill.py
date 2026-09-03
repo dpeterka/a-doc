@@ -159,3 +159,134 @@ def test_the_prompt_names_the_vacuous_forms() -> None:
     for phrase in ("further testing", "more information", "clinical correlation"):
         assert phrase in _SYSTEM
     assert "wrong rule-out" in _SYSTEM
+
+
+# --- the machine-checkable half (without it, nothing retires) -------------------------------------
+
+
+def test_prose_alone_does_not_make_a_lead_retirable() -> None:
+    """The gap this half exists to close. `retirement._rule_out_met` returns
+    immediately unless `rule_out_check` is set — it never reads the prose. A
+    backfill writing only `rule_out` would satisfy ADR 0035 and still retire
+    nothing, which is the same shape as the evaluator-with-no-writer it was
+    meant to fix."""
+    from adoc.casefile.retirement import _rule_out_met
+
+    prose_only = _hyp("a", rule_out="a normal serum metanephrines")
+
+    assert prose_only.rule_out_check is None
+    assert _rule_out_met(prose_only, {}) is None  # type: ignore[arg-type]
+
+
+def test_a_check_is_built_when_the_analyte_is_on_file() -> None:
+    client, _ = _client(
+        [
+            {
+                "proposals": [
+                    {
+                        "id": "a",
+                        "rule_out": "a normal serum metanephrines",
+                        "analyte": "Metanephrines",
+                        "operator": "normal",
+                    }
+                ]
+            }
+        ]
+    )
+
+    ops, report = propose_rule_outs(client, _ledger(_hyp("a")), analytes=["Metanephrines", "CRP"])
+
+    (op,) = ops
+    assert op.rule_out_check is not None
+    assert op.rule_out_check.analyte == "Metanephrines"
+    assert op.rule_out_check.operator == "normal"
+    assert report.checkable == 1
+
+
+def test_an_analyte_not_on_file_is_refused_not_written() -> None:
+    """`evaluate_rule_out` treats an analyte with no result as NOT MET, so a
+    check naming one is indistinguishable from a working check and can never
+    fire — the silent-absence shape this repository keeps hitting. The prose
+    is still kept; only the unevaluable check is dropped."""
+    client, _ = _client(
+        [
+            {
+                "proposals": [
+                    {
+                        "id": "a",
+                        "rule_out": "a normal serum metanephrines",
+                        "analyte": "Metanephrines",
+                        "operator": "normal",
+                    }
+                ]
+            }
+        ]
+    )
+
+    ops, report = propose_rule_outs(client, _ledger(_hyp("a")), analytes=["CRP"])
+
+    (op,) = ops
+    assert op.rule_out == "a normal serum metanephrines"
+    assert op.rule_out_check is None
+    assert report.checkable == 0
+    assert report.unknown_analytes == ["Metanephrines"]
+
+
+def test_a_threshold_operator_without_a_threshold_is_refused() -> None:
+    """`RuleOutCheck`'s validator requires it. Refusing here keeps the
+    failure a counted outcome rather than an exception mid-batch."""
+    client, _ = _client(
+        [
+            {
+                "proposals": [
+                    {
+                        "id": "a",
+                        "rule_out": "a CRP below 5",
+                        "analyte": "CRP",
+                        "operator": "below",
+                    }
+                ]
+            }
+        ]
+    )
+
+    ops, _report = propose_rule_outs(client, _ledger(_hyp("a")), analytes=["CRP"])
+
+    (op,) = ops
+    assert op.rule_out_check is None
+
+
+def test_a_non_lab_rule_out_keeps_its_prose_and_no_check() -> None:
+    """Imaging, biopsies and examination findings are real rule-outs that no
+    lab lookup can answer. They must not be forced into a check."""
+    client, _ = _client(
+        [
+            {
+                "proposals": [
+                    {
+                        "id": "a",
+                        "rule_out": "a temporal-bone CT showing no bone erosion",
+                        "analyte": "",
+                        "operator": "",
+                    }
+                ]
+            }
+        ]
+    )
+
+    ops, report = propose_rule_outs(client, _ledger(_hyp("a")), analytes=["CRP"])
+
+    (op,) = ops
+    assert op.rule_out_check is None
+    assert report.proposed == 1
+    assert report.checkable == 0
+    assert report.unknown_analytes == []
+
+
+def test_the_prompt_asks_for_both_halves() -> None:
+    from adoc.casefile.rule_out_backfill import _SYSTEM
+
+    assert "machine-checkable" in _SYSTEM
+    for operator in ("negative", "normal", "below", "above"):
+        assert operator in _SYSTEM
+    assert "cannot be evaluated" in _SYSTEM
