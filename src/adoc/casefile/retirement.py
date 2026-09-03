@@ -46,6 +46,7 @@ present in git history, reversible by the next review that finds new support.
 
 from __future__ import annotations
 
+import re
 from datetime import date
 
 from pydantic import BaseModel, Field
@@ -149,6 +150,30 @@ _NEGATIVE_MARKERS = (
 )
 
 
+def normalize_analyte(text: str) -> str:
+    """Lowercase, non-alphanumerics stripped — the key shape a `LabLookup`
+    uses.
+
+    Exported and applied at lookup time because the two sides disagreed and
+    the disagreement was silent. `review.build_lab_lookup` keys on
+    `_normalize_analyte(name)`, so `Vitamin B12` is stored under
+    `vitaminb12`; `evaluate_rule_out` looked up `check.analyte` RAW. Only a
+    single lowercase word could ever match.
+
+    Measured on the real case file: of 16 machine-checkable rule-outs
+    proposed against 461 stored analytes, **15 answered "no result on file"
+    and 1 matched** — the one whose analyte was `ferritin`. Every multi-word
+    or capitalised name was unreachable.
+
+    Same shape as `criteria._RA_RF`, which was `r"rheumatoid factor"` with a
+    literal space matched against a space-stripped name: a check that cannot
+    fire looks exactly like a check that fires and finds nothing. Here it
+    would have made ADR 0038's evaluator and ADR 0047's writer both correct
+    in isolation and jointly useless.
+    """
+    return re.sub(r"[^a-z0-9]", "", text.lower())
+
+
 def evaluate_rule_out(check: RuleOutCheck, labs: LabLookup) -> tuple[bool, str]:
     """`(met, why)`. Not-met and cannot-tell are both `False` — deliberately.
 
@@ -160,7 +185,7 @@ def evaluate_rule_out(check: RuleOutCheck, labs: LabLookup) -> tuple[bool, str]:
     `why` carries the reason either way, so a report can say what happened
     rather than only what changed.
     """
-    fact = labs.get(check.analyte)
+    fact = labs.get(normalize_analyte(check.analyte)) or labs.get(check.analyte)
     if fact is None:
         return False, f"no {check.analyte} result on file"
 
