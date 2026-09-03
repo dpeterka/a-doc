@@ -414,3 +414,76 @@ def test_an_unevaluatable_rule_out_leaves_the_old_rules_in_charge() -> None:
 
     assert report.retirements == []
     assert report.protected_count == 1
+
+
+# --- the analyte-normalisation bug ---------------------------------------------------------------
+
+
+def test_a_multi_word_analyte_resolves_against_a_normalized_lookup() -> None:
+    """Measured on the real case file: of 16 machine-checkable rule-outs
+    proposed against 461 stored analytes, **15 answered "no result on file"
+    and 1 matched** — the one whose analyte was `ferritin`.
+
+    `review.build_lab_lookup` keys on the normalized name, so `Vitamin B12`
+    is stored under `vitaminb12`; `evaluate_rule_out` looked it up RAW. Only
+    a single lowercase word could ever match.
+
+    Same shape as `criteria._RA_RF` — a check that cannot fire looks exactly
+    like a check that fires and finds nothing. Here it would have made ADR
+    0038's evaluator and ADR 0047's writer both correct in isolation and
+    jointly useless.
+    """
+    from adoc.casefile.retirement import LabFact, evaluate_rule_out
+    from adoc.casefile.schema import RuleOutCheck
+
+    # Keyed the way `build_lab_lookup` keys it.
+    labs = {
+        "vitaminb12": LabFact(
+            value=410.0, value_text="", flag="", unit="pg/mL", ref="labs:vitamin-b12:2026-05-02"
+        )
+    }
+
+    met, why = evaluate_rule_out(RuleOutCheck(analyte="Vitamin B12", operator="normal"), labs)
+
+    assert met is True, why
+
+
+def test_every_spelling_of_one_analyte_resolves_to_the_same_row() -> None:
+    from adoc.casefile.retirement import LabFact, evaluate_rule_out
+    from adoc.casefile.schema import RuleOutCheck
+
+    labs = {
+        "complementc3": LabFact(
+            value=110.0,
+            value_text="",
+            flag="",
+            unit="mg/dL",
+            ref="labs:complement-c3:2026-05-02",
+        )
+    }
+
+    for spelling in ("Complement C3", "complement c3", "complementc3", "Complement-C3"):
+        met, why = evaluate_rule_out(RuleOutCheck(analyte=spelling, operator="normal"), labs)
+        assert met is True, f"{spelling!r}: {why}"
+
+
+def test_an_analyte_genuinely_absent_is_still_not_met() -> None:
+    """The property that must survive the fix. An analyte nobody has
+    measured must never end a hypothesis — absence of a test reads nothing
+    like a negative result, and conflating them is the one failure this
+    evaluator must not have."""
+    from adoc.casefile.retirement import LabFact, evaluate_rule_out
+    from adoc.casefile.schema import RuleOutCheck
+
+    labs = {
+        "ferritin": LabFact(
+            value=100.0, value_text="", flag="", unit="ng/mL", ref="labs:ferritin:2026-05-02"
+        )
+    }
+
+    met, why = evaluate_rule_out(
+        RuleOutCheck(analyte="Serum Metanephrines", operator="normal"), labs
+    )
+
+    assert met is False
+    assert "no Serum Metanephrines result on file" in why

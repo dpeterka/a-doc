@@ -189,10 +189,15 @@ class RuleOutCheck(BaseModel):
     """
 
     analyte: str
-    """Matched against stored lab names the same way `knowledge.criteria`
-    matches them — a regex over the normalized name, because the stored
-    spellings are `Complement C4c` and `Smith (Sm) Antibody`, not the
-    textbook names."""
+    """A stored lab name. Matched by NORMALIZED equality — lowercased with
+    non-alphanumerics stripped, so `Complement C3`, `complement c3` and
+    `complementc3` all resolve to the same row.
+
+    Not a regex, whatever this docstring said before: `retirement.
+    evaluate_rule_out` does a dict lookup, and the lookup is keyed on the
+    normalized name. Writing a raw multi-word name here used to miss every
+    time — measured, 15 of 16 checks on the real case file answered "no
+    result on file" for analytes that were present."""
     operator: Literal["negative", "normal", "below", "above"]
     threshold: float | None = None
     unit: str = ""
