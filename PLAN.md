@@ -264,15 +264,16 @@ contract:
 
 | ADR | Theme | Findings it closes | Status |
 |---|---|---|---|
-| 0038 | How a hypothesis ends | CLN-05, CLN-01, PAT-03 | shipped (v0.27.0) |
+| 0038 | How a hypothesis ends | CLN-05, PAT-03 (**not** CLN-01 — see 0047) | shipped (v0.27.0) |
 | 0039 | How a review reads | PAT-01, PAT-02, PAT-04 | shipped (v0.28.0) |
 | 0040 | What the composer sounds like | PAT-08 | shipped (v0.28.0) |
 | 0041 | The appointment agenda | PAT-07 | shipped (v0.28.0) |
 | 0042 | Criteria read the whole record | CLN-03 | shipped (v0.28.0) |
-| 0043 | The declared graph is the real graph | DEV-01 | merged to develop |
-| 0044 | The engines can see the serology | CLN-02 | in review (#300) |
-| 0045 | Ask about this | PAT-05 | this branch |
-| 0046 | Which minute | PAT-06 | this branch |
+| 0043 | The declared graph is the real graph | DEV-01 | shipped (v0.29.0) |
+| 0044 | The engines can see the serology | CLN-02 | shipped (v0.29.0) |
+| 0045 | Ask about this | PAT-05 | shipped (v0.29.0) |
+| 0046 | Which minute | PAT-06 | shipped (v0.29.0) |
+| 0047 | A lead states how it ends | CLN-01 (reopened) | this branch |
 
 Three findings were rejected on review rather than adopted, and the ADRs say
 why: PAT-01's proposed `patient_summary` LLM node (a fourth frontier call
@@ -282,7 +283,13 @@ PAT-08's "Your Case Co-Pilot" persona (PLAN.md risk 3 — a co-pilot claims
 shared authority over a decision this system must never appear to share;
 ADR 0040).
 
-**The track is complete with 0046** — every finding in the review is now
+**CLN-01 is reopened.** ADR 0038 was recorded as closing it; measured on
+2026-09-02 the case file holds 46 active leads, **none ever retired**, and
+**0 of 54 state what would rule them out** — the review path never enforced
+ADR 0035's requirement and ADR 0038 shipped an evaluator with no writer.
+ADR 0047 closes the writer.
+
+**The rest of the track is complete with 0046** — every finding in the review is now
 either shipped, declined with a recorded reason, or measured as already
 done. Two of the five ADRs found a bug the review
 did not mention: 0040 found `CriteriaResult.citation` rendered nowhere, and
@@ -323,10 +330,33 @@ the patient:
 
 *Known open issues carried into phase 4:*
 
-- An intermittent `tests/test_web_*` failure, roughly 1 run in 6 under load,
-  a different file each time and always "expected content missing from HTML".
-  Test order is not randomised, so it is state or timing. Did not reproduce
-  in 10 clean runs on an idle machine.
+- An intermittent `tests/test_web_*` failure, a different file each time and
+  always "expected content missing from HTML". Test order is not randomised,
+  so it is state or timing.
+
+  **Narrowed 2026-09-02 by a 2x2 over the two variables** (21 runs total):
+
+  | configuration | runs | failures |
+  |---|---|---|
+  | `test_web_*` alone, under CPU load | 12 | 0 |
+  | `test_web_*` alone, with coverage | 4 | 0 |
+  | full suite, no coverage | 3 | 0 |
+  | **full suite + coverage** | 3 | **1** |
+
+  Neither variable alone reproduced it in 19 runs; the combination did once
+  (`test_web_confirm.py::test_disagreement_row_shows_use_reading_a_and_b_buttons`).
+  Coverage adds roughly 20% wall-clock, so the leading hypothesis is a
+  timing sensitivity that only the slowest configuration exposes — not
+  cross-test state, which would have shown up in the no-coverage full run.
+
+  Two things ruled out: it is **not** the in-memory SQLite (`LabsDb` holds
+  one `check_same_thread=False` connection behind an `RLock`, so there is no
+  second empty `:memory:` database to race), and it is **not** parallelism
+  (no xdist; the suite is sequential).
+
+  Caveat on the reproduction: the working tree was being edited while those
+  runs executed, so the collected-test count drifted. Suggestive, not clean.
+  The next step is a 20-run loop in configuration C against a frozen tree.
 - ~~`rule_out` is empty on every active hypothesis~~ — ADR 0038 makes it
   evaluable (`rule_out_check`) and fixes `UpdateHypothesis.rule_out`, which
   was declared and silently dropped by `apply_diff`, so existing hypotheses

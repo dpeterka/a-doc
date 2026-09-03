@@ -5,6 +5,109 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.30.0] — 2026-09-03
+
+*ADR 0047 — a lead states how it ends. CLN-01 reopened and addressed.*
+
+### Context
+
+The case file holds 54 hypotheses, 46 active, and **has never retired one**.
+Measured in production 2026-09-02:
+
+```
+rule_out_check populated       0 / 54
+rule_out prose populated       0 / 54
+definitive-exclusion evidence  0
+_outweighed fires for          1 / 46
+   evidence for : against   618 : 43     median margin −8
+age-based park                 0         threshold 30d+, oldest lead 7d
+exempt from assessment        13
+```
+
+Every retirement path was inert, each for its own reason, and the root cause
+is one thing: **nothing in the pipeline produces refutation at the rate
+needed to end anything.** At 14:1, a rule that retires on "more against than
+for" is unreachable by construction, not by tuning.
+
+Underneath sat a plain defect. ADR 0035 required every new hypothesis to
+state what would rule it out, and `casefile/rule_out.py` enforces it in code.
+`reason/stages.py` calls it on the diagnostic chat path.
+**`build_review_ledger_diff` never did** — and 43 of the 46 active
+hypotheses were created there. ADR 0038 then built `RuleOutCheck` and a
+retirement rule to evaluate the field: an evaluator with no writer, running
+every review with nothing to read.
+
+### Added
+
+- **`adoc rule-out-backfill`** gives the leads already on the board a way to
+  end. It proposes and does not invent: a lead the model declines, or answers
+  with a vacuous phrase, is left alone and counted. `--dry-run` prints
+  without writing. **A wrong rule-out is worse than none — a wrong one
+  retires a live lead.** Lands through `apply_and_save` so the ledger
+  invariants check it, and a failing batch costs only that batch.
+
+  It proposes **both halves**: the prose a patient reads, and the
+  `RuleOutCheck` a deterministic evaluator can answer.
+  `retirement._rule_out_met` never reads the prose, so prose alone would
+  satisfy ADR 0035 and still retire nothing. The check is **refused rather
+  than approximated** — the analyte must appear in the labs actually on file,
+  because `evaluate_rule_out` treats an unmeasured analyte as *not met* and a
+  check naming an invented one can never fire. `checkable` is reported
+  separately from `proposed`, since it is the number that decides whether
+  anything can retire.
+
+### Changed
+
+- **The review path now enforces what the chat path always has.**
+  `DivergenceDecisionPayload` gains `rule_out`;
+  `prompts/divergence_adjudicator.md` (v2 → v3) asks for it on every
+  accepted `panel_only` divergence, naming the vacuous forms so the model
+  does not reach for them. An accepted lead with no usable rule-out is
+  **dropped rather than added**, and the review's rationale says how many and
+  why.
+
+  **Reviews will add fewer hypotheses, and some weeks none. That is the
+  point.**
+
+### Fixed
+
+- **A panel-proposed `definitive-exclusion` is no longer downgraded to
+  `moderate`.** `_EVIDENCE_STRENGTHS` was a hardcoded
+  `{"strong","moderate","weak"}` — a duplicate of the schema's
+  `EvidenceStrength` that ADR 0038 extended and this copy never learned
+  about. So a blind-panel member asserting the schema's own literal had it
+  flattened onto the additive scale, which is exactly the summation ADR 0038
+  exists to prevent. The synonym map made it worse: `definitive` → `strong`,
+  but `definitive-exclusion` → `moderate`. Now derived from the schema with
+  `get_args`. Observed in production; that path had never once run.
+
+### Corrected
+
+- **PLAN.md recorded ADR 0038 as closing CLN-01. It does not.** CLN-01 is
+  reopened, and this release addresses it.
+
+### Not fixed, and stated as such in the ADR
+
+- `_outweighed` is decorative at 618:43 and is **not** the convergence
+  mechanism. The mechanism is a *met rule-out*.
+- The engines still cannot refute incumbents. The 2026-09-02 review produced
+  **15 `opposes` verdicts and `nothing to apply`** — correctly, since
+  `opposes` writes `evidence_against` only for `ledger_only` divergences and
+  LIRICAL's 55 findings were mostly `engine_only`.
+- The age rule cannot fire while the oldest lead is 7 days old on a v17
+  ledger. **That is itself unexplained.**
+- 13 leads remain exempt from assessment. Once a lead states how it ends,
+  ADR 0038's rules already run *before* `is_protected`.
+
+### Notes
+
+- ADR 0044's question is answered: engine adjudication went from
+  **66/66 neutral** to **{corroborates: 0, opposes: 15, neutral: 50}** on 65
+  divergences. The engines have started disagreeing. They still cannot act
+  on it.
+- ADR 0043 measured in production: the blind panel ran 3 nodes concurrently,
+  **183.2s wall clock against 458.1s sequential — 2.50×**.
+
 ## [0.29.1] — 2026-09-02
 
 *Hotfix. A model-facing instruction was reaching the patient.*

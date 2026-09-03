@@ -56,7 +56,7 @@ from collections import defaultdict
 from collections.abc import Callable, Iterable, Sequence
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, get_args
 
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
@@ -81,6 +81,7 @@ from adoc.casefile.retirement import (
     render_retirements,
     retirements_to_diff,
 )
+from adoc.casefile.rule_out import strip_ops_missing_rule_out
 from adoc.casefile.schema import (
     AddEvidence,
     AddHypothesis,
@@ -176,7 +177,20 @@ class TrendScanResult(BaseModel):
     findings: list[TrendFinding] = Field(default_factory=list)
 
 
-_EVIDENCE_STRENGTHS = frozenset({"strong", "moderate", "weak"})
+# Derived from the schema, never restated. This was a hardcoded
+# `{"strong", "moderate", "weak"}` and ADR 0038 added a fourth member —
+# so a panel proposing the schema's own `definitive-exclusion` had it
+# SILENTLY DOWNGRADED to `moderate`, which is precisely the summation ADR
+# 0038 exists to prevent. Observed in production on 2026-09-02:
+#
+#   WARNING review: panel used an unknown evidence strength
+#   'definitive-exclusion'; recording as 'moderate'
+#
+# Letting it through is safe because force is gated elsewhere and on a
+# different axis: `retirement.DEFINITIVE_EXCLUSION_SOURCES` restricts WHICH
+# SOURCES may assert an exclusion, so a panel item only excludes anything if
+# its citation is a lab, document, encounter or patient report.
+_EVIDENCE_STRENGTHS = frozenset(get_args(EvidenceStrength))
 
 _EVIDENCE_STRENGTH_SYNONYMS = {
     "supporting": "moderate",
@@ -189,7 +203,7 @@ _EVIDENCE_STRENGTH_SYNONYMS = {
     "medium": "moderate",
     "low": "weak",
 }
-"""Words panel members reach for instead of the three the schema allows.
+"""Words panel members reach for instead of the ones the schema allows.
 `supporting` is the one observed in production; the rest are the obvious
 neighbours, mapped so a near-miss keeps its meaning rather than flattening
 to the default."""
@@ -460,6 +474,15 @@ class DivergenceDecisionPayload(BaseModel):
     divergence: str
     decision: Literal["accept", "reject"]
     rationale: str
+    rule_out: str = ""
+    """What single result would take this lead off the board (ADR 0047).
+
+    Required in practice for an accepted `panel_only`, but defaulted rather
+    than required by the schema: ADR 0028 — no single field of one item may
+    fail a whole payload. An accepted divergence that arrives without one is
+    DROPPED by `strip_ops_missing_rule_out`, loudly, which is ADR 0016's
+    strip-don't-reject rule and the same handling the diagnostic chat path
+    has always applied."""
 
 
 logger = logging.getLogger(__name__)
@@ -919,6 +942,7 @@ def build_review_ledger_diff(
                         status="active",
                         origin="challenger",
                         first_proposed=today,
+                        rule_out=decision.rule_out.strip(),
                         evidence_for=(
                             _resolvable_evidence(divergence, db, repo)
                             if db is not None and repo is not None
@@ -1002,6 +1026,31 @@ def build_review_ledger_diff(
         dag_node="apply_review_diff",
         timestamp=datetime.now(UTC),
     )
+    # ADR 0047: the same enforcement the diagnostic chat path has applied
+    # since ADR 0035 — and which this path never did. 43 of the ledger's 46
+    # active hypotheses were created here, and every one of them has an empty
+    # `rule_out`, so nothing in the retirement pass could ever evaluate them.
+    # An evaluator with no writer is not a feature.
+    #
+    # Strip rather than reject, for ADR 0016/0028's reasons: one missing
+    # field must never discard a whole adjudication. Dropping the lead is a
+    # real cost and the right one — a hypothesis nobody will state a
+    # falsification condition for is exactly what fills a board that only
+    # ever grows.
+    ops, dropped_no_rule_out = strip_ops_missing_rule_out(ops)
+    for hypothesis_id, name in dropped_no_rule_out:
+        logger.warning(
+            "review: dropped add_hypothesis %r (%s): no usable rule_out (ADR 0035/0047)",
+            hypothesis_id,
+            name,
+        )
+    if dropped_no_rule_out:
+        rationale = (
+            f"{rationale}\n\n{len(dropped_no_rule_out)} accepted lead(s) were not added: "
+            "the adjudicator gave no result that would rule them out, and a lead with no "
+            "stated way to end does not go on the board (ADR 0047)."
+        )
+
     return LedgerDiff(provenance=provenance, rationale=rationale, ops=ops)
 
 

@@ -183,6 +183,8 @@ def _happy_path_transport(calls: list[TransportRequest]) -> Any:
             "divergence": "panel-only:sjogrensyndrome",
             "decision": "accept",
             "rationale": "dry eyes/mouth history supports considering this independently",
+            # ADR 0047: an accepted panel_only without this is dropped.
+            "rule_out": "a negative anti-SSA/Ro with a normal labial gland biopsy",
         },
         {
             "divergence": "ledger-only:pe-01",
@@ -2590,3 +2592,199 @@ def test_a_vocabulary_gap_is_named_in_the_report() -> None:
 
     assert "no term in the published phenotype ontology" in text
     assert "Anti-Smith antibody positivity" in text
+
+
+def test_a_panel_definitive_exclusion_is_not_downgraded() -> None:
+    """Observed in production on 2026-09-02, the first review run after
+    v0.29.0:
+
+        WARNING review: panel used an unknown evidence strength
+        'definitive-exclusion'; recording as 'moderate'
+
+    `_EVIDENCE_STRENGTHS` was a hardcoded `{"strong", "moderate", "weak"}`
+    and ADR 0038 added a fourth member to the schema without updating it. A
+    panel asserting the schema's own literal had it silently flattened into
+    the additive scale — precisely the summation ADR 0038 exists to prevent.
+
+    Letting it through is safe on a different axis:
+    `retirement.DEFINITIVE_EXCLUSION_SOURCES` restricts which SOURCES may
+    assert an exclusion, so a panel item only excludes anything if its
+    citation is a lab, document, encounter or patient report.
+    """
+    from adoc.reason.review import BlindEvidenceItem
+
+    item = BlindEvidenceItem(
+        claim="Serum metanephrines were normal",
+        source="labs:metanephrines:2026-05-02",
+        strength="definitive-exclusion",
+    )
+
+    assert item.strength == "definitive-exclusion"
+
+
+def test_the_accepted_strengths_are_derived_from_the_schema() -> None:
+    """The bug was a duplicated list drifting from its source of truth.
+    Deriving it means the next `EvidenceStrength` member cannot be silently
+    downgraded the way this one was."""
+    from typing import get_args
+
+    from adoc.casefile.schema import EvidenceStrength
+    from adoc.reason.review import _EVIDENCE_STRENGTHS
+
+    assert frozenset(get_args(EvidenceStrength)) == _EVIDENCE_STRENGTHS
+
+
+def test_an_actually_unknown_strength_still_falls_back(caplog: Any) -> None:
+    """The fallback is still load-bearing — panels do reach for words the
+    schema has never had, which is why the synonym map exists."""
+    from adoc.reason.review import BlindEvidenceItem
+
+    item = BlindEvidenceItem(
+        claim="x", source="labs:crp:2026-05-02", strength="extremely compelling"
+    )
+
+    assert item.strength == "moderate"
+
+
+def test_a_synonym_still_maps_rather_than_flattening() -> None:
+    from adoc.reason.review import BlindEvidenceItem
+
+    assert (
+        BlindEvidenceItem(claim="x", source="labs:crp:2026-05-02", strength="supporting").strength
+        == "moderate"
+    )
+    assert (
+        BlindEvidenceItem(claim="x", source="labs:crp:2026-05-02", strength="conclusive").strength
+        == "strong"
+    )
+
+
+# --- ADR 0047: a lead states how it ends ---------------------------------------------------------
+
+
+def test_an_accepted_lead_with_no_rule_out_is_dropped(repo: DataRepo, db: LabsDb) -> None:
+    """Measured in production on 2026-09-02: 46 active hypotheses, **0 with a
+    `rule_out`**, none ever retired. 43 of the 46 were created by this path,
+    which — unlike the diagnostic chat path — never applied ADR 0035's
+    requirement. The retirement pass has been evaluating a field nothing
+    writes.
+
+    Dropping the lead is a real cost and the right one. A hypothesis nobody
+    will state a falsification condition for is exactly what fills a board
+    that only ever grows.
+    """
+    seeded = _seed_ledger(repo)
+    diff = build_review_ledger_diff(
+        divergence_set=DivergenceSet(
+            divergences=[
+                Divergence(
+                    id="panel-only:something",
+                    kind="panel_only",
+                    name="Something Plausible",
+                    panel_probability_bucket="low",
+                )
+            ]
+        ),
+        adjudication=AdjudicationResult(
+            decisions=[
+                DivergenceDecisionPayload(
+                    divergence="panel-only:something",
+                    decision="accept",
+                    rationale="the panel made a fair case",
+                    rule_out="",
+                )
+            ]
+        ),
+        challenge_sweep=ChallengeSweepResult(notes=[]),
+        current_ledger=seeded,
+        today=date(2026, 9, 2),
+    )
+
+    assert not [op for op in diff.ops if isinstance(op, AddHypothesis)]
+    assert "no result that would rule them out" in diff.rationale
+
+
+def test_an_accepted_lead_with_a_rule_out_is_added_and_carries_it(
+    repo: DataRepo, db: LabsDb
+) -> None:
+    """The other half: the requirement must be satisfiable, or the review
+    stops adding anything at all."""
+    seeded = _seed_ledger(repo)
+    diff = build_review_ledger_diff(
+        divergence_set=DivergenceSet(
+            divergences=[
+                Divergence(
+                    id="panel-only:something",
+                    kind="panel_only",
+                    name="Something Plausible",
+                    panel_probability_bucket="low",
+                )
+            ]
+        ),
+        adjudication=AdjudicationResult(
+            decisions=[
+                DivergenceDecisionPayload(
+                    divergence="panel-only:something",
+                    decision="accept",
+                    rationale="the panel made a fair case",
+                    rule_out="a normal serum metanephrines",
+                )
+            ]
+        ),
+        challenge_sweep=ChallengeSweepResult(notes=[]),
+        current_ledger=seeded,
+        today=date(2026, 9, 2),
+    )
+
+    (added,) = [op for op in diff.ops if isinstance(op, AddHypothesis)]
+    assert added.hypothesis.rule_out == "a normal serum metanephrines"
+
+
+def test_a_vacuous_rule_out_does_not_satisfy_the_requirement(repo: DataRepo, db: LabsDb) -> None:
+    """ "Further testing" names the wish for a result, not a result. A
+    requirement any hypothesis can satisfy is not a requirement —
+    `casefile.rule_out._EMPTY_PHRASES` exists for exactly this and the
+    review path now goes through it too."""
+    seeded = _seed_ledger(repo)
+    diff = build_review_ledger_diff(
+        divergence_set=DivergenceSet(
+            divergences=[
+                Divergence(
+                    id="panel-only:something",
+                    kind="panel_only",
+                    name="Something Plausible",
+                    panel_probability_bucket="low",
+                )
+            ]
+        ),
+        adjudication=AdjudicationResult(
+            decisions=[
+                DivergenceDecisionPayload(
+                    divergence="panel-only:something",
+                    decision="accept",
+                    rationale="the panel made a fair case",
+                    rule_out="further testing would clarify this",
+                )
+            ]
+        ),
+        challenge_sweep=ChallengeSweepResult(notes=[]),
+        current_ledger=seeded,
+        today=date(2026, 9, 2),
+    )
+
+    assert not [op for op in diff.ops if isinstance(op, AddHypothesis)]
+
+
+def test_the_adjudicator_is_asked_for_a_rule_out() -> None:
+    """The schema field is only half of it — the prompt has to ask, and its
+    version has to move so provenance records which contract produced a
+    given lead."""
+    from adoc.reason.prompts import load_prompt
+
+    prompt = load_prompt("divergence_adjudicator")
+
+    assert int(str(prompt.version).lstrip("v")) >= 3
+    assert "rule_out" in prompt.text
+    assert "no stated way to die" in prompt.text
+    # The prompt must name the vacuous forms, or the model supplies them.
+    assert "further testing" in prompt.text

@@ -8,6 +8,7 @@ commit a ledger diff, and spend minutes of frontier calls from one click.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from urllib.parse import quote_plus
 
@@ -125,3 +126,73 @@ def test_the_review_sections_carry_links_on_the_case_file_page(tmp_path: Path) -
     # the hypothesis card's "Ask about this lead".
     assert quote_plus("What changed this week") in body
     assert ">Ask about this</a>" in body
+
+
+def test_the_real_template_question_survives_the_round_trip(tmp_path: Path) -> None:
+    """Every other test here hand-writes a question without a double quote.
+    `ASK_PROMPT_TEMPLATE` contains two, and Jinja escapes them to `&#34;` —
+    so a naive `seeded in body` check fails against a page that is in fact
+    correct. This walks the actual path: render the review, take the link
+    the page emits, follow it, and assert the composer holds the question a
+    browser will show.
+    """
+    import html as html_lib
+    from urllib.parse import unquote_plus
+
+    app, repo, _db, _calls = build_app(tmp_path)
+    reviews = repo.root / "case" / "reviews"
+    reviews.mkdir(parents=True, exist_ok=True)
+    (reviews / "2026-09-02-weekly.md").write_text(
+        "# Weekly review\n\n## Your complement results\n\nText.\n"
+    )
+    client = TestClient(app)
+    login(client)
+
+    ledger_html = client.get("/ledger").text
+    match = re.search(r'href="/chat\?ask=([^"]+)"', ledger_html)
+    assert match, "the review section emitted no ask link"
+    seeded = unquote_plus(html_lib.unescape(match.group(1)))
+    assert seeded == (
+        'Can you explain the "Your complement results" part of my review in plain terms?'
+    )
+
+    chat_html = client.get("/chat", params={"ask": seeded}).text
+    textarea = chat_html[chat_html.index("<textarea") : chat_html.index("</textarea>")]
+    body = textarea[textarea.index(">") + 1 :]
+
+    # Escaped in the source, decoded by the browser's parser inside a
+    # textarea — so what she sees is the question with its quotes.
+    assert "&#34;" in body
+    assert html_lib.unescape(body) == seeded
+
+
+def test_a_prefilled_question_can_actually_be_sent(tmp_path: Path) -> None:
+    """The other half of "does clicking it do anything": pressing Send on
+    the pre-filled text runs a real turn and returns a reply. Without this,
+    the bridge could pre-fill something `chat_send` rejects and no test
+    would notice."""
+    from web_support import make_informational_transport, mark_intake_complete
+
+    calls: list = []
+    transport = make_informational_transport("Complement is a group of blood proteins.", calls)
+    app, repo, _db, _calls = build_app(
+        tmp_path,
+        primary_transport=transport,
+        visit_capture_transport=transport,
+    )
+    mark_intake_complete(repo)
+    client = TestClient(app)
+    login(client)
+
+    seeded = 'Can you explain the "Your complement results" part of my review in plain terms?'
+    client.get("/chat", params={"ask": seeded})
+
+    from adoc.web.casefile_helpers import read_recent_chat
+
+    assert read_recent_chat(repo) == [], "following the link must send nothing"
+
+    response = client.post("/chat/send", data={"text": seeded})
+
+    assert response.status_code == 200
+    assert "Complement is a group of blood proteins" in response.text
+    assert len(read_recent_chat(repo)) == 2  # her message and the reply
