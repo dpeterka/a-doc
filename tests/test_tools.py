@@ -221,7 +221,10 @@ def test_answer_informational_blocks_dosing_language(repo: DataRepo, db: LabsDb)
     answer = answer_informational(client, repo, db, "What should I take for inflammation?")
 
     assert "20 mg prednisone" not in answer
-    assert "withholding" in answer.lower() or "can't share" in answer.lower()
+    # Wording changed in 0.29.1; the property is that the reply identifies
+    # itself as withheld and carries no model-facing instruction.
+    assert "holding it back" in answer.lower() or "can't share" in answer.lower()
+    assert "Rewrite this response" not in answer
 
 
 # --- informational_llm_result gates at the source (Violation 1 regression) --------------------
@@ -256,7 +259,10 @@ def test_informational_llm_result_gates_dosing_language_after_a_rewrite_attempt(
     result = informational_llm_result(client, repo, db, "What should I take for inflammation?")
 
     assert "20 mg prednisone" not in result.text
-    assert "withholding" in result.text.lower()
+    # Wording changed in 0.29.1; the property is that the reply identifies
+    # itself as withheld and carries no model-facing instruction.
+    assert "holding it back" in result.text.lower()
+    assert "Rewrite this response" not in result.text
     assert len(calls) == 2  # first attempt + one gate-guided rewrite, then withheld
 
 
@@ -375,3 +381,38 @@ def test_run_informational_turn_never_screens_content(repo: DataRepo, db: LabsDb
     run_informational_turn(client, repo, db, "I want to kill myself")
 
     assert calls
+
+
+def test_a_withheld_answer_never_shows_the_model_its_own_instruction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Observed in production on 2026-09-02. The withheld message
+    interpolated `GateResult.rewrite_instruction` — which is written FOR A
+    MODEL ("Rewrite this response to remove any specific drug name...") —
+    straight into the patient's transcript. She was handed an order
+    addressed to someone else, mid-conversation, with no way to tell what it
+    meant.
+
+    ADR 0040 asserted that string is "never shown to anyone". True in
+    `reason/stages.py`, which is where I checked; false here, which is where
+    I did not.
+    """
+    from adoc.reason.safety import _REWRITE_INSTRUCTION
+    from adoc.reason.tools import _GATE_BLOCKED_MESSAGE
+
+    assert "Rewrite this response" not in _GATE_BLOCKED_MESSAGE
+    assert _REWRITE_INSTRUCTION not in _GATE_BLOCKED_MESSAGE
+    # No leftover format placeholder either — the bug was a `.format()` call.
+    assert "{" not in _GATE_BLOCKED_MESSAGE
+
+
+def test_the_withheld_message_tells_her_what_to_do_instead() -> None:
+    """A refusal that only says "no" leaves her stuck. This one says what
+    was withheld, what usually works instead, and that nothing was lost."""
+    from adoc.reason.tools import _GATE_BLOCKED_MESSAGE
+
+    assert "without the dose" in _GATE_BLOCKED_MESSAGE
+    assert "Nothing is lost" in _GATE_BLOCKED_MESSAGE
+    # Addressed to her, not about the system's internals.
+    for machinery in ("gate", "ledger", "node", "rewrite", "token"):
+        assert machinery not in _GATE_BLOCKED_MESSAGE.lower()

@@ -242,10 +242,31 @@ _INFORMATIONAL_SYSTEM = (
 )
 
 _GATE_BLOCKED_MESSAGE = (
-    "I drafted an answer, but it included specific treatment or dosing language, "
-    "which this tool never passes on directly — so I'm withholding it rather than "
-    "showing it to you. {rewrite_instruction}"
+    "I drafted an answer to that, but it named a medication dose or told you to "
+    "change something you take — which is the one thing I never pass on, however "
+    "sensible it looks. So I am holding it back rather than showing it to you.\n\n"
+    "Two things usually work: ask me the same question without the dose in it "
+    '("what is on file about my ear drops?" rather than the strength), or bring '
+    "it to the doctor as one of the questions on your review. Nothing is lost — "
+    "your case file already has everything you have told me."
 )
+"""What the patient sees when an informational answer is withheld.
+
+This used to interpolate `GateResult.rewrite_instruction`, which is written
+FOR A MODEL — "Rewrite this response to remove any specific drug name, dose,
+or instruction to..." — straight into her transcript. She was handed an
+order addressed to someone else, in the middle of a conversation about her
+ears, with no way to tell what it meant or what to do about it. Observed in
+production on 2026-09-02.
+
+ADR 0040 asserted that `_REWRITE_INSTRUCTION` "is an instruction to the
+model, never shown to anyone". That was checked against `reason/stages.py`,
+where it is true, and not against this module, where it was not. ADR 0047
+corrects it.
+
+The replacement says three things she can act on: what was withheld, what
+she can do instead, and that nothing was lost.
+"""
 
 # How many completions `informational_llm_result` may spend on one answer:
 # the first attempt plus one gate-guided rewrite — same budget and shape as
@@ -424,8 +445,16 @@ def informational_llm_result(
 
     assert result is not None
     assert gate is not None
-    withheld_text = _GATE_BLOCKED_MESSAGE.format(rewrite_instruction=gate.rewrite_instruction or "")
-    return result.model_copy(update={"text": withheld_text})
+    # The offending spans and `gate.rewrite_instruction` are MODEL-facing and
+    # stay model-facing: they are fed back into the rewrite loop above and
+    # logged here, never rendered. Logging the reasons but not the text, the
+    # same rule `web.routes.chat` keeps for a ContractViolation.
+    logger.warning(
+        "informational: answer withheld by the treatment gate after %d attempt(s); reason(s)=%s",
+        _INFORMATIONAL_GATE_ATTEMPTS,
+        sorted({span.reason for span in gate.spans}),
+    )
+    return result.model_copy(update={"text": _GATE_BLOCKED_MESSAGE})
 
 
 def answer_informational(client: LlmClient, repo: DataRepo, db: LabsDb, question: str) -> str:
