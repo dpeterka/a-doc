@@ -5,6 +5,41 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.31.0] — 2026-09-04
+
+*A human review step between a proposed rule-out and the ledger.*
+
+### Added
+
+- **`adoc rule-out-backfill --propose-to <path>` / `--apply-from <path>`.**
+  ADR 0047's apply path was all-or-nothing: `--dry-run` printed, and the
+  default wrote all 43 proposals. Measured on the real case file that is not
+  acceptable — 7 would retire a lead immediately, and several of those
+  rule-outs were clinically wrong.
+
+  The obvious selective version (`--only <ids>`) would have been broken by
+  non-determinism. Four runs over the same ledger gave 46/18, 44/16, 43/18
+  and 40/13 proposals, **declining a different set of leads each time** — so
+  approving ids from one run and re-proposing at apply time writes something
+  the reviewer never read: the ids match and the rule-outs do not.
+
+  So the proposal is frozen to a file and applying is a separate, model-free
+  step. `retires_on_next_review: true` marks the entries whose check is
+  already met, because those are the ones that end a lead the moment they
+  land.
+
+  Three properties make it a review rather than theatre:
+
+  - **What was approved is byte-for-byte what is written.**
+    `_apply_reviewed_rule_outs` never builds an `LlmClient`, and a test
+    asserts it with a client that *raises if constructed* — structural
+    rather than a promise.
+  - **The review is in git.** The proposal file is committed to the data
+    repo, so the diff it produced sits beside the version reviewed.
+  - **A hand-edited file clears the same bar as the model's output.** An
+    entry naming a hypothesis the ledger no longer holds is skipped rather
+    than created; a vacuous rule-out typed by hand is refused.
+
 ## [0.30.2] — 2026-09-04
 
 ### Fixed
