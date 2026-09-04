@@ -487,3 +487,210 @@ def test_an_analyte_genuinely_absent_is_still_not_met() -> None:
 
     assert met is False
     assert "no Serum Metanephrines result on file" in why
+
+
+# --- the tier cap -----------------------------------------------------------------------------
+
+
+def _cap_hyp(
+    hid: str,
+    *,
+    tier: str = "expanded",
+    probability: str = "low",
+    evidence: int = 1,
+    strong: bool = False,
+    origin: str = "challenger",
+    status: str = "active",
+) -> Hypothesis:
+    from adoc.casefile.schema import Evidence
+
+    return Hypothesis(
+        id=hid,
+        name=f"Lead {hid}",
+        tier=tier,  # type: ignore[arg-type]
+        probability=probability,  # type: ignore[arg-type]
+        status=status,  # type: ignore[arg-type]
+        origin=origin,  # type: ignore[arg-type]
+        first_proposed=date(2026, 8, 1),
+        evidence_for=[
+            Evidence(
+                claim=f"finding {i}",
+                source="labs:crp:2026-05-02",
+                strength="strong" if strong else "moderate",
+            )
+            for i in range(evidence)
+        ],
+    )
+
+
+def _cap_ledger(*hyps: Hypothesis) -> Ledger:
+    return Ledger(version=1, updated=date(2026, 9, 4), hypotheses=list(hyps))
+
+
+def test_a_tier_under_its_cap_folds_nothing() -> None:
+    from adoc.casefile.retirement import propose_tier_folds
+
+    ledger = _cap_ledger(*[_cap_hyp(f"h{i}") for i in range(3)])
+
+    assert propose_tier_folds(ledger, today=date(2026, 9, 4), caps={"expanded": 12}) == []
+
+
+def test_the_weakest_fold_first_and_are_parked_not_ruled_out() -> None:
+    """Nothing is deleted or refuted. A parked lead keeps its evidence and
+    returns the moment it earns its way back."""
+    from adoc.casefile.retirement import propose_tier_folds
+
+    ledger = _cap_ledger(
+        _cap_hyp("strong-lead", evidence=4, strong=True, probability="high"),
+        _cap_hyp("weak-lead", evidence=1, probability="minimal"),
+    )
+
+    folds = propose_tier_folds(ledger, today=date(2026, 9, 4), caps={"expanded": 1})
+
+    assert [f.hypothesis_id for f in folds] == ["weak-lead"]
+    assert folds[0].to_status == "parked"
+    assert "not ruled out" in folds[0].reason
+
+
+def test_an_uncited_lead_folds_before_any_cited_one() -> None:
+    """A lead with no evidence at all is a placeholder, not a lead.
+
+    Achieved by evidence weight rather than a separate key: every evidence
+    item contributes at least 1, so an uncited lead scores 0 and is the
+    unique minimum. `_fold_rank` briefly carried an explicit uncited-first
+    key and it was removed as decoration — a negative control showed no
+    input could make the two keys disagree.
+    """
+    from adoc.casefile.retirement import propose_tier_folds
+
+    ledger = _cap_ledger(
+        _cap_hyp("uncited", evidence=0, probability="high"),
+        _cap_hyp("cited-but-minimal", evidence=1, probability="minimal"),
+    )
+
+    folds = propose_tier_folds(ledger, today=date(2026, 9, 4), caps={"expanded": 1})
+
+    assert [f.hypothesis_id for f in folds] == ["uncited"]
+
+
+def test_evidence_weight_outranks_the_models_own_probability() -> None:
+    """Probability is model-assigned and is deliberately the LAST
+    substantive key. A lead the model called `high` on one weak citation
+    folds before one it called `low` with four strong ones."""
+    from adoc.casefile.retirement import propose_tier_folds
+
+    ledger = _cap_ledger(
+        _cap_hyp("thin-but-confident", evidence=1, probability="high"),
+        _cap_hyp("well-evidenced", evidence=4, strong=True, probability="low"),
+    )
+
+    folds = propose_tier_folds(ledger, today=date(2026, 9, 4), caps={"expanded": 1})
+
+    assert [f.hypothesis_id for f in folds] == ["thin-but-confident"]
+
+
+def test_the_safety_checklist_is_never_capped() -> None:
+    """`cant-miss` exists so a dangerous possibility stays visible however
+    unlikely (ADR 0039). Capping it would delete the mechanism to tidy the
+    page — and all 10 on the real ledger are `minimal` or `low`, so a
+    probability-ordered cap would take them first."""
+    from adoc.casefile.retirement import TIER_CAPS, propose_tier_folds
+
+    ledger = _cap_ledger(
+        *[_cap_hyp(f"cm{i}", tier="cant-miss", probability="minimal") for i in range(20)]
+    )
+
+    assert "cant-miss" not in TIER_CAPS
+    assert propose_tier_folds(ledger, today=date(2026, 9, 4)) == []
+
+
+def test_a_patient_raised_lead_is_never_folded() -> None:
+    """Her own theories are exactly what a tidying rule must not quietly
+    remove."""
+    from adoc.casefile.retirement import propose_tier_folds
+
+    ledger = _cap_ledger(
+        _cap_hyp("hers", origin="patient", evidence=0, probability="minimal"),
+        _cap_hyp("strong", evidence=4, strong=True, probability="high"),
+    )
+
+    folds = propose_tier_folds(ledger, today=date(2026, 9, 4), caps={"expanded": 1})
+
+    assert [f.hypothesis_id for f in folds] == ["strong"]
+
+
+def test_a_protected_lead_still_occupies_its_slot() -> None:
+    """The cap is about how much the page shows, and a protected lead is on
+    the page. Exempting it from the count would let a tier grow without
+    limit by accumulating protected leads."""
+    from adoc.casefile.retirement import propose_tier_folds
+
+    ledger = _cap_ledger(
+        _cap_hyp("hers", origin="patient"),
+        _cap_hyp("a"),
+        _cap_hyp("b"),
+    )
+
+    folds = propose_tier_folds(ledger, today=date(2026, 9, 4), caps={"expanded": 2})
+
+    assert len(folds) == 1
+    assert folds[0].hypothesis_id != "hers"
+
+
+def test_a_parked_lead_does_not_count_toward_the_cap() -> None:
+    """Otherwise the cap would fold the same tier repeatedly, once per
+    review, until nothing was left."""
+    from adoc.casefile.retirement import propose_tier_folds
+
+    ledger = _cap_ledger(
+        _cap_hyp("live-a"),
+        _cap_hyp("live-b"),
+        *[_cap_hyp(f"gone{i}", status="parked") for i in range(10)],
+    )
+
+    assert propose_tier_folds(ledger, today=date(2026, 9, 4), caps={"expanded": 2}) == []
+
+
+def test_a_clinical_reason_beats_the_cap_for_the_same_lead() -> None:
+    """A lead the rules can end should end for its own stated reason, not be
+    swept away as one of the weakest in an overfull tier. A reader deserves
+    the real reason when there is one."""
+    from adoc.casefile.retirement import LabFact, propose_retirements
+    from adoc.casefile.schema import RuleOutCheck
+
+    endable = _cap_hyp("endable", evidence=1, probability="minimal")
+    endable.rule_out_check = RuleOutCheck(analyte="ferritin", operator="normal")
+    ledger = _cap_ledger(endable, *[_cap_hyp(f"h{i}", evidence=4, strong=True) for i in range(20)])
+    labs = {
+        "ferritin": LabFact(
+            value=100.0, value_text="", flag="", unit="ng/mL", ref="labs:ferritin:2026-05-02"
+        )
+    }
+
+    report = propose_retirements(ledger, today=date(2026, 9, 4), labs=labs)
+    by_id = {r.hypothesis_id: r for r in report.retirements}
+
+    assert "endable" in by_id
+    assert by_id["endable"].to_status == "ruled-out"
+    assert "rule-out condition is now met" in by_id["endable"].reason
+
+
+def test_no_lead_is_retired_twice_in_one_pass() -> None:
+    """The cap runs over the ledger as it stands, so a lead the rules just
+    ended is still in the tier. It must not also be folded."""
+    from adoc.casefile.retirement import LabFact, propose_retirements
+    from adoc.casefile.schema import RuleOutCheck
+
+    endable = _cap_hyp("endable", evidence=1, probability="minimal")
+    endable.rule_out_check = RuleOutCheck(analyte="ferritin", operator="normal")
+    ledger = _cap_ledger(endable, *[_cap_hyp(f"h{i}") for i in range(20)])
+    labs = {
+        "ferritin": LabFact(
+            value=100.0, value_text="", flag="", unit="ng/mL", ref="labs:ferritin:2026-05-02"
+        )
+    }
+
+    report = propose_retirements(ledger, today=date(2026, 9, 4), labs=labs)
+    ids = [r.hypothesis_id for r in report.retirements]
+
+    assert len(ids) == len(set(ids)), "a lead was retired twice in one pass"

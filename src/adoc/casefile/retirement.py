@@ -51,6 +51,7 @@ from datetime import date
 
 from pydantic import BaseModel, Field
 
+from adoc.casefile.ledger import ACTIVE_STATUSES
 from adoc.casefile.schema import (
     Evidence,
     Hypothesis,
@@ -351,6 +352,104 @@ def _rule_out_met(hypothesis: Hypothesis, labs: LabLookup) -> Retirement | None:
     )
 
 
+# How many active leads each tier may hold before the weakest fold away.
+#
+# `cant-miss` is deliberately absent and is NEVER capped: it is the safety
+# checklist (ADR 0039), the whole point of which is that a dangerous
+# possibility stays visible however unlikely. Capping it would delete the
+# mechanism to tidy the page.
+#
+# Measured 2026-09-04 on the real ledger: 46 active — 0 most-likely,
+# 10 cant-miss (all protected), 36 expanded (8 high / 11 moderate / 14 low /
+# 3 minimal, 3 patient-raised).
+TIER_CAPS: dict[str, int] = {"most-likely": 5, "expanded": 12}
+
+
+def _fold_rank(hypothesis: Hypothesis, today: date) -> tuple[int, int, int]:
+    """Sort key for "fold this one first". Lower is weaker.
+
+    Ordered so the objective criterion decides first and the model's own
+    opinion only breaks ties:
+
+    1. **Evidence weight**, counting strong double — the same weighing
+       `_outweighed` uses. Grounded in what is cited rather than in a bucket
+       a model wrote. An **uncited** lead scores 0 and therefore always
+       folds first, which is the intended behaviour.
+
+       This started as two keys, uncited-first and then weight. The separate
+       key was removed as decoration: every evidence item contributes at
+       least 1, so an uncited lead is the unique minimum already and no
+       input can make the two keys disagree. A negative control proved it —
+       deleting the uncited key changed no test.
+    2. **Probability**, last of the substantive keys precisely because it is
+       model-assigned. It separates leads the first key ranks equal.
+    3. **Longest untouched**, so a stale lead folds before a fresh one.
+    """
+    rank = {"high": 0, "moderate": 1, "low": 2, "minimal": 3}
+    weight = sum(2 if e.strength == "strong" else 1 for e in hypothesis.evidence_for)
+    touched = hypothesis.last_challenged or hypothesis.first_proposed
+    return (
+        weight,
+        -rank.get(hypothesis.probability, 9),
+        -(today - touched).days,
+    )
+
+
+def propose_tier_folds(
+    ledger: Ledger, *, today: date, caps: dict[str, int] | None = None
+) -> list[Retirement]:
+    """Park the weakest leads in any tier over its cap.
+
+    A ceiling is a blunt instrument and it is chosen deliberately: it is the
+    only convergence mechanism here that needs no model in the loop and no
+    judgement about clinical truth. It does not decide a lead is WRONG — it
+    decides the board can only show so many at once, which is a statement
+    about the reader, not the medicine.
+
+    Three properties keep that honest:
+
+    - **`parked`, never `ruled-out`.** Nothing is deleted or refuted. A
+      parked lead keeps its evidence and reappears the moment it earns its
+      way back.
+    - **`cant-miss` is never capped**, and neither is anything
+      `is_protected` — the patient's own theories and the safety checklist
+      are exactly what a tidying rule must not quietly remove.
+    - **Deterministic and stated.** `_fold_rank` ranks on cited evidence
+      first and the model's probability only as a tie-break.
+    """
+    limits = TIER_CAPS if caps is None else caps
+    folds: list[Retirement] = []
+    for tier, cap in limits.items():
+        eligible = [
+            h
+            for h in ledger.hypotheses
+            if h.status in ACTIVE_STATUSES and h.tier == tier and not is_protected(h)
+        ]
+        # Protected leads still occupy the tier — the cap is about how much
+        # the page shows, and a protected lead is on the page.
+        occupied = sum(
+            1 for h in ledger.hypotheses if h.status in ACTIVE_STATUSES and h.tier == tier
+        )
+        over = occupied - cap
+        if over <= 0:
+            continue
+        weakest = sorted(eligible, key=lambda h: _fold_rank(h, today))[:over]
+        folds.extend(
+            Retirement(
+                hypothesis_id=h.id,
+                hypothesis_name=h.name,
+                to_status="parked",
+                reason=(
+                    f"the {tier} tier holds {occupied} leads and shows at most {cap}; "
+                    "this was among the weakest by cited evidence. Parked, not ruled out — "
+                    "it keeps its evidence and returns if it earns its way back"
+                ),
+            )
+            for h in weakest
+        )
+    return folds
+
+
 def propose_retirements(
     ledger: Ledger,
     *,
@@ -404,6 +503,23 @@ def propose_retirements(
             if proposal is not None:
                 retirements.append(proposal)
                 break
+
+    # The cap runs LAST, over what the clinical rules left behind. Order
+    # matters: a lead the rules can end should end for its own stated reason
+    # ("its rule-out condition is now met"), not be swept away as one of the
+    # weakest in an overfull tier. A reader deserves the real reason when
+    # there is one.
+    #
+    # It also runs over the ledger as it stands, so leads retired above are
+    # still counted as occupying their tier this pass. They will not be next
+    # time, which is correct — the cap should not compound with the rules in
+    # a single review.
+    already = {r.hypothesis_id for r in retirements}
+    retirements.extend(
+        fold
+        for fold in propose_tier_folds(ledger, today=today)
+        if fold.hypothesis_id not in already
+    )
 
     return RetirementReport(
         retirements=retirements, protected_count=protected, refused_exclusions=refused
