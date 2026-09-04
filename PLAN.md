@@ -256,6 +256,41 @@ is next, and its scope is listed under "Phase 4 — Extras" below.*
 **Original scope:**  patient HPO phenotype profile; LIRICAL (phenotype-only) + Monarch sem-sim as independent differential engines rendered alongside the LLM panel in deep reviews with divergence adjudication; Monarch KG SQLite + Orphadata + phenotype.hpoa + Mondo as chat tools; ~10 hand-encoded ACR/EULAR classification scorers (SLE 2019, Sjögren 2016, SLICC, CASPAR, myositis, ANCA vasculitides…) + ICAP ANA-pattern mapping, computed deterministically from labs+phenotype, always labeled "classification, not diagnostic, criteria"; PubMed E-utilities with PMID-linked citations; StatPearls/GeneReviews local FTS5; `adoc eval` gains the rare-disease-cohort differential-recall suite and the retrospective self-case replay, enabling gated model rotation.
 *Acceptance:* reviews show LLM vs LIRICAL differentials with explicit divergence adjudication; criteria render itemized (points, threshold); every literature claim carries a PMID; `adoc eval --candidate` produces an incumbent-vs-candidate comparison report from a single command.
 
+**Convergence and elicitation — the next track.** The adversarial review is
+closed; this is the work it did not cover. The board holds 46 active leads
+and has retired one. Measured 2026-09-04: **618 evidence-for items to 43
+evidence-against**, so every convergence rule starves on its input rather
+than its threshold.
+
+Six items, ordered by impact — meaning effect on *a directed set of leads to
+pursue*, not merely on the count:
+
+| # | item | ADR | effect | risk |
+|---|---|---|---|---|
+| 1 | **Cap the board.** Ceiling per tier; lowest-probability *uncited* leads fold to `parked` on overflow. | — | 46 → ~23 this week | low — reversible, and "uncited" is objective, not a model score |
+| 2 | **Track a new symptom before it is a lead.** `emerging` section outside the differential. | 0050 | stops the cap refilling; separates a 2-week ear symptom from a 4-year pattern | medium — a wrong window defers a real finding |
+| 3 | **Let the engines oppose incumbents.** `opposes` currently writes counter-evidence only for `ledger_only`; LIRICAL's findings are mostly `engine_only`, so 15 opposing verdicts moved nothing. | — | fixes the 618:43 *cause*; deterministic, at volume | medium-high — unmeasured whether those 15 are *good* opposes |
+| 4 | **`_outweighed`.** Fires for 1 of 46 at a 14:1 ratio. | — | trivial once #3 lands; likely a deletion | low |
+| 5 | **The chat asks.** `gap_scan` stage: name the ≤2 unknowns that would most change the differential, ask one. | 0048 | highest ceiling of the six — every turn converts an unknown into a known | low, but the largest build |
+| 6 | **A lead can end because the cause was removed.** `resolved` status + a trend-change question. | 0049 | one lead today; supplies a missing *category* | low; cheap enough to ride along with any release |
+
+Ordering rationale, since it is not obvious:
+
+- **#1 first** because it is the only item that changes the number without a
+  model in the loop, and it is fully reversible. It is also the most
+  cosmetic — it makes the list shorter, not better — which is why it is
+  paired immediately with #2.
+- **#2 before #3** because without it the cap refills. ADR 0047 already
+  slowed the inflow by dropping leads with no rule-out; #2 closes the
+  remaining class.
+- **#4 depends on #3.** Retuning a rule whose inputs are 14:1 is tuning the
+  threshold of a starved rule.
+- **#5 is ordered by time-to-effect, not by ceiling.** Its ceiling is the
+  highest of the six: it is the only item that improves the *quality* of
+  what enters the board rather than pruning what already did. If the
+  priority is directedness over count, it moves to first.
+- **#6 is smallest.** Fold it into whichever release is nearest.
+
 **Between phases 3 and 4 — the adversarial-review adoption track.** An
 external adversarial review (2026-09-01) produced 20-odd findings across
 patient experience and clinical logic. Regrouped by what actually shares
