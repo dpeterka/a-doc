@@ -131,6 +131,51 @@ Three properties make it safe to point at a real case file:
   before the rule-outs exist would remove the safety net without providing
   the mechanism meant to replace it.
 
+## Measured on the real case file, 2026-09-03
+
+The dry run, and then a simulation of what would retire:
+
+```
+46 active lead(s) with no way to end
+461 analyte(s) on file
+proposed 43-46, machine-checkable 16-18, declined 0-3, vacuous 0
+```
+
+Two findings, both from insisting on the simulation rather than trusting
+the proposal count.
+
+**First, a latent bug that would have made all of this decorative.**
+`build_lab_lookup` keys on the normalized analyte name;
+`evaluate_rule_out` looked it up raw. Of 16 checkable rule-outs over 461
+stored analytes, **15 answered "no result on file" and 1 matched** — the one
+whose analyte was `ferritin`, the only single-lowercase-word name. Fixed in
+v0.30.1. After the fix: **7 would retire, 11 not met, 0 unanswerable.**
+
+**Second, and the reason this ships as propose-not-apply: several of those
+7 are clinically wrong**, in one consistent way. Each treats a single
+current normal value as excluding a condition that is not settled by one:
+
+| lead | proposed rule-out | why it is wrong |
+|---|---|---|
+| mast-cell activation syndrome | tryptase normal | MCAS wants an acute-episode rise; most patients have a normal baseline |
+| accelerated bone loss from estrogen deficiency | estradiol normal | the loss already happened; today's level does not undo it |
+| primary ovarian insufficiency | FSH normal | published criteria want elevated FSH twice, ≥4 weeks apart |
+| perimenopause | FSH normal | FSH swings widely in perimenopause by definition |
+
+Of the seven, the cortisol one (>18 µg/dL excluding adrenal insufficiency)
+and the platelet one are defensible; the rest are the plausible-sounding
+kind that would quietly end a live lead.
+
+This is **the same shape ADR 0042 found in the criteria scorers**: a normal
+draw is frequently an expected treatment effect or a between-episode value,
+not evidence the finding never happened. The backfill prompt now names the
+three traps — episodic, historical/cumulative, and repeat-testing — and
+tells the model to return nothing rather than substitute the convenient
+single value.
+
+**The backfill has not been applied.** A dry run that produces seven
+retirements, of which several are wrong, is the dry run doing its job.
+
 ## Consequences
 
 - **Reviews will add fewer hypotheses**, and some weeks none. That is the

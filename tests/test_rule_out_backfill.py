@@ -290,3 +290,24 @@ def test_the_prompt_asks_for_both_halves() -> None:
     for operator in ("negative", "normal", "below", "above"):
         assert operator in _SYSTEM
     assert "cannot be evaluated" in _SYSTEM
+
+
+def test_the_prompt_warns_about_the_single_normal_result_trap() -> None:
+    """Measured on the real case file: with the analyte-matching bug fixed,
+    the backfill would have retired 7 leads immediately — and several of
+    those rule-outs are clinically wrong in one specific way. Each treats a
+    single current normal value as excluding a condition that is episodic
+    (MCAS on a baseline tryptase), historical (bone loss on today's
+    estradiol), or defined by repeat testing (POI on one FSH).
+
+    The same shape ADR 0042 found in the criteria scorers — a normal draw is
+    frequently an expected treatment effect or a between-episode value, not
+    evidence the finding never happened.
+    """
+    from adoc.casefile.rule_out_backfill import _SYSTEM
+
+    assert "SINGLE NORMAL RESULT IS NOT A RULE-OUT" in _SYSTEM
+    for trap in ("tryptase", "estradiol", "FSH"):
+        assert trap.lower() in _SYSTEM.lower()
+    assert "two occasions" in _SYSTEM
+    assert "Do not substitute the convenient single value" in _SYSTEM
