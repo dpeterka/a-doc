@@ -5,6 +5,42 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.30.1] — 2026-09-03
+
+*Found by simulating what ADR 0047's backfill would actually retire — which
+is the only reason it was found.*
+
+### Fixed
+
+- **A rule-out's analyte is matched on the normalized name.**
+  `review.build_lab_lookup` keys the lookup on `_normalize_analyte(name)`,
+  so `Vitamin B12` is stored under `vitaminb12`;
+  `retirement.evaluate_rule_out` looked up `check.analyte` **raw**. Only a
+  single lowercase word could ever match.
+
+  Measured against the real case file: of **16** machine-checkable rule-outs
+  proposed over **461** stored analytes, **15 answered "no result on file"
+  and 1 matched** — the one whose analyte was `ferritin`. Every multi-word
+  or capitalised name was unreachable.
+
+  Same shape as `criteria._RA_RF` (`r"rheumatoid factor"`, a literal space
+  matched against a space-stripped name) and the `LabFlag` set that missed
+  `LL`: **a check that cannot fire looks exactly like a check that fires and
+  finds nothing.** This one would have made ADR 0038's evaluator and ADR
+  0047's writer each correct in isolation and jointly useless.
+
+  Fixed at the evaluator rather than the writer, so every caller benefits —
+  a check written by a review, by the web UI, or by hand resolves the same
+  way. `normalize_analyte` is exported; the raw key is still tried as a
+  fallback.
+
+  The property that had to survive is pinned: **an analyte genuinely absent
+  is still not met.** Absence of a test reads nothing like a negative result,
+  and conflating them is the one failure this evaluator must not have.
+
+- `RuleOutCheck.analyte`'s docstring claimed regex matching over the
+  normalized name. It is a dict lookup and never was a regex. Corrected.
+
 ## [0.30.0] — 2026-09-03
 
 *ADR 0047 — a lead states how it ends. CLN-01 reopened and addressed.*
