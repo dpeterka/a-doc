@@ -440,3 +440,116 @@ def test_the_check_survives_review_intact(tmp_path: Path) -> None:
     (op,) = proposals_to_ops(reviewed, ledger)[0]
 
     assert op.rule_out_check == check
+
+
+# --- the check must test what its own prose says --------------------------------------------------
+
+
+def test_a_check_looser_than_its_prose_is_refused() -> None:
+    """Measured on the real case file, 2026-09-04, and the most dangerous
+    thing this exercise turned up. The prose was clinically sophisticated
+    and the check was a loose approximation of it — and the check is what
+    fires:
+
+        prose  "250-ug cosyntropin STIMULATION test shows a STIMULATED
+                cortisol >=18 at 30-60 minutes"
+        check  Cortisol above 18       <- any cortisol, incl. a baseline
+        stored 18.8 ug/dL              <- a baseline draw
+
+    That would have retired a can't-miss adrenal-insufficiency lead on
+    evidence its own stated rule-out does not accept.
+    """
+    client, _ = _client(
+        [
+            {
+                "proposals": [
+                    {
+                        "id": "a",
+                        "rule_out": (
+                            "250-ug cosyntropin (ACTH) stimulation test shows an adequate "
+                            "stimulated serum cortisol (30-60 minute cortisol >= 18 ug/dL)"
+                        ),
+                        "analyte": "Cortisol",
+                        "operator": "above",
+                        "threshold": 18.0,
+                        "unit": "ug/dL",
+                    }
+                ]
+            }
+        ]
+    )
+
+    ops, report = propose_rule_outs(client, _ledger(_hyp("a")), analytes=["Cortisol"])
+
+    (op,) = ops
+    # The prose survives — it is a real rule-out, for a human to evaluate.
+    assert "cosyntropin" in op.rule_out
+    # The check does not.
+    assert op.rule_out_check is None
+    assert report.checkable == 0
+    assert any("cosyntropin" in entry for entry in report.inexpressible)
+
+
+def test_every_qualifier_the_grammar_cannot_hold_is_refused() -> None:
+    """`RuleOutCheck` reads the most recent stored row for one analyte. It
+    cannot know how a specimen was provoked, when it was drawn relative to
+    anything else, whether it was a repeat, or what tube it came in."""
+    from adoc.casefile.rule_out_backfill import check_is_expressible
+
+    refuse = [
+        "250-ug cosyntropin stimulation test with a stimulated cortisol >= 18",
+        "Biotin within range on the same day as the questioned assays",
+        "Platelet normal when repeated in a sodium-citrate tube",
+        "elevated FSH on two occasions at least four weeks apart",
+        "a tryptase drawn during an acute episode",
+        "a fasting glucose below 100",
+        "a morning cortisol above 18",
+    ]
+    for prose in refuse:
+        assert check_is_expressible(prose) is not None, prose
+
+
+def test_a_plain_rule_out_is_still_expressible() -> None:
+    """The guard is conservative, not prohibitive. Over-refusing would make
+    every rule-out prose-only and retire nothing — the state ADR 0047 exists
+    to end."""
+    from adoc.casefile.rule_out_backfill import check_is_expressible
+
+    allow = [
+        "a normal serum metanephrines",
+        "a negative anti-dsDNA",
+        "a CRP below 5 mg/L",
+        "AMH within the lab's age-appropriate reference range",
+        "a normal ferritin",
+    ]
+    for prose in allow:
+        assert check_is_expressible(prose) is None, prose
+
+
+def test_the_prompt_states_the_check_must_match_its_prose() -> None:
+    from adoc.casefile.rule_out_backfill import _SYSTEM
+
+    assert "MUST TEST EXACTLY WHAT YOUR PROSE SAYS" in _SYSTEM
+    assert "baseline cortisol is not a cosyntropin-stimulated cortisol" in _SYSTEM
+
+
+def test_no_pattern_carries_a_mangled_escape() -> None:
+    """A `\\b` written through a shell heredoc becomes a literal backspace
+    (0x08), and `re` then matches backspace-morning-backspace, which no text
+    contains. Caught because one qualifier silently stopped matching while
+    the pattern still LOOKED right in the file.
+
+    Same family as `criteria._RA_RF`: a regex that cannot fire is
+    indistinguishable from one that fires and finds nothing.
+    """
+    from adoc.casefile.rule_out_backfill import _INEXPRESSIBLE_PATTERNS
+
+    for pattern in _INEXPRESSIBLE_PATTERNS:
+        assert "\x08" not in pattern, f"literal backspace in {pattern!r}"
+        assert "\x0c" not in pattern, f"literal form-feed in {pattern!r}"
+
+    # And every pattern must actually be able to match something.
+    import re
+
+    for pattern in _INEXPRESSIBLE_PATTERNS:
+        re.compile(pattern)  # raises on a malformed pattern
