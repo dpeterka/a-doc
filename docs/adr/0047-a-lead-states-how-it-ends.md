@@ -176,6 +176,48 @@ single value.
 **The backfill has not been applied.** A dry run that produces seven
 retirements, of which several are wrong, is the dry run doing its job.
 
+## The review step, because a dry run is not a review
+
+The measurement above is why applying all 43 proposals is not acceptable
+and why `--dry-run` is not enough on its own. Two further facts settle the
+shape:
+
+- **The proposals are not reproducible.** Four runs over the same ledger
+  gave 46/18, 44/16, 43/18 and 40/13 proposals, declining a different set of
+  leads each time. So `--only <ids>` layered on a fresh run would write
+  something the reviewer never read: the ids would match and the rule-outs
+  would not.
+- **The failure mode is plausible-sounding wrongness**, which a second
+  prompt pass is worst at catching. It needs a person.
+
+So the flow is three steps, and the middle one is a file:
+
+```
+adoc rule-out-backfill --propose-to case/proposed-rule-outs.yaml
+    one model call; writes a reviewable file into the data repo and
+    commits it; NOTHING reaches the ledger
+
+    -> review it. Delete any entry you do not accept.
+       `retires_on_next_review: true` marks the entries whose check is
+       already met — applying one of those ends that lead.
+
+adoc rule-out-backfill --apply-from case/proposed-rule-outs.yaml
+    NO model call. Writes exactly what the file says, through
+    `apply_and_save` so the invariants check it.
+```
+
+Three properties make this a review rather than theatre:
+
+- **What was approved is byte-for-byte what is written.** `--apply-from` is
+  a separate function that never builds an `LlmClient`, and a test asserts
+  it with a client that raises if constructed.
+- **The review is in the history.** The proposal file is committed to the
+  data repo, so the diff it produced sits next to the version that was
+  reviewed.
+- **A hand-edited file clears the same bar as the model's output.** An
+  entry naming a hypothesis the ledger no longer holds is skipped, never
+  created; a vacuous rule-out typed in by hand is refused.
+
 ## Consequences
 
 - **Reviews will add fewer hypotheses**, and some weeks none. That is the

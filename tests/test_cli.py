@@ -1632,3 +1632,154 @@ def test_console_entrypoint_help_subprocess() -> None:
     )
     assert result.returncode == 0
     assert "adoc" in result.stdout
+
+
+# --- ADR 0047's two-step review flow -------------------------------------------------------------
+
+
+def _seed_lead_without_rule_out(data_dir: Path) -> None:
+    from datetime import UTC, datetime
+
+    from adoc.casefile.ledger import apply_and_save
+    from adoc.casefile.repo import HISTORY_RELPATH, LEDGER_RELPATH
+    from adoc.casefile.schema import (
+        AddHypothesis,
+        Evidence,
+        Hypothesis,
+        LedgerDiff,
+        Provenance,
+    )
+
+    def hyp(hid: str, tier: str) -> Hypothesis:
+        return Hypothesis(
+            id=hid,
+            name=f"Condition {hid}",
+            tier=tier,
+            probability="low",
+            status="active",
+            origin="challenger",
+            first_proposed=date(2026, 8, 1),
+            last_challenged_version=1,
+            evidence_for=[
+                Evidence(claim="a finding", source="labs:crp:2026-05-02", strength="moderate")
+            ],
+        )
+
+    apply_and_save(
+        data_dir / LEDGER_RELPATH,
+        data_dir / HISTORY_RELPATH,
+        LedgerDiff(
+            provenance=Provenance(
+                app_version="test",
+                prompt_template_version="t@v1",
+                model_id="m",
+                dag_node="seed",
+                timestamp=datetime(2026, 8, 1, tzinfo=UTC),
+            ),
+            rationale="seed",
+            ops=[
+                AddHypothesis(hypothesis=hyp("target", "expanded")),
+                AddHypothesis(hypothesis=hyp("safety", "cant-miss")),
+            ],
+        ),
+    )
+
+
+def test_apply_from_makes_no_model_call(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The property the whole two-step flow rests on. The proposals are not
+    reproducible — four production runs over one ledger gave 46/18, 44/16,
+    43/18 and 40/13, declining different leads each time — so approving from
+    one run and re-proposing at apply time would write something the
+    reviewer never read.
+
+    `_build_llm_client` is replaced with something that fails if called.
+    """
+    from adoc.casefile.rule_out_backfill import ProposalFile, ReviewableProposal, write_proposals
+
+    data_dir = tmp_path / "a-doc-data"
+    DataRepo.init_at(data_dir)
+    _seed_lead_without_rule_out(data_dir)
+    monkeypatch.setenv("ADOC_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("ADOC_MODELS_FILE", str(REPO_ROOT / "models.yaml"))
+
+    def _explode(_settings: object) -> object:
+        raise AssertionError("--apply-from must not build a model client")
+
+    monkeypatch.setattr(cli, "_build_llm_client", _explode)
+
+    write_proposals(
+        data_dir / "case" / "reviewed.yaml",
+        ProposalFile(
+            generated=date(2026, 9, 4),
+            proposals=[
+                ReviewableProposal(
+                    id="target", name="Condition target", rule_out="a normal serum ferritin"
+                )
+            ],
+        ),
+    )
+
+    code = main(["rule-out-backfill", "--apply-from", "case/reviewed.yaml"])
+
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "applied 1" in out
+    from adoc.casefile.ledger import load_ledger
+    from adoc.casefile.repo import LEDGER_RELPATH
+
+    ledger = load_ledger(data_dir / LEDGER_RELPATH)
+    target = next(h for h in ledger.hypotheses if h.id == "target")
+    assert target.rule_out == "a normal serum ferritin"
+
+
+def test_apply_from_writes_only_what_the_reviewed_file_kept(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Pruning the file prunes the write — that is the review."""
+    from adoc.casefile.ledger import load_ledger
+    from adoc.casefile.repo import LEDGER_RELPATH
+    from adoc.casefile.rule_out_backfill import ProposalFile, ReviewableProposal, write_proposals
+
+    data_dir = tmp_path / "a-doc-data"
+    DataRepo.init_at(data_dir)
+    _seed_lead_without_rule_out(data_dir)
+    monkeypatch.setenv("ADOC_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("ADOC_MODELS_FILE", str(REPO_ROOT / "models.yaml"))
+    monkeypatch.setattr(cli, "_build_llm_client", lambda s: None)
+
+    # The reviewer kept `target` and deleted the `safety` entry.
+    write_proposals(
+        data_dir / "case" / "reviewed.yaml",
+        ProposalFile(
+            generated=date(2026, 9, 4),
+            proposals=[
+                ReviewableProposal(id="target", name="t", rule_out="a normal serum ferritin")
+            ],
+        ),
+    )
+
+    assert main(["rule-out-backfill", "--apply-from", "case/reviewed.yaml"]) == 0
+
+    ledger = load_ledger(data_dir / LEDGER_RELPATH)
+    assert next(h for h in ledger.hypotheses if h.id == "target").rule_out
+    assert not next(h for h in ledger.hypotheses if h.id == "safety").rule_out
+
+
+def test_apply_from_a_missing_file_fails_loudly(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An apply that silently did nothing would look exactly like a
+    successful run, and the operator would believe a review had landed."""
+    data_dir = tmp_path / "a-doc-data"
+    DataRepo.init_at(data_dir)
+    _seed_lead_without_rule_out(data_dir)
+    monkeypatch.setenv("ADOC_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("ADOC_MODELS_FILE", str(REPO_ROOT / "models.yaml"))
+    monkeypatch.setattr(cli, "_build_llm_client", lambda s: None)
+
+    code = main(["rule-out-backfill", "--apply-from", "case/nope.yaml"])
+
+    assert code == 1
+    assert "no proposal file" in capsys.readouterr().err
