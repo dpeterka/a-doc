@@ -256,6 +256,46 @@ is next, and its scope is listed under "Phase 4 — Extras" below.*
 **Original scope:**  patient HPO phenotype profile; LIRICAL (phenotype-only) + Monarch sem-sim as independent differential engines rendered alongside the LLM panel in deep reviews with divergence adjudication; Monarch KG SQLite + Orphadata + phenotype.hpoa + Mondo as chat tools; ~10 hand-encoded ACR/EULAR classification scorers (SLE 2019, Sjögren 2016, SLICC, CASPAR, myositis, ANCA vasculitides…) + ICAP ANA-pattern mapping, computed deterministically from labs+phenotype, always labeled "classification, not diagnostic, criteria"; PubMed E-utilities with PMID-linked citations; StatPearls/GeneReviews local FTS5; `adoc eval` gains the rare-disease-cohort differential-recall suite and the retrospective self-case replay, enabling gated model rotation.
 *Acceptance:* reviews show LLM vs LIRICAL differentials with explicit divergence adjudication; criteria render itemized (points, threshold); every literature claim carries a PMID; `adoc eval --candidate` produces an incumbent-vs-candidate comparison report from a single command.
 
+**Convergence and elicitation — the next track.** The adversarial review is
+closed; this is the work it did not cover. The board holds 46 active leads
+and has retired one. Measured 2026-09-04: **618 evidence-for items to 43
+evidence-against**, so every convergence rule starves on its input rather
+than its threshold.
+
+Seven items, ordered by impact — meaning effect on *a directed set of leads
+to pursue*, not merely on the count:
+
+| # | item | ADR | effect | risk |
+|---|---|---|---|---|
+| 0 | **Write `hypothesis_ids` on a question.** `review.py` passes it; 0 of 55 stored questions carry one. | — | unblocks ranking a question by which lead it moves | none — likely a one-line defect |
+| 1 | **The chat follows up on the 19 open questions it already asked.** No generation: they exist, with an `ask` and a `why`. Selection plus a composer instruction. | 0048 §1 | 19 unanswered questions start closing; **no model call** | low |
+| 2 | **Cap the board.** Ceiling per tier; lowest-probability *uncited* leads fold to `parked` on overflow. | — | 46 → ~23 this week | low — reversible, and "uncited" is objective, not a model score |
+| 3 | **Track a new symptom before it is a lead.** `emerging` section outside the differential. | 0050 | stops the cap refilling; separates a 2-week ear symptom from a 4-year pattern | medium — a wrong window defers a real finding |
+| 4 | **Let the engines oppose incumbents.** `opposes` currently writes counter-evidence only for `ledger_only`; LIRICAL's findings are mostly `engine_only`, so 15 opposing verdicts moved nothing. | — | fixes the 618:43 *cause*; deterministic, at volume | medium-high — unmeasured whether those 15 are *good* opposes |
+| 5 | **`_outweighed`.** Fires for 1 of 46 at a 14:1 ratio. | — | trivial once #4 lands; likely a deletion | low |
+| 6 | **`gap_scan`.** Generate a question when nothing open is worth asking. | 0048 §2 | keeps #1 from stalling once the backlog clears | low, largest build |
+| 7 | **A lead can end because the cause was removed.** `resolved` status + a trend-change question. | 0049 | one lead today; supplies a missing *category* | low; cheap enough to ride along with any release |
+
+Ordering rationale, since it is not obvious:
+
+- **#0 and #1 first because they are nearly free.** ADR 0048 was originally
+  scoped as one item and that hid it: following up on questions that already
+  exist needs **no model call at all**, only selection and a composer
+  instruction. Nineteen patient-answerable questions are open and none has
+  ever been answered. That is the cheapest unclaimed value in the system.
+- **#2 next** because it is the only item that changes the *number* with no
+  model in the loop, and it is fully reversible. It is also the most
+  cosmetic — a shorter list, not a better one — which is why #3 follows
+  immediately.
+- **#3 before #4** because without it the cap refills. ADR 0047 already
+  slowed the inflow by dropping leads with no rule-out; #3 closes the
+  remaining class.
+- **#5 depends on #4.** Retuning a rule whose inputs are 14:1 is tuning the
+  threshold of a starved rule.
+- **#6 is the expensive half of 0048** and only matters once #1 has worked
+  through the backlog.
+- **#7 is smallest.** Fold it into whichever release is nearest.
+
 **Between phases 3 and 4 — the adversarial-review adoption track.** An
 external adversarial review (2026-09-01) produced 20-odd findings across
 patient experience and clinical logic. Regrouped by what actually shares
