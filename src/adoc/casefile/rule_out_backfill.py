@@ -29,10 +29,12 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterable, Sequence
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
+from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, Field
+from ruamel.yaml import YAML
 
 from adoc import __version__
 from adoc.casefile.rule_out import is_usable_rule_out
@@ -141,6 +143,116 @@ class BackfillReport(BaseModel):
     rather than written."""
     unknown_ids: list[str] = Field(default_factory=list)
     applied: int = 0
+
+
+PROPOSALS_RELPATH = "case/proposed-rule-outs.yaml"
+"""Where `--propose-to` writes by default. Inside the data repo so the
+review is git-tracked next to the diff it produces."""
+
+_FILE_HEADER = """\
+# Proposed rule-outs, awaiting review. NOTHING HERE IS ON THE LEDGER YET.
+#
+# Delete any entry you do not accept, then apply exactly what is left:
+#
+#     adoc rule-out-backfill --apply-from {relpath}
+#
+# `--apply-from` makes NO model call. What this file says is what gets
+# written, byte for byte — which is the point: the proposals are not
+# reproducible. Four runs over the same ledger gave 46/18, 44/16, 43/18
+# and 40/13 proposals, declining different leads each time. Approving from
+# one run and re-proposing at apply time would write something you never
+# read.
+#
+# `retires_on_next_review: true` means the check is ALREADY MET: applying
+# it ends that lead the next time a review runs. Those are the entries
+# worth a second look — a wrong one ends a live lead.
+"""
+
+
+class ReviewableProposal(BaseModel):
+    """One proposal, with everything a human needs to accept or delete it."""
+
+    id: str
+    name: str
+    """Carried for review only — `apply_from` matches on `id`."""
+    rule_out: str
+    check: RuleOutCheck | None = None
+    retires_on_next_review: bool = False
+    """The check is already met against the labs on file. Advisory: the
+    retirement itself happens in the review's `retirement_pass`, evaluated
+    fresh at that time, not here."""
+    evaluates_to: str = ""
+    """Why, in the evaluator's own words."""
+
+
+class ProposalFile(BaseModel):
+    """A frozen set of proposals. Reviewed by deleting entries."""
+
+    generated: date
+    app_version: str = ""
+    model_id: str = ""
+    proposals: list[ReviewableProposal] = Field(default_factory=list)
+
+
+def write_proposals(path: Path, proposals: ProposalFile) -> None:
+    """Write the file with its instructions at the top.
+
+    Comments rather than a separate README: the person reading this is
+    reading it because they are about to change a differential, and the
+    instructions belong where their eyes are."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    yaml = YAML()
+    yaml.default_flow_style = False
+    with path.open("w", encoding="utf-8") as fh:
+        fh.write(_FILE_HEADER.format(relpath=PROPOSALS_RELPATH))
+        yaml.dump(proposals.model_dump(mode="json"), fh)
+
+
+def load_proposals(path: Path) -> ProposalFile:
+    """Load a reviewed proposal file.
+
+    Raises rather than returning empty on a malformed file: an
+    `--apply-from` that silently applied nothing would look exactly like a
+    successful run, and the operator would believe a review had landed.
+    """
+    if not path.is_file():
+        raise FileNotFoundError(f"no proposal file at {path}")
+    yaml = YAML(typ="safe")
+    with path.open("r", encoding="utf-8") as fh:
+        raw = yaml.load(fh)
+    if not raw:
+        raise ValueError(f"proposal file at {path} is empty")
+    return ProposalFile.model_validate(raw)
+
+
+def proposals_to_ops(
+    proposals: ProposalFile, ledger: Ledger
+) -> tuple[list[UpdateHypothesis], list[str]]:
+    """`(ops, skipped)` for a reviewed file. No model call, no invention.
+
+    An entry naming a hypothesis the ledger no longer holds is SKIPPED and
+    reported — never created. The file is a review of leads that existed
+    when it was written, and a retirement or a rebuild in between must not
+    resurrect one.
+    """
+    existing = {h.id for h in ledger.hypotheses}
+    ops: list[UpdateHypothesis] = []
+    skipped: list[str] = []
+    for proposal in proposals.proposals:
+        if proposal.id not in existing:
+            skipped.append(proposal.id)
+            continue
+        if not is_usable_rule_out(proposal.rule_out):
+            # A hand-edited file can carry anything. The same bar the
+            # model's output has to clear.
+            skipped.append(f"{proposal.id} (rule-out not usable)")
+            continue
+        ops.append(
+            UpdateHypothesis(
+                id=proposal.id, rule_out=proposal.rule_out.strip(), rule_out_check=proposal.check
+            )
+        )
+    return ops, skipped
 
 
 def needs_rule_out(ledger: Ledger) -> list[Hypothesis]:

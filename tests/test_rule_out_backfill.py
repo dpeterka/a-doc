@@ -6,11 +6,19 @@ Fake transports throughout; no network.
 from __future__ import annotations
 
 from datetime import date
+from pathlib import Path
+
+import pytest
 
 from adoc.casefile.rule_out_backfill import (
+    ProposalFile,
+    ReviewableProposal,
     backfill_diff,
+    load_proposals,
     needs_rule_out,
+    proposals_to_ops,
     propose_rule_outs,
+    write_proposals,
 )
 from adoc.casefile.schema import Evidence, Hypothesis, Ledger, UpdateHypothesis
 from adoc.config import ModelBinding
@@ -311,3 +319,124 @@ def test_the_prompt_warns_about_the_single_normal_result_trap() -> None:
         assert trap.lower() in _SYSTEM.lower()
     assert "two occasions" in _SYSTEM
     assert "Do not substitute the convenient single value" in _SYSTEM
+
+
+# --- the two-step review flow --------------------------------------------------------------------
+
+
+def _proposal_file(*entries: ReviewableProposal) -> ProposalFile:
+    return ProposalFile(
+        generated=date(2026, 9, 4),
+        app_version="test",
+        model_id="challenger",
+        proposals=list(entries),
+    )
+
+
+def test_a_reviewed_file_round_trips(tmp_path: Path) -> None:
+    from adoc.casefile.schema import RuleOutCheck
+
+    path = tmp_path / "case" / "proposed-rule-outs.yaml"
+    original = _proposal_file(
+        ReviewableProposal(
+            id="a",
+            name="Condition a",
+            rule_out="a normal serum metanephrines",
+            check=RuleOutCheck(analyte="Metanephrines", operator="normal"),
+            retires_on_next_review=True,
+            evaluates_to="Metanephrines is within the lab's reference range",
+        )
+    )
+
+    write_proposals(path, original)
+    reloaded = load_proposals(path)
+
+    assert reloaded == original
+
+
+def test_the_file_tells_the_reviewer_what_to_do(tmp_path: Path) -> None:
+    """The instructions live in the file because the person reading it is
+    about to change a differential."""
+    path = tmp_path / "p.yaml"
+    write_proposals(path, _proposal_file())
+    text = path.read_text()
+
+    assert "NOTHING HERE IS ON THE LEDGER YET" in text
+    assert "--apply-from" in text
+    assert "Delete any entry you do not accept" in text
+    # The non-determinism is the reason the file exists; say so. Asserted on
+    # a fragment that survives the header's line wrapping.
+    assert "reproducible" in text
+    assert "46/18" in text
+    assert "retires_on_next_review" in text
+
+
+def test_deleting_an_entry_means_it_is_not_applied(tmp_path: Path) -> None:
+    """The whole review mechanism: pruning the file prunes the write."""
+    ledger = _ledger(_hyp("keep"), _hyp("drop"))
+    reviewed = _proposal_file(
+        ReviewableProposal(id="keep", name="Keep", rule_out="a normal ferritin")
+    )
+
+    ops, skipped = proposals_to_ops(reviewed, ledger)
+
+    assert [op.id for op in ops] == ["keep"]
+    assert skipped == []
+
+
+def test_an_entry_for_a_lead_the_ledger_no_longer_holds_is_skipped(tmp_path: Path) -> None:
+    """A retirement or a rebuild between propose and apply must not
+    resurrect a lead."""
+    ledger = _ledger(_hyp("still-here"))
+    reviewed = _proposal_file(
+        ReviewableProposal(id="still-here", name="Here", rule_out="a normal ferritin"),
+        ReviewableProposal(id="vanished", name="Gone", rule_out="a normal CRP"),
+    )
+
+    ops, skipped = proposals_to_ops(reviewed, ledger)
+
+    assert [op.id for op in ops] == ["still-here"]
+    assert skipped == ["vanished"]
+
+
+def test_a_hand_edited_vacuous_rule_out_is_still_refused(tmp_path: Path) -> None:
+    """A file a human has edited can carry anything, and must clear the same
+    bar the model's output clears."""
+    ledger = _ledger(_hyp("a"))
+    reviewed = _proposal_file(
+        ReviewableProposal(id="a", name="A", rule_out="further testing would clarify")
+    )
+
+    ops, skipped = proposals_to_ops(reviewed, ledger)
+
+    assert ops == []
+    assert skipped == ["a (rule-out not usable)"]
+
+
+def test_a_malformed_file_raises_rather_than_applying_nothing(tmp_path: Path) -> None:
+    """An `--apply-from` that silently applied nothing would look exactly
+    like a successful run, and the operator would believe a review had
+    landed."""
+    empty = tmp_path / "empty.yaml"
+    empty.write_text("")
+    with pytest.raises(ValueError, match="empty"):
+        load_proposals(empty)
+
+    with pytest.raises(FileNotFoundError):
+        load_proposals(tmp_path / "nope.yaml")
+
+
+def test_the_check_survives_review_intact(tmp_path: Path) -> None:
+    """What was reviewed is what gets written — including the machine-
+    checkable half, which is the part that can end a lead."""
+    from adoc.casefile.schema import RuleOutCheck
+
+    ledger = _ledger(_hyp("a"))
+    check = RuleOutCheck(analyte="Cortisol", operator="above", threshold=18.0, unit="ug/dL")
+    reviewed = _proposal_file(
+        ReviewableProposal(id="a", name="A", rule_out="a morning cortisol above 18", check=check)
+    )
+
+    (op,) = proposals_to_ops(reviewed, ledger)[0]
+
+    assert op.rule_out_check == check

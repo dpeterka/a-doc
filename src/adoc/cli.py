@@ -43,6 +43,7 @@ from pathlib import Path
 
 from fastapi import FastAPI
 
+from adoc import __version__
 from adoc.backup import (
     BackupError,
     NoBackupError,
@@ -59,7 +60,19 @@ from adoc.casefile.phenotype_backfill import backfill_phenotype
 from adoc.casefile.regimen import REGIMEN_RELPATH, load_regimen, save_regimen
 from adoc.casefile.regimen_backfill import backfill_from_encounters
 from adoc.casefile.repo import HISTORY_RELPATH, LEDGER_RELPATH, DataRepo
-from adoc.casefile.rule_out_backfill import backfill_diff, needs_rule_out, propose_rule_outs
+from adoc.casefile.retirement import evaluate_rule_out
+from adoc.casefile.rule_out_backfill import (
+    PROPOSALS_RELPATH,
+    ProposalFile,
+    ReviewableProposal,
+    backfill_diff,
+    load_proposals,
+    needs_rule_out,
+    proposals_to_ops,
+    propose_rule_outs,
+    write_proposals,
+)
+from adoc.casefile.schema import Ledger
 from adoc.config import Settings, load_model_bindings
 from adoc.evals.report import write_comparison_report, write_report
 from adoc.evals.runner import known_suites, run_suite
@@ -94,7 +107,7 @@ from adoc.privacy import (
     scaffold_identifiers_file,
 )
 from adoc.reason.client import LlmClient, LlmError
-from adoc.reason.review import run_review_tick
+from adoc.reason.review import build_lab_lookup, run_review_tick
 from adoc.reason.stages import render_new_evidence_note, run_post_ingest_dag
 from adoc.web.users import USERS_RELPATH, add_user, list_users, remove_user
 
@@ -993,6 +1006,41 @@ def _cmd_regimen_backfill(_args: argparse.Namespace) -> int:
     return 0
 
 
+def _apply_reviewed_rule_outs(
+    repo: DataRepo, ledger_path: Path, ledger: Ledger, relpath: Path
+) -> int:
+    """Write exactly what a reviewed proposal file says. No model call.
+
+    A separate function so that property is structural rather than a
+    promise: this path never builds an `LlmClient`, and a test asserts it
+    with a transport that fails if invoked.
+    """
+    path = relpath if relpath.is_absolute() else repo.root / relpath
+    try:
+        proposals = load_proposals(path)
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"rule-out-backfill: {exc}", file=sys.stderr)
+        return 1
+
+    ops, skipped = proposals_to_ops(proposals, ledger)
+    print(f"rule-out-backfill: {len(proposals.proposals)} reviewed proposal(s) in {path.name}")
+    for reason in skipped:
+        print(f"rule-out-backfill: skipped {reason}")
+    if not ops:
+        print("rule-out-backfill: nothing to apply")
+        return 0
+
+    diff = backfill_diff(ops, model_id=proposals.model_id or "reviewed")
+    apply_and_save(ledger_path, repo.root / HISTORY_RELPATH, diff)
+    repo.commit(f"casefile: applied {len(ops)} reviewed rule-out(s) (ADR 0047)", paths=["case"])
+    after = load_ledger(ledger_path)
+    checkable = sum(1 for h in after.hypotheses if h.rule_out_check is not None)
+    remaining = len(needs_rule_out(after))
+    print(f"rule-out-backfill: applied {len(ops)}; ledger now v{after.version}")
+    print(f"rule-out-backfill: {checkable} machine-checkable, {remaining} with no way to end")
+    return 0
+
+
 def _cmd_rule_out_backfill(args: argparse.Namespace) -> int:
     """Give the leads already on the board a way to end (ADR 0047).
 
@@ -1021,6 +1069,15 @@ def _cmd_rule_out_backfill(args: argparse.Namespace) -> int:
 
     ledger_path = repo.root / LEDGER_RELPATH
     ledger = load_ledger(ledger_path)
+
+    # --apply-from writes exactly what a reviewed file says and makes NO
+    # model call. That is the point: the proposals are not reproducible —
+    # four runs over the same ledger gave 46/18, 44/16, 43/18 and 40/13,
+    # declining different leads each time — so approving from one run and
+    # re-proposing at apply time would write something never reviewed.
+    if args.apply_from:
+        return _apply_reviewed_rule_outs(repo, ledger_path, ledger, Path(args.apply_from))
+
     targets = needs_rule_out(ledger)
     if not targets:
         # Said out loud: "0 written" with exit 0 is indistinguishable from a
@@ -1045,6 +1102,52 @@ def _cmd_rule_out_backfill(args: argparse.Namespace) -> int:
     if report.unknown_ids:
         print(f", {len(report.unknown_ids)} unknown id(s)", end="")
     print()
+
+    if args.propose_to:
+        relpath = args.propose_to
+        path = repo.root / relpath
+        with LabsDb(
+            settings.data_dir / "labs.sqlite", journal_mode=settings.sqlite_journal_mode
+        ) as db:
+            labs = build_lab_lookup(db)
+        by_id = {h.id: h for h in ledger.hypotheses}
+        reviewable: list[ReviewableProposal] = []
+        for op in ops:
+            met, why = (False, "")
+            if op.rule_out_check is not None:
+                met, why = evaluate_rule_out(op.rule_out_check, labs)
+            reviewable.append(
+                ReviewableProposal(
+                    id=op.id,
+                    name=by_id[op.id].name if op.id in by_id else op.id,
+                    rule_out=op.rule_out or "",
+                    check=op.rule_out_check,
+                    retires_on_next_review=met,
+                    evaluates_to=why,
+                )
+            )
+        write_proposals(
+            path,
+            ProposalFile(
+                generated=date.today(),
+                app_version=__version__,
+                model_id="challenger",
+                proposals=reviewable,
+            ),
+        )
+        repo.commit(
+            f"casefile: propose {len(reviewable)} rule-out(s) for review (ADR 0047)",
+            paths=[relpath],
+        )
+        already = sum(1 for r in reviewable if r.retires_on_next_review)
+        print(f"rule-out-backfill: wrote {len(reviewable)} proposal(s) to {relpath}")
+        print(
+            f"rule-out-backfill: {already} would RETIRE a lead on the next review "
+            "- check those first"
+        )
+        print("rule-out-backfill: nothing is on the ledger yet. Review the file, delete")
+        print("rule-out-backfill: what you do not accept, then apply it with --apply-from")
+        return 0
 
     if args.dry_run:
         for op in ops:
@@ -1299,6 +1402,26 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help="propose without writing — print what would be recorded and stop",
+    )
+    rule_out_parser.add_argument(
+        "--propose-to",
+        nargs="?",
+        const=PROPOSALS_RELPATH,
+        default=None,
+        metavar="PATH",
+        help=(
+            f"propose to a reviewable file in the data repo (default {PROPOSALS_RELPATH}) "
+            "and stop - nothing reaches the ledger until --apply-from"
+        ),
+    )
+    rule_out_parser.add_argument(
+        "--apply-from",
+        default=None,
+        metavar="PATH",
+        help=(
+            "apply exactly what a reviewed proposal file says. Makes NO model call, "
+            "so what was reviewed is what gets written"
+        ),
     )
     rule_out_parser.set_defaults(func=_cmd_rule_out_backfill)
     subparsers.add_parser(
