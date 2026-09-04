@@ -5,6 +5,39 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.31.1] — 2026-09-04
+
+### Fixed
+
+- **A `RuleOutCheck` may not test something looser than its own prose.**
+  Found by reading the four proposals marked `retires_on_next_review` in the
+  real proposal file. The prose was clinically sophisticated; the check was
+  a loose approximation of it; the check is what fires:
+
+  ```
+  prose  "250-ug cosyntropin (ACTH) STIMULATION test shows an adequate
+          STIMULATED serum cortisol (30-60 minute cortisol >= 18)"
+  check  Cortisol above 18        <- any cortisol, including a baseline
+  stored 18.8 ug/dL               <- a baseline draw
+  ```
+
+  That would have retired a **can't-miss adrenal-insufficiency lead** on
+  evidence its own rule-out does not accept. Two more of the same shape: a
+  biotin check ignoring "on the same day as the questioned assays", and a
+  platelet check ignoring "repeated in a sodium-citrate tube".
+
+  `check_is_expressible` now scans the prose for qualifiers the grammar
+  cannot hold — provocation, same-day pairing, repeat, tube type, timed
+  draw, during-an-episode — and refuses the check while keeping the prose.
+  Verified against all four real proposals: three refused, the AMH one
+  (whose check genuinely matches its prose) allowed.
+
+- **Ten guard patterns contained a literal backspace (`0x08`) instead of
+  `\b`**, eaten by the heredoc that wrote them. `\bmorning\b` compiled as
+  backspace-morning-backspace and could never match, while looking correct
+  in the file. Fourth instance of that family (`_RA_RF`, `LabFlag`, the
+  analyte lookup). A test asserts no pattern carries a mangled escape.
+
 ## [0.31.0] — 2026-09-04
 
 *A human review step between a proposed rule-out and the ledger.*
