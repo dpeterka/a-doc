@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.30.2] — 2026-09-04
+
+### Fixed
+
+- **The rule-out backfill prompt names the single-normal-result trap.**
+  Measured on the real case file with v0.30.1's analyte fix in place, the
+  backfill would retire **7** leads immediately (was 1 before the fix) — and
+  several of those rule-outs are clinically wrong in one consistent way:
+
+  | lead | proposed rule-out | why it is wrong |
+  |---|---|---|
+  | mast-cell activation syndrome | tryptase normal | MCAS wants an acute-episode rise; most patients have a normal baseline |
+  | accelerated bone loss from estrogen deficiency | estradiol normal | the loss already happened; today's level does not undo it |
+  | primary ovarian insufficiency | FSH normal | criteria want elevated FSH on two occasions ≥4 weeks apart |
+  | perimenopause | FSH normal | FSH swings widely in perimenopause by definition |
+
+  Of the seven, the cortisol rule-out (>18 µg/dL excluding adrenal
+  insufficiency) and the platelet one are defensible. The rest are the
+  plausible-sounding kind that would quietly end a live lead.
+
+  **The same shape ADR 0042 found in the criteria scorers**: a normal draw is
+  frequently an expected treatment effect or a between-episode value, not
+  evidence the finding never happened. The prompt now names all three traps
+  — episodic, historical/cumulative, repeat-testing — and instructs the model
+  to return an empty string rather than substitute the convenient single
+  value.
+
+  **The backfill has still not been applied.** A dry run producing seven
+  retirements of which several are wrong is the dry run doing its job.
+
 ## [0.30.1] — 2026-09-03
 
 *Found by simulating what ADR 0047's backfill would actually retire — which
