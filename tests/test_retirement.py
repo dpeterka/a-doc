@@ -694,3 +694,28 @@ def test_no_lead_is_retired_twice_in_one_pass() -> None:
     ids = [r.hypothesis_id for r in report.retirements]
 
     assert len(ids) == len(set(ids)), "a lead was retired twice in one pass"
+
+
+def test_the_default_cap_on_the_real_distribution() -> None:
+    """Pins the CONSEQUENCE of the default, not the constant.
+
+    Reproduces the production distribution measured 2026-09-04 — 36
+    expanded, 3 of them patient-raised — so a change to `TIER_CAPS` shows up
+    as a change in how many leads a reader stops seeing, which is the thing
+    worth being deliberate about. 20 is the owner's call, not derived.
+    """
+    from adoc.casefile.retirement import propose_tier_folds
+
+    expanded = [_cap_hyp(f"h{i}", evidence=(i % 4) + 1) for i in range(33)]
+    hers = [_cap_hyp(f"hers{i}", origin="patient") for i in range(3)]
+    cant_miss = [_cap_hyp(f"cm{i}", tier="cant-miss", probability="minimal") for i in range(10)]
+    ledger = _cap_ledger(*expanded, *hers, *cant_miss)
+
+    folds = propose_tier_folds(ledger, today=date(2026, 9, 4))
+
+    assert len(folds) == 16, "36 expanded at a cap of 20 should fold 16"
+    assert all(f.to_status == "parked" for f in folds)
+    # None of hers, and none of the safety checklist.
+    folded = {f.hypothesis_id for f in folds}
+    assert not folded & {h.id for h in hers}
+    assert not folded & {h.id for h in cant_miss}

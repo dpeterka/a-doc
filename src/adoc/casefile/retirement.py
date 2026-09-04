@@ -361,8 +361,16 @@ def _rule_out_met(hypothesis: Hypothesis, labs: LabLookup) -> Retirement | None:
 #
 # Measured 2026-09-04 on the real ledger: 46 active — 0 most-likely,
 # 10 cant-miss (all protected), 36 expanded (8 high / 11 moderate / 14 low /
-# 3 minimal, 3 patient-raised).
-TIER_CAPS: dict[str, int] = {"most-likely": 5, "expanded": 12}
+# 3 minimal, 3 patient-raised). At a cap of 20 that folds 16 and leaves 30
+# active: 10 can't-miss plus 20 expanded.
+#
+# 20 is the owner's call, not a derived number, and it is the tunable here —
+# the mechanism does not change if it moves. Deliberately not aggressive:
+# every folded lead is one a reader stops seeing, and the fold ranks on
+# CITED EVIDENCE, which is a proxy for "well documented" rather than for
+# "unlikely". A lead can be thinly evidenced because nobody has tested it
+# yet, which is the ordinary state of this differential.
+TIER_CAPS: dict[str, int] = {"most-likely": 5, "expanded": 20}
 
 
 def _fold_rank(hypothesis: Hypothesis, today: date) -> tuple[int, int, int]:
