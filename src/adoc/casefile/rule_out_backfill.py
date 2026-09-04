@@ -28,6 +28,7 @@ retire a live lead.
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Iterable, Sequence
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -95,7 +96,17 @@ _SYSTEM = (
     "Leave `analyte` empty when the rule-out is imaging, a biopsy, an "
     "examination finding, or anything else not in that list. Do not "
     "approximate a name to make it fit: an analyte nobody has measured "
-    "cannot be evaluated, and an invented one is silently useless."
+    "cannot be evaluated, and an invented one is silently useless.\n\n"
+    "THE CHECK MUST TEST EXACTLY WHAT YOUR PROSE SAYS, and the check can "
+    "only read the most recent stored value for one analyte. It cannot know "
+    "how a specimen was provoked, when it was drawn relative to anything "
+    "else, whether it was a repeat, or what tube it came in. So if your "
+    "rule-out depends on a STIMULATED value, a SAME-DAY pairing, a REPEAT "
+    "draw, a specific TUBE, a FASTING or MORNING sample, or a measurement "
+    "DURING AN EPISODE — leave `analyte` empty and keep the condition in "
+    "the prose alone. A check looser than its own prose retires a lead on "
+    "evidence that rule-out does not accept: a baseline cortisol is not a "
+    "cosyntropin-stimulated cortisol."
 )
 
 
@@ -141,6 +152,11 @@ class BackfillReport(BaseModel):
     unknown_analytes: list[str] = Field(default_factory=list)
     """Analytes named that are not on file — an unevaluable check, recorded
     rather than written."""
+    inexpressible: list[str] = Field(default_factory=list)
+    """Rule-outs whose prose asks for something a `RuleOutCheck` cannot hold
+    — a stimulated draw, a same-day pairing, a repeat, a tube type. The
+    prose is kept; the check is refused, because a check looser than its own
+    prose retires a lead on the wrong evidence."""
     unknown_ids: list[str] = Field(default_factory=list)
     applied: int = 0
 
@@ -294,7 +310,91 @@ def _render(batch: Sequence[Hypothesis]) -> str:
     return "\n".join(lines)
 
 
-def _checkable(proposal: RuleOutProposal, known: dict[str, str]) -> RuleOutCheck | None:
+# Qualifiers a `RuleOutCheck` CANNOT express. Its grammar is one analyte,
+# one of four operators, and an optional threshold — it reads the most
+# recent stored row and nothing else. It cannot know how a specimen was
+# provoked, when it was drawn relative to something else, whether it was a
+# repeat, or what tube it came in.
+#
+# Measured on the real case file, 2026-09-04. The prose was clinically
+# sophisticated and the check was a loose approximation of it, and the
+# check is what fires:
+#
+#   prose  "250-ug cosyntropin STIMULATION test shows a STIMULATED cortisol
+#           >=18 at 30-60 minutes"
+#   check  Cortisol above 18        <- any cortisol, including a baseline
+#   stored 18.8 ug/dL               <- a baseline draw
+#
+# That would have retired a can't-miss adrenal-insufficiency lead on
+# evidence its own stated rule-out does not accept. Same shape twice more:
+# a biotin check ignoring "on the same day as the questioned assays", and a
+# platelet check ignoring "repeated in a sodium-citrate tube".
+#
+# So when the prose asks for something the grammar cannot hold, the prose is
+# kept and the check is refused. A rule-out a machine cannot evaluate is a
+# rule-out for a human to evaluate — which is honest. A check that tests
+# something LOOSER than its own prose is a lead retired on the wrong
+# evidence.
+_INEXPRESSIBLE_PATTERNS: tuple[str, ...] = (
+    # provocation / dynamic testing
+    r"stimulat",
+    r"cosyntropin",
+    r"\bacth\b.{0,20}\btest",
+    r"provoc",
+    r"challenge test",
+    r"suppression test",
+    r"tolerance test",
+    r"post[- ]dose",
+    # temporal pairing with another event
+    r"same[- ]day",
+    r"same time as",
+    r"concurrent",
+    r"simultaneous",
+    r"paired with",
+    r"while (still )?(on|taking)",
+    r"before and after",
+    # repeat / confirmatory
+    r"\brepeat",
+    r"two occasions",
+    r"on two\b",
+    r"second (draw|sample|measurement)",
+    r"confirmatory",
+    r"weeks apart",
+    r"twice",
+    # specimen handling
+    r"citrate",
+    r"heparin tube",
+    r"different tube",
+    r"\bedta\b",
+    # timed draw
+    r"fasting",
+    r"\bmorning\b",
+    r"\b8 ?a\.?m",
+    r"diurnal",
+    # episodic
+    r"during (an?|the) (attack|episode|flare|crisis)",
+    r"acute episode",
+    r"symptomatic episode",
+)
+
+_INEXPRESSIBLE_RE = re.compile("|".join(_INEXPRESSIBLE_PATTERNS), re.IGNORECASE)
+
+
+def check_is_expressible(rule_out: str) -> str | None:
+    """The first qualifier in `rule_out` a `RuleOutCheck` cannot hold, or
+    `None` when the prose is within the grammar.
+
+    Deterministic and deliberately conservative: a false positive costs a
+    machine-checkable rule-out that a human keeps in prose, and a false
+    negative retires a lead on evidence its own rule-out does not accept.
+    """
+    match = _INEXPRESSIBLE_RE.search(rule_out)
+    return match.group(0) if match else None
+
+
+def _checkable(
+    proposal: RuleOutProposal, known: dict[str, str], *, inexpressible: list[str] | None = None
+) -> RuleOutCheck | None:
     """The machine-checkable half, or `None` if it cannot be made evaluable.
 
     Refuses rather than approximates. `evaluate_rule_out` treats an analyte
@@ -304,6 +404,13 @@ def _checkable(proposal: RuleOutProposal, known: dict[str, str]) -> RuleOutCheck
     """
     analyte = proposal.analyte.strip()
     if not analyte or not proposal.operator:
+        return None
+    qualifier = check_is_expressible(proposal.rule_out)
+    if qualifier is not None:
+        # The prose asks for something the grammar cannot hold. Keep the
+        # prose; refuse the check.
+        if inexpressible is not None:
+            inexpressible.append(f"{proposal.id} ({qualifier!r})")
         return None
     stored = known.get(analyte.lower())
     if stored is None:
@@ -377,7 +484,7 @@ def propose_rule_outs(
                 report.unusable += 1
                 continue
             report.proposed += 1
-            check = _checkable(proposal, lowered)
+            check = _checkable(proposal, lowered, inexpressible=report.inexpressible)
             if check is not None:
                 report.checkable += 1
             elif proposal.analyte.strip():
