@@ -267,8 +267,7 @@ to pursue*, not merely on the count:
 
 | # | item | ADR | effect | risk |
 |---|---|---|---|---|
-| 0 | **Write `hypothesis_ids` on a question.** `review.py` passes it; 0 of 55 stored questions carry one. | — | unblocks ranking a question by which lead it moves | none — likely a one-line defect |
-| 1 | **The chat follows up on the 19 open questions it already asked.** No generation: they exist, with an `ask` and a `why`. Selection plus a composer instruction. | 0048 §1 | 19 unanswered questions start closing; **no model call** | low |
+| 1 | ✅ **The chat follows up on the 19 open questions it already asked.** No generation: they exist, with an `ask` and a `why`. Selection plus a composer instruction. | 0048 §1 | 19 unanswered questions start closing; **no model call** | low |
 | 2 | **Cap the board.** Ceiling per tier; lowest-probability *uncited* leads fold to `parked` on overflow. | — | 46 → ~23 this week | low — reversible, and "uncited" is objective, not a model score |
 | 3 | **Track a new symptom before it is a lead.** `emerging` section outside the differential. | 0050 | stops the cap refilling; separates a 2-week ear symptom from a 4-year pattern | medium — a wrong window defers a real finding |
 | 4 | **Let the engines oppose incumbents.** `opposes` currently writes counter-evidence only for `ledger_only`; LIRICAL's findings are mostly `engine_only`, so 15 opposing verdicts moved nothing. | — | fixes the 618:43 *cause*; deterministic, at volume | medium-high — unmeasured whether those 15 are *good* opposes |
@@ -278,11 +277,17 @@ to pursue*, not merely on the count:
 
 Ordering rationale, since it is not obvious:
 
-- **#0 and #1 first because they are nearly free.** ADR 0048 was originally
-  scoped as one item and that hid it: following up on questions that already
-  exist needs **no model call at all**, only selection and a composer
-  instruction. Nineteen patient-answerable questions are open and none has
-  ever been answered. That is the cheapest unclaimed value in the system.
+- **#1 first because it is nearly free.** ADR 0048 was originally scoped as
+  one item and that hid it: following up on questions that already exist
+  needs **no model call at all**, only selection and a composer instruction.
+  Nineteen patient-answerable questions are open and none has ever been
+  answered. That is the cheapest unclaimed value in the system.
+
+  (An earlier version of this list carried an item #0, "write
+  `hypothesis_ids` on a question". It was a misreading: all 55 questions
+  carry them. The `audience` filter in the probe used `"patient"` where the
+  literal is `"you"`, returned nothing, and the follow-up count of 0 was
+  read as 0-of-55 rather than 0-of-0.)
 - **#2 next** because it is the only item that changes the *number* with no
   model in the loop, and it is fully reversible. It is also the most
   cosmetic — a shorter list, not a better one — which is why #3 follows
