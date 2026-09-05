@@ -13,13 +13,16 @@ from datetime import date
 from pathlib import Path
 
 from adoc.casefile.questions import (
+    MAX_CHAT_ASKS,
     QUESTIONS_RELPATH,
     OpenQuestion,
     OpenQuestions,
     load_questions,
     mark_answered,
     merge_proposed,
+    next_question_to_ask,
     question_id,
+    record_chat_ask,
     save_questions,
 )
 
@@ -212,3 +215,117 @@ def test_resolve_answered_on_an_unwritable_store_returns_zero(tmp_path: Path) ->
     from adoc.casefile.questions import resolve_answered
 
     assert resolve_answered(tmp_path / "nope", ["x"], on=date(2026, 9, 1), note="") == 0
+
+
+# --- ADR 0048 §1: the chat follows up on questions that already exist -----------------------------
+
+
+def _q(
+    qid: str,
+    *,
+    audience: str = "you",
+    status: str = "open",
+    hypothesis_ids: list[str] | None = None,
+    chat_asks: int = 0,
+    first_asked: date = date(2026, 8, 29),
+) -> OpenQuestion:
+    return OpenQuestion(
+        id=qid,
+        panel=f"Panel {qid}",
+        ask=f"Ask about {qid}?",
+        audience=audience,  # type: ignore[arg-type]
+        status=status,  # type: ignore[arg-type]
+        hypothesis_ids=hypothesis_ids or [],
+        chat_asks=chat_asks,
+        first_asked_on=first_asked,
+        last_asked_on=first_asked,
+    )
+
+
+def test_a_question_bearing_on_a_changed_lead_wins() -> None:
+    """The most useful question is about the thing just being reasoned over.
+    All 55 stored questions carry `hypothesis_ids`, so this is the primary
+    key rather than an aspiration."""
+    store = OpenQuestions(
+        questions=[
+            _q("older", first_asked=date(2026, 8, 1)),
+            _q("relevant", hypothesis_ids=["sle-01"]),
+        ]
+    )
+
+    chosen = next_question_to_ask(store, changed_hypothesis_ids={"sle-01"})
+
+    assert chosen is not None and chosen.id == "relevant"
+
+
+def test_a_doctor_question_is_never_asked_in_chat() -> None:
+    """ "What did your rheumatologist say" is not something she can answer,
+    and putting it at the end of a chat reply wastes the turn."""
+    store = OpenQuestions(questions=[_q("doc-one", audience="doctor")])
+
+    assert next_question_to_ask(store) is None
+
+
+def test_an_answered_question_is_not_re_asked() -> None:
+    store = OpenQuestions(questions=[_q("done", status="answered")])
+
+    assert next_question_to_ask(store) is None
+
+
+def test_the_backlog_is_spread_rather_than_hammered() -> None:
+    """Fewest chat-asks first, so the top of the list is not asked three
+    times while question 19 is never reached."""
+    store = OpenQuestions(
+        questions=[
+            _q("asked-once", chat_asks=1, first_asked=date(2026, 8, 1)),
+            _q("never-asked", chat_asks=0, first_asked=date(2026, 8, 29)),
+        ]
+    )
+
+    chosen = next_question_to_ask(store)
+
+    assert chosen is not None and chosen.id == "never-asked"
+
+
+def test_the_oldest_breaks_a_tie() -> None:
+    store = OpenQuestions(
+        questions=[
+            _q("newer", first_asked=date(2026, 9, 2)),
+            _q("older", first_asked=date(2026, 8, 29)),
+        ]
+    )
+
+    chosen = next_question_to_ask(store)
+
+    assert chosen is not None and chosen.id == "older"
+
+
+def test_a_question_asked_to_exhaustion_stops_being_asked() -> None:
+    """There is no signal for a decline — she may answer something else, or
+    nothing. So the chat stops after `MAX_CHAT_ASKS` and the question stays
+    open for the doctor list. A third ask is nagging; dropping it from the
+    record would lose a real question."""
+    store = OpenQuestions(questions=[_q("tired", chat_asks=MAX_CHAT_ASKS)])
+
+    assert next_question_to_ask(store) is None
+    assert store.questions[0].is_open
+
+
+def test_recording_an_ask_moves_it_down_the_queue() -> None:
+    """Without this the same question is asked every turn forever."""
+    store = OpenQuestions(questions=[_q("a"), _q("b")])
+
+    first = next_question_to_ask(store)
+    assert first is not None
+    record_chat_ask(store, first.id, on=date(2026, 9, 4))
+    second = next_question_to_ask(store)
+
+    assert second is not None
+    assert second.id != first.id
+    assert next(q for q in store.questions if q.id == first.id).chat_asks == 1
+
+
+def test_nothing_to_ask_returns_none_rather_than_inventing() -> None:
+    """An empty backlog must not produce a filler question — that is what
+    ADR 0048 §2's `gap_scan` is for, and it is a separate decision."""
+    assert next_question_to_ask(OpenQuestions(questions=[])) is None

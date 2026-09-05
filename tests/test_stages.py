@@ -9,7 +9,7 @@ gate, a Challenger-less DAG failing closed) are pinned as data in
 from __future__ import annotations
 
 import json
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -19,7 +19,7 @@ from ruamel.yaml import YAML
 
 from adoc.casefile.ledger import load_ledger
 from adoc.casefile.repo import LEDGER_RELPATH, DataRepo
-from adoc.casefile.schema import LedgerDiff
+from adoc.casefile.schema import Ledger, LedgerDiff
 from adoc.config import ModelBinding
 from adoc.labs.db import DocumentTextPage, LabsDb
 from adoc.labs.models import LabDocument, LabResult
@@ -1483,3 +1483,101 @@ def test_informational_turn_never_sets_the_review_marker(repo: DataRepo, db: Lab
     run_informational_turn(client, repo, db, "How has my potassium been lately?")
 
     assert load_review_marker(repo) is None
+
+
+# --- ADR 0048 §1: the composer is TOLD which question to end on ------------------------------
+
+
+def test_the_composer_is_told_the_question_to_ask(repo: DataRepo, db: LabsDb) -> None:
+    """The property the whole feature rests on, and the one a selector test
+    cannot reach: a question chosen in code is useless if the composer never
+    sees it.
+
+    The open questions have always been in the context pack, under a heading
+    that literally reads "she can answer these herself — ask them in
+    conversation", and 19 sat unasked. A section the model may notice is not
+    an instruction; naming ONE, in its own block, is.
+    """
+    from adoc.casefile.questions import OpenQuestion
+    from adoc.reason.stages import composer_stage
+
+    calls: list[TransportRequest] = []
+    transport = _make_primary_transport_with_reply_sequence(
+        [],
+        [
+            {
+                "tiers_rendered": "Here is where things stand.",
+                "tests_to_request": [],
+                "framing_ack": True,
+            }
+        ],
+        calls,
+    )
+    client = _build_client(transport, transport)
+    question = OpenQuestion(
+        id="supplement-labels",
+        panel="Your supplement labels",
+        ask="Can you photograph every supplement you take?",
+        why="Several leads turn on what you are actually taking.",
+        audience="you",
+        first_asked_on=date(2026, 8, 29),
+        last_asked_on=date(2026, 8, 29),
+    )
+
+    composer_stage(
+        client,
+        Ledger(version=1, updated=datetime(2026, 9, 4, tzinfo=UTC), hypotheses=[]),
+        build_context(repo, db, include_ledger=False),
+        db,
+        ask_question=question,
+    )
+
+    sent = "\n".join(m.content for m in calls[-1].messages)
+    assert "Ask her this" in sent
+    assert "Can you photograph every supplement you take?" in sent
+    assert "supplement-labels" in sent
+    assert "Several leads turn on what you are actually taking." in sent
+
+
+def test_the_composer_is_told_nothing_when_there_is_no_question(repo: DataRepo, db: LabsDb) -> None:
+    """An empty backlog must not produce a filler block the model then feels
+    obliged to answer."""
+    from adoc.reason.stages import composer_stage
+
+    calls: list[TransportRequest] = []
+    transport = _make_primary_transport_with_reply_sequence(
+        [],
+        [
+            {
+                "tiers_rendered": "Here is where things stand.",
+                "tests_to_request": [],
+                "framing_ack": True,
+            }
+        ],
+        calls,
+    )
+    client = _build_client(transport, transport)
+
+    composer_stage(
+        client,
+        Ledger(version=1, updated=datetime(2026, 9, 4, tzinfo=UTC), hypotheses=[]),
+        build_context(repo, db, include_ledger=False),
+        db,
+        ask_question=None,
+    )
+
+    sent = "\n".join(m.content for m in calls[-1].messages)
+    assert "Ask her this" not in sent
+
+
+def test_the_composer_prompt_requires_ending_with_the_question() -> None:
+    """The block is only half of it — the prompt has to say what to do with
+    it, and its version has to move so provenance records which contract
+    produced a given reply."""
+    from adoc.reason.prompts import load_prompt
+
+    prompt = load_prompt("composer")
+
+    assert int(str(prompt.version).lstrip("v")) >= 4
+    assert "Ask her this" in prompt.text
+    assert "do not invent a question" in prompt.text

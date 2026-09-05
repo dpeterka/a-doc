@@ -1,6 +1,6 @@
 # ADR 0048 — The chat asks
 
-Status: proposed (2026-09-04)
+Status: §1 accepted (2026-09-04); §2 proposed
 
 ## Context
 
@@ -63,7 +63,8 @@ Measured in production, 2026-09-04:
 55 open questions, 0 ever answered
    36 audience="doctor"
    19 audience="you"     <- patient-answerable, open, never followed up
-    0 with hypothesis_ids populated
+   55 with hypothesis_ids populated
+   55 with an `ask`, 40 with a `why`
 ```
 
 Nineteen things the system has asked her and never returned to. They are in
@@ -83,9 +84,8 @@ This needs **no generation**. The questions exist, each has an `ask` and a
 - An answer closes it through the existing `resolve_answered` path, which
   already works — it is how the intake agent closes questions today.
 
-Because the questions already carry `hypothesis_ids` *as a field*, ranking
-by "which lead would this move" is a one-line change **once that field is
-actually written** — see the consequence below.
+All 55 carry `hypothesis_ids`, so ranking by "which lead would this move"
+is available immediately and is the primary sort key.
 
 ### 2. `gap_scan` fills the gap when nothing open is worth asking
 
@@ -118,13 +118,6 @@ once the backlog is worked through.
 
 ## Consequences
 
-- **`hypothesis_ids` is written by nobody.** `review.py` passes it at the
-  call site and 0 of 55 stored questions carry one. The field exists, the
-  writer does not — the fourth instance of that shape this week, after the
-  rule-out evaluator, the flag predicates and the analyte lookup. Until it
-  is fixed, ranking falls back to recency and the best signal available
-  ("which lead would this answer move") is unusable. Worth fixing first; it
-  is likely a one-line defect rather than a design change.
 - **A fifth model call per diagnostic turn — but only for decision 2.**
   Decision 1 adds none. On a path that already takes minutes this matters,
   and it is the reason the two are separated.
