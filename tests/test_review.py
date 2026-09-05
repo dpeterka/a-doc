@@ -2788,3 +2788,51 @@ def test_the_adjudicator_is_asked_for_a_rule_out() -> None:
     assert "no stated way to die" in prompt.text
     # The prompt must name the vacuous forms, or the model supplies them.
     assert "further testing" in prompt.text
+
+
+def test_the_review_renders_recent_findings_in_their_own_section(
+    repo: DataRepo, db: LabsDb
+) -> None:
+    """ADR 0050: tracked, never hidden. The two literatures only reconcile if
+    the finding stays where a reader can see it."""
+    from adoc.reason.review import render_emerging
+
+    recent = Hypothesis(
+        id="itchy-ears",
+        name="Ear canal dermatitis",
+        tier="expanded",
+        probability="low",
+        status="active",
+        origin="challenger",
+        first_proposed=date(2026, 8, 25),
+        evidence_for=[
+            Evidence(claim="new symptom", source="patient-report:2026-08-25", strength="moderate")
+        ],
+    )
+    ledger = Ledger(version=1, updated=date(2026, 9, 4), hypotheses=[recent])
+
+    text = "\n".join(render_emerging(ledger, today=date(2026, 9, 4), window_days=90))
+
+    assert "Recent findings, still being watched" in text
+    assert "Ear canal dermatitis" in text
+    assert "not being ignored" in text
+    assert "2026-08-25" in text
+
+
+def test_nothing_recent_renders_no_section(repo: DataRepo, db: LabsDb) -> None:
+    """An empty heading is worse than no heading."""
+    from adoc.reason.review import render_emerging
+
+    old = Hypothesis(
+        id="established",
+        name="Something long-standing",
+        tier="expanded",
+        probability="low",
+        status="active",
+        origin="challenger",
+        first_proposed=date(2024, 1, 1),
+        evidence_for=[Evidence(claim="old", source="labs:ana:2024-01-01", strength="moderate")],
+    )
+    ledger = Ledger(version=1, updated=date(2026, 9, 4), hypotheses=[old])
+
+    assert render_emerging(ledger, today=date(2026, 9, 4), window_days=90) == []

@@ -269,7 +269,7 @@ to pursue*, not merely on the count:
 |---|---|---|---|---|
 | 1 | ✅ **The chat follows up on the 19 open questions it already asked.** No generation: they exist, with an `ask` and a `why`. Selection plus a composer instruction. | 0048 §1 | 19 unanswered questions start closing; **no model call** | low |
 | 2 | ✅ **Cap the board.** Ceiling per tier; weakest-by-cited-evidence fold to `parked` on overflow. `cant-miss` and patient-raised never fold. | — | 46 → 30 | low — reversible; ranks on cited evidence, probability only breaks ties |
-| 3 | **Track a new symptom before it is a lead.** `emerging` section outside the differential. | 0050 | stops the cap refilling; separates a 2-week ear symptom from a 4-year pattern | medium — a wrong window defers a real finding |
+| 3 | ✅ **Track a new symptom before it is a lead.** `emerging` section outside the differential. | 0050 | 8 leads move out of the differential; stops the cap refilling | medium — a wrong window defers a real finding |
 | 4 | **Let the engines oppose incumbents.** `opposes` currently writes counter-evidence only for `ledger_only`; LIRICAL's findings are mostly `engine_only`, so 15 opposing verdicts moved nothing. | — | fixes the 618:43 *cause*; deterministic, at volume | medium-high — unmeasured whether those 15 are *good* opposes |
 | 5 | **`_outweighed`.** Fires for 1 of 46 at a 14:1 ratio. | — | trivial once #4 lands; likely a deletion | low |
 | 6 | **`gap_scan`.** Generate a question when nothing open is worth asking. | 0048 §2 | keeps #1 from stalling once the backlog clears | low, largest build |
