@@ -5,6 +5,109 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.32.0] — 2026-09-08
+
+*The convergence track, items 1–4.*
+
+### Added
+
+- **The chat ends a reply with a question she can actually answer**
+  (ADR 0048 §1). Measured: 55 open questions, 19 patient-answerable, **none
+  ever answered**, while the context pack carried them under a heading
+  reading "she can answer these herself — ask them in conversation". No
+  model call is added — the questions already exist; what was missing was
+  code that picked one and a prompt that said to ask it. `composer.md` → v4.
+
+- **A cap on what the board shows at once.** Weakest-by-cited-evidence fold
+  to `parked` on overflow; `cant-miss` and patient-raised never fold, and
+  the clinical rules run first so a lead that can end for its own stated
+  reason does. Expanded caps at 20.
+
+- **An `emerging` section for findings too new to act on** (ADR 0050).
+  Derived at render time from the age of a hypothesis's oldest cited
+  evidence — 618 of 618 evidence sources parse a date. Never a can't-miss
+  lead: deferring a dangerous possibility is the premature-closure failure
+  the literature names. An emerging lead neither occupies a cap slot nor is
+  eligible to be folded.
+
+  Combined effect on the real ledger: 46 active → 20 differential + 10
+  can't-miss shown, plus 8 tracked separately.
+
+### Fixed
+
+- **Abnormal is a comparison, not a flag** (ADR 0051). Every layer asking
+  "is this high, low or normal" read the lab's flag column and nothing else,
+  and only **187 of 2079** stored rows carry a flag — so the question was
+  answered from 9% of the record and the other 91% read as *not abnormal*
+  rather than as *nobody said*.
+
+  | layer | consequence |
+  |---|---|
+  | `knowledge.criteria` | 17 of 26 rules matched an analyte and could never be satisfied |
+  | ADR 0044 | derived **1** HPO term from 461 analytes — the serology never reached the engines |
+  | `evaluate_rule_out` | `normal` returned **True for an empty flag**, claiming "within the lab's reference range" having checked none |
+  | `reason.context` | same predicate, and rendered no range at all |
+
+  Root cause: `labs.db._parse_ref_range` is anchored with `$` and rejects a
+  trailing unit, so `'16-232 ng/mL'` parses to `(None, None)` while
+  `'140-400'` works. 920 rows carry a `ref_text` and no bounds for that
+  reason; **51 sit measurably outside their range with no flag**.
+
+  One predicate now — flag, then numeric bounds, then `ref_text` parsed at
+  read time so stored rows are fixed without a migration. **`None` when the
+  record cannot say, and `None` is never "normal".** The context pack
+  renders the interval and the section is retitled "Out of range".
+
+- **A `RuleOutCheck`'s analyte is matched on the normalized name.** Of 16
+  machine-checkable rule-outs over 461 analytes, 15 answered "no result on
+  file" and 1 matched — the one whose analyte was a single lowercase word.
+
+### Notes
+
+- ADR 0044 was reported as working on the evidence that engine adjudication
+  went 66/66 neutral → 15 opposes. **That inference was wrong**: all 15 were
+  `engine_only` "do not adopt" decisions, unrelated to the query. Whether
+  ADR 0051 actually raises the derived-term count is **unmeasured** and must
+  be checked on the next review.
+- The convergence track's item #4, "let the engines oppose incumbents", was
+  **removed** rather than built. Measurement showed it inert twice over: all
+  15 `opposes` were `engine_only`, so there is no incumbent to attach
+  counter-evidence to; and only 1 of 46 leads has support the engines could
+  see, so ADR 0036's narrow exception would fire once.
+
+## [0.31.1] — 2026-09-04
+
+### Fixed
+
+- **A `RuleOutCheck` may not test something looser than its own prose.**
+  Found by reading the four proposals marked `retires_on_next_review` in the
+  real proposal file. The prose was clinically sophisticated; the check was
+  a loose approximation of it; the check is what fires:
+
+  ```
+  prose  "250-ug cosyntropin (ACTH) STIMULATION test shows an adequate
+          STIMULATED serum cortisol (30-60 minute cortisol >= 18)"
+  check  Cortisol above 18        <- any cortisol, including a baseline
+  stored 18.8 ug/dL               <- a baseline draw
+  ```
+
+  That would have retired a **can't-miss adrenal-insufficiency lead** on
+  evidence its own rule-out does not accept. Two more of the same shape: a
+  biotin check ignoring "on the same day as the questioned assays", and a
+  platelet check ignoring "repeated in a sodium-citrate tube".
+
+  `check_is_expressible` now scans the prose for qualifiers the grammar
+  cannot hold — provocation, same-day pairing, repeat, tube type, timed
+  draw, during-an-episode — and refuses the check while keeping the prose.
+  Verified against all four real proposals: three refused, the AMH one
+  (whose check genuinely matches its prose) allowed.
+
+- **Ten guard patterns contained a literal backspace (`0x08`) instead of
+  `\b`**, eaten by the heredoc that wrote them. `\bmorning\b` compiled as
+  backspace-morning-backspace and could never match, while looking correct
+  in the file. Fourth instance of that family (`_RA_RF`, `LabFlag`, the
+  analyte lookup). A test asserts no pattern carries a mangled escape.
+
 ## [0.31.0] — 2026-09-04
 
 *A human review step between a proposed rule-out and the ledger.*
