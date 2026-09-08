@@ -25,7 +25,15 @@ from pydantic import BaseModel, Field
 
 from adoc import __version__
 from adoc.casefile.ledger import load_ledger
-from adoc.casefile.questions import resolve_answered
+from adoc.casefile.questions import (
+    QUESTIONS_RELPATH,
+    OpenQuestion,
+    load_questions,
+    next_question_to_ask,
+    record_chat_ask,
+    resolve_answered,
+    save_questions,
+)
 from adoc.casefile.repo import HISTORY_RELPATH, DataRepo
 from adoc.casefile.rule_out import strip_ops_missing_rule_out
 from adoc.casefile.schema import (
@@ -606,7 +614,14 @@ def _composer_gate_feedback(gate: GateResult) -> str:
     return " ".join(p for p in parts if p)
 
 
-def composer_stage(client: LlmClient, ledger: Ledger, ctx: ContextPack, db: LabsDb) -> PatientReply:
+def composer_stage(
+    client: LlmClient,
+    ledger: Ledger,
+    ctx: ContextPack,
+    db: LabsDb,
+    *,
+    ask_question: OpenQuestion | None = None,
+) -> PatientReply:
     """Composer/Steward stage (role `primary_reasoner`, schema `PatientReply`).
     Renders the post-challenge ledger for the patient.
 
@@ -626,6 +641,19 @@ def composer_stage(client: LlmClient, ledger: Ledger, ctx: ContextPack, db: Labs
     prompt = load_prompt("composer")
     ledger_text = _render_ledger_for_prompt(ledger)
     user_content = f"{ctx.render()}\n\n## Current Ledger (post-challenge)\n\n{ledger_text}\n"
+    # ADR 0048: the question to end on, chosen in code. The context pack has
+    # carried the open questions all along, under a heading that literally
+    # says "she can answer these herself — ask them in conversation", and
+    # every one of them went unasked: 55 open, 19 patient-answerable, none
+    # ever answered. A section the model may notice is not an instruction.
+    # Naming ONE, in its own block, is.
+    if ask_question is not None:
+        user_content += (
+            "\n## Ask her this, at the end of your reply\n\n"
+            f"- id: {ask_question.id}\n"
+            f"- question: {ask_question.ask or ask_question.panel}\n"
+            + (f"- why it matters: {ask_question.why}\n" if ask_question.why else "")
+        )
 
     messages = [Message(role="user", content=user_content)]
     reply: PatientReply | None = None
@@ -1155,7 +1183,25 @@ def build_diagnostic_dag(
         context_pack = ctx["context_pack"]
         assert isinstance(context_pack, ContextPack)
 
-        reply = composer_stage(client, ledger, context_pack, db)
+        # ADR 0048: pick one open, patient-answerable question to end on.
+        # Deterministic — no model call. Preferring one that bears on a
+        # hypothesis this turn just touched, which is why it runs after
+        # `apply` and reads the applied ledger rather than the prior one.
+        questions_path = repo.root / Path(QUESTIONS_RELPATH)
+        store = load_questions(questions_path)
+        touched = {h.id for h in ledger.hypotheses}
+        ask_question = next_question_to_ask(store, changed_hypothesis_ids=touched)
+
+        reply = composer_stage(client, ledger, context_pack, db, ask_question=ask_question)
+
+        if ask_question is not None:
+            # Recorded when the reply is composed, not when it is read: an
+            # unanswered question that was genuinely asked has still been
+            # asked, and there is no signal for the alternative.
+            save_questions(
+                questions_path,
+                record_chat_ask(store, ask_question.id, on=datetime.now(UTC).date()),
+            )
         results["composer"] = reply
         return reply
 

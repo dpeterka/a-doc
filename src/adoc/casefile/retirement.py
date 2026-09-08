@@ -51,6 +51,8 @@ from datetime import date
 
 from pydantic import BaseModel, Field
 
+from adoc.casefile.emerging import EMERGING_WINDOW_DAYS, is_emerging
+from adoc.casefile.ledger import ACTIVE_STATUSES
 from adoc.casefile.schema import (
     Evidence,
     Hypothesis,
@@ -60,6 +62,7 @@ from adoc.casefile.schema import (
     Provenance,
     RuleOutCheck,
     UpdateHypothesis,
+    is_protected,
 )
 
 LabLookup = dict[str, "LabFact"]
@@ -131,6 +134,16 @@ class LabFact(BaseModel):
     value_text: str = ""
     flag: str = ""
     """The lab's own high/low/abnormal flag, lowercased, or empty."""
+    position: str = ""
+    """`high` | `low` | `normal`, or EMPTY for cannot-tell (ADR 0051).
+
+    Computed by the caller via `labs.reference.range_position`, which reads
+    the flag first and falls back to the reference range — because only 187
+    of 2079 stored rows carry a flag, and this evaluator previously read
+    an empty flag as "normal".
+
+    Empty is never "normal". That distinction is the whole reason this field
+    exists rather than the evaluator re-deriving it from `flag`."""
     unit: str = ""
     ref: str = ""
     """A `labs:<slug>:<date>` source ref, so a retirement can cite what ended
@@ -201,10 +214,19 @@ def evaluate_rule_out(check: RuleOutCheck, labs: LabLookup) -> tuple[bool, str]:
         return False, f"{check.analyte} is not negative ({fact.value_text.strip()})"
 
     if check.operator == "normal":
-        flag = fact.flag.strip().lower()
-        if flag in ("", "n", "normal"):
+        # An empty flag is NOT normal. This used to return True for one, and
+        # report "is within the lab's reference range" without having looked
+        # at a range — on a record where 91% of rows carry no flag. It is
+        # the exact conflation this evaluator's own docstring forbids, one
+        # level in: cannot-tell must never end a hypothesis.
+        if fact.position == "normal":
             return True, f"{check.analyte} is within the lab's reference range"
-        return False, f"{check.analyte} is flagged {flag!r}"
+        if fact.position in ("high", "low"):
+            return False, f"{check.analyte} reads {fact.position}"
+        return False, (
+            f"{check.analyte} has a result on file but nothing to judge it against — "
+            "no flag from the lab and no usable reference range"
+        )
 
     # below / above — both require a threshold, and a unit that matches.
     if fact.value is None:
@@ -253,11 +275,6 @@ def refused_definitive_exclusions(hypothesis: Hypothesis) -> list[Evidence]:
         if item.strength == "definitive-exclusion"
         and not item.source.startswith(DEFINITIVE_EXCLUSION_SOURCES)
     ]
-
-
-def is_protected(hypothesis: Hypothesis) -> bool:
-    """Whether this hypothesis may never be retired automatically."""
-    return hypothesis.tier == "cant-miss" or hypothesis.origin == "patient"
 
 
 def _no_supporting_evidence(hypothesis: Hypothesis) -> Retirement | None:
@@ -351,6 +368,121 @@ def _rule_out_met(hypothesis: Hypothesis, labs: LabLookup) -> Retirement | None:
     )
 
 
+# How many active leads each tier may hold before the weakest fold away.
+#
+# `cant-miss` is deliberately absent and is NEVER capped: it is the safety
+# checklist (ADR 0039), the whole point of which is that a dangerous
+# possibility stays visible however unlikely. Capping it would delete the
+# mechanism to tidy the page.
+#
+# Measured 2026-09-04 on the real ledger: 46 active — 0 most-likely,
+# 10 cant-miss (all protected), 36 expanded (8 high / 11 moderate / 14 low /
+# 3 minimal, 3 patient-raised). At a cap of 20 that folds 16 and leaves 30
+# active: 10 can't-miss plus 20 expanded.
+#
+# 20 is the owner's call, not a derived number, and it is the tunable here —
+# the mechanism does not change if it moves. Deliberately not aggressive:
+# every folded lead is one a reader stops seeing, and the fold ranks on
+# CITED EVIDENCE, which is a proxy for "well documented" rather than for
+# "unlikely". A lead can be thinly evidenced because nobody has tested it
+# yet, which is the ordinary state of this differential.
+TIER_CAPS: dict[str, int] = {"most-likely": 5, "expanded": 20}
+
+
+def _fold_rank(hypothesis: Hypothesis, today: date) -> tuple[int, int, int]:
+    """Sort key for "fold this one first". Lower is weaker.
+
+    Ordered so the objective criterion decides first and the model's own
+    opinion only breaks ties:
+
+    1. **Evidence weight**, counting strong double — the same weighing
+       `_outweighed` uses. Grounded in what is cited rather than in a bucket
+       a model wrote. An **uncited** lead scores 0 and therefore always
+       folds first, which is the intended behaviour.
+
+       This started as two keys, uncited-first and then weight. The separate
+       key was removed as decoration: every evidence item contributes at
+       least 1, so an uncited lead is the unique minimum already and no
+       input can make the two keys disagree. A negative control proved it —
+       deleting the uncited key changed no test.
+    2. **Probability**, last of the substantive keys precisely because it is
+       model-assigned. It separates leads the first key ranks equal.
+    3. **Longest untouched**, so a stale lead folds before a fresh one.
+    """
+    rank = {"high": 0, "moderate": 1, "low": 2, "minimal": 3}
+    weight = sum(2 if e.strength == "strong" else 1 for e in hypothesis.evidence_for)
+    touched = hypothesis.last_challenged or hypothesis.first_proposed
+    return (
+        weight,
+        -rank.get(hypothesis.probability, 9),
+        -(today - touched).days,
+    )
+
+
+def propose_tier_folds(
+    ledger: Ledger,
+    *,
+    today: date,
+    caps: dict[str, int] | None = None,
+    emerging_window_days: int = EMERGING_WINDOW_DAYS,
+) -> list[Retirement]:
+    """Park the weakest leads in any tier over its cap.
+
+    A ceiling is a blunt instrument and it is chosen deliberately: it is the
+    only convergence mechanism here that needs no model in the loop and no
+    judgement about clinical truth. It does not decide a lead is WRONG — it
+    decides the board can only show so many at once, which is a statement
+    about the reader, not the medicine.
+
+    Three properties keep that honest:
+
+    - **`parked`, never `ruled-out`.** Nothing is deleted or refuted. A
+      parked lead keeps its evidence and reappears the moment it earns its
+      way back.
+    - **`cant-miss` is never capped**, and neither is anything
+      `is_protected` — the patient's own theories and the safety checklist
+      are exactly what a tidying rule must not quietly remove.
+    - **Deterministic and stated.** `_fold_rank` ranks on cited evidence
+      first and the model's probability only as a tie-break.
+    """
+    limits = TIER_CAPS if caps is None else caps
+    folds: list[Retirement] = []
+    for tier, cap in limits.items():
+        in_tier = [h for h in ledger.hypotheses if h.status in ACTIVE_STATUSES and h.tier == tier]
+        # ADR 0050: an emerging lead is NOT in the differential, so it
+        # neither occupies a slot nor is eligible to be folded out of one.
+        # Both halves matter. Counting them would fold real leads to make
+        # room for findings the page has already set aside; folding them
+        # would park the very thing the emerging section exists to keep
+        # visible — and they are thinly evidenced by construction, so they
+        # would rank lowest and go first.
+        in_differential = [
+            h for h in in_tier if not is_emerging(h, today=today, window_days=emerging_window_days)
+        ]
+        eligible = [h for h in in_differential if not is_protected(h)]
+        # Protected leads still occupy the tier — the cap is about how much
+        # the page shows, and a protected lead is on the page.
+        occupied = len(in_differential)
+        over = occupied - cap
+        if over <= 0:
+            continue
+        weakest = sorted(eligible, key=lambda h: _fold_rank(h, today))[:over]
+        folds.extend(
+            Retirement(
+                hypothesis_id=h.id,
+                hypothesis_name=h.name,
+                to_status="parked",
+                reason=(
+                    f"the {tier} tier holds {occupied} leads and shows at most {cap}; "
+                    "this was among the weakest by cited evidence. Parked, not ruled out — "
+                    "it keeps its evidence and returns if it earns its way back"
+                ),
+            )
+            for h in weakest
+        )
+    return folds
+
+
 def propose_retirements(
     ledger: Ledger,
     *,
@@ -404,6 +536,23 @@ def propose_retirements(
             if proposal is not None:
                 retirements.append(proposal)
                 break
+
+    # The cap runs LAST, over what the clinical rules left behind. Order
+    # matters: a lead the rules can end should end for its own stated reason
+    # ("its rule-out condition is now met"), not be swept away as one of the
+    # weakest in an overfull tier. A reader deserves the real reason when
+    # there is one.
+    #
+    # It also runs over the ledger as it stands, so leads retired above are
+    # still counted as occupying their tier this pass. They will not be next
+    # time, which is correct — the cap should not compound with the rules in
+    # a single review.
+    already = {r.hypothesis_id for r in retirements}
+    retirements.extend(
+        fold
+        for fold in propose_tier_folds(ledger, today=today)
+        if fold.hypothesis_id not in already
+    )
 
     return RetirementReport(
         retirements=retirements, protected_count=protected, refused_exclusions=refused

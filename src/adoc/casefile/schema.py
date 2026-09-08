@@ -338,6 +338,19 @@ class Hypothesis(BaseModel):
         return value
 
 
+def is_protected(hypothesis: Hypothesis) -> bool:
+    """Whether this hypothesis may never be retired or deferred automatically.
+
+    Two lines over `Hypothesis` alone, so it belongs beside the model rather
+    than inside `casefile.retirement`. It moved here when `casefile.emerging`
+    needed the same rule (ADR 0050): both modules answer "may an automatic
+    pass set this aside", and having one import the other for two lines made
+    an import cycle. Restating the predicate in both would have been the
+    fourth duplicated-constant defect in a week.
+    """
+    return hypothesis.tier == "cant-miss" or hypothesis.origin == "patient"
+
+
 class Ledger(BaseModel):
     """The full `differential-ledger.yaml` document."""
 

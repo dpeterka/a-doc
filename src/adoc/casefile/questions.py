@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from datetime import date
 from pathlib import Path
 from typing import Literal
@@ -68,6 +68,19 @@ class OpenQuestion(BaseModel):
     status: QuestionStatus = "open"
     first_asked_on: date
     last_asked_on: date
+    """When a REVIEW last proposed it. Distinct from `last_chat_ask_on`
+    below: the review re-proposing a panel is not the same event as the
+    chat putting the question to her."""
+
+    chat_asks: int = 0
+    """How many times a chat reply has actually put this to her (ADR 0048).
+
+    Capped by `MAX_CHAT_ASKS`. There is no way to detect a decline — she may
+    answer something else, or nothing — so instead of guessing, the chat
+    stops asking after a fixed number of attempts and the question stays
+    open for the doctor list. Asking a third time is nagging; dropping it
+    from the record would lose a real question."""
+    last_chat_ask_on: date | None = None
     answered_on: date | None = None
     answer_note: str = ""
     """One patient-grounded sentence recording what closed it — not the
@@ -206,6 +219,75 @@ def resolve_answered(root: Path, ids: Sequence[str], *, on: date, note: str) -> 
     except Exception as exc:  # noqa: BLE001 - never fail a turn over this
         logger.warning("questions: could not resolve answered questions: %s", exc)
         return 0
+
+
+MAX_CHAT_ASKS = 2
+"""How many times the chat may put one question to her before letting it
+rest. Two, because the first may land mid-thought and the second catches
+that; a third is nagging."""
+
+
+def askable_in_chat(store: OpenQuestions) -> list[OpenQuestion]:
+    """Open, patient-answerable, and not already asked to exhaustion."""
+    return [
+        q
+        for q in store.questions
+        if q.is_open and q.audience == "you" and q.chat_asks < MAX_CHAT_ASKS
+    ]
+
+
+def next_question_to_ask(
+    store: OpenQuestions, *, changed_hypothesis_ids: Collection[str] = ()
+) -> OpenQuestion | None:
+    """The one question a chat reply should end with, or `None` (ADR 0048).
+
+    Deterministic — no model call. The questions already exist, each with an
+    `ask` and a `why`; what was missing was any code that picked one.
+    Measured 2026-09-04: 55 open questions, 19 of them patient-answerable,
+    **none ever answered**, while the context pack has been telling every
+    stage "she can answer these herself — ask them in conversation".
+
+    Ranked by:
+
+    1. **Bears on a hypothesis that changed this turn.** The most useful
+       question is about the thing just being reasoned over, and all 55
+       stored questions carry `hypothesis_ids`, so this is available rather
+       than aspirational.
+    2. **Fewest chat asks.** Spread attention across the backlog instead of
+       hammering the top of the list.
+    3. **Oldest first.** A question open since August outranks one opened
+       this week.
+    4. **Id**, so the choice is stable between two otherwise equal
+       candidates and a test can pin it.
+    """
+    changed = set(changed_hypothesis_ids)
+    candidates = askable_in_chat(store)
+    if not candidates:
+        return None
+    return min(
+        candidates,
+        key=lambda q: (
+            0 if changed and changed.intersection(q.hypothesis_ids) else 1,
+            q.chat_asks,
+            q.first_asked_on,
+            q.id,
+        ),
+    )
+
+
+def record_chat_ask(store: OpenQuestions, question_id_: str, *, on: date) -> OpenQuestions:
+    """Note that the chat put `question_id_` to her, so it is not repeated.
+
+    Recorded when the reply is composed rather than when it is read: an
+    unanswered question that was genuinely asked has still been asked, and
+    the alternative — waiting for evidence she saw it — has no signal to
+    wait for.
+    """
+    for q in store.questions:
+        if q.id == question_id_:
+            q.chat_asks += 1
+            q.last_chat_ask_on = on
+    return store
 
 
 def render_for_context(store: OpenQuestions) -> str:
