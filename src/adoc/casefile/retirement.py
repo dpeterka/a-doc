@@ -134,6 +134,16 @@ class LabFact(BaseModel):
     value_text: str = ""
     flag: str = ""
     """The lab's own high/low/abnormal flag, lowercased, or empty."""
+    position: str = ""
+    """`high` | `low` | `normal`, or EMPTY for cannot-tell (ADR 0051).
+
+    Computed by the caller via `labs.reference.range_position`, which reads
+    the flag first and falls back to the reference range — because only 187
+    of 2079 stored rows carry a flag, and this evaluator previously read
+    an empty flag as "normal".
+
+    Empty is never "normal". That distinction is the whole reason this field
+    exists rather than the evaluator re-deriving it from `flag`."""
     unit: str = ""
     ref: str = ""
     """A `labs:<slug>:<date>` source ref, so a retirement can cite what ended
@@ -204,10 +214,19 @@ def evaluate_rule_out(check: RuleOutCheck, labs: LabLookup) -> tuple[bool, str]:
         return False, f"{check.analyte} is not negative ({fact.value_text.strip()})"
 
     if check.operator == "normal":
-        flag = fact.flag.strip().lower()
-        if flag in ("", "n", "normal"):
+        # An empty flag is NOT normal. This used to return True for one, and
+        # report "is within the lab's reference range" without having looked
+        # at a range — on a record where 91% of rows carry no flag. It is
+        # the exact conflation this evaluator's own docstring forbids, one
+        # level in: cannot-tell must never end a hypothesis.
+        if fact.position == "normal":
             return True, f"{check.analyte} is within the lab's reference range"
-        return False, f"{check.analyte} is flagged {flag!r}"
+        if fact.position in ("high", "low"):
+            return False, f"{check.analyte} reads {fact.position}"
+        return False, (
+            f"{check.analyte} has a result on file but nothing to judge it against — "
+            "no flag from the lab and no usable reference range"
+        )
 
     # below / above — both require a threshold, and a unit that matches.
     if fact.value is None:

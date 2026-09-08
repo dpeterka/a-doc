@@ -33,7 +33,8 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from adoc.casefile.regimen import Regimen
-from adoc.labs.models import LabResult, flag_is_high, flag_is_low
+from adoc.labs.models import LabResult
+from adoc.labs.reference import is_high, is_low
 from adoc.labs.validate import convert_value
 
 CLASSIFICATION_DISCLAIMER = (
@@ -353,7 +354,7 @@ def _below_reference(row: LabResult) -> bool:
     reference range is a better authority than any constant this file could
     hardcode.
     """
-    return flag_is_low(row.flag)
+    return is_low(row)
 
 
 def _numeric_below(row: LabResult, threshold: float) -> bool:
@@ -770,7 +771,7 @@ def _any_positive_item(
 
 
 def _numeric_above_ref(row: LabResult) -> bool:
-    return flag_is_high(row.flag)
+    return is_high(row)
 
 
 def _lowest_on_record(view: LabView, names: tuple[str, ...]) -> LabResult | None:

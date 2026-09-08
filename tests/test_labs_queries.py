@@ -64,16 +64,62 @@ def test_trend_series_is_time_ordered_with_ref_ranges(db: LabsDb) -> None:
     assert all(r.ref_low == 3.5 and r.ref_high == 5.1 for r in series)
 
 
-def test_abnormal_summary_defaults_to_latest_flagged_per_analyte(db: LabsDb) -> None:
+def test_abnormal_summary_defaults_to_the_latest_out_of_range_per_analyte(db: LabsDb) -> None:
+    """Replaces `..._latest_flagged_per_analyte`. ADR 0051 changed the
+    predicate from "carries a flag" to "reads out of range", because only
+    187 of 2079 stored rows carry a flag and the other 1892 were reading as
+    normal rather than as unknown."""
     db.insert_results(
         [
             _lab(lab_date=date(2026, 1, 1), value=6.0, flag=LabFlag.HIGH),
             _lab(lab_date=date(2026, 6, 1), value=4.1, flag=None),
-            _lab(name="sodium", value=140.0, ucum_unit="mmol/L"),
+            # Its own range — `_lab` defaults to potassium's, and 140
+            # against 3.5-5.1 would read high for a fixture reason.
+            _lab(name="sodium", value=140.0, ucum_unit="mmol/L", ref_low=135.0, ref_high=145.0),
         ]
     )
     summary = abnormal_summary(db)
-    assert summary == []  # latest potassium result is not flagged; sodium never flagged
+    # Latest potassium 4.1 is inside 3.5-5.1 and sodium 140 inside 135-145.
+    assert summary == []
+
+
+def test_an_unflagged_row_outside_its_reference_range_is_abnormal(db: LabsDb) -> None:
+    """The 42 rows this unlocks. Measured on the real record: 42 sit above
+    their reference range and 9 below, with no flag, and every one of them
+    read as unremarkable to both the criteria scorers and the model."""
+    db.insert_results(
+        [
+            _lab(
+                name="ferritin",
+                value=410.0,
+                ucum_unit="ng/mL",
+                ref_low=None,
+                ref_high=None,
+                ref_text="16-232 ng/mL",
+            )
+        ]
+    )
+
+    summary = abnormal_summary(db)
+
+    assert [row.name for row in summary] == ["ferritin"]
+
+
+def test_an_unflagged_row_inside_its_range_is_not_abnormal(db: LabsDb) -> None:
+    db.insert_results(
+        [
+            _lab(
+                name="ferritin",
+                value=100.0,
+                ucum_unit="ng/mL",
+                ref_low=None,
+                ref_high=None,
+                ref_text="16-232 ng/mL",
+            )
+        ]
+    )
+
+    assert abnormal_summary(db) == []
 
 
 def test_abnormal_summary_since_returns_history(db: LabsDb) -> None:

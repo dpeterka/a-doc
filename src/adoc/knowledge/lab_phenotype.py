@@ -50,7 +50,8 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from adoc.knowledge.hpo import HpoIndex
-from adoc.labs.models import LabResult, flag_is_high, flag_is_low
+from adoc.labs.models import LabResult
+from adoc.labs.reference import is_high, is_low
 
 Condition = Literal["positive", "high", "low", "titer_at_least"]
 
@@ -303,16 +304,16 @@ def _is_positive(row: LabResult) -> bool:
         positives = ("positive", "reactive", "detected", "present", "abnormal")
         if any(marker in text for marker in positives):
             return True
-    return flag_is_high(row.flag)
+    return is_high(row)
 
 
 def _satisfies(rule: LabPhenotypeRule, row: LabResult) -> bool:
     if rule.condition == "positive":
         return _is_positive(row)
     if rule.condition == "high":
-        return flag_is_high(row.flag)
+        return is_high(row)
     if rule.condition == "low":
-        return flag_is_low(row.flag)
+        return is_low(row)
     if rule.condition == "titer_at_least":
         return _titer_at_least(row, rule.threshold or 0.0)
     return False
