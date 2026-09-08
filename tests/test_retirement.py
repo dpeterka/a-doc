@@ -343,7 +343,11 @@ def test_a_met_rule_out_ends_the_hypothesis_that_stated_it() -> None:
     hypothesis.rule_out_check = RuleOutCheck(analyte="ddimer", operator="normal")
 
     report = propose_retirements(
-        _ledger(hypothesis), today=_TODAY, labs={"ddimer": _lab(value=0.3, unit="mg/L")}
+        _ledger(hypothesis),
+        today=_TODAY,
+        # `position` is required for "normal" since ADR 0051 — an empty
+        # one is cannot-tell, not normal.
+        labs={"ddimer": _lab(value=0.3, unit="mg/L", position="normal")},
     )
 
     assert [r.to_status for r in report.retirements] == ["ruled-out"]
@@ -439,7 +443,12 @@ def test_a_multi_word_analyte_resolves_against_a_normalized_lookup() -> None:
     # Keyed the way `build_lab_lookup` keys it.
     labs = {
         "vitaminb12": LabFact(
-            value=410.0, value_text="", flag="", unit="pg/mL", ref="labs:vitamin-b12:2026-05-02"
+            value=410.0,
+            value_text="",
+            flag="",
+            position="normal",
+            unit="pg/mL",
+            ref="labs:vitamin-b12:2026-05-02",
         )
     }
 
@@ -457,6 +466,7 @@ def test_every_spelling_of_one_analyte_resolves_to_the_same_row() -> None:
             value=110.0,
             value_text="",
             flag="",
+            position="normal",
             unit="mg/dL",
             ref="labs:complement-c3:2026-05-02",
         )
@@ -477,7 +487,12 @@ def test_an_analyte_genuinely_absent_is_still_not_met() -> None:
 
     labs = {
         "ferritin": LabFact(
-            value=100.0, value_text="", flag="", unit="ng/mL", ref="labs:ferritin:2026-05-02"
+            value=100.0,
+            value_text="",
+            flag="",
+            position="normal",
+            unit="ng/mL",
+            ref="labs:ferritin:2026-05-02",
         )
     }
 
@@ -663,7 +678,12 @@ def test_a_clinical_reason_beats_the_cap_for_the_same_lead() -> None:
     ledger = _cap_ledger(endable, *[_cap_hyp(f"h{i}", evidence=4, strong=True) for i in range(20)])
     labs = {
         "ferritin": LabFact(
-            value=100.0, value_text="", flag="", unit="ng/mL", ref="labs:ferritin:2026-05-02"
+            value=100.0,
+            value_text="",
+            flag="",
+            position="normal",
+            unit="ng/mL",
+            ref="labs:ferritin:2026-05-02",
         )
     }
 
@@ -686,7 +706,12 @@ def test_no_lead_is_retired_twice_in_one_pass() -> None:
     ledger = _cap_ledger(endable, *[_cap_hyp(f"h{i}") for i in range(20)])
     labs = {
         "ferritin": LabFact(
-            value=100.0, value_text="", flag="", unit="ng/mL", ref="labs:ferritin:2026-05-02"
+            value=100.0,
+            value_text="",
+            flag="",
+            position="normal",
+            unit="ng/mL",
+            ref="labs:ferritin:2026-05-02",
         )
     }
 
@@ -766,3 +791,41 @@ def test_emerging_leads_do_not_shield_the_differential_from_the_cap() -> None:
 
     assert len(folds) == 2
     assert "new" not in {f.hypothesis_id for f in folds}
+
+
+def test_a_result_with_nothing_to_judge_it_against_never_ends_a_hypothesis() -> None:
+    """ADR 0051, and the sharpest form of this evaluator's own rule. A row
+    can be PRESENT and still say nothing: 1892 of 2079 stored rows carry no
+    flag, and 920 of those have a reference range only as unparsed text.
+
+    `evaluate_rule_out` used to read an empty flag as normal and report "is
+    within the lab's reference range" — having looked at no range. That is
+    cannot-tell ending a hypothesis, which the docstring calls the one
+    failure it must not have.
+    """
+    hypothesis = _h("pulmonary-embolism", tier="cant-miss")
+    hypothesis.rule_out = "a normal d-dimer"
+    hypothesis.rule_out_check = RuleOutCheck(analyte="ddimer", operator="normal")
+
+    report = propose_retirements(
+        _ledger(hypothesis),
+        today=_TODAY,
+        # Present, numeric, and unjudgeable: no flag, no range.
+        labs={"ddimer": _lab(value=0.3, unit="mg/L")},
+    )
+
+    assert report.retirements == []
+
+
+def test_an_out_of_range_result_does_not_satisfy_a_normal_rule_out() -> None:
+    hypothesis = _h("pulmonary-embolism", tier="cant-miss")
+    hypothesis.rule_out = "a normal d-dimer"
+    hypothesis.rule_out_check = RuleOutCheck(analyte="ddimer", operator="normal")
+
+    report = propose_retirements(
+        _ledger(hypothesis),
+        today=_TODAY,
+        labs={"ddimer": _lab(value=2.9, unit="mg/L", position="high")},
+    )
+
+    assert report.retirements == []

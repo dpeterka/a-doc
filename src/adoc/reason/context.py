@@ -40,6 +40,7 @@ from adoc.labs.db import LabsDb
 from adoc.labs.models import LabResult
 from adoc.labs.panels import derived_from_note, panel_sort_key
 from adoc.labs.queries import abnormal_summary
+from adoc.labs.reference import reference_bounds
 from adoc.labs.validate import canonical_unit, convert_value
 
 CASE_SUMMARY_RELPATH = "case/case-summary.md"
@@ -397,11 +398,31 @@ def _trajectories_section(db: LabsDb) -> ContextSection:
     )
 
 
+def _range_note(row: LabResult) -> str:
+    """The reference interval, shown so a reader can judge the value.
+
+    ADR 0051: this section rendered `value [flag] date` and never the range.
+    A model asked whether a result is abnormal was given no way to answer
+    except the flag — which 91% of stored rows do not carry. It was not
+    outperforming the deterministic layer here; both read the same
+    impoverished view.
+    """
+    low, high = reference_bounds(row)
+    if low is not None and high is not None:
+        return f" (ref {low:g}–{high:g})"
+    if high is not None:
+        return f" (ref <{high:g})"
+    if low is not None:
+        return f" (ref >{low:g})"
+    text = (row.ref_text or "").strip()
+    return f" (ref {text})" if text else ""
+
+
 def _labs_section(db: LabsDb) -> ContextSection:
     abnormal = abnormal_summary(db)
     latest = db.latest_panel()
 
-    lines: list[str] = ["### Abnormal (most recent per analyte)"]
+    lines: list[str] = ["### Out of range (most recent per analyte)"]
     if abnormal:
         for panel, panel_rows in _group_rows_by_panel(abnormal):
             lines.append(f"**{panel}**")
@@ -412,11 +433,11 @@ def _labs_section(db: LabsDb) -> ContextSection:
                 ref = _labs_ref(row)
                 ref_suffix = f"  `{ref}`" if ref else ""
                 lines.append(
-                    f"- {_labs_label(row)}: {value}{unit}{flag} — "
+                    f"- {_labs_label(row)}: {value}{unit}{flag}{_range_note(row)} — "
                     f"{row.date.isoformat()}{ref_suffix}"
                 )
     else:
-        lines.append("- _None currently flagged._")
+        lines.append("- _Nothing on file reads out of range._")
 
     lines.append("")
     lines.append("### Latest panel (all analytes)")
@@ -434,7 +455,7 @@ def _labs_section(db: LabsDb) -> ContextSection:
                 ref = _labs_ref(row)
                 ref_suffix = f"  `{ref}`" if ref else ""
                 lines.append(
-                    f"- {_labs_label(row)}: {value}{unit} — "
+                    f"- {_labs_label(row)}: {value}{unit}{_range_note(row)} — "
                     f"{row.date.isoformat()}{note_suffix}{ref_suffix}"
                 )
     else:

@@ -118,6 +118,7 @@ from adoc.knowledge.pubmed import PUBMED_CACHE_RELPATH, PubMedArticle, PubMedCli
 from adoc.knowledge.semsim import load_index
 from adoc.labs.db import LabsDb
 from adoc.labs.queries import abnormal_summary
+from adoc.labs.reference import range_position
 from adoc.labs.validate import canonicalize, trend_outlier
 from adoc.reason.citations import check_evidence_citations
 from adoc.reason.client import LlmClient, Message
@@ -2215,6 +2216,9 @@ def build_lab_lookup(db: LabsDb) -> LabLookup:
             value=row.value,
             value_text=row.value_text or "",
             flag=row.flag.value if row.flag is not None else "",
+            # ADR 0051: computed here because `casefile` must not import
+            # `labs`. Empty means cannot-tell, never normal.
+            position=range_position(row) or "",
             unit=row.ucum_unit or "",
             ref=f"labs:{_lab_slug(row.name)}:{row.date.isoformat()}",
         )
