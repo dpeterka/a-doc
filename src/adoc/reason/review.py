@@ -61,6 +61,7 @@ from typing import Any, Literal, get_args
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 from adoc import __version__
+from adoc.casefile.emerging import EMERGING_WINDOW_DAYS, split_emerging
 from adoc.casefile.ledger import ACTIVE_STATUSES, load_ledger
 from adoc.casefile.phenotype import PHENOTYPE_RELPATH, load_phenotype, select_for_engine
 from adoc.casefile.questions import (
@@ -1371,6 +1372,66 @@ def render_short_version(
     ]
 
 
+def render_emerging(ledger: Ledger, *, today: date, window_days: int) -> list[str]:
+    """Findings too new to be treated as leads, kept visible (ADR 0050).
+
+    Its own section, outside the differential, because the two literatures
+    only reconcile if the finding stays where a reader can see it: watchful
+    waiting lowers testing "without missing serious pathology", while
+    premature closure is most common exactly when a new finding is folded
+    into the existing story.
+
+    Never a can't-miss lead — deferring a dangerous possibility is the
+    failure the second literature names, and the safety checklist exists for
+    precisely that case.
+    """
+    _differential, emerging = split_emerging(
+        [h for h in _sorted_for_reading(ledger) if h.status in ACTIVE_STATUSES],
+        today=today,
+        window_days=window_days,
+    )
+    if not emerging:
+        return []
+    months = max(1, round(window_days / 30))
+    out = [
+        "## Recent findings, still being watched",
+        "",
+        f"_These rest only on things first recorded in the last {window_days} days. "
+        "They are not being ignored and nothing has been discarded — they are simply "
+        "not yet being treated as established leads, because a new finding is more "
+        "often part of something already on this list than a separate condition of "
+        f"its own. Anything still here in {months} month(s), or corroborated sooner, "
+        "joins the list above._",
+        "",
+    ]
+    for hypothesis in emerging:
+        first_seen = min(
+            (
+                d
+                for d in (_evidence_date(e.source) for e in hypothesis.evidence_for)
+                if d is not None
+            ),
+            default=None,
+        )
+        since = f" — first recorded {first_seen.isoformat()}" if first_seen else ""
+        out.append(f"- **{redact_gated_text(hypothesis.name)}**{since}")
+    out.append("")
+    return out
+
+
+def _evidence_date(source: str) -> date | None:
+    match = _EVIDENCE_DATE_RE.search(source)
+    if match is None:
+        return None
+    try:
+        return date.fromisoformat(match.group(1))
+    except ValueError:  # pragma: no cover - a malformed ref is not a date
+        return None
+
+
+_EVIDENCE_DATE_RE = re.compile(r"(\d{4}-\d{2}-\d{2})")
+
+
 def _sorted_for_reading(ledger: Ledger) -> list[Hypothesis]:
     """Tier then probability then name — mirrors `web.casefile_helpers.
     sort_hypotheses`, duplicated for the same reason `_LIT_TIER_RANK` is."""
@@ -1724,6 +1785,7 @@ def render_review_markdown(
     engine_adjudication: EngineAdjudicationResult | None = None,
     engine_notes: list[str] | None = None,
     engine_query: LabPhenotypeResult | None = None,
+    emerging_window_days: int = EMERGING_WINDOW_DAYS,
     literature: LiteratureRefreshResult | None = None,
     trigger_summary: str = "",
 ) -> str:
@@ -1774,6 +1836,7 @@ def render_review_markdown(
         test_chooser=test_chooser,
     )
 
+    lines += render_emerging(ledger_after, today=review_date, window_days=emerging_window_days)
     lines.append("## What changed this week")
     lines.append("")
     if not accepted:

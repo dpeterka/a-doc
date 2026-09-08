@@ -719,3 +719,50 @@ def test_the_default_cap_on_the_real_distribution() -> None:
     folded = {f.hypothesis_id for f in folds}
     assert not folded & {h.id for h in hers}
     assert not folded & {h.id for h in cant_miss}
+
+
+def test_an_emerging_lead_neither_occupies_a_slot_nor_is_folded() -> None:
+    """Both halves matter (ADR 0050). Counting emerging leads would fold real
+    ones to make room for findings the page has already set aside; folding
+    them would park the very thing the emerging section exists to keep
+    visible — and they are thinly evidenced by construction, so they would
+    rank lowest and go first."""
+    from adoc.casefile.emerging import is_emerging
+    from adoc.casefile.retirement import propose_tier_folds
+    from adoc.casefile.schema import Evidence
+
+    def recent(hid: str) -> Hypothesis:
+        h = _cap_hyp(hid, evidence=0)
+        h.evidence_for = [Evidence(claim="new", source="labs:x:2026-09-01", strength="moderate")]
+        return h
+
+    established = [_cap_hyp(f"old{i}", evidence=2) for i in range(4)]
+    for h in established:
+        h.evidence_for[0].source = "labs:y:2024-01-01"
+    emerging = [recent(f"new{i}") for i in range(5)]
+    ledger = _cap_ledger(*established, *emerging)
+
+    assert all(is_emerging(h, today=date(2026, 9, 4)) for h in emerging)
+    folds = propose_tier_folds(ledger, today=date(2026, 9, 4), caps={"expanded": 4})
+
+    # 4 in the differential against a cap of 4 — nothing over, nothing folded,
+    # even though 9 leads are active in the tier.
+    assert folds == []
+
+
+def test_emerging_leads_do_not_shield_the_differential_from_the_cap() -> None:
+    """The other direction: excluding them must not make the cap unreachable."""
+    from adoc.casefile.retirement import propose_tier_folds
+    from adoc.casefile.schema import Evidence
+
+    established = [_cap_hyp(f"old{i}", evidence=2) for i in range(6)]
+    for h in established:
+        h.evidence_for[0].source = "labs:y:2024-01-01"
+    new = _cap_hyp("new", evidence=0)
+    new.evidence_for = [Evidence(claim="n", source="labs:x:2026-09-01", strength="moderate")]
+    ledger = _cap_ledger(*established, new)
+
+    folds = propose_tier_folds(ledger, today=date(2026, 9, 4), caps={"expanded": 4})
+
+    assert len(folds) == 2
+    assert "new" not in {f.hypothesis_id for f in folds}

@@ -51,6 +51,7 @@ from datetime import date
 
 from pydantic import BaseModel, Field
 
+from adoc.casefile.emerging import EMERGING_WINDOW_DAYS, is_emerging
 from adoc.casefile.ledger import ACTIVE_STATUSES
 from adoc.casefile.schema import (
     Evidence,
@@ -61,6 +62,7 @@ from adoc.casefile.schema import (
     Provenance,
     RuleOutCheck,
     UpdateHypothesis,
+    is_protected,
 )
 
 LabLookup = dict[str, "LabFact"]
@@ -256,11 +258,6 @@ def refused_definitive_exclusions(hypothesis: Hypothesis) -> list[Evidence]:
     ]
 
 
-def is_protected(hypothesis: Hypothesis) -> bool:
-    """Whether this hypothesis may never be retired automatically."""
-    return hypothesis.tier == "cant-miss" or hypothesis.origin == "patient"
-
-
 def _no_supporting_evidence(hypothesis: Hypothesis) -> Retirement | None:
     """A hypothesis nothing supports.
 
@@ -404,7 +401,11 @@ def _fold_rank(hypothesis: Hypothesis, today: date) -> tuple[int, int, int]:
 
 
 def propose_tier_folds(
-    ledger: Ledger, *, today: date, caps: dict[str, int] | None = None
+    ledger: Ledger,
+    *,
+    today: date,
+    caps: dict[str, int] | None = None,
+    emerging_window_days: int = EMERGING_WINDOW_DAYS,
 ) -> list[Retirement]:
     """Park the weakest leads in any tier over its cap.
 
@@ -428,16 +429,21 @@ def propose_tier_folds(
     limits = TIER_CAPS if caps is None else caps
     folds: list[Retirement] = []
     for tier, cap in limits.items():
-        eligible = [
-            h
-            for h in ledger.hypotheses
-            if h.status in ACTIVE_STATUSES and h.tier == tier and not is_protected(h)
+        in_tier = [h for h in ledger.hypotheses if h.status in ACTIVE_STATUSES and h.tier == tier]
+        # ADR 0050: an emerging lead is NOT in the differential, so it
+        # neither occupies a slot nor is eligible to be folded out of one.
+        # Both halves matter. Counting them would fold real leads to make
+        # room for findings the page has already set aside; folding them
+        # would park the very thing the emerging section exists to keep
+        # visible — and they are thinly evidenced by construction, so they
+        # would rank lowest and go first.
+        in_differential = [
+            h for h in in_tier if not is_emerging(h, today=today, window_days=emerging_window_days)
         ]
+        eligible = [h for h in in_differential if not is_protected(h)]
         # Protected leads still occupy the tier — the cap is about how much
         # the page shows, and a protected lead is on the page.
-        occupied = sum(
-            1 for h in ledger.hypotheses if h.status in ACTIVE_STATUSES and h.tier == tier
-        )
+        occupied = len(in_differential)
         over = occupied - cap
         if over <= 0:
             continue

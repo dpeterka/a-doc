@@ -1,6 +1,6 @@
 # ADR 0050 — A new symptom is tracked before it is a lead
 
-Status: proposed (2026-09-04)
+Status: accepted (2026-09-04)
 
 ## Context
 
@@ -53,9 +53,25 @@ precision.**
 
 ## Decision
 
+### 0. What this ADR assumed, and what is actually there
+
+The draft said "a hypothesis whose supporting **phenotype terms** are all
+newer than the window". **A `Hypothesis` has no link to phenotype terms.**
+`PhenotypeTerm.first_seen` exists and is unused, but nothing joins a term to
+the lead it supports.
+
+What a hypothesis does have is cited evidence whose source refs carry dates,
+and measurement says that is enough: on the real ledger **618 of 618
+evidence sources parse a date** (`labs:` 521, `encounter:` 82,
+`patient-report:` 15). Exactly one active lead has no dated evidence at all.
+
+So the criterion is the age of a hypothesis's **oldest cited evidence** —
+which is the better question anyway, because it asks what the lead actually
+rests on rather than what a separate matcher happened to extract.
+
 ### 1. An `emerging` section, outside the differential
 
-A hypothesis whose supporting phenotype terms are **all** newer than
+A hypothesis whose cited evidence is **all** newer than
 `EMERGING_WINDOW_DAYS` renders in its own section and is excluded from the
 differential's counts, its tier totals, and the agenda's lead list.
 
@@ -89,6 +105,35 @@ can't-miss lead is the premature-closure failure the literature names.
 cited as its basis and its arbitrariness stated. Not a constant buried in a
 module, because the literature says the right number varies by condition and
 this one will need revisiting.
+
+## Measured, 2026-09-04
+
+By age of oldest cited evidence, over 46 active leads:
+
+```
+ 30d ->  8 hypotheses (3 can't-miss, exempt)
+ 60d -> 11 (3)
+ 90d -> 11 (3)     <- the chosen window
+180d -> 15 (3)
+oldest-evidence age: min 7d, p25 170d, median 311d, max 2563d
+```
+
+So the window moves **8** leads into the emerging section. Combined with
+item #2's cap of 20:
+
+```
+expanded 36: 8 emerging -> 28 in the differential
+cap 20 -> fold 8
+active 46 -> 20 differential + 10 can't-miss = 30 shown
+           + 8 tracked in their own section
+```
+
+The interaction had to be decided explicitly and is the subtler half of the
+work: an emerging lead **neither occupies a cap slot nor is eligible to be
+folded**. Counting them would fold real leads to make room for findings the
+page has already set aside; folding them would park the very thing this
+section exists to keep visible — and they are thinly evidenced by
+construction, so they would rank lowest and go first.
 
 ## Consequences
 

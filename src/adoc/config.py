@@ -87,6 +87,13 @@ class Settings(BaseSettings):
     # switches itself off with a warning rather than failing.
     hpo_index_path: Path = Path("/opt/hpo-index.json")
 
+    # How recent every citation must be for a lead to count as still
+    # emerging rather than part of the differential (ADR 0050). Ninety days
+    # is the NCHS chronic-disease convention; it is a stated default rather
+    # than a derived threshold, because the right number varies by condition
+    # (chronic cough is 8 weeks, the CDC uses a year).
+    emerging_window_days: int = 90
+
     # The phenotype-similarity index (`scripts/build_semsim_index.py`), baked
     # into the image beside the HPO index and for the same reasons: it is a
     # build artifact of a public ontology, not patient data, and versioning it
