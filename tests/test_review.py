@@ -2411,6 +2411,7 @@ _PRE_0043_ORDER = [
     "staleness_scan",
     "deferred_entailment_sweep",
     "ops_metrics",
+    "resolution_scan",
     "convergence_snapshot",
     "render_report",
 ]

@@ -80,8 +80,13 @@ from adoc.casefile.questions import (
     question_id,
     save_questions,
 )
-from adoc.casefile.regimen import REGIMEN_RELPATH, load_regimen
+from adoc.casefile.regimen import REGIMEN_RELPATH, Regimen, load_regimen
 from adoc.casefile.repo import HISTORY_RELPATH, LEDGER_RELPATH, DataRepo
+from adoc.casefile.resolution import (
+    ResolutionQuestion,
+    propose_resolution_questions,
+    render_resolution_questions,
+)
 from adoc.casefile.retirement import (
     LabFact,
     LabLookup,
@@ -127,6 +132,7 @@ from adoc.knowledge.semsim import load_index
 from adoc.labs.db import LabsDb
 from adoc.labs.queries import abnormal_summary
 from adoc.labs.reference import range_position
+from adoc.labs.resolution import detect_resolution_signals
 from adoc.labs.validate import canonicalize, trend_outlier
 from adoc.reason.citations import check_evidence_citations
 from adoc.reason.client import LlmClient, Message
@@ -746,6 +752,17 @@ class RoleCost(BaseModel):
     input_tokens: int
     output_tokens: int
     cost_estimate: float
+
+
+class ResolutionScanResult(BaseModel):
+    """What the resolution scan found. Empty is the ordinary outcome.
+
+    `error` is separate from an empty `items` for the reason it always is
+    here: a scan that could not run looks exactly like a scan that ran and
+    found nothing."""
+
+    items: list[ResolutionQuestion] = Field(default_factory=list)
+    error: str = ""
 
 
 class OpsMetrics(BaseModel):
@@ -1796,6 +1813,7 @@ def render_review_markdown(
     engine_query: LabPhenotypeResult | None = None,
     emerging_window_days: int = EMERGING_WINDOW_DAYS,
     literature: LiteratureRefreshResult | None = None,
+    resolution: ResolutionScanResult | None = None,
     convergence: ConvergenceSnapshot | None = None,
     convergence_previous: ConvergenceSnapshot | None = None,
     trigger_summary: str = "",
@@ -1938,6 +1956,12 @@ def render_review_markdown(
             lines.append("### What the ANA pattern points at")
             lines.append("")
             lines += icap_lines
+
+    # ADR 0049. Before the boundary section: a lead that may already be over
+    # is clinical news, and the reader should reach it while still reading
+    # about her case.
+    if resolution is not None and resolution.items:
+        lines += render_resolution_questions(resolution.items)
 
     # ADR 0052. Placed after the clinical sections and before the engines: it
     # is a statement about the review process, not about the patient, and a
@@ -2953,6 +2977,51 @@ def build_review_dag(
         results["ops_metrics"] = metrics
         return metrics
 
+    def _resolution_scan_fn(ctx: Ctx) -> BaseModel:
+        """Analytes heading back toward normal under a live lead (ADR 0049).
+
+        Deterministic — no model call. Runs after `apply_review_diff` so it
+        judges the differential this review produced.
+
+        The transition to `resolved` is NOT made here and is not made by any
+        code path: a stopped supplement preceding a falling level is a
+        correlation, and acting on it would be the system deciding a
+        hypothesis is over on temporal coincidence. It asks; her answer is
+        what ends the lead.
+        """
+        ledger = ctx["apply_review_diff"]
+        assert isinstance(ledger, Ledger)
+        today = clock().date()
+        regimen_path = repo.root / Path(REGIMEN_RELPATH)
+        regimen = load_regimen(regimen_path) if regimen_path.exists() else Regimen()
+
+        result = ResolutionScanResult()
+        try:
+            signals = detect_resolution_signals(db)
+            result.items = propose_resolution_questions(signals, ledger, regimen, today=today)
+        except Exception as exc:  # noqa: BLE001 - a review must survive this
+            logger.warning("resolution_scan: failed: %s", exc, exc_info=True)
+            result.error = str(exc)
+            results["resolution_scan"] = result
+            return result
+
+        if result.items:
+            # Same store, same ids, same close path as every other question
+            # (ADR 0048 constraint 3). A question asked here and answered in
+            # chat must close; one the review already asked must not reappear
+            # under a second id.
+            questions_path = repo.root / QUESTIONS_RELPATH
+            save_questions(
+                questions_path,
+                merge_proposed(
+                    load_questions(questions_path),
+                    [item.question for item in result.items],
+                    asked_on=today,
+                ),
+            )
+        results["resolution_scan"] = result
+        return result
+
     def _convergence_snapshot_fn(ctx: Ctx) -> BaseModel:
         """Count the board this review just committed, and append the count
         (ADR 0052).
@@ -3072,6 +3141,11 @@ def build_review_dag(
                 else None
             ),
             literature=literature_result,
+            resolution=(
+                res
+                if isinstance(res := results.get("resolution_scan"), ResolutionScanResult)
+                else None
+            ),
             convergence=convergence,
             convergence_previous=(
                 prev
@@ -3315,6 +3389,16 @@ def build_review_dag(
     )
     nodes.append(
         Node(
+            name="resolution_scan",
+            fn=_resolution_scan_fn,
+            input_model=Ledger,
+            output_model=ResolutionScanResult,
+            depends_on="apply_review_diff",
+            after=("ops_metrics",),
+        )
+    )
+    nodes.append(
+        Node(
             name="convergence_snapshot",
             fn=_convergence_snapshot_fn,
             input_model=OpsMetrics,
@@ -3330,6 +3414,7 @@ def build_review_dag(
             output_model=ReviewReport,
             depends_on=(
                 "ops_metrics",
+                "resolution_scan",
                 "convergence_snapshot",
                 "trend_scan",
                 "criteria_scan",

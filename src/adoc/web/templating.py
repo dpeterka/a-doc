@@ -13,6 +13,7 @@ from pathlib import Path
 from fastapi.templating import Jinja2Templates
 from starlette.requests import Request
 
+from adoc.casefile.ledger import ACTIVE_STATUSES
 from adoc.casefile.repo import DataRepo
 from adoc.intake.facts import INTAKE_FACTS_RELPATH
 from adoc.web.casefile_helpers import (
@@ -59,6 +60,9 @@ def safety_status(hypothesis: object) -> str:
     status = getattr(hypothesis, "status", "")
     if status == "ruled-out":
         return "Ruled out"
+    if status == "resolved":
+        # ADR 0049: not "ruled out". This one was real and is over.
+        return "Resolved"
     if getattr(hypothesis, "rule_out_check", None) is not None:
         return "One test would settle this"
     if str(getattr(hypothesis, "rule_out", "") or "").strip():
@@ -73,6 +77,7 @@ _STATUS_LABELS = {
     "ruled-out": "Ruled out",
     "confirmed-by-doctor": "Confirmed by your doctor",
     "parked": "Parked",
+    "resolved": "Resolved — the cause was removed",
 }
 
 _ORIGIN_LABELS = {
@@ -113,6 +118,11 @@ def has_intake_facts(request: Request) -> bool:
 
 
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
+# ADR 0049: the set of statuses a lead can still be acted on from, taken from
+# the one definition rather than restated in a template. A hardcoded copy has
+# already gone stale once here, and a stale copy in the card would take the
+# "my doctor ruled this out" control off a lead she can still act on.
+templates.env.globals["active_statuses"] = ACTIVE_STATUSES
 templates.env.globals["disclaimer_text"] = DISCLAIMER_TEXT
 templates.env.globals["has_intake_facts"] = has_intake_facts
 templates.env.filters["markdown_lite"] = render_markdown_lite

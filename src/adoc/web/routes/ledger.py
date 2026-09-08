@@ -180,6 +180,70 @@ def ledger_view(
     )
 
 
+@router.post("/hypotheses/{hypothesis_id}/resolved")
+def mark_resolved(
+    request: Request,
+    hypothesis_id: str,
+    reason: str = Form(...),
+    repo: DataRepo = Depends(get_repo),
+) -> Response:
+    """Record that a lead was TRUE and is now over (ADR 0049).
+
+    The counterpart to `retire_hypothesis`, and deliberately a separate route
+    with a separate status. "Selenium excess — ruled out" tells a doctor it
+    never happened and invites a re-prescription; "resolved: supplement
+    stopped, level normalised" tells them what happened and how it ended.
+
+    This is the ONLY path to `resolved`. The review can detect that an
+    analyte is heading back toward its range and can name a stopped
+    supplement that might explain it, but a stop preceding a fall is a
+    correlation — turning it into a status change automatically would be the
+    system deciding a hypothesis is over on temporal coincidence. A person
+    makes that call here.
+
+    The evidence is recorded `for`, not `against`: the hypothesis was
+    correct. Filing the resolution as counter-evidence would, on the ADR 0053
+    scale, make the lead look refuted by the very fact that confirms it.
+    """
+    ledger_path = repo.root / LEDGER_RELPATH
+    ledger = load_ledger(ledger_path)
+    if not any(h.id == hypothesis_id for h in ledger.hypotheses):
+        return RedirectResponse(url="/ledger", status_code=303)
+
+    reason_text = reason.strip()
+    if not reason_text:
+        return RedirectResponse(url="/ledger", status_code=303)
+
+    today = datetime.now(UTC).date()
+    diff = LedgerDiff(
+        provenance=Provenance(
+            app_version=__version__,
+            prompt_template_version="n/a-patient-directed",
+            model_id="none",
+            dag_node="mark_resolved",
+            timestamp=datetime.now(UTC),
+        ),
+        rationale=f"Patient-directed resolution of {hypothesis_id!r}: {reason_text}",
+        ops=[
+            AddEvidence(
+                id=hypothesis_id,
+                for_or_against="for",
+                evidence=Evidence(
+                    claim=f"Resolved — {reason_text}",
+                    source=f"patient-report:{today.isoformat()}",
+                    strength="moderate",
+                ),
+            ),
+            UpdateHypothesis(id=hypothesis_id, status="resolved"),
+        ],
+    )
+    try:
+        repo.apply_ledger_diff(ledger_path, repo.root / HISTORY_RELPATH, diff)
+    except Exception as exc:  # noqa: BLE001 - a failed write must not 500 the page
+        logger.warning("mark_resolved: could not apply %s: %s", hypothesis_id, exc)
+    return RedirectResponse(url="/ledger", status_code=303)
+
+
 @router.post("/hypotheses/{hypothesis_id}/retire")
 def retire_hypothesis(
     request: Request,
