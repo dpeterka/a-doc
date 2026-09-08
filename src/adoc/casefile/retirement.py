@@ -47,6 +47,7 @@ present in git history, reversible by the next review that finds new support.
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from datetime import date
 from typing import Literal
 
@@ -56,6 +57,7 @@ from adoc.casefile.emerging import EMERGING_WINDOW_DAYS, is_emerging
 from adoc.casefile.ledger import ACTIVE_STATUSES
 from adoc.casefile.schema import (
     Evidence,
+    EvidenceStrength,
     Hypothesis,
     HypothesisStatus,
     Ledger,
@@ -308,21 +310,42 @@ def _no_supporting_evidence(hypothesis: Hypothesis) -> Retirement | None:
     )
 
 
-def _outweighed(hypothesis: Hypothesis) -> Retirement | None:
-    """More against than for, counting strong evidence double.
+# What one piece of evidence is worth on the balance scale (ADR 0053).
+#
+# Written out per strength rather than as `2 if strong else 1`. That
+# expression got two things wrong. It scored `definitive-exclusion` — added
+# later, by ADR 0038 — at 1, BELOW a merely `strong` item: a strength that
+# exists to end an argument counted for less than one that does not. And it
+# contradicted its own docstring, which promised that "three weak observations
+# do not outweigh one strong contradicting result" while scoring them 3 to 2.
+#
+# Doubling at each step keeps that promise: three weak (3) lose to one strong
+# (4), and no quantity of weak evidence reaches a definitive exclusion. The
+# same shape — an older function that never learned about a newer literal —
+# had already been found once in `_EVIDENCE_STRENGTHS`, so this is a table the
+# type checker can see through and `test_every_strength_has_a_weight` can
+# enumerate.
+EVIDENCE_WEIGHT: dict[EvidenceStrength, int] = {
+    "definitive-exclusion": 8,
+    "strong": 4,
+    "moderate": 2,
+    "weak": 1,
+}
 
-    Weighted rather than counted flat because three weak observations do not
-    outweigh one strong contradicting result, and treating them as equal would
-    let volume beat quality.
-    """
+
+def weigh_evidence(items: Iterable[Evidence]) -> int:
+    """Total weight, so volume cannot beat quality: three weak observations do
+    not outweigh one strong contradicting result."""
+    return sum(EVIDENCE_WEIGHT[item.strength] for item in items)
+
+
+def _outweighed(hypothesis: Hypothesis) -> Retirement | None:
+    """More against than for, on the weighted scale above."""
     if not hypothesis.evidence_for:
         return None
 
-    def weigh(items: list) -> int:
-        return sum(2 if e.strength == "strong" else 1 for e in items)
-
-    against = weigh(hypothesis.evidence_against)
-    if against <= weigh(hypothesis.evidence_for):
+    against = weigh_evidence(hypothesis.evidence_against)
+    if against <= weigh_evidence(hypothesis.evidence_for):
         return None
     return Retirement(
         hypothesis_id=hypothesis.id,
