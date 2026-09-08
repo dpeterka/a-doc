@@ -270,10 +270,11 @@ to pursue*, not merely on the count:
 | 1 | ✅ **The chat follows up on the 19 open questions it already asked.** No generation: they exist, with an `ask` and a `why`. Selection plus a composer instruction. | 0048 §1 | 19 unanswered questions start closing; **no model call** | low |
 | 2 | ✅ **Cap the board.** Ceiling per tier; weakest-by-cited-evidence fold to `parked` on overflow. `cant-miss` and patient-raised never fold. | — | 46 → 30 | low — reversible; ranks on cited evidence, probability only breaks ties |
 | 3 | ✅ **Track a new symptom before it is a lead.** `emerging` section outside the differential. | 0050 | 8 leads move out of the differential; stops the cap refilling | medium — a wrong window defers a real finding |
-| 4 | ✅ **Abnormal is a comparison, not a flag.** Replaced "engines oppose incumbents", which measurement showed to be inert: all 15 `opposes` were `engine_only` (no incumbent to attach to), and only 1 of 46 leads had support the engine could see. | 0051 | 187→up to 238 abnormal rows; unblocks ADR 0044, the criteria scorers, the rule-out evaluator and every context pack | low |
-| 5 | **`_outweighed`.** Fires for 1 of 46 at a 14:1 ratio. | — | trivial once #4 lands; likely a deletion | low |
-| 6 | **`gap_scan`.** Generate a question when nothing open is worth asking. | 0048 §2 | keeps #1 from stalling once the backlog clears | low, largest build |
-| 7 | **A lead can end because the cause was removed.** `resolved` status + a trend-change question. | 0049 | one lead today; supplies a missing *category* | low; cheap enough to ride along with any release |
+| 4 | ✅ **Abnormal is a comparison, not a flag.** Replaced "engines oppose incumbents", which measurement showed to be inert: all 15 `opposes` were `engine_only` (no incumbent to attach to), and only 1 of 46 leads had support the engine could see. | 0051 | measured: **32 → 49** out-of-range on the 536-row latest panel, 28 newly visible, 332 cannot-tell | low |
+| 5 | ✅ **`_outweighed`.** Not retuned — **repaired**. Its `2 if strong else 1` scored ADR 0038's `definitive-exclusion` at 1, below `strong`, and scored three weak items above one strong, contradicting its own docstring. | 0053 | a weight table total over `EvidenceStrength` | low |
+| 6 | ✅ **`gap_scan`.** Generate a question when nothing open is worth asking. | 0048 §2 | keeps #1 from stalling once the backlog clears | low, largest build |
+| 7 | ✅ **A lead can end because the cause was removed.** `resolved` status + a trend-change question. | 0049 | one lead today; supplies a missing *category* | low |
+| — | ✅ **Every review records its own boundary.** Six releases were each measured by hand against a number recalled from the release before, and twice the recollection was wrong. | 0052 | the next review's delta is a fact on disk | low |
 
 Ordering rationale, since it is not obvious:
 

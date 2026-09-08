@@ -1,6 +1,6 @@
 # ADR 0049 — A lead can end because the cause was removed
 
-Status: proposed (2026-09-04)
+Status: accepted (2026-09-08)
 
 Extends [ADR 0038](0038-how-a-hypothesis-ends.md) and
 [ADR 0047](0047-a-lead-states-how-it-ends.md).
@@ -115,3 +115,35 @@ let a human make the causal claim.
 insufficient. `gap_scan` reasons over the differential; a trend heading
 toward normal is a deterministic observation over the labs, and detecting it
 in code is cheaper and more reliable than hoping a model notices.
+
+## As built (2026-09-08)
+
+Three deviations from the proposal, each deliberate.
+
+**`monitoring` is not a status and never was.** The Context section listed it
+among the existing values. `HypothesisStatus` has `active`,
+`patient-proposed`, `challenged`, `ruled-out`, `confirmed-by-doctor` and
+`parked`. Noted because a plan written against a status set that does not
+exist is how a consumer gets missed.
+
+**There is no `declined` status** (ADR 0048 constraint 6, inherited here).
+§1 shipped `MAX_CHAT_ASKS` instead: there is no signal for a decline — she may
+answer something else, or nothing — so the chat stops after two attempts and
+the question stays open for the doctor list. A `declined` value nothing could
+ever set would be an unreachable state, which is the shape this codebase keeps
+finding and removing.
+
+**Detection is not `TrendFinding`.** `trend_outlier` looks for a >40% jump
+against the median of prior draws; it is an extraction-error detector, and a
+value drifting steadily back into range is exactly what it is built NOT to
+flag. `casefile.resolution.classify_series` is a separate, simpler test: how
+much of the FIRST reading's excursion beyond its bound has closed. Judged
+against the excursion rather than the slope, because a value that halves and
+then plateaus just inside the range has resolved, and a slope test would call
+the plateau flat.
+
+The boundary held. `casefile/resolution.py` contains neither the string
+`"resolved"` nor `UpdateHypothesis`, and both facts are pinned by tests. One
+code path writes the status — a form she submits — and
+`test_only_a_person_can_mark_a_lead_resolved` greps the tree to keep it that
+way.

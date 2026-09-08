@@ -40,6 +40,22 @@
         {% endfor %}
       </details>
     {% endif %}
+
+    {% if groups.resolved %}
+      {# ADR 0049: these were REAL and are over, so they belong neither with
+         what is worth discussing now nor with the low-likelihood tail. #}
+      <h2 class="group-heading">
+        Sorted out <span class="muted">({{ groups.resolved | length }})</span>
+      </h2>
+      <p class="muted">
+        These were real findings, and something changed that fixed them — usually
+        stopping or changing something you were taking. Kept on the record with what
+        happened, because a doctor seeing the old result needs to know how it ended.
+      </p>
+      {% for h in groups.resolved %}
+        {% include "_hypothesis_card.html" %}
+      {% endfor %}
+    {% endif %}
   {% else %}
     <p class="muted">
       Leads appear here once you've had a diagnostic conversation with a-doc — every

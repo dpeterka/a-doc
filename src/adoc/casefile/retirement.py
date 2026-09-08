@@ -47,7 +47,9 @@ present in git history, reversible by the next review that finds new support.
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from datetime import date
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -55,6 +57,7 @@ from adoc.casefile.emerging import EMERGING_WINDOW_DAYS, is_emerging
 from adoc.casefile.ledger import ACTIVE_STATUSES
 from adoc.casefile.schema import (
     Evidence,
+    EvidenceStrength,
     Hypothesis,
     HypothesisStatus,
     Ledger,
@@ -88,6 +91,11 @@ DEFINITIVE_EXCLUSION_SOURCES = ("labs:", "doc:", "encounter:", "patient-report:"
 STALE_DAYS = 90
 
 
+RetirementCause = Literal[
+    "unsupported", "outweighed", "stale", "definitive-exclusion", "rule-out-met", "tier-fold"
+]
+
+
 class Retirement(BaseModel):
     """One proposed status change, with the reason in plain words."""
 
@@ -95,6 +103,12 @@ class Retirement(BaseModel):
     hypothesis_name: str
     to_status: HypothesisStatus
     reason: str
+    cause: RetirementCause = "unsupported"
+    """WHICH mechanism proposed this. `to_status` cannot answer that: three
+    different rules write `parked` — no supporting evidence, gone stale, and
+    the ADR 0045 tier cap — so a count of parked leads attributes a change to
+    whichever mechanism the reader happens to have in mind. ADR 0052 needs
+    the attribution to be a fact rather than a guess."""
 
 
 class RetirementReport(BaseModel):
@@ -292,30 +306,53 @@ def _no_supporting_evidence(hypothesis: Hypothesis) -> Retirement | None:
         hypothesis_name=hypothesis.name,
         to_status="parked",
         reason="nothing on file supports this",
+        cause="unsupported",
     )
 
 
-def _outweighed(hypothesis: Hypothesis) -> Retirement | None:
-    """More against than for, counting strong evidence double.
+# What one piece of evidence is worth on the balance scale (ADR 0053).
+#
+# Written out per strength rather than as `2 if strong else 1`. That
+# expression got two things wrong. It scored `definitive-exclusion` — added
+# later, by ADR 0038 — at 1, BELOW a merely `strong` item: a strength that
+# exists to end an argument counted for less than one that does not. And it
+# contradicted its own docstring, which promised that "three weak observations
+# do not outweigh one strong contradicting result" while scoring them 3 to 2.
+#
+# Doubling at each step keeps that promise: three weak (3) lose to one strong
+# (4), and no quantity of weak evidence reaches a definitive exclusion. The
+# same shape — an older function that never learned about a newer literal —
+# had already been found once in `_EVIDENCE_STRENGTHS`, so this is a table the
+# type checker can see through and `test_every_strength_has_a_weight` can
+# enumerate.
+EVIDENCE_WEIGHT: dict[EvidenceStrength, int] = {
+    "definitive-exclusion": 8,
+    "strong": 4,
+    "moderate": 2,
+    "weak": 1,
+}
 
-    Weighted rather than counted flat because three weak observations do not
-    outweigh one strong contradicting result, and treating them as equal would
-    let volume beat quality.
-    """
+
+def weigh_evidence(items: Iterable[Evidence]) -> int:
+    """Total weight, so volume cannot beat quality: three weak observations do
+    not outweigh one strong contradicting result."""
+    return sum(EVIDENCE_WEIGHT[item.strength] for item in items)
+
+
+def _outweighed(hypothesis: Hypothesis) -> Retirement | None:
+    """More against than for, on the weighted scale above."""
     if not hypothesis.evidence_for:
         return None
 
-    def weigh(items: list) -> int:
-        return sum(2 if e.strength == "strong" else 1 for e in items)
-
-    against = weigh(hypothesis.evidence_against)
-    if against <= weigh(hypothesis.evidence_for):
+    against = weigh_evidence(hypothesis.evidence_against)
+    if against <= weigh_evidence(hypothesis.evidence_for):
         return None
     return Retirement(
         hypothesis_id=hypothesis.id,
         hypothesis_name=hypothesis.name,
         to_status="ruled-out",
         reason="the evidence against outweighs the evidence for",
+        cause="outweighed",
     )
 
 
@@ -339,6 +376,7 @@ def _stale(hypothesis: Hypothesis, *, today: date, stale_days: int) -> Retiremen
         hypothesis_name=hypothesis.name,
         to_status="parked",
         reason=f"{hypothesis.probability} probability and untouched for {age} days",
+        cause="stale",
     )
 
 
@@ -351,6 +389,7 @@ def _excluded_by_definitive_evidence(hypothesis: Hypothesis) -> Retirement | Non
         hypothesis_name=hypothesis.name,
         to_status="ruled-out",
         reason=f"ruled out by a definitive result — {item.claim.strip()} ({item.source})",
+        cause="definitive-exclusion",
     )
 
 
@@ -365,6 +404,7 @@ def _rule_out_met(hypothesis: Hypothesis, labs: LabLookup) -> Retirement | None:
         hypothesis_name=hypothesis.name,
         to_status="ruled-out",
         reason=f"its own rule-out condition is now met — {why}",
+        cause="rule-out-met",
     )
 
 
@@ -477,6 +517,7 @@ def propose_tier_folds(
                     "this was among the weakest by cited evidence. Parked, not ruled out — "
                     "it keeps its evidence and returns if it earns its way back"
                 ),
+                cause="tier-fold",
             )
             for h in weakest
         )

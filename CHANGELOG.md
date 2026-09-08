@@ -5,6 +5,89 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.33.0] — 2026-09-08
+
+*The convergence track, items 5–7 — and a boundary so the next review can say
+what any of it did.*
+
+### Added
+
+- **Every review records its own boundary** (ADR 0052). Six releases on this
+  track were each measured by hand, once, on deploy day, against a number
+  recalled from the release before. That method produced two wrong numbers in
+  a fortnight: an "8 emerging" projection taken *before* the corroboration
+  rule it was projecting existed (the real figure was 2), and a "187 of 2079"
+  before/after where 2079 is every stored row ever and the change acted on
+  the 536-row latest panel.
+
+  Each review now appends one line to `case/convergence.jsonl` — the board's
+  shape and the `app_version` that produced it — and renders the delta against
+  the previous line. Append-only, versioned, and `delta(None)` is `{}`: a new
+  counter's first reading did not *add* the whole board, and reporting "+46
+  leads" would be the same false before/after this exists to stop.
+
+- **A lead can end because the cause was removed** (ADR 0049). `resolved` is
+  a distinct status. The motivating case is on this ledger: selenium was high,
+  fell steadily toward normal, and the hypothesis "selenium excess from
+  supplementation" was **correct** — a doctor prescribed it, the dose was too
+  much, she stopped. `ruled-out` says the hypothesis was false and invites a
+  re-prescription; `parked` says nobody is looking and loses the finding. So
+  the lead sat active forever with a falling analyte under it.
+
+  The review detects an analyte closing the gap back to its reference range
+  and names a stopped supplement from `regimen.yaml` that might explain it.
+  **It asks.** `casefile/resolution.py` contains neither the string
+  `"resolved"` nor `UpdateHypothesis`, both pinned by tests, and one code path
+  writes the status — a form she submits. A stop preceding a fall is a
+  correlation, and acting on it would be the system deciding a hypothesis is
+  over on temporal coincidence.
+
+- **`gap_scan`** (ADR 0048 §2): the chat proposes a question when the backlog
+  runs dry. §1's `MAX_CHAT_ASKS` caps each open question at two chat asks;
+  once every one is spent, `next_question_to_ask` correctly returns `None` and
+  the chat quietly stops asking anything at all. A mechanism out of input
+  looks exactly like one working with nothing to say. Runs only on that
+  `None`, only after `apply`, and never fails a turn.
+
+### Fixed
+
+- **The retirement balance scale did not know every evidence strength**
+  (ADR 0053). `_outweighed` weighed each item with `2 if strong else 1`. That
+  scored `definitive-exclusion` — added later by ADR 0038 — at **1**, below a
+  merely `strong` item: a strength that exists to end an argument counted for
+  less than one that does not. It also scored three weak items at 3 against
+  one strong at 2, contradicting its own docstring's promise that "three weak
+  observations do not outweigh one strong contradicting result". A lead
+  supported by one strong result could be retired by three weak notes.
+
+  This is the **third** instance of one shape: an older function that never
+  learned about a newer literal. `_EVIDENCE_STRENGTHS` was the same bug.
+  Replaced with a table total over `EvidenceStrength`, doubling at each step,
+  and `test_every_strength_has_a_weight` enumerates `get_args` against its
+  keys.
+
+- **There is no `retired` status, and the first draft of the boundary counted
+  one.** Found while writing ADR 0052. The check could not fire and would have
+  reported 0 retirements forever — which looks exactly like a differential
+  nothing ever leaves. The snapshot counts `ruled-out` and `parked`, and
+  `Retirement` gained a `cause`, because `to_status` cannot attribute a
+  change: three separate rules write `parked`.
+
+- **The hypothesis card restated `ACTIVE_STATUSES` as a hardcoded tuple.** A
+  stale copy would silently take the "my doctor ruled this out" control off a
+  lead she can still act on. Now passed in from the one definition.
+
+### Not measured
+
+- Whether `_outweighed` fires more often on the live ledger. The board carries
+  far more supporting than contradicting citations, so the rule may still be
+  starved of input rather than mis-weighted — a different problem, upstream in
+  what the Challenger records. ADR 0052's snapshot will attribute the answer
+  on the next review instead of leaving it to recollection.
+- Whether `gap_scan` ever fires. With 19 questions open it should not, and
+  that is the correct outcome; `GapScanResult.ran` distinguishes it from the
+  stage failing.
+
 ## [0.32.0] — 2026-09-08
 
 *The convergence track, items 1–4.*
@@ -41,6 +124,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   answered from 9% of the record and the other 91% read as *not abnormal*
   rather than as *nobody said*.
 
+  Measured after deploy, on one denominator (the 536-row latest panel):
+  **32 → 49 out-of-range results, 28 of them newly visible.** 332 rows
+  remain cannot-tell — no flag and no usable range — and now say so instead
+  of reading as normal.
+
   | layer | consequence |
   |---|---|
   | `knowledge.criteria` | 17 of 26 rules matched an analyte and could never be satisfied |
@@ -66,9 +154,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - ADR 0044 was reported as working on the evidence that engine adjudication
   went 66/66 neutral → 15 opposes. **That inference was wrong**: all 15 were
-  `engine_only` "do not adopt" decisions, unrelated to the query. Whether
-  ADR 0051 actually raises the derived-term count is **unmeasured** and must
-  be checked on the next review.
+  `engine_only` "do not adopt" decisions, unrelated to the query.
+
+  Measured after deploy: the engine query goes from 8 human + **1**
+  lab-derived to 8 + **3** (CRP, TSH, thrombocytopenia). **Still no
+  serology** — a fact about the record rather than a defect: the current
+  anti-dsDNA, SS-A, RF, anti-CCP and ANCA results all read negative or carry
+  nothing to judge them against. One real gap remains: **no stored analyte
+  matches the ANA rule at all**, and ANA is the entry criterion for the SLE
+  set.
+- Board shape after deploy: 46 active → **30 differential + 2 emerging, 14
+  folded**. The emerging count is 2 rather than the 8 projected from the raw
+  date measurement, because that projection predated
+  `MAX_SOURCES_TO_STAY_EMERGING`: six of the eight carry three or more
+  distinct citations and are corroborated rather than merely recent.
 - The convergence track's item #4, "let the engines oppose incumbents", was
   **removed** rather than built. Measurement showed it inert twice over: all
   15 `opposes` were `engine_only`, so there is no incumbent to attach
