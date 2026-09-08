@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import re
 from datetime import date
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -88,6 +89,11 @@ DEFINITIVE_EXCLUSION_SOURCES = ("labs:", "doc:", "encounter:", "patient-report:"
 STALE_DAYS = 90
 
 
+RetirementCause = Literal[
+    "unsupported", "outweighed", "stale", "definitive-exclusion", "rule-out-met", "tier-fold"
+]
+
+
 class Retirement(BaseModel):
     """One proposed status change, with the reason in plain words."""
 
@@ -95,6 +101,12 @@ class Retirement(BaseModel):
     hypothesis_name: str
     to_status: HypothesisStatus
     reason: str
+    cause: RetirementCause = "unsupported"
+    """WHICH mechanism proposed this. `to_status` cannot answer that: three
+    different rules write `parked` — no supporting evidence, gone stale, and
+    the ADR 0045 tier cap — so a count of parked leads attributes a change to
+    whichever mechanism the reader happens to have in mind. ADR 0052 needs
+    the attribution to be a fact rather than a guess."""
 
 
 class RetirementReport(BaseModel):
@@ -292,6 +304,7 @@ def _no_supporting_evidence(hypothesis: Hypothesis) -> Retirement | None:
         hypothesis_name=hypothesis.name,
         to_status="parked",
         reason="nothing on file supports this",
+        cause="unsupported",
     )
 
 
@@ -316,6 +329,7 @@ def _outweighed(hypothesis: Hypothesis) -> Retirement | None:
         hypothesis_name=hypothesis.name,
         to_status="ruled-out",
         reason="the evidence against outweighs the evidence for",
+        cause="outweighed",
     )
 
 
@@ -339,6 +353,7 @@ def _stale(hypothesis: Hypothesis, *, today: date, stale_days: int) -> Retiremen
         hypothesis_name=hypothesis.name,
         to_status="parked",
         reason=f"{hypothesis.probability} probability and untouched for {age} days",
+        cause="stale",
     )
 
 
@@ -351,6 +366,7 @@ def _excluded_by_definitive_evidence(hypothesis: Hypothesis) -> Retirement | Non
         hypothesis_name=hypothesis.name,
         to_status="ruled-out",
         reason=f"ruled out by a definitive result — {item.claim.strip()} ({item.source})",
+        cause="definitive-exclusion",
     )
 
 
@@ -365,6 +381,7 @@ def _rule_out_met(hypothesis: Hypothesis, labs: LabLookup) -> Retirement | None:
         hypothesis_name=hypothesis.name,
         to_status="ruled-out",
         reason=f"its own rule-out condition is now met — {why}",
+        cause="rule-out-met",
     )
 
 
@@ -477,6 +494,7 @@ def propose_tier_folds(
                     "this was among the weakest by cited evidence. Parked, not ruled out — "
                     "it keeps its evidence and returns if it earns its way back"
                 ),
+                cause="tier-fold",
             )
             for h in weakest
         )

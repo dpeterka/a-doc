@@ -61,6 +61,14 @@ from typing import Any, Literal, get_args
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 from adoc import __version__
+from adoc.casefile.convergence import (
+    SNAPSHOT_RELPATH,
+    ConvergenceSnapshot,
+    append_snapshot,
+    latest_snapshot,
+)
+from adoc.casefile.convergence import measure as measure_convergence
+from adoc.casefile.convergence import render as render_convergence
 from adoc.casefile.emerging import EMERGING_WINDOW_DAYS, split_emerging
 from adoc.casefile.ledger import ACTIVE_STATUSES, load_ledger
 from adoc.casefile.phenotype import PHENOTYPE_RELPATH, load_phenotype, select_for_engine
@@ -1788,6 +1796,8 @@ def render_review_markdown(
     engine_query: LabPhenotypeResult | None = None,
     emerging_window_days: int = EMERGING_WINDOW_DAYS,
     literature: LiteratureRefreshResult | None = None,
+    convergence: ConvergenceSnapshot | None = None,
+    convergence_previous: ConvergenceSnapshot | None = None,
     trigger_summary: str = "",
 ) -> str:
     """Render the review report: plain-language "what changed"/"what to
@@ -1928,6 +1938,12 @@ def render_review_markdown(
             lines.append("### What the ANA pattern points at")
             lines.append("")
             lines += icap_lines
+
+    # ADR 0052. Placed after the clinical sections and before the engines: it
+    # is a statement about the review process, not about the patient, and a
+    # reader looking for what to do next should reach that first.
+    if convergence is not None:
+        lines += render_convergence(convergence, convergence_previous)
 
     if lirical is not None and (lirical.findings or lirical.error):
         lines.append("## A second opinion from the phenotype engine")
@@ -2310,6 +2326,10 @@ def build_review_dag(
     source_text)` pair) when omitted; tests should always inject fakes.
     """
     results: dict[str, BaseModel] = sink if sink is not None else {}
+    # Plain values a node hands a later node that are not artifacts. `results`
+    # is typed to BaseModel because everything in it is a DAG output; a count
+    # does not belong there.
+    scratch: dict[str, object] = {}
     # What the engine adjudication considered and deliberately did NOT act on.
     # Kept beside `results` rather than inside the node's own artifact because
     # the deterministic apply is what discovers them, and the report renders
@@ -2620,6 +2640,7 @@ def build_review_dag(
             if term_id not in merged:
                 merged.append(term_id)
         results["engine_query"] = derived
+        scratch["engine_query_size"] = len(merged)
         return merged, negated, derived
 
     def _lirical_divergence_fn(ctx: Ctx) -> BaseModel:
@@ -2932,6 +2953,51 @@ def build_review_dag(
         results["ops_metrics"] = metrics
         return metrics
 
+    def _convergence_snapshot_fn(ctx: Ctx) -> BaseModel:
+        """Count the board this review just committed, and append the count
+        (ADR 0052).
+
+        Runs after every stage that can change the ledger, so the numbers are
+        the ones a reader will see in the report above them — not a
+        mid-review state that no artifact reflects.
+
+        Never raises. A review that produced a real differential must not be
+        lost because a measurement log could not be written.
+        """
+        raw_final = results.get("apply_engine_diff")
+        ledger_after = raw_final if isinstance(raw_final, Ledger) else ctx["apply_review_diff"]
+        assert isinstance(ledger_after, Ledger)
+        criteria = ctx["criteria_scan"]
+        assert isinstance(criteria, CriteriaScanResult)
+
+        raw_retire = results.get("retirement_pass")
+        retirement = raw_retire if isinstance(raw_retire, RetirementReport) else None
+
+        raw_query = results.get("engine_query")
+        derived = raw_query if isinstance(raw_query, LabPhenotypeResult) else None
+
+        snapshot = measure_convergence(
+            ledger_after,
+            app_version=__version__,
+            today=clock().date(),
+            retirements=retirement.retirements if retirement is not None else (),
+            open_questions=len(load_questions(repo.root / QUESTIONS_RELPATH).open_questions()),
+            criteria_sets=len(criteria.results),
+            criteria_met_items=sum(
+                1 for r in criteria.results for i in r.items if i.state == "met"
+            ),
+            engine_terms=(size if isinstance(size := scratch.get("engine_query_size"), int) else 0),
+            engine_terms_lab_derived=len(derived.term_ids) if derived else 0,
+        )
+        previous = None
+        try:
+            previous = latest_snapshot(repo.root / SNAPSHOT_RELPATH)
+            append_snapshot(repo.root / SNAPSHOT_RELPATH, snapshot)
+        except OSError:
+            logger.warning("review: could not write the convergence snapshot", exc_info=True)
+        scratch["convergence_previous"] = previous
+        return snapshot
+
     def _render_report_fn(ctx: Ctx) -> BaseModel:
         review_date = clock().date()
         ledger_before = ctx["current_ledger"]
@@ -2966,6 +3032,8 @@ def build_review_dag(
         # the report first.
         criteria = ctx["criteria_scan"]
         assert isinstance(criteria, CriteriaScanResult)
+        convergence = ctx["convergence_snapshot"]
+        assert isinstance(convergence, ConvergenceSnapshot)
 
         raw_lirical = results.get("lirical_divergence")
         lirical_result = raw_lirical if isinstance(raw_lirical, LiricalComparison) else None
@@ -3004,6 +3072,12 @@ def build_review_dag(
                 else None
             ),
             literature=literature_result,
+            convergence=convergence,
+            convergence_previous=(
+                prev
+                if isinstance(prev := scratch.get("convergence_previous"), ConvergenceSnapshot)
+                else None
+            ),
         )
         relpath, tag_name = _review_relpath_and_tag(repo, review_date, now=clock())
         repo.write(relpath, markdown)
@@ -3241,12 +3315,22 @@ def build_review_dag(
     )
     nodes.append(
         Node(
+            name="convergence_snapshot",
+            fn=_convergence_snapshot_fn,
+            input_model=OpsMetrics,
+            output_model=ConvergenceSnapshot,
+            depends_on=("ops_metrics", "criteria_scan", "apply_review_diff"),
+        )
+    )
+    nodes.append(
+        Node(
             name="render_report",
             fn=_render_report_fn,
             input_model=OpsMetrics,
             output_model=ReviewReport,
             depends_on=(
                 "ops_metrics",
+                "convergence_snapshot",
                 "trend_scan",
                 "criteria_scan",
                 "current_ledger",

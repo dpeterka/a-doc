@@ -41,6 +41,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   answered from 9% of the record and the other 91% read as *not abnormal*
   rather than as *nobody said*.
 
+  Measured after deploy, on one denominator (the 536-row latest panel):
+  **32 → 49 out-of-range results, 28 of them newly visible.** 332 rows
+  remain cannot-tell — no flag and no usable range — and now say so instead
+  of reading as normal.
+
   | layer | consequence |
   |---|---|
   | `knowledge.criteria` | 17 of 26 rules matched an analyte and could never be satisfied |
@@ -66,9 +71,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - ADR 0044 was reported as working on the evidence that engine adjudication
   went 66/66 neutral → 15 opposes. **That inference was wrong**: all 15 were
-  `engine_only` "do not adopt" decisions, unrelated to the query. Whether
-  ADR 0051 actually raises the derived-term count is **unmeasured** and must
-  be checked on the next review.
+  `engine_only` "do not adopt" decisions, unrelated to the query.
+
+  Measured after deploy: the engine query goes from 8 human + **1**
+  lab-derived to 8 + **3** (CRP, TSH, thrombocytopenia). **Still no
+  serology** — a fact about the record rather than a defect: the current
+  anti-dsDNA, SS-A, RF, anti-CCP and ANCA results all read negative or carry
+  nothing to judge them against. One real gap remains: **no stored analyte
+  matches the ANA rule at all**, and ANA is the entry criterion for the SLE
+  set.
+- Board shape after deploy: 46 active → **30 differential + 2 emerging, 14
+  folded**. The emerging count is 2 rather than the 8 projected from the raw
+  date measurement, because that projection predated
+  `MAX_SOURCES_TO_STAY_EMERGING`: six of the eight carry three or more
+  distinct citations and are corroborated rather than merely recent.
 - The convergence track's item #4, "let the engines oppose incumbents", was
   **removed** rather than built. Measurement showed it inert twice over: all
   15 `opposes` were `engine_only`, so there is no incumbent to attach
