@@ -98,24 +98,35 @@ def is_unsubstantiated(hypothesis: Any) -> bool:
 
 
 def group_hypotheses(hypotheses: Sequence[Any]) -> dict[str, list[Any]]:
-    """Split a sorted differential into what to lead with and what to fold
-    away: `leading` (can't-miss at any probability, plus anything high or
-    moderate) and `secondary` (the low/minimal tail).
+    """Split a sorted differential into what to lead with, what to fold away,
+    and what is finished: `leading` (can't-miss at any probability, plus
+    anything high or moderate), `secondary` (the low/minimal tail), and
+    `resolved`.
 
     Within `leading`, substantiated leads come first. A can't-miss entry with
     no cited evidence and low or minimal probability is a placeholder the
     challenger raised as a safety net — it belongs on the page, but reading
     it above a lead the labs actually support tells the patient the wrong
     thing about her own case.
+
+    `resolved` comes out first and unconditionally (ADR 0049). A lead that
+    was TRUE and is over — a selenium excess whose supplement was stopped —
+    read among things "worth discussing now" says the opposite of what
+    happened, and read among the low-likelihood tail buries a real finding.
+    Every hypothesis still appears in exactly one group; nothing is dropped.
     """
     ordered = sort_hypotheses(hypotheses)
+    resolved = [h for h in ordered if getattr(h, "status", "") == "resolved"]
+    remaining = [h for h in ordered if h not in resolved]
     leading = [
-        h for h in ordered if h.tier == "cant-miss" or h.probability not in SECONDARY_PROBABILITIES
+        h
+        for h in remaining
+        if h.tier == "cant-miss" or h.probability not in SECONDARY_PROBABILITIES
     ]
     # Stable: `sort_hypotheses` order is preserved inside each half.
     leading.sort(key=is_unsubstantiated)
-    secondary = [h for h in ordered if h not in leading]
-    return {"leading": leading, "secondary": secondary}
+    secondary = [h for h in remaining if h not in leading]
+    return {"leading": leading, "secondary": secondary, "resolved": resolved}
 
 
 def summarize_diff_ops(diff: Any) -> dict[str, Any]:

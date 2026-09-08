@@ -15,6 +15,7 @@ from datetime import UTC, date, datetime, timedelta
 import pytest
 
 from adoc.casefile.retirement import (
+    EVIDENCE_WEIGHT,
     STALE_DAYS,
     LabFact,
     RetirementReport,
@@ -22,8 +23,9 @@ from adoc.casefile.retirement import (
     is_protected,
     propose_retirements,
     render_retirements,
+    weigh_evidence,
 )
-from adoc.casefile.schema import Evidence, Hypothesis, Ledger, RuleOutCheck
+from adoc.casefile.schema import Evidence, EvidenceStrength, Hypothesis, Ledger, RuleOutCheck
 
 _TODAY = date(2026, 8, 30)
 
@@ -117,9 +119,10 @@ def test_counter_evidence_outweighing_support_rules_it_out() -> None:
     assert report.retirements[0].to_status == "ruled-out"
 
 
-def test_strong_evidence_counts_double() -> None:
-    """Three weak observations do not outweigh one strong contradicting
-    result; treating them as equal would let volume beat quality."""
+def test_strength_decides_the_direction_not_the_count() -> None:
+    """Both leads have one item on each side. What separates them is which
+    side the strong one is on — treating the items as equal would let volume
+    beat quality. (The scale doubles at each step; ADR 0053.)"""
     survives = _h(
         "survives",
         evidence_for=[_ev(strength="strong")],
@@ -829,3 +832,48 @@ def test_an_out_of_range_result_does_not_satisfy_a_normal_rule_out() -> None:
     )
 
     assert report.retirements == []
+
+
+# --- the balance scale knows every strength (ADR 0053) ------------------------
+
+
+def test_every_strength_has_a_weight() -> None:
+    """`2 if strong else 1` scored `definitive-exclusion` — added later by ADR
+    0038 — at 1, BELOW a merely `strong` item: a strength that exists to end an
+    argument counted for less than one that does not. The same shape had
+    already been found once in `_EVIDENCE_STRENGTHS`. A table that is total
+    over the literal cannot repeat it — a new strength with no weight fails
+    here instead of scoring silently.
+    """
+    from typing import get_args
+
+    assert set(EVIDENCE_WEIGHT) == set(get_args(EvidenceStrength))
+
+
+def test_a_definitive_exclusion_outweighs_a_strong_supporting_result() -> None:
+    """The property the old expression had backwards."""
+    assert EVIDENCE_WEIGHT["definitive-exclusion"] > EVIDENCE_WEIGHT["strong"]
+
+
+def test_three_weak_observations_do_not_outweigh_one_strong_result() -> None:
+    """The scale's own docstring promised this and the arithmetic broke it:
+    weak scored 1 and strong 2, so three weak came to 3 and won. A lead one
+    strong result supports could be retired by three weak notes against it."""
+    weak_three = [
+        Evidence(claim="c", source="labs:x:2026-01-01", strength="weak") for _ in range(3)
+    ]
+    strong_one = [Evidence(claim="c", source="labs:x:2026-01-01", strength="strong")]
+
+    assert weigh_evidence(weak_three) < weigh_evidence(strong_one)
+
+
+def test_no_quantity_of_weak_evidence_reaches_a_definitive_exclusion() -> None:
+    """A definitive exclusion is a different kind of claim, not a large
+    amount of the ordinary kind. ADR 0038 restricts who may make one; the
+    scale has to respect that or the restriction buys nothing."""
+    many_weak = [Evidence(claim="c", source="labs:x:2026-01-01", strength="weak") for _ in range(7)]
+    one_exclusion = [
+        Evidence(claim="c", source="labs:x:2026-01-01", strength="definitive-exclusion")
+    ]
+
+    assert weigh_evidence(many_weak) < weigh_evidence(one_exclusion)

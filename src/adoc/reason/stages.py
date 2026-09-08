@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Sequence
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Literal
 
@@ -28,8 +28,10 @@ from adoc.casefile.ledger import load_ledger
 from adoc.casefile.questions import (
     QUESTIONS_RELPATH,
     OpenQuestion,
+    OpenQuestions,
     load_questions,
     next_question_to_ask,
+    question_id,
     record_chat_ask,
     resolve_answered,
     save_questions,
@@ -138,6 +140,38 @@ class InsufficientEvidenceNote(BaseModel):
 
     topic: str
     reason: str
+
+
+class GapQuestion(BaseModel):
+    """One question `gap_scan` proposes (ADR 0048 §2)."""
+
+    panel: str
+    ask: str = ""
+    why: str = ""
+    hypothesis_ids: list[str] = Field(default_factory=list)
+
+
+class GapScanPayload(BaseModel):
+    """What the gap-scan LLM call returns."""
+
+    questions: list[GapQuestion] = Field(default_factory=list)
+
+
+class GapScanResult(BaseModel):
+    """What the stage did. Recorded even when it did nothing.
+
+    Empty is a valid, expected outcome. Distinguishing "did not run", "ran and
+    found nothing", and "ran and failed" matters here for the reason it always
+    matters in this codebase: a stage that cannot fire looks exactly like a
+    stage that fires and finds nothing.
+    """
+
+    ran: bool = False
+    proposed: list[GapQuestion] = Field(default_factory=list)
+    accepted_ids: list[str] = Field(default_factory=list)
+    """Proposals that were new and went into the store. A proposal matching an
+    existing question is dropped rather than re-opened under a second id."""
+    error: str = ""
 
 
 class _LedgerDiffPayload(BaseModel):
@@ -612,6 +646,97 @@ def _composer_gate_feedback(gate: GateResult) -> str:
         )
     parts.append("Return the complete corrected reply in the same schema.")
     return " ".join(p for p in parts if p)
+
+
+# How many questions the gap scan may propose in one turn. Two, because the
+# prompt is told to give its best first and a third is by its own admission
+# not good enough — but only ONE is ever asked (ADR 0048 constraint 1). The
+# second is banked for the next turn.
+MAX_GAP_QUESTIONS = 2
+
+
+def gap_scan_stage(
+    client: LlmClient,
+    ledger: Ledger,
+    ctx: ContextPack,
+    store: OpenQuestions,
+    *,
+    today: date,
+) -> GapScanResult:
+    """Name what nobody has asked her yet (ADR 0048 §2, role `test_chooser`).
+
+    Runs only when there is nothing left to ask: every open, patient-answerable
+    question has hit `MAX_CHAT_ASKS`. With 19 sitting open that is not today's
+    problem — it is what stops the mechanism stalling once the backlog is
+    worked through, and the stall would be silent.
+
+    Never raises. A turn that produced a real reply must not fail because a
+    question could not be invented, and an empty result is a correct answer,
+    not a failure — so the two are recorded distinctly.
+    """
+    result = GapScanResult(ran=True)
+    try:
+        prompt = load_prompt("gap_scan")
+        known = "\n".join(f"- {q.panel}" for q in store.questions if q.panel.strip())
+        user_content = (
+            f"{ctx.render()}\n\n## Current Ledger (post-challenge)\n\n"
+            f"{_render_ledger_for_prompt(ledger)}\n\n"
+            "## Questions already on the list — do not repeat or reword these\n\n"
+            f"{known or '(none)'}\n"
+        )
+        completion = client.complete(
+            "test_chooser",
+            system=prompt.text,
+            messages=[Message(role="user", content=user_content)],
+            schema=GapScanPayload,
+        )
+        payload = completion.parsed
+        assert isinstance(payload, GapScanPayload)
+    except Exception as exc:  # noqa: BLE001 - a turn must survive this
+        logger.warning("gap_scan: proposing a question failed: %s", exc, exc_info=True)
+        result.error = str(exc)
+        return result
+
+    # The ledger decides which hypothesis ids exist. ADR 0028: one invented id
+    # costs its own reference, never the question that carries it.
+    real_ids = {h.id for h in ledger.hypotheses}
+    known_ids = {q.id for q in store.questions}
+    for item in payload.questions[:MAX_GAP_QUESTIONS]:
+        if not item.panel.strip() or not item.ask.strip():
+            continue
+        item.hypothesis_ids = [hid for hid in item.hypothesis_ids if hid in real_ids]
+        result.proposed.append(item)
+        qid = question_id(item.panel)
+        if qid in known_ids:
+            # Already asked under this id — including one she has ANSWERED.
+            # Re-opening it would ask her again for something the store
+            # already holds, which is the exact failure ADR 0033 exists to
+            # stop.
+            logger.info("gap_scan: proposed %r is already on the list; dropped", item.panel)
+            continue
+        known_ids.add(qid)
+        result.accepted_ids.append(qid)
+
+    if result.accepted_ids:
+        accepted = {qid for qid in result.accepted_ids}
+        store.questions.extend(
+            OpenQuestion(
+                id=question_id(item.panel),
+                panel=item.panel,
+                ask=item.ask,
+                why=item.why,
+                # ADR 0048 constraint 2. Not the model's to choose: the stage
+                # exists to find something SHE can answer, and a prompt that
+                # merely asks for that has no way to be held to it.
+                audience="you",
+                hypothesis_ids=item.hypothesis_ids,
+                first_asked_on=today,
+                last_asked_on=today,
+            )
+            for item in result.proposed
+            if question_id(item.panel) in accepted
+        )
+    return result
 
 
 def composer_stage(
@@ -1191,6 +1316,19 @@ def build_diagnostic_dag(
         store = load_questions(questions_path)
         touched = {h.id for h in ledger.hypotheses}
         ask_question = next_question_to_ask(store, changed_hypothesis_ids=touched)
+
+        # ADR 0048 §2: only when there is nothing left to ask. This is the
+        # fifth model call of the turn and the reason the two decisions are
+        # separated — picking from the backlog costs nothing, inventing does.
+        # Runs after `apply` so the question is about the differential THIS
+        # turn produced (constraint 4, the ordering argument of ADR 0043).
+        if ask_question is None:
+            today = datetime.now(UTC).date()
+            gap = gap_scan_stage(client, ledger, context_pack, store, today=today)
+            results["gap_scan"] = gap
+            if gap.accepted_ids:
+                save_questions(questions_path, store)
+                ask_question = next_question_to_ask(store, changed_hypothesis_ids=touched)
 
         reply = composer_stage(client, ledger, context_pack, db, ask_question=ask_question)
 

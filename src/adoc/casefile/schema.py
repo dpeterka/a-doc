@@ -28,7 +28,19 @@ HypothesisStatus = Literal[
     "ruled-out",
     "confirmed-by-doctor",
     "parked",
+    "resolved",
 ]
+"""How a lead ends, and the distinction is clinical rather than cosmetic
+(ADR 0049).
+
+`ruled-out` says the hypothesis was FALSE. `parked` says nobody is looking
+any more. `resolved` says it was TRUE and the finding no longer stands
+because the cause was removed — a selenium excess whose supplement was
+stopped and whose level came back down. A doctor reading "selenium excess —
+ruled out" concludes it never happened and may re-prescribe; reading
+"resolved" they get both the finding and its history.
+
+A resolved lead is ended, so it is neither active nor retirement-eligible."""
 Origin = Literal["model", "patient", "doctor", "challenger"]
 EvidenceStrength = Literal["strong", "moderate", "weak", "definitive-exclusion"]
 """`definitive-exclusion` is not "very strong" — it is a different kind of

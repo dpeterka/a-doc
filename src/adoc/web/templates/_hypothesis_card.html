@@ -110,7 +110,28 @@
 
         {# PAT-03 / ADR 0038: the only way a can't-miss or your-own-idea lead
            can leave the list. Shown only while it is still being tracked. #}
-        {% if h.status in ("active", "patient-proposed", "challenged") %}
+        {# `active_statuses` is passed in from `ledger.ACTIVE_STATUSES`, not
+           restated here: a hardcoded copy of that set has already gone stale
+           once in this codebase, and a stale copy here would silently take
+           the control off a card she can still act on. #}
+        {% if h.status in active_statuses %}
+          {# ADR 0049: a separate control, because "ruled out" and "sorted
+             out" are different outcomes and folding them into one loses the
+             finding. #}
+          <details class="retire-control">
+            <summary>This one's sorted out now</summary>
+            <form method="post" action="/ledger/hypotheses/{{ h.id | urlencode }}/resolved">
+              <label for="resolved-reason-{{ h.id }}">What changed?</label>
+              <input
+                id="resolved-reason-{{ h.id }}"
+                name="reason"
+                type="text"
+                required
+                placeholder="e.g. I stopped the selenium supplement in May"
+              />
+              <button type="submit">Mark as sorted out</button>
+            </form>
+          </details>
           <details class="retire-control">
             <summary>My doctor ruled this out</summary>
             <form method="post" action="/ledger/hypotheses/{{ h.id | urlencode }}/retire">
