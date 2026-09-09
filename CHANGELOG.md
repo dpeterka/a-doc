@@ -77,13 +77,22 @@ what any of it did.*
   stale copy would silently take the "my doctor ruled this out" control off a
   lead she can still act on. Now passed in from the one definition.
 
+### Measured after deploy
+
+- **The rescale changed nothing, and that is the useful finding.**
+  `_outweighed` still fires for **1 of 46** on ledger version 18. Total
+  evidence weight is **1303 for against 76** — 17:1 — with **22 of 46 leads
+  carrying no counter-evidence at all**, and 2 `strong` items against in the
+  entire ledger against 108 for.
+
+  The rule was mis-weighted *and* starved; only the first was fixed. A balance
+  scale cannot retire anything when one side is empty. The remaining problem
+  is upstream: the Challenger records supporting citations an order of
+  magnitude more often than contradicting ones, and that is where a
+  differential that only ever grows comes from.
+
 ### Not measured
 
-- Whether `_outweighed` fires more often on the live ledger. The board carries
-  far more supporting than contradicting citations, so the rule may still be
-  starved of input rather than mis-weighted — a different problem, upstream in
-  what the Challenger records. ADR 0052's snapshot will attribute the answer
-  on the next review instead of leaving it to recollection.
 - Whether `gap_scan` ever fires. With 19 questions open it should not, and
   that is the correct outcome; `GapScanResult.ran` distinguishes it from the
   stage failing.
