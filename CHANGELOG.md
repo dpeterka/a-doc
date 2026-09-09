@@ -169,9 +169,11 @@ what any of it did.*
   answered from 9% of the record and the other 91% read as *not abnormal*
   rather than as *nobody said*.
 
-  Measured after deploy, on one denominator (the 536-row latest panel):
-  **32 → 49 out-of-range results, 28 of them newly visible.** 332 rows
-  remain cannot-tell — no flag and no usable range — and now say so instead
+  Measured after deploy by querying `labs.sqlite` directly, on one
+  denominator (the 536-row latest panel): **32 → 49 out-of-range results, 28
+  of them newly visible.** This one is a property of the stored rows and does
+  not need a review to be true — but nothing had yet *read* it into a
+  differential. 332 rows remain cannot-tell — no flag and no usable range — and now say so instead
   of reading as normal.
 
   | layer | consequence |
@@ -208,11 +210,17 @@ what any of it did.*
   nothing to judge them against. One real gap remains: **no stored analyte
   matches the ANA rule at all**, and ANA is the entry criterion for the SLE
   set.
-- Board shape after deploy: 46 active → **30 differential + 2 emerging, 14
-  folded**. The emerging count is 2 rather than the 8 projected from the raw
-  date measurement, because that projection predated
+- Board shape **as the new code computes it**, 46 active → 30 differential +
+  2 emerging, 14 would fold. The emerging count is 2 rather than the 8
+  projected from the raw date measurement, because that projection predated
   `MAX_SOURCES_TO_STAY_EMERGING`: six of the eight carry three or more
   distinct citations and are corroborated rather than merely recent.
+
+  **This had not happened when it was written, and the original wording
+  ("Board shape after deploy") said it had.** Corrected in 0.33.2. Every
+  number in this entry is what the functions return when a probe calls them;
+  none of it reached the case file, because no full review had run since
+  2026-09-04 on 0.31.1 — see 0.33.2 for why.
 - The convergence track's item #4, "let the engines oppose incumbents", was
   **removed** rather than built. Measurement showed it inert twice over: all
   15 `opposes` were `engine_only`, so there is no incumbent to attach
