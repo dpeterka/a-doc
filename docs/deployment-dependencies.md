@@ -113,6 +113,41 @@ The sidecar build step is `continue-on-error`: it downloads LIRICAL's data
 from external hosts and fails for reasons unrelated to this repository. It
 did, and skipped the ECS deploy, so a release shipped nothing.
 
+## A dependency that is not a variable: the ledger has to be written
+
+Everything above is about the app being *able* to do something. This is about
+whether it *has*.
+
+A full review runs at most weekly. The `a-doc-review` EventBridge rule fires
+every 30 minutes, and `reason.review_trigger` declines almost all of them —
+no `review-wanted` marker, and a 7-day floor since the last full run. That
+gating is correct and cheap; a full review is four to five frontier calls.
+
+The cost is that **shipping a change to the review and running it are
+different events, and the gap between them can be a week**. In September 2026
+that gap swallowed an entire work track: ADRs 0044, 0045, 0049, 0050, 0051,
+0052 and 0053 all deployed green across 0.32.0 and 0.33.0, and the ledger's
+last write was still `app_version 0.31.1`. The board stayed at 46 active
+leads, and the tick logged
+
+    review: skipped full review this tick (no review-wanted marker set, and
+    only 6 days ... has passed since the last full review — floor (7 days)
+    not yet elapsed)
+
+every half hour — the correct message, and at a glance indistinguishable from
+a pipeline that has stopped.
+
+The second-order damage was worse than the delay. With no review running, the
+only way to see what the new code did was to call it by hand in a probe — and
+**a probe's output reads exactly like a deployed outcome**. Two changelog
+entries were written that way before anyone noticed the difference.
+
+`scripts/check_deploy_deps.py --in-task` now reports the age of the last
+ledger write and the `app_version` that made it. A ledger last touched by a
+version several releases behind means every release since has been theory.
+`adoc review --force` bypasses the gating when a change needs exercising
+before its floor elapses.
+
 ## The recurring failure mode
 
 Every entry above fails **silently** except `ADOC_DATA_DIR`. That is
@@ -125,3 +160,8 @@ it means *absence looks exactly like working*. Two rules follow:
 2. **Verify a new dependency in production once, by measurement**, before
    calling it done. Not "the deploy went green" — a probe that shows the thing
    working. See `verify-by-measurement-not-silence` in the project memory.
+3. **A probe is not an outcome.** Rule 2 pushes toward calling the new code
+   directly to see what it returns, and that is the right move — but what it
+   proves is "this function computes X", never "X happened to the case file".
+   Those are the same sentence in a changelog and different facts on disk.
+   Say which one you have.

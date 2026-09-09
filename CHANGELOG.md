@@ -5,6 +5,59 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.33.2] — 2026-09-09
+
+*The convergence track finally ran. 46 active leads → 32.*
+
+### Fixed
+
+- **Nothing had executed any of the convergence work.** ADRs 0044, 0045, 0049,
+  0050, 0051, 0052 and 0053 shipped across 0.32.0 and 0.33.0, deployed green,
+  and the ledger's last write was still `app_version 0.31.1` from 2026-09-04.
+  `reason.review_trigger` holds a 7-day floor, so the tick declined every 30
+  minutes with
+
+      review: skipped full review this tick (no review-wanted marker set, and
+      only 6 days ... has passed since the last full review — floor (7 days)
+      not yet elapsed)
+
+  — the correct message, and at a glance indistinguishable from a stalled
+  pipeline. Forced with `adoc review --force`, ledger 18 → 20:
+
+  | | before | after |
+  |---|---|---|
+  | active | 46 | **32** |
+  | differential | 46 | **30** |
+  | emerging | — | **2** |
+  | parked | 8 | **22** |
+
+  15 leads left in one run. ADR 0052's snapshot attributes them: **14
+  `tier-fold`, 1 `rule-out-met`** — the cap did essentially all of it, and
+  `_outweighed` contributed zero exactly as its own measurement predicted.
+
+- **`scripts/check_deploy_deps.py --in-task` now reports the age of the last
+  ledger write and the `app_version` that made it.** A ledger last touched by
+  a version several releases behind means every release since has been
+  theory. Threshold is 14 days — twice the review floor, so one skipped week
+  is not an alarm.
+
+- **Two changelog claims in 0.32.0 described probe output as a deployed
+  outcome.** With no review running, the only way to see what the new code did
+  was to call it by hand — and a probe's result reads exactly like something
+  that happened. "Board shape after deploy: 46 active → 30 differential + 2
+  emerging, 14 folded" had not happened. Reworded, and
+  `docs/deployment-dependencies.md` gains a third rule: **a probe is not an
+  outcome.**
+
+### Known, unaddressed
+
+- **The board is bounded, not converging.** The cap discards the weakest leads
+  after the fact; nothing here made the reasoning propose fewer. Steady state
+  is ~25 + can't-miss. The measured cause of growth is upstream: **1303 units
+  of evidence-for against 76 evidence-against**, 22 of 46 leads with no
+  counter-evidence at all. A differential only shrinks when something argues
+  against its members.
+
 ## [0.33.1] — 2026-09-09
 
 *Dependencies, and the answer to the one thing 0.33.0 shipped unmeasured.*
@@ -169,9 +222,11 @@ what any of it did.*
   answered from 9% of the record and the other 91% read as *not abnormal*
   rather than as *nobody said*.
 
-  Measured after deploy, on one denominator (the 536-row latest panel):
-  **32 → 49 out-of-range results, 28 of them newly visible.** 332 rows
-  remain cannot-tell — no flag and no usable range — and now say so instead
+  Measured after deploy by querying `labs.sqlite` directly, on one
+  denominator (the 536-row latest panel): **32 → 49 out-of-range results, 28
+  of them newly visible.** This one is a property of the stored rows and does
+  not need a review to be true — but nothing had yet *read* it into a
+  differential. 332 rows remain cannot-tell — no flag and no usable range — and now say so instead
   of reading as normal.
 
   | layer | consequence |
@@ -208,11 +263,17 @@ what any of it did.*
   nothing to judge them against. One real gap remains: **no stored analyte
   matches the ANA rule at all**, and ANA is the entry criterion for the SLE
   set.
-- Board shape after deploy: 46 active → **30 differential + 2 emerging, 14
-  folded**. The emerging count is 2 rather than the 8 projected from the raw
-  date measurement, because that projection predated
+- Board shape **as the new code computes it**, 46 active → 30 differential +
+  2 emerging, 14 would fold. The emerging count is 2 rather than the 8
+  projected from the raw date measurement, because that projection predated
   `MAX_SOURCES_TO_STAY_EMERGING`: six of the eight carry three or more
   distinct citations and are corroborated rather than merely recent.
+
+  **This had not happened when it was written, and the original wording
+  ("Board shape after deploy") said it had.** Corrected in 0.33.2. Every
+  number in this entry is what the functions return when a probe calls them;
+  none of it reached the case file, because no full review had run since
+  2026-09-04 on 0.31.1 — see 0.33.2 for why.
 - The convergence track's item #4, "let the engines oppose incumbents", was
   **removed** rather than built. Measurement showed it inert twice over: all
   15 `opposes` were `engine_only`, so there is no incumbent to attach
