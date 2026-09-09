@@ -5,6 +5,42 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.33.1] — 2026-09-09
+
+*Dependencies, and the answer to the one thing 0.33.0 shipped unmeasured.*
+
+### Measured
+
+- **The ADR 0053 rescale changed nothing on the live ledger, and that is the
+  useful finding.** The probe that could answer it was blocked when 0.33.0
+  shipped, so the ADR recorded the consequence as *unmeasured* rather than
+  guessing. Run against ledger version 18, 46 active leads:
+
+  | | for | against |
+  | --- | --- | --- |
+  | weight | **1303** | **76** |
+  | `strong` items | 108 | 2 |
+  | `moderate` items | 361 | 27 |
+  | `weak` items | 149 | 14 |
+
+  `_outweighed` fires for **1 of 46** — exactly as before. **22 of 46 leads
+  carry no counter-evidence at all**, and the entire ledger holds 2 `strong`
+  items against.
+
+  The rule was mis-weighted *and* starved; 0.33.0 fixed only the first. At
+  17:1 no weighting short of an inversion changes the outcome, and inverting
+  it would retire the board. **The remaining problem is upstream**: the
+  Challenger records supporting citations an order of magnitude more often
+  than contradicting ones, and that — not the weighting — is where a
+  differential that only ever grows comes from.
+
+### Changed
+
+- openai 3.5.0 → 3.8.0, pydantic 2.13.4 → 2.13.5, boto3 1.43.82 → 1.43.89,
+  sse-starlette 3.4.8 → 3.4.11, ruff 0.16.4 → 0.16.6. Held back through the
+  convergence track so a dependency change could not be confused with a
+  measured effect; released now that the measuring is done.
+
 ## [0.33.0] — 2026-09-08
 
 *The convergence track, items 5–7 — and a boundary so the next review can say
@@ -77,13 +113,22 @@ what any of it did.*
   stale copy would silently take the "my doctor ruled this out" control off a
   lead she can still act on. Now passed in from the one definition.
 
+### Measured after deploy
+
+- **The rescale changed nothing, and that is the useful finding.**
+  `_outweighed` still fires for **1 of 46** on ledger version 18. Total
+  evidence weight is **1303 for against 76** — 17:1 — with **22 of 46 leads
+  carrying no counter-evidence at all**, and 2 `strong` items against in the
+  entire ledger against 108 for.
+
+  The rule was mis-weighted *and* starved; only the first was fixed. A balance
+  scale cannot retire anything when one side is empty. The remaining problem
+  is upstream: the Challenger records supporting citations an order of
+  magnitude more often than contradicting ones, and that is where a
+  differential that only ever grows comes from.
+
 ### Not measured
 
-- Whether `_outweighed` fires more often on the live ledger. The board carries
-  far more supporting than contradicting citations, so the rule may still be
-  starved of input rather than mis-weighted — a different problem, upstream in
-  what the Challenger records. ADR 0052's snapshot will attribute the answer
-  on the next review instead of leaving it to recollection.
 - Whether `gap_scan` ever fires. With 19 questions open it should not, and
   that is the correct outcome; `GapScanResult.ran` distinguishes it from the
   stage failing.

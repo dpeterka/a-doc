@@ -58,9 +58,26 @@ instead of scoring silently.
   act on volume. Both directions are intended.
 - The two exclusions are untouched: `cant-miss` and patient-origin leads are
   still never retired by any rule, whatever the scale says.
-- Whether `_outweighed` now fires more often on the live ledger is
-  **unmeasured**. The board carries far more supporting than contradicting
-  citations, so the rule may still be starved of input rather than
-  mis-weighted — a different problem, upstream in what the Challenger records.
-  ADR 0052's snapshot will attribute the answer on the next review instead of
-  leaving it to recollection.
+- Whether `_outweighed` now fires more often on the live ledger: **measured
+  on 2026-09-09, and the answer is no.** Ledger version 18, 46 active leads:
+
+  | | for | against |
+  | --- | --- | --- |
+  | weight | **1303** | **76** |
+  | `strong` items | 108 | 2 |
+  | `moderate` items | 361 | 27 |
+  | `weak` items | 149 | 14 |
+
+  `_outweighed` fires for **1 of 46**, exactly as it did before the rescale.
+  **22 of 46 leads carry no counter-evidence at all**, and only 2 `strong`
+  items against exist in the whole ledger against 108 for.
+
+  So the rule was mis-weighted AND starved, and only the first was fixed here.
+  A scale cannot retire anything when one side of it is empty: at 17:1 no
+  weighting short of an inversion would change the outcome, and inverting it
+  would retire the board. **The remaining problem is upstream** — the
+  Challenger records supporting citations an order of magnitude more often
+  than contradicting ones, and that is where a differential that only ever
+  grows comes from. Fixing the weights was still worth doing (a
+  `definitive-exclusion` scoring below `strong` was wrong on its own terms),
+  but it is not the thing that will shrink the board.
