@@ -276,6 +276,48 @@ to pursue*, not merely on the count:
 | 7 | ✅ **A lead can end because the cause was removed.** `resolved` status + a trend-change question. | 0049 | one lead today; supplies a missing *category* | low |
 | — | ✅ **Every review records its own boundary.** Six releases were each measured by hand against a number recalled from the release before, and twice the recollection was wrong. | 0052 | the next review's delta is a fact on disk | low |
 
+### What the track actually did (measured 2026-09-09, ledger v18 → v20)
+
+Everything above shipped across 0.32.0 and 0.33.0 and **changed nothing for
+five days**, because no full review ran. `reason.review_trigger` holds a 7-day
+floor; the tick declined every 30 minutes with the correct message, and the
+ledger's last write stayed at `app_version 0.31.1`. Forced with
+`adoc review --force`:
+
+| | before | after |
+|---|---|---|
+| active | 46 | **32** |
+| differential | 46 | **30** |
+| emerging | — | **2** |
+| parked | 8 | **22** |
+| ruled-out | 0 | **1** |
+
+15 leads left the board in one run, and the snapshot attributes them:
+**14 `tier-fold`, 1 `rule-out-met`.**
+
+Read that attribution honestly:
+
+- **The cap (item 2) did essentially all of the work.** It is the only
+  mechanism here that bounds the board rather than arguing with it, and it is
+  the deterministic ceiling asked for: 5 `most-likely` + 20 `expanded`, with
+  `cant-miss` (11) and patient-raised uncapped because neither may be folded.
+  Steady state is therefore **~25 + can't-miss**, and the board cannot grow
+  past it however many leads a review proposes.
+- **`_outweighed` (item 5) contributed zero**, as ADR 0053's own measurement
+  predicted. It was mis-weighted *and* starved; only the first was fixed.
+- **The emerging tier (item 3) held 2 back**, and `gap_scan` (item 6) and
+  resolution (item 7) correctly did nothing — 70 questions are open, so the
+  backlog has not run dry, and no analyte under a live lead is heading back
+  into range.
+
+**The growth problem is not solved, it is bounded.** Nothing here made the
+reasoning propose fewer leads; the cap discards the weakest after the fact.
+The measured cause of growth is upstream and unaddressed: **1303 units of
+evidence-for against 76 evidence-against, with 22 of 46 leads carrying no
+counter-evidence at all.** A differential only shrinks when something argues
+against its members, and the Challenger records support an order of magnitude
+more often than opposition. That is the next thing worth building.
+
 Ordering rationale, since it is not obvious:
 
 - **#1 first because it is nearly free.** ADR 0048 was originally scoped as

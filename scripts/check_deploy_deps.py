@@ -11,7 +11,8 @@ because a reference index is missing. The cost of that choice is that absence
 looks exactly like working, so it has to be checked deliberately.
 
     python scripts/check_deploy_deps.py             # task definitions, from AWS
-    python scripts/check_deploy_deps.py --in-task   # also the files, from inside a task
+    python scripts/check_deploy_deps.py --in-task   # also the files, and how
+                                                    # long since a full review
 
 Exit 0 when everything required is present, 1 otherwise. Optional entries are
 reported but never fail the run.
@@ -21,8 +22,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 
 TASK_FAMILIES = ("a-doc-web", "a-doc-jobs")
@@ -163,6 +166,79 @@ def check_lirical_paths(root: Path) -> int:
     return 0
 
 
+# How long the ledger may go untouched before that is worth reporting. The
+# review tick runs every 30 minutes and declines most of them — `reason.review`
+# holds a 7-day floor — so "no full review today" is normal and "no full review
+# in two weeks" is a stalled pipeline. Twice the floor, so one skipped week is
+# not an alarm.
+STALE_REVIEW_DAYS = 14
+
+
+def check_last_review(data_dir: Path) -> int:
+    """How long since a full review actually wrote to the ledger.
+
+    This exists because six releases of convergence work shipped, deployed
+    green, and changed nothing on the board — and nothing said so. The tick
+    logged `skipped full review this tick` every 30 minutes for six days,
+    which is the CORRECT message and is indistinguishable, at a glance, from
+    a pipeline that has stopped.
+
+    The consequence was worse than a stalled pipeline: with no review running,
+    the only way to see what the new code did was to run it by hand in a
+    probe — and a probe's output reads exactly like a deployed outcome. Two
+    changelog entries were written that way before anyone noticed.
+
+    Reports the app version that last wrote, too. A ledger last touched by a
+    version several releases behind means every release since has been
+    theory.
+    """
+    history = data_dir / "case" / "ledger-history.jsonl"
+    if not history.exists():
+        print(f"  MISSING  {history} — no review has ever written to the ledger")
+        return 1
+
+    last_line = ""
+    for line in history.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            last_line = line
+    if not last_line:
+        print(f"  MISSING  {history} is empty — no review has ever written")
+        return 1
+
+    try:
+        entry = json.loads(last_line)
+        stamp = entry["resulting_updated"]
+        written_by = entry.get("diff", {}).get("provenance", {}).get("app_version", "?")
+        when = datetime.fromisoformat(stamp)
+    except Exception as exc:  # noqa: BLE001 - a malformed line is itself the finding
+        print(f"  MISSING  {history} last line unreadable ({exc})")
+        return 1
+
+    age = datetime.now(UTC) - when
+    days = age.days
+    running = _running_version()
+    behind = running is not None and written_by != running
+
+    if days >= STALE_REVIEW_DAYS:
+        print(
+            f"  STALE    ledger last written {days}d ago by {written_by} — "
+            f"no full review in {STALE_REVIEW_DAYS}+ days"
+        )
+        return 1
+    note = f" (running {running} — every release since has not been exercised)" if behind else ""
+    print(f"  ok       ledger last written {days}d ago by {written_by}{note}")
+    return 0
+
+
+def _running_version() -> str | None:
+    try:
+        from adoc import __version__
+
+        return __version__
+    except Exception:  # noqa: BLE001 - only used to enrich a message
+        return None
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -176,6 +252,9 @@ def main(argv: list[str] | None = None) -> int:
     print("check-deploy-deps: see docs/deployment-dependencies.md")
     failures = check_lirical_paths(Path(args.root))
     failures += check_reference_files() if args.in_task else check_task_definitions()
+    if args.in_task:
+        data_dir = os.environ.get("ADOC_DATA_DIR")
+        failures += check_last_review(Path(data_dir)) if data_dir else 0
 
     print()
     if failures:
