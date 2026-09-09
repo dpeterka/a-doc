@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.33.3] — 2026-09-09
+
+### Fixed
+
+- **`check_deploy_deps.py` was never in the image.** `--in-task` mode checks
+  the reference indexes on disk and, as of 0.33.2, how long since a full
+  review wrote to the ledger — all things that only exist inside a running
+  task. The Dockerfile copies `src` and `models.yaml` and never copied the
+  script, so that half of the verifier had not once run where it was meant
+  to:
+
+      /opt/venv/bin/python: can't open file
+      '/app/scripts/check_deploy_deps.py': [Errno 2] No such file
+
+  Found by running it, one release after adding a check to it. A checker that
+  cannot be invoked is indistinguishable from a checker that passes — the
+  exact shape the file exists to catch, in the file itself. Pinned by a test
+  on the Dockerfile.
+
 ## [0.33.2] — 2026-09-09
 
 *The convergence track finally ran. 46 active leads → 32.*
