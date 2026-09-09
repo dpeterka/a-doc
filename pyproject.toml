@@ -14,7 +14,7 @@ dependencies = [
   "openai",
   "fastapi",
   "uvicorn[standard]",
-  "pydantic>=2",
+  "pydantic>=2.13.5",
   "pydantic-settings",
   "jinja2",
   "ruamel.yaml",
