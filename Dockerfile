@@ -46,6 +46,13 @@ RUN uv sync --frozen --no-dev
 # not just source code.
 COPY models.yaml ./
 
+# The deployment verifier itself. Without this, `--in-task` mode — the half
+# that checks the reference indexes on disk and how long since a full review
+# wrote to the ledger — cannot run where the things it checks actually live.
+# It was unrunnable in production from the day it was written, which is the
+# same shape it exists to catch.
+COPY scripts/check_deploy_deps.py ./scripts/check_deploy_deps.py
+
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 COPY deploy/container/run-ingest.sh /usr/local/bin/run-ingest.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh /usr/local/bin/run-ingest.sh
