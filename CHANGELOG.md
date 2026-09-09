@@ -5,6 +5,59 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.33.2] — 2026-09-09
+
+*The convergence track finally ran. 46 active leads → 32.*
+
+### Fixed
+
+- **Nothing had executed any of the convergence work.** ADRs 0044, 0045, 0049,
+  0050, 0051, 0052 and 0053 shipped across 0.32.0 and 0.33.0, deployed green,
+  and the ledger's last write was still `app_version 0.31.1` from 2026-09-04.
+  `reason.review_trigger` holds a 7-day floor, so the tick declined every 30
+  minutes with
+
+      review: skipped full review this tick (no review-wanted marker set, and
+      only 6 days ... has passed since the last full review — floor (7 days)
+      not yet elapsed)
+
+  — the correct message, and at a glance indistinguishable from a stalled
+  pipeline. Forced with `adoc review --force`, ledger 18 → 20:
+
+  | | before | after |
+  |---|---|---|
+  | active | 46 | **32** |
+  | differential | 46 | **30** |
+  | emerging | — | **2** |
+  | parked | 8 | **22** |
+
+  15 leads left in one run. ADR 0052's snapshot attributes them: **14
+  `tier-fold`, 1 `rule-out-met`** — the cap did essentially all of it, and
+  `_outweighed` contributed zero exactly as its own measurement predicted.
+
+- **`scripts/check_deploy_deps.py --in-task` now reports the age of the last
+  ledger write and the `app_version` that made it.** A ledger last touched by
+  a version several releases behind means every release since has been
+  theory. Threshold is 14 days — twice the review floor, so one skipped week
+  is not an alarm.
+
+- **Two changelog claims in 0.32.0 described probe output as a deployed
+  outcome.** With no review running, the only way to see what the new code did
+  was to call it by hand — and a probe's result reads exactly like something
+  that happened. "Board shape after deploy: 46 active → 30 differential + 2
+  emerging, 14 folded" had not happened. Reworded, and
+  `docs/deployment-dependencies.md` gains a third rule: **a probe is not an
+  outcome.**
+
+### Known, unaddressed
+
+- **The board is bounded, not converging.** The cap discards the weakest leads
+  after the fact; nothing here made the reasoning propose fewer. Steady state
+  is ~25 + can't-miss. The measured cause of growth is upstream: **1303 units
+  of evidence-for against 76 evidence-against**, 22 of 46 leads with no
+  counter-evidence at all. A differential only shrinks when something argues
+  against its members.
+
 ## [0.33.1] — 2026-09-09
 
 *Dependencies, and the answer to the one thing 0.33.0 shipped unmeasured.*
