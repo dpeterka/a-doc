@@ -123,3 +123,20 @@ def test_only_the_last_line_decides(tmp_path: Path) -> None:
     )
 
     assert check_last_review(tmp_path) == 0
+
+
+def test_the_verifier_ships_in_the_image() -> None:
+    """`--in-task` checks the reference indexes on disk and the age of the
+    last ledger write — things that only exist inside a running task. The
+    Dockerfile copied `src` and `models.yaml` but not this script, so that
+    half of the verifier had never once run where it was meant to:
+
+        /opt/venv/bin/python: can't open file
+        '/app/scripts/check_deploy_deps.py': [Errno 2] No such file
+
+    A checker that cannot be invoked is indistinguishable from a checker that
+    passes, which is the shape it was written to catch.
+    """
+    dockerfile = (Path(__file__).parent.parent / "Dockerfile").read_text(encoding="utf-8")
+
+    assert "scripts/check_deploy_deps.py" in dockerfile
