@@ -158,6 +158,7 @@ from adoc.reason.review_trigger import (
     ReviewMarker,
     clear_review_marker,
     load_review_marker,
+    mark_review_wanted,
 )
 from adoc.reason.tools import redact_gated_text
 from adoc.reason.verify import (
@@ -3718,6 +3719,76 @@ class ReviewTickResult(BaseModel):
     full_review: ReviewReport | None = None
 
 
+# The reason text a version-change marker carries. Matched on to decide
+# whether this version has already asked, so a review that legitimately
+# writes nothing does not re-arm the marker every tick forever.
+VERSION_CHANGE_REASON = "deployed {version}; the ledger was last written by {written_by}"
+
+
+def last_ledger_writer(repo: DataRepo) -> str | None:
+    """The `app_version` that last wrote to the ledger, or `None`.
+
+    Read from the last line of `ledger-history.jsonl` rather than tracked
+    separately: that file is the append-only record of every diff actually
+    applied, so it cannot disagree with what happened.
+    """
+    history = repo.root / HISTORY_RELPATH
+    if not history.exists():
+        return None
+    last_line = ""
+    for line in history.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            last_line = line
+    if not last_line:
+        return None
+    try:
+        entry = json.loads(last_line)
+        written_by = entry.get("diff", {}).get("provenance", {}).get("app_version")
+    except Exception:  # noqa: BLE001 - an unreadable line is not worth a failed tick
+        return None
+    return written_by if isinstance(written_by, str) and written_by else None
+
+
+def mark_review_wanted_on_version_change(
+    repo: DataRepo, *, running_version: str = __version__, at: datetime | None = None
+) -> str | None:
+    """Ask for a review when the running code has never touched the ledger.
+
+    Shipping a change to the review and RUNNING it are different events, and
+    the gap between them is up to the 7-day floor. In September 2026 that gap
+    swallowed a whole work track: ADRs 0044, 0045, 0049, 0050, 0051, 0052 and
+    0053 deployed green across two releases and the ledger's last write was
+    still `0.31.1`. The board did not move, the tick logged `skipped full
+    review this tick` every 30 minutes — the correct message — and nothing
+    distinguished that from a stalled pipeline.
+
+    With a marker set, `should_run_full_review` needs only the 6-hour
+    cooldown instead of the 7-day floor, so a release is exercised the same
+    day it ships.
+
+    Self-clearing and self-healing: once a review runs, the ledger's last
+    writer IS the running version and this stops firing. It does not depend
+    on a CI step having run, which is the failure mode
+    `docs/deployment-dependencies.md` is entirely about.
+
+    Returns the reason it set, or `None` if it set nothing.
+    """
+    written_by = last_ledger_writer(repo)
+    if written_by is None or written_by == running_version:
+        return None
+
+    reason = VERSION_CHANGE_REASON.format(version=running_version, written_by=written_by)
+    existing = load_review_marker(repo)
+    if existing is not None and any(r.reason == reason for r in existing.reasons):
+        # Already asked for this version. A review that legitimately writes no
+        # diff leaves `written_by` unchanged, and without this check the marker
+        # would re-arm every tick and run a full review every 6 hours forever.
+        return None
+    mark_review_wanted(repo, reason, at=at)
+    logger.info("review: %s — asking for a full review", reason)
+    return reason
+
+
 def run_review_tick(
     repo: DataRepo,
     db: LabsDb,
@@ -3789,6 +3860,10 @@ def run_review_tick(
     if force:
         should_run, decision_reason = True, "forced via `adoc review --force`"
     else:
+        # Before reading the marker, not after: a release that has never
+        # touched the ledger asks for a review here, and the read below has to
+        # see it.
+        mark_review_wanted_on_version_change(repo, at=now)
         marker = load_review_marker(repo)
         last_full_review_at = resolved_lookup()
         should_run, decision_reason = should_run_full_review(
