@@ -5,6 +5,65 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.34.0] — 2026-09-10
+
+*Five defects from an adversarial review, and a release now exercises itself.*
+
+### Added
+
+- **A release asks for a review when it has never written to the ledger.**
+  Shipping a change to the review and *running* it are different events, and
+  the gap between them is up to the 7-day floor. That gap swallowed ADRs 0044,
+  0045, 0049, 0050, 0051, 0052 and 0053 — deployed green, board unmoved for
+  five days, the tick logging the correct `skipped full review this tick` the
+  whole time. `run_review_tick` now compares the running `app_version` against
+  the last writer in `ledger-history.jsonl` and sets the review-wanted marker
+  when they differ, which drops the wait from the 7-day floor to the 6-hour
+  cooldown. Self-clearing, deduped per version, and it appends rather than
+  replacing what ingest or a chat turn recorded.
+
+### Fixed
+
+Findings 2–6 of an adversarial review of 0.33.0–0.33.3. Finding 1 shipped as
+hotfix 0.33.4.
+
+- **`gap_scan` wrote duplicate ids into the question store.** `result.proposed`
+  collected before the dedup check, and the store was filled by re-filtering it
+  on `question_id(item.panel) in accepted` — true for *every* proposal sharing
+  an accepted id, so "Morning stiffness" and "morning  STIFFNESS" both landed
+  under one id. Two entries with one id mean `by_id` returns one and
+  `record_chat_ask` increments one, so `MAX_CHAT_ASKS` never binds and the
+  question is asked forever.
+
+- **`classify_series` missed the case ADR 0049 was written from.** Anchored on
+  the *first* reading, so any pre-supplement draw made the whole series
+  `unknown`. The selenium story is *normal → started → high → stopped →
+  falling*; with a 2023 normal on file the question was never asked. Anchors on
+  the peak now — and only a peak the latest reading could have come down from.
+
+- **`check_last_review` raised on a naive timestamp.** `TypeError: can't
+  subtract offset-naive and offset-aware datetimes`, with the arithmetic
+  outside the guard. A verifier that dies on malformed input tells you nothing
+  about what you asked it to verify.
+
+- **`mark_resolved` had no test.** The only writer of `resolved` and the point
+  of ADR 0049. `test_only_a_person_can_mark_a_lead_resolved` grepped that it is
+  the sole writer and never called it, so "the route is broken" and "the route
+  is correctly the only one" read identically.
+
+- **`convergence_snapshot` ordered before `resolution_scan` by declaration
+  order**, with no edge. The snapshot counts open questions and
+  `resolution_scan` writes to that store. The ADR 0043 complaint, reintroduced
+  one release later.
+
+### Note
+
+Two of the tests written for these fixes were **vacuous**, and the negative
+controls caught them: the naive-timestamp test asserted "returns 0 or 1",
+which any non-raising implementation satisfies, and the declared DAG edge had
+no test at all. Both strengthened. A control that does not fail is a finding
+about the test, not a clean bill of health.
+
 ## [0.33.4] — 2026-09-10
 
 ### Fixed

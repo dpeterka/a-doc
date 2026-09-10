@@ -701,6 +701,7 @@ def gap_scan_stage(
     # costs its own reference, never the question that carries it.
     real_ids = {h.id for h in ledger.hypotheses}
     known_ids = {q.id for q in store.questions}
+    accepted_questions: list[OpenQuestion] = []
     for item in payload.questions[:MAX_GAP_QUESTIONS]:
         if not item.panel.strip() or not item.ask.strip():
             continue
@@ -708,20 +709,25 @@ def gap_scan_stage(
         result.proposed.append(item)
         qid = question_id(item.panel)
         if qid in known_ids:
-            # Already asked under this id — including one she has ANSWERED.
-            # Re-opening it would ask her again for something the store
-            # already holds, which is the exact failure ADR 0033 exists to
-            # stop.
+            # Already asked under this id — including one she has ANSWERED,
+            # and including a duplicate earlier in THIS payload. Re-opening it
+            # would ask her again for something the store already holds, which
+            # is the exact failure ADR 0033 exists to stop.
             logger.info("gap_scan: proposed %r is already on the list; dropped", item.panel)
             continue
         known_ids.add(qid)
         result.accepted_ids.append(qid)
-
-    if result.accepted_ids:
-        accepted = {qid for qid in result.accepted_ids}
-        store.questions.extend(
+        # Built HERE, in the loop that decided to accept it, rather than by
+        # re-filtering `result.proposed` afterwards. That filter matched on
+        # `question_id(item.panel) in accepted`, which is true for every
+        # proposal sharing an accepted id — so "Morning stiffness" and
+        # "morning  STIFFNESS" both landed in the store under one id. Two
+        # entries with the same id mean `by_id` returns one of them and
+        # `record_chat_ask` increments one of them, so `MAX_CHAT_ASKS` never
+        # binds and the question is asked forever.
+        accepted_questions.append(
             OpenQuestion(
-                id=question_id(item.panel),
+                id=qid,
                 panel=item.panel,
                 ask=item.ask,
                 why=item.why,
@@ -733,9 +739,9 @@ def gap_scan_stage(
                 first_asked_on=today,
                 last_asked_on=today,
             )
-            for item in result.proposed
-            if question_id(item.panel) in accepted
         )
+
+    store.questions.extend(accepted_questions)
     return result
 
 

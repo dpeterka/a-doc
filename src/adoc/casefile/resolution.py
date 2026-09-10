@@ -99,16 +99,33 @@ def classify_series(
 ) -> tuple[TrendDirection, float, float, Literal["high", "low"] | None]:
     """`(direction, fraction_closed, bound, side)` for one analyte's series.
 
-    Judged from the FIRST reading's excursion beyond the bound it broke, not
-    from the slope: a value that halves and then plateaus just inside the
-    range has resolved, and a slope test would call the plateau flat.
+    Judged from the WORST reading's excursion beyond the bound it broke, not
+    from the slope and not from the first reading.
+
+    Not the slope, because a value that halves and then plateaus just inside
+    the range has resolved, and a slope test would call the plateau flat.
+
+    Not the first reading, because the story this exists for is *normal →
+    supplement started → high → stopped → falling*. Anchored on the first
+    reading, any pre-supplement draw on file made the whole series read
+    `unknown` and the question was never asked — the detector would have
+    missed the selenium case ADR 0049 was written from, whenever the record
+    reached back far enough to show it starting normal.
+
+    The peak is the right anchor either way: it is the excursion the lead was
+    raised on.
     """
     if len(values) < MIN_SERIES_POINTS:
         return "unknown", 0.0, 0.0, None
 
     ordered = sorted(values)
-    first_value = ordered[0][1]
-    last_value = ordered[-1][1]
+    last_date, last_value = ordered[-1]
+    # The worst reading, and only from among those the last one could have
+    # come down FROM. A peak after the latest draw is not something that has
+    # resolved.
+    high_peak = max(ordered[:-1], key=lambda pair: pair[1])[1] if len(ordered) > 1 else last_value
+    low_peak = min(ordered[:-1], key=lambda pair: pair[1])[1] if len(ordered) > 1 else last_value
+    first_value = high_peak if ref_high is not None and high_peak > ref_high else low_peak
 
     if ref_high is not None and first_value > ref_high:
         bound, side = ref_high, "high"
@@ -119,8 +136,8 @@ def classify_series(
         excursion = bound - first_value
         closed = (last_value - first_value) / excursion if excursion else 0.0
     else:
-        # It did not start outside a bound we can see, so there is no
-        # excursion to close. Not flat — unjudgeable.
+        # It never went outside a bound we can see, so there is no excursion
+        # to close. Not flat — unjudgeable.
         return "unknown", 0.0, 0.0, None
 
     if closed >= MIN_CLOSED_FRACTION:

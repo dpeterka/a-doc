@@ -265,3 +265,48 @@ def test_the_gap_scan_reads_the_ledger_this_turn_produced() -> None:
 
     assert apply_fn < composer_fn < gap_call
     assert 'ledger = ctx["apply"]' in source[composer_fn:gap_call]
+
+
+def test_two_proposals_naming_the_same_topic_land_once() -> None:
+    """The store is keyed by id. `result.proposed` collected before the dedup
+    check and the store was filled by re-filtering it on
+    `question_id(panel) in accepted` — true for EVERY proposal sharing an
+    accepted id, so "Morning stiffness" and "morning  STIFFNESS" both landed
+    under one id.
+
+    Two entries with the same id mean `by_id` returns one of them and
+    `record_chat_ask` increments one of them, so `MAX_CHAT_ASKS` never binds
+    and the question is asked forever — the nagging the cap exists to stop.
+    """
+    store = _store()
+    payload = {
+        "questions": [
+            {"panel": "Morning stiffness", "ask": "How long?", "why": "w", "hypothesis_ids": []},
+            {
+                "panel": "morning  STIFFNESS",
+                "ask": "Worse waking?",
+                "why": "w",
+                "hypothesis_ids": [],
+            },
+        ]
+    }
+
+    result = gap_scan_stage(_client(payload), _ledger("a"), _ctx(), store, today=_TODAY)
+
+    ids = [q.id for q in store.questions]
+    assert len(ids) == len(set(ids)), f"duplicate ids in the store: {ids}"
+    assert len(ids) == 1
+    assert len(result.accepted_ids) == 1
+    assert len(result.proposed) == 2, "both are still recorded as proposed"
+
+
+def test_a_stored_question_carries_the_id_that_was_accepted() -> None:
+    """The id in the store and the id in `accepted_ids` must be the same
+    string, or nothing downstream can reconcile them."""
+    store = _store()
+
+    result = gap_scan_stage(
+        _client(_payload("When the rash appears")), _ledger("a"), _ctx(), store, today=_TODAY
+    )
+
+    assert [q.id for q in store.questions] == result.accepted_ids
