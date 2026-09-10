@@ -694,3 +694,117 @@ def test_the_safety_status_reaches_the_rendered_card(tmp_path: Path) -> None:
 
     assert "chip-safety" in body
     assert "Being tracked" in body
+
+
+# --- ADR 0049: marking a lead sorted out ------------------------------------
+
+
+def test_a_patient_can_mark_a_lead_resolved(tmp_path: Path) -> None:
+    """The only writer of `resolved`, and the entire point of ADR 0049 — and
+    it shipped with no test at all. `test_only_a_person_can_mark_a_lead_
+    resolved` greps that this route is the sole writer and never once calls
+    it, so "the route is broken" and "the route is correctly the only one"
+    read identically.
+    """
+    app, repo, _db, _calls = build_app(tmp_path)
+    _seed_one(repo)
+    client = TestClient(app)
+    login(client)
+
+    response = client.post(
+        "/ledger/hypotheses/pheochromocytoma/resolved",
+        data={"reason": "I stopped the selenium supplement in May"},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    ledger = load_ledger(repo.root / LEDGER_RELPATH)
+    hypothesis = next(h for h in ledger.hypotheses if h.id == "pheochromocytoma")
+    assert hypothesis.status == "resolved"
+
+
+def test_a_resolution_is_recorded_as_evidence_FOR(tmp_path: Path) -> None:
+    """The hypothesis was correct. Filing the resolution as counter-evidence
+    would, on the ADR 0053 scale, make the lead look refuted by the very fact
+    that confirms it."""
+    app, repo, _db, _calls = build_app(tmp_path)
+    _seed_one(repo)
+    client = TestClient(app)
+    login(client)
+
+    client.post(
+        "/ledger/hypotheses/pheochromocytoma/resolved",
+        data={"reason": "Stopped the supplement"},
+        follow_redirects=False,
+    )
+
+    ledger = load_ledger(repo.root / LEDGER_RELPATH)
+    hypothesis = next(h for h in ledger.hypotheses if h.id == "pheochromocytoma")
+    assert hypothesis.evidence_against == []
+    evidence = hypothesis.evidence_for[-1]
+    assert evidence.source.startswith("patient-report:")
+    assert "Stopped the supplement" in evidence.claim
+
+
+def test_resolving_writes_through_the_invariant_checked_path(tmp_path: Path) -> None:
+    """Same rule as retirement: no private back door."""
+    from adoc.casefile.repo import HISTORY_RELPATH
+
+    app, repo, _db, _calls = build_app(tmp_path)
+    _seed_one(repo)
+    client = TestClient(app)
+    login(client)
+    before = (repo.root / HISTORY_RELPATH).read_text(encoding="utf-8").count("\n")
+
+    client.post(
+        "/ledger/hypotheses/pheochromocytoma/resolved",
+        data={"reason": "Stopped it"},
+        follow_redirects=False,
+    )
+
+    assert (repo.root / HISTORY_RELPATH).read_text(encoding="utf-8").count("\n") == before + 1
+
+
+def test_an_empty_reason_resolves_nothing(tmp_path: Path) -> None:
+    """ "Resolved" with no account of what changed is the outcome without the
+    finding — exactly what `parked` already does badly."""
+    app, repo, _db, _calls = build_app(tmp_path)
+    _seed_one(repo)
+    client = TestClient(app)
+    login(client)
+
+    client.post(
+        "/ledger/hypotheses/pheochromocytoma/resolved",
+        data={"reason": "   "},
+        follow_redirects=False,
+    )
+
+    ledger = load_ledger(repo.root / LEDGER_RELPATH)
+    assert next(h for h in ledger.hypotheses if h.id == "pheochromocytoma").status != "resolved"
+
+
+def test_an_unknown_hypothesis_does_not_500(tmp_path: Path) -> None:
+    app, repo, _db, _calls = build_app(tmp_path)
+    _seed_one(repo)
+    client = TestClient(app)
+    login(client)
+
+    response = client.post(
+        "/ledger/hypotheses/not-a-lead/resolved",
+        data={"reason": "x"},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+
+
+def test_the_sorted_out_control_is_offered_on_an_active_lead(tmp_path: Path) -> None:
+    """A status nothing can reach is a status that does not exist."""
+    app, repo, _db, _calls = build_app(tmp_path)
+    _seed_one(repo)
+    client = TestClient(app)
+    login(client)
+
+    body = client.get("/ledger").text
+
+    assert "/ledger/hypotheses/pheochromocytoma/resolved" in body

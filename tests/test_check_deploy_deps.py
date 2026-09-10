@@ -140,3 +140,22 @@ def test_the_verifier_ships_in_the_image() -> None:
     dockerfile = (Path(__file__).parent.parent / "Dockerfile").read_text(encoding="utf-8")
 
     assert "scripts/check_deploy_deps.py" in dockerfile
+
+
+def test_a_naive_timestamp_is_reported_not_raised(tmp_path: Path) -> None:
+    """A tz-less timestamp parses fine and then explodes on subtraction:
+
+        TypeError: can't subtract offset-naive and offset-aware datetimes
+
+    The arithmetic sat outside the guard, so the whole verifier died. A
+    verifier that dies on malformed input tells you nothing about the thing
+    you asked it to verify — the failure mode this file exists to catch.
+    """
+    path = tmp_path / "case" / "ledger-history.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"resulting_updated": "2026-09-04T14:50:04.744496", "diff": {}}) + "\n",
+        encoding="utf-8",
+    )
+
+    assert check_last_review(tmp_path) in (0, 1), "the verifier raised instead of reporting"

@@ -439,3 +439,55 @@ def test_a_resolved_lead_is_off_the_active_board() -> None:
     from adoc.casefile.ledger import ACTIVE_STATUSES
 
     assert "resolved" not in ACTIVE_STATUSES
+
+
+def test_a_value_that_spiked_and_came_back_is_detected() -> None:
+    """The shape ADR 0049 was actually written from: normal → supplement
+    started → high → stopped → falling.
+
+    Anchored on the FIRST reading, any pre-supplement draw on file made the
+    whole series read `unknown` and the question was never asked. The detector
+    would have missed the selenium case it exists for, whenever the record
+    reached back far enough to show it starting normal — and silently, since
+    "no signal" and "cannot judge" rendered the same.
+    """
+    series = [
+        (date(2023, 1, 1), 120.0),  # before the supplement — in range
+        (date(2025, 1, 1), 250.0),  # the excursion the lead was raised on
+        (date(2025, 8, 1), 200.0),
+        (date(2026, 8, 1), 160.0),  # coming back down
+    ]
+
+    direction, closed, bound, side = classify_series(series, ref_low=None, ref_high=150.0)
+
+    assert direction == "toward-reference"
+    assert side == "high" and bound == 150.0
+    assert closed > 0.85
+
+
+def test_a_low_value_that_recovered_is_detected_too() -> None:
+    series = [(date(2023, 1, 1), 12.0), (date(2025, 1, 1), 4.0), (date(2026, 8, 1), 9.5)]
+
+    direction, _closed, _bound, side = classify_series(series, ref_low=10.0, ref_high=None)
+
+    assert direction == "toward-reference" and side == "low"
+
+
+def test_a_peak_in_the_latest_draw_is_not_a_resolution() -> None:
+    """The anchor is the worst reading the LAST one could have come down
+    from. A value peaking today has not resolved; it is the finding."""
+    series = [(date(2026, 1, 1), 160.0), (date(2026, 4, 1), 200.0), (date(2026, 8, 1), 300.0)]
+
+    direction, _closed, _bound, _side = classify_series(series, ref_low=None, ref_high=150.0)
+
+    assert direction != "toward-reference"
+
+
+def test_a_series_that_never_left_the_range_is_still_unknown() -> None:
+    """Anchoring on the peak must not turn ordinary variation inside the range
+    into an excursion. The peak has to actually break a bound."""
+    series = [(date(2026, 1, 1), 100.0), (date(2026, 4, 1), 148.0), (date(2026, 8, 1), 105.0)]
+
+    direction, _closed, _bound, side = classify_series(series, ref_low=None, ref_high=150.0)
+
+    assert direction == "unknown" and side is None
