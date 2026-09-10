@@ -210,11 +210,17 @@ def check_last_review(data_dir: Path) -> int:
         stamp = entry["resulting_updated"]
         written_by = entry.get("diff", {}).get("provenance", {}).get("app_version", "?")
         when = datetime.fromisoformat(stamp)
+        # A naive timestamp parses fine and then explodes on subtraction. The
+        # arithmetic lives inside the guard for that reason: a verifier that
+        # dies on malformed input tells you nothing about the thing you asked
+        # it to verify, which is the failure mode this file exists to catch.
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=UTC)
+        age = datetime.now(UTC) - when
     except Exception as exc:  # noqa: BLE001 - a malformed line is itself the finding
         print(f"  MISSING  {history} last line unreadable ({exc})")
         return 1
 
-    age = datetime.now(UTC) - when
     days = age.days
     running = _running_version()
     behind = running is not None and written_by != running

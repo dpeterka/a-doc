@@ -3404,6 +3404,11 @@ def build_review_dag(
             input_model=OpsMetrics,
             output_model=ConvergenceSnapshot,
             depends_on=("ops_metrics", "criteria_scan", "apply_review_diff"),
+            # The snapshot counts open questions, and `resolution_scan` writes
+            # to that store. Without this edge the two ordered by declaration
+            # order alone — the same unstated dependency ADR 0043 was written
+            # about, reintroduced one release later.
+            after=("resolution_scan",),
         )
     )
     nodes.append(
