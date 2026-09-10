@@ -877,3 +877,67 @@ def test_no_quantity_of_weak_evidence_reaches_a_definitive_exclusion() -> None:
     ]
 
     assert weigh_evidence(many_weak) < weigh_evidence(one_exclusion)
+
+
+# --- ADR 0038's source restriction reaches the balance scale too -------------
+
+
+def _refused_exclusion() -> Evidence:
+    """A definitive-exclusion claimed from a source not permitted to make one.
+    `pmid:` is literature: it can say what is true of a disease, never what is
+    true of this patient."""
+    return Evidence(
+        claim="a paper says otherwise",
+        source="pmid:99999",
+        strength="definitive-exclusion",
+    )
+
+
+def test_a_refused_exclusion_cannot_retire_a_lead_through_the_balance_scale() -> None:
+    """The regression ADR 0053 introduced and 0.33.4 closed.
+
+    `_excluded_by_definitive_evidence` had always checked the source and
+    declined. `_outweighed` had not — and once ADR 0053 raised the strength
+    from 1 to 8, one refused item outweighed a strong plus a moderate
+    supporting result. The pass reported "this came from a source not
+    permitted to make this claim" and ruled the hypothesis out in the same
+    run.
+    """
+    lead = _h(
+        "sle-01",
+        evidence_for=[_ev(strength="strong"), _ev(strength="moderate")],
+        evidence_against=[_refused_exclusion()],
+    )
+
+    report = propose_retirements(_ledger(lead), today=_TODAY)
+
+    assert report.retirements == [], "a source that may not exclude just excluded"
+    assert report.refused_exclusions, "and the refusal was reported while it happened"
+
+
+def test_a_refused_exclusion_weighs_nothing() -> None:
+    assert weigh_evidence([_refused_exclusion()]) == 0
+
+
+def test_a_permitted_exclusion_still_carries_its_full_weight() -> None:
+    """The fix must not disarm the mechanism it protects. A lab result may
+    end a hypothesis, and ADR 0038 exists so that it can."""
+    permitted = Evidence(
+        claim="anti-dsDNA negative on repeat",
+        source="labs:anti-dsdna:2026-08-01",
+        strength="definitive-exclusion",
+    )
+
+    assert weigh_evidence([permitted]) == EVIDENCE_WEIGHT["definitive-exclusion"]
+
+
+def test_a_refused_exclusion_weighs_nothing_on_the_supporting_side_too() -> None:
+    """Deliberate, and the one direction worth stating out loud: zeroing a
+    supporting item REMOVES support and pushes toward retirement. It is
+    correct here because a definitive-exclusion in `evidence_for` is
+    incoherent — nothing definitively excludes in favour of a hypothesis — and
+    counting incoherent data as the heaviest item on the scale is worse. There
+    are none on the live ledger; this pins the behaviour so it can never be
+    reached by accident.
+    """
+    assert weigh_evidence([_refused_exclusion(), _ev(strength="weak")]) == EVIDENCE_WEIGHT["weak"]
