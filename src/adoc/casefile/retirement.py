@@ -333,10 +333,36 @@ EVIDENCE_WEIGHT: dict[EvidenceStrength, int] = {
 }
 
 
+def exclusion_is_permitted(item: Evidence) -> bool:
+    """Whether this item is allowed to make the definitive-exclusion claim it
+    makes. Vacuously true for every other strength."""
+    return item.strength != "definitive-exclusion" or item.source.startswith(
+        DEFINITIVE_EXCLUSION_SOURCES
+    )
+
+
 def weigh_evidence(items: Iterable[Evidence]) -> int:
     """Total weight, so volume cannot beat quality: three weak observations do
-    not outweigh one strong contradicting result."""
-    return sum(EVIDENCE_WEIGHT[item.strength] for item in items)
+    not outweigh one strong contradicting result.
+
+    A `definitive-exclusion` from a source ADR 0038 does not permit weighs
+    **nothing**. ADR 0053 raised that strength to 8 without consulting the
+    source, and re-opened the exact door ADR 0038 closed: the pass would
+    report "this exclusion came from a source not permitted to make it" and
+    rule the hypothesis out anyway, through `_outweighed`, in the same run.
+    One such item beat a strong plus a moderate supporting result.
+    `_excluded_by_definitive_exclusion` had always checked the source; the
+    balance scale had not, and at the old weight of 1 that almost never
+    mattered.
+
+    Zeroed wherever it appears, not only in `evidence_against`. On the
+    supporting side a definitive-exclusion is incoherent — nothing
+    "definitively excludes" *in favour* of a hypothesis — and counting
+    incoherent data as the heaviest item on the scale is worse than counting
+    it as none. That direction is deliberate and pinned by a test: it removes
+    support, so it must never be reached by accident.
+    """
+    return sum(EVIDENCE_WEIGHT[item.strength] for item in items if exclusion_is_permitted(item))
 
 
 def _outweighed(hypothesis: Hypothesis) -> Retirement | None:

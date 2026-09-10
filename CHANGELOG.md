@@ -5,6 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.33.4] — 2026-09-10
+
+### Fixed
+
+- **A refused `definitive-exclusion` could retire a lead through the balance
+  scale.** ADR 0038 restricts which sources may end a hypothesis: a lab, a
+  document, an encounter, or the patient's own report. Literature cannot —
+  a paper says what is true of a disease, never what is true of this patient.
+  `_excluded_by_definitive_evidence` had always checked that and declined.
+
+  **`_outweighed` had not**, and ADR 0053 (0.33.0) raised the strength's
+  weight from 1 to 8 without consulting the source. At 1 it almost never
+  mattered; at 8 one refused item outweighed a strong plus a moderate
+  supporting result. The pass would report
+
+      refused_exclusions: ['SLE: a paper says otherwise']
+
+  and rule the hypothesis out in the same run, for `cause="outweighed"`.
+
+  `weigh_evidence` now scores an unpermitted definitive-exclusion at **0**,
+  wherever it appears. Zeroing it on the supporting side too is deliberate: a
+  definitive-exclusion in `evidence_for` is incoherent, and counting
+  incoherent data as the heaviest item on the scale is worse than counting it
+  as none. That direction removes support, so it is pinned by its own test.
+
+  **Never fired.** The live ledger carries zero `definitive-exclusion` items
+  on either side, and the next scheduled review was seven days out. Found by
+  adversarial review of 0.33.0, not by a failure.
+
 ## [0.33.3] — 2026-09-09
 
 ### Fixed
