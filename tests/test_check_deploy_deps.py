@@ -151,11 +151,18 @@ def test_a_naive_timestamp_is_reported_not_raised(tmp_path: Path) -> None:
     verifier that dies on malformed input tells you nothing about the thing
     you asked it to verify — the failure mode this file exists to catch.
     """
+    naive = (datetime.now(UTC) - timedelta(days=1)).replace(tzinfo=None)
     path = tmp_path / "case" / "ledger-history.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
-        json.dumps({"resulting_updated": "2026-09-04T14:50:04.744496", "diff": {}}) + "\n",
+        json.dumps({"resulting_updated": naive.isoformat(), "diff": {}}) + "\n",
         encoding="utf-8",
     )
 
-    assert check_last_review(tmp_path) in (0, 1), "the verifier raised instead of reporting"
+    # 0, not 1: a yesterday timestamp must be READ as yesterday. Returning 1
+    # would mean the guard caught the TypeError and reported the line as
+    # unreadable — no longer a crash, but still the wrong answer, and an
+    # assertion of "0 or 1" cannot tell those apart. That weaker assertion was
+    # the first version of this test, and a negative control caught it passing
+    # against code with the fix removed.
+    assert check_last_review(tmp_path) == 0

@@ -2838,3 +2838,23 @@ def test_nothing_recent_renders_no_section(repo: DataRepo, db: LabsDb) -> None:
     ledger = Ledger(version=1, updated=date(2026, 9, 4), hypotheses=[old])
 
     assert render_emerging(ledger, today=date(2026, 9, 4), window_days=90) == []
+
+
+def test_the_snapshot_waits_for_the_resolution_scan() -> None:
+    """ADR 0043, and the second time this exact omission has shipped.
+
+    `convergence_snapshot` counts open questions; `resolution_scan` writes to
+    that store. With no edge between them the order came from the order the
+    nodes happen to be appended in, so a reordering would have the snapshot
+    count a store one of its inputs had not written to yet — and the number
+    would simply be wrong, with nothing failing.
+    """
+    import inspect
+
+    from adoc.reason import review as module
+
+    source = inspect.getsource(module.build_review_dag)
+    decl = source.index('name="convergence_snapshot"')
+    block = source[decl : decl + 700]
+
+    assert '"resolution_scan"' in block, "convergence_snapshot declares no edge to resolution_scan"
