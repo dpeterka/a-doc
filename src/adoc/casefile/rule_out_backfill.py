@@ -38,6 +38,7 @@ from pydantic import BaseModel, Field
 from ruamel.yaml import YAML
 
 from adoc import __version__
+from adoc.casefile.ledger import ACTIVE_STATUSES
 from adoc.casefile.rule_out import is_usable_rule_out
 from adoc.casefile.schema import (
     Hypothesis,
@@ -272,13 +273,40 @@ def proposals_to_ops(
 
 
 def needs_rule_out(ledger: Ledger) -> list[Hypothesis]:
-    """Active leads with nothing that could end them."""
+    """Active leads with nothing at all that could end them.
+
+    `ACTIVE_STATUSES`, not a restatement of it. This read
+    `{"active", "monitoring"}` — and **`monitoring` is not a status**;
+    `HypothesisStatus` has never contained it. So the set was really just
+    `{"active"}`, and every `patient-proposed` or `challenged` lead was
+    invisible to the backfill. The same shape as `_EVIDENCE_STRENGTHS` and the
+    `retired` count in ADR 0052: a literal set written out beside the
+    definition instead of taken from it.
+    """
     return [
         h
         for h in ledger.hypotheses
-        if h.status in {"active", "monitoring"}
+        if h.status in ACTIVE_STATUSES
         and not (h.rule_out or "").strip()
         and h.rule_out_check is None
+    ]
+
+
+def needs_checkable_rule_out(ledger: Ledger) -> list[Hypothesis]:
+    """Active leads with no MACHINE-CHECKABLE end condition (ADR 0054).
+
+    Wider than `needs_rule_out` on purpose, and the wider set is the one that
+    matters. Prose satisfies a reader; `_rule_out_met` — the only
+    deterministic rule that ends a lead on evidence rather than on absence or
+    age — reads `rule_out_check` and nothing else.
+
+    Measured on the live ledger the day ADR 0054 was written: **4 of 33**
+    active leads carried a check, 26 carried prose alone, 3 carried neither.
+    `needs_rule_out` saw those 3. The rule that could end things could reach
+    4. The other 26 were invisible to both.
+    """
+    return [
+        h for h in ledger.hypotheses if h.status in ACTIVE_STATUSES and h.rule_out_check is None
     ]
 
 
