@@ -5,6 +5,69 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.35.0] — 2026-09-12
+
+*ADR 0054 — the Challenger must pay for what it proposes.*
+
+The first measured before/after this project has had that was not a
+recollection, from two ADR 0052 snapshots:
+
+    2026-09-09  0.33.1  active 32  off_board 15  questions 70
+    2026-09-10  0.34.0  active 33  off_board  0  questions 92
+
+One review added a lead, removed none, and opened 22 more questions.
+
+### Changed
+
+- **A counter-argument names what kind of attack it made.** `cited` (backed by
+  a real `add_evidence`/`against` op), `nothing-on-file` (naming what was
+  looked for), or `alternative` (naming a better explanation). Required for
+  **every hypothesis the diff touches, in every tier**.
+
+  The old contract required *prose*, for `most-likely` hypotheses only — and
+  the live board holds **zero** of those. It covered nothing. Meanwhile 15 of
+  33 leads carried no counter-evidence at all and the evidence weight was
+  **519 for against 36**. `challenger.md` (v3) has asked for cited
+  counter-evidence in three separate places for several releases; nothing held
+  it to that.
+
+  Unbacked outcomes are **normalised in code, not failed by the contract**: a
+  violation on this node stops the turn and she gets no reply. Every
+  correction moves toward the weaker claim, so the failure mode is a lead
+  surviving that might have gone — never a lead retired on a citation that was
+  not there.
+
+- **A tier pinned at its cap says so.** `folds proposed: 0` meant two opposite
+  things and read identically — a tier comfortably under its cap, or a tier
+  against its limit with every rule that could lower it inert. The board has
+  been in the second state since 2026-09-09, `expanded` at exactly 20 against
+  a cap of 20, and said nothing.
+
+### Fixed
+
+- **`needs_rule_out` matched `{"active", "monitoring"}`, and `monitoring` is
+  not a status** — it has never been in `HypothesisStatus`. The set was really
+  `{"active"}`, so every `patient-proposed` and `challenged` lead was
+  invisible to the rule-out backfill. Third instance of this shape after
+  `_EVIDENCE_STRENGTHS` and ADR 0052's `retired` count; now taken from
+  `ACTIVE_STATUSES`.
+
+- **Prose rule-outs were counted as end conditions.** `_rule_out_met` — the
+  only deterministic rule that ends a lead on evidence rather than absence or
+  age — reads `rule_out_check` and nothing else. On the live ledger 4 of 33
+  leads carry a check and 26 carry prose alone. `needs_rule_out` saw 3 of
+  them; `needs_checkable_rule_out` sees 29.
+
+### Not done
+
+- The rule-out backfill does not yet run as a review node. It proposes into a
+  human-reviewed file (ADR 0047) and running it unattended needs a decision
+  about who applies the proposals.
+- **Whether any of this shrinks the board is unmeasured.** It supplies the
+  input every retirement rule is starving on; what the evidence says once
+  somebody is required to look is a separate question, and ADR 0052's snapshot
+  will answer it on the next review rather than anyone's recollection.
+
 ## [0.34.0] — 2026-09-10
 
 *Five defects from an adversarial review, and a release now exercises itself.*

@@ -1,6 +1,6 @@
 # ADR 0054 — The Challenger must pay for what it proposes
 
-- **Status**: proposed
+- **Status**: accepted
 - **Date**: 2026-09-12
 - **Extends**: [ADR 0002](0002-challenger-stage.md) (the Challenger stage),
   [ADR 0038](0038-how-a-hypothesis-ends.md) (how a hypothesis ends),
@@ -192,3 +192,43 @@ the symptom. But 30 of 33 leads being challenger-origin is not yet known to be
 *wrong* — a stage told to surface what else could explain the findings is
 supposed to produce candidates. Decide it on the measurement this ADR
 produces, once the cost of proposing a lead is no longer zero.
+
+## As built (2026-09-12)
+
+**The outcome is normalised in code, not enforced by the contract.** The ADR
+implied a contract that rejects an unbacked `cited` or an abstention naming
+nothing. Built that way first, and it is wrong: a `ContractViolation` on the
+Challenger node **stops the turn**, so a model that ignores the new fields —
+an older one, a degraded one — takes her chat down entirely. The first draft
+failed 19 tests for exactly that reason before any model was involved.
+
+`normalize_counter_arguments` now runs at the end of `challenger_stage` and
+every correction it makes moves in the safe direction: an unbacked `cited`
+becomes `nothing-on-file`, an unnamed `alternative` becomes
+`nothing-on-file`, an abstention with no subject records `(not named)`. The
+one upgrade is reading `cited` off an op the verdict actually carries.
+
+It runs **after** the entailment strip, because that strip can remove the very
+`add_evidence` op a `cited` outcome rests on — the unbacked case arrived at
+from the other direction. Pinned by a test on the source order.
+
+The contract keeps two jobs: coverage (hard — every touched hypothesis, every
+tier) and a regression guard that no unbacked `cited` survives, which reaching
+means normalisation did not run.
+
+**Part 2 grew a second function.** `needs_rule_out` matched
+`{"active", "monitoring"}` and **`monitoring` is not a status** — it has never
+been in `HypothesisStatus`. So the set was really `{"active"}` and every
+`patient-proposed` and `challenged` lead was invisible to the backfill. That
+is the third instance of this exact shape after `_EVIDENCE_STRENGTHS` and ADR
+0052's `retired` count, and it is now taken from `ACTIVE_STATUSES`.
+
+`needs_checkable_rule_out` is the set that matters: prose satisfies a reader,
+`_rule_out_met` reads `rule_out_check` and nothing else. The narrow function
+saw **3** of 33 leads; the wide one sees **29**.
+
+**Deferred: the backfill does not yet run as a review node.** The ADR said it
+should run every review. The measured blocker is that it proposes into a
+two-step human-reviewed file (`case/proposed-rule-outs.yaml`, ADR 0047) and
+wiring it to run unattended needs a decision about who applies the proposals.
+Recorded here rather than half-built.
