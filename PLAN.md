@@ -310,6 +310,32 @@ Read that attribution honestly:
   backlog has not run dry, and no analyte under a live lead is heading back
   into range.
 
+### The first measured delta (2026-09-10, ledger v20 → v21)
+
+The version-change trigger (0.34.0) fired a review the same day it deployed,
+and ADR 0052 recorded the first before/after this project has had that was not
+a recollection:
+
+| | 09-09 (0.33.1) | 09-10 (0.34.0) |
+|---|---|---|
+| active | 32 | **33** |
+| differential | 30 | **31** |
+| off the board | 15 | **0** |
+| open questions | 70 | **92** |
+
+One review added a lead, removed none, opened 22 more questions. Diagnosed in
+ADR 0054; four measured causes, none of them the retirement rules themselves:
+
+- **4 of 33** leads carry a machine-checkable `rule_out_check`, so the one
+  deterministic rule that fires on evidence can only ever reach four of them.
+- **30 of 33** are challenger-origin and **15** carry no counter-evidence at
+  all. Evidence weight for : against is **519 : 36**.
+- The Challenger's only contract covers `most-likely`, and the board holds
+  **0** leads in that tier. It is inert.
+- `expanded` sits at exactly **20 in-differential against a cap of 20**, so
+  the fold proposes nothing, and 11 `cant-miss` are protected from every rule.
+  The automatic floor is ~33 and the board is resting on it.
+
 **The growth problem is not solved, it is bounded.** Nothing here made the
 reasoning propose fewer leads; the cap discards the weakest after the fact.
 The measured cause of growth is upstream and unaddressed: **1303 units of
