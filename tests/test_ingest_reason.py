@@ -108,9 +108,21 @@ def _make_fake_llm_client() -> LlmClient:
 
     def challenger_transport(request: TransportRequest) -> TransportResponse:
         tool_input = {
-            "counter_arguments": [],
+            # ADR 0054: every hypothesis the diff touches, in every tier. This
+            # fixture's note used to read "no most-likely hypothesis proposed,
+            # nothing to attack yet" — which was the rule, and was the reason
+            # a `cant-miss` lead could enter the ledger with nobody required
+            # to look at it once.
+            "counter_arguments": [
+                {
+                    "hypothesis_id": "reactive-lead-01",
+                    "argument": "Nothing on file speaks against this yet.",
+                    "outcome": "nothing-on-file",
+                    "looked_for": "an alternative explanation for the raised marker",
+                }
+            ],
             "additional_ops": [],
-            "verdict_notes": "no most-likely hypothesis proposed, nothing to attack yet",
+            "verdict_notes": "reviewed",
         }
         return TransportResponse(text="", tool_input=tool_input, input_tokens=5, output_tokens=5)
 

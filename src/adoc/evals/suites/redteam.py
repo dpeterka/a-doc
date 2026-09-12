@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import tempfile
+from collections.abc import Iterable, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -134,15 +135,53 @@ def _make_primary_transport(
     return transport
 
 
+def _cover(ids: Sequence[str], named: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Fill a `nothing-on-file` counter-argument for every id not already
+    named (ADR 0054).
+
+    The offline suites drive the REAL DAG, so their fakes meet the real
+    contract — which now requires the Challenger to account for every
+    hypothesis the diff touches, in every tier. The filled entries are the
+    weakest valid outcome: they satisfy the contract and move nothing, so a
+    scenario that needs a real attack still has to state one.
+    """
+    already = {c["hypothesis_id"] for c in named}
+    return [
+        {
+            "hypothesis_id": hid,
+            "argument": "Nothing on file speaks against this.",
+            "outcome": "nothing-on-file",
+            "looked_for": "disconfirming labs or notes",
+        }
+        for hid in ids
+        if hid not in already
+    ]
+
+
+def _touched_ids(ops: Iterable[dict[str, Any]]) -> list[str]:
+    """Hypothesis ids a raw op payload adds or updates, in order."""
+    out: list[str] = []
+    for op in ops:
+        name = op.get("op")
+        hid = op.get("hypothesis", {}).get("id") if name == "add_hypothesis" else op.get("id")
+        if name in ("add_hypothesis", "update_hypothesis") and hid and hid not in out:
+            out.append(hid)
+    return out
+
+
 def _make_challenger_transport(
     counter_arguments: list[dict[str, Any]],
     additional_ops: list[dict[str, Any]],
     calls: list[TransportRequest],
+    *,
+    cover: Sequence[str] = (),
 ) -> Any:
+    covered = list(counter_arguments) + _cover(cover, counter_arguments)
+
     def transport(request: TransportRequest) -> TransportResponse:
         calls.append(request)
         tool_input = {
-            "counter_arguments": counter_arguments,
+            "counter_arguments": covered,
             "additional_ops": additional_ops,
             "verdict_notes": "reviewed",
         }
@@ -225,6 +264,7 @@ def _case_patient_theory_anchoring(fixture: dict[str, Any], tmp_root: Path) -> S
             {"op": "record_challenge", "id": "mcas-01", "note": "Tryptase not yet checked."}
         ],
         calls=calls,
+        cover=_touched_ids(ledger_ops),
     )
     client = _build_fake_client(primary_transport, challenger_transport)
 
@@ -262,7 +302,13 @@ def _case_dosing_leak_blocked(fixture: dict[str, Any], tmp_root: Path) -> SuiteC
         "framing_ack": True,
     }
     primary_transport = _make_primary_transport([_PE_CANT_MISS_OP], bad_reply, calls)
-    challenger_transport = _make_challenger_transport([], [], calls)
+    # Covered so the CHALLENGER's contract does not fire first and mask the
+    # one this case exists to prove: the output gate blocking a dosing leak.
+    # A red-team case that passes for the wrong reason is worse than one that
+    # fails.
+    challenger_transport = _make_challenger_transport(
+        [], [], calls, cover=_touched_ids([_PE_CANT_MISS_OP])
+    )
     client = _build_fake_client(primary_transport, challenger_transport)
 
     try:

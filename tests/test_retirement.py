@@ -941,3 +941,47 @@ def test_a_refused_exclusion_weighs_nothing_on_the_supporting_side_too() -> None
     reached by accident.
     """
     assert weigh_evidence([_refused_exclusion(), _ev(strength="weak")]) == EVIDENCE_WEIGHT["weak"]
+
+
+# --- ADR 0054: a tier pinned at its cap says so ------------------------------
+
+
+def test_a_tier_at_its_cap_is_reported() -> None:
+    """`folds proposed: 0` means two opposite things and reads identically: a
+    tier comfortably under its cap, or a tier pinned against its limit with
+    every rule that could lower it inert. The live board has been in the
+    second state since 2026-09-09 — `expanded` at exactly 20 against a cap of
+    20 — and said nothing.
+    """
+    from adoc.casefile.retirement import TIER_CAPS
+
+    cap = TIER_CAPS["expanded"]
+    full = _ledger(*(_h(f"h-{i}", evidence_for=[_ev()]) for i in range(cap)))
+
+    report = propose_retirements(full, today=_TODAY)
+
+    assert report.retirements == [], "at the cap, not over it — nothing should fold"
+    assert report.at_capacity == {"expanded": cap}
+
+
+def test_a_tier_under_its_cap_is_not_reported() -> None:
+    """An alarm that fires on the ordinary case gets ignored, and then the
+    real one is ignored too."""
+    from adoc.casefile.retirement import TIER_CAPS
+
+    room = _ledger(*(_h(f"h-{i}", evidence_for=[_ev()]) for i in range(TIER_CAPS["expanded"] - 3)))
+
+    assert propose_retirements(room, today=_TODAY).at_capacity == {}
+
+
+def test_the_report_says_the_list_cannot_shorten_on_its_own() -> None:
+    """Written for the reader who has watched the number not move for a week
+    and cannot tell whether anything is trying."""
+    from adoc.casefile.retirement import TIER_CAPS
+
+    full = _ledger(*(_h(f"h-{i}", evidence_for=[_ev()]) for i in range(TIER_CAPS["expanded"])))
+
+    rendered = "\n".join(render_retirements(propose_retirements(full, today=_TODAY)))
+
+    assert "is full" in rendered
+    assert "cannot get shorter on its own" in rendered

@@ -553,3 +553,53 @@ def test_no_pattern_carries_a_mangled_escape() -> None:
 
     for pattern in _INEXPRESSIBLE_PATTERNS:
         re.compile(pattern)  # raises on a malformed pattern
+
+
+# --- ADR 0054: the wider set is the one that matters -------------------------
+
+
+def test_needs_rule_out_uses_the_real_active_statuses() -> None:
+    """This read `{"active", "monitoring"}` — and `monitoring` is not a
+    status; `HypothesisStatus` has never contained it. So the set was really
+    just `{"active"}` and every `patient-proposed` or `challenged` lead was
+    invisible to the backfill. Same shape as `_EVIDENCE_STRENGTHS` and ADR
+    0052's `retired` count: a literal written out beside the definition
+    instead of taken from it.
+    """
+    from adoc.casefile.ledger import ACTIVE_STATUSES
+    from adoc.casefile.rule_out_backfill import needs_rule_out
+
+    bare = [_hyp(f"h-{status}", status=status) for status in ACTIVE_STATUSES]
+
+    found = needs_rule_out(_ledger(*bare))
+
+    assert len(found) == len(ACTIVE_STATUSES), "an active status was invisible to the backfill"
+
+
+def test_monitoring_is_not_a_status() -> None:
+    """Pinned directly, because the literal set that named it read as
+    plausible for as long as nobody checked."""
+    from typing import get_args
+
+    from adoc.casefile.schema import HypothesisStatus
+
+    assert "monitoring" not in get_args(HypothesisStatus)
+
+
+def test_prose_alone_does_not_make_a_lead_endable() -> None:
+    """`_rule_out_met` — the only deterministic rule that ends a lead on
+    evidence rather than absence or age — reads `rule_out_check` and nothing
+    else. Measured on the live ledger: 4 of 33 carried a check, 26 carried
+    prose alone, and `needs_rule_out` saw neither group."""
+    from adoc.casefile.rule_out_backfill import needs_checkable_rule_out, needs_rule_out
+
+    ledger = _ledger(_hyp("prose-01", rule_out="a normal cosyntropin-stimulated cortisol"))
+
+    assert needs_rule_out(ledger) == [], "prose satisfies the narrow check"
+    assert [h.id for h in needs_checkable_rule_out(ledger)] == ["prose-01"]
+
+
+def test_an_ended_lead_needs_no_rule_out() -> None:
+    from adoc.casefile.rule_out_backfill import needs_checkable_rule_out
+
+    assert needs_checkable_rule_out(_ledger(_hyp("done-01", status="ruled-out"))) == []
