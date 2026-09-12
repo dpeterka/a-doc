@@ -195,10 +195,31 @@ def _constant_primary_transport(ops: list[dict[str, Any]], reply: dict[str, Any]
     return transport
 
 
+# Every hypothesis id this suite's scenarios put into a diff. Listed rather
+# than derived because the transport is a module-level constant with no access
+# to the ops it is answering — and a stale list fails loudly at the contract
+# rather than passing quietly.
+_HALLUCINATION_HYPOTHESIS_IDS = ("pe-01", "sle-01", "sle-02", "sle-03", "sle-04")
+
+
 def _constant_challenger_transport(request: TransportRequest) -> TransportResponse:
     return TransportResponse(
         text="",
-        tool_input={"counter_arguments": [], "additional_ops": [], "verdict_notes": "reviewed"},
+        tool_input={
+            # ADR 0054: the contract covers every hypothesis the diff touches,
+            # in every tier, so an empty verdict no longer clears it.
+            "counter_arguments": [
+                {
+                    "hypothesis_id": hid,
+                    "argument": "Nothing on file speaks against this.",
+                    "outcome": "nothing-on-file",
+                    "looked_for": "disconfirming labs or notes",
+                }
+                for hid in _HALLUCINATION_HYPOTHESIS_IDS
+            ],
+            "additional_ops": [],
+            "verdict_notes": "reviewed",
+        },
         input_tokens=5,
         output_tokens=5,
     )

@@ -97,9 +97,47 @@ class PatientTurn(BaseModel):
     text: str
 
 
+UNNAMED_SEARCH = "(not named)"
+"""Recorded when an abstention says nothing about what was looked for. Kept
+rather than dropped: "we required a subject and got none" is a countable fact
+about the stage, and a blank would be indistinguishable from never asking."""
+
+CounterOutcome = Literal["cited", "nothing-on-file", "alternative"]
+"""What kind of attack a counter-argument actually made (ADR 0054).
+
+Prose is not one of them. The Challenger's prompt has asked for cited
+counter-evidence in three separate places for several releases; the only
+contract on it required a *prose* argument, and only for `most-likely`
+hypotheses — of which the live board has none. So the one enforcement point
+covered nothing, and the board reached 33 active leads with 15 of them
+carrying no counter-evidence at all and a for:against evidence weight of
+519:36.
+
+Naming the outcome is what makes the difference checkable. `cited` moves the
+balance scale; the other two do not, and say so.
+"""
+
+
 class CounterArgument(BaseModel):
     hypothesis_id: str
     argument: str
+
+    outcome: CounterOutcome = "nothing-on-file"
+    """Defaulted, not required, and deliberately defaulted to the WEAKEST
+    value. A model that omits the field has not made a cited attack, and
+    reading the omission as one would let the whole mechanism be satisfied by
+    silence. The contract checks the outcome it finds, so an omission fails
+    the citation requirement rather than passing it."""
+
+    looked_for: str = ""
+    """For `nothing-on-file`: what was searched for and not found. An
+    abstention without this is not an abstention, it is a shrug — and ADR 0054
+    makes the abstention cheap precisely so it can be held to naming its
+    subject."""
+
+    alternative_id: str = ""
+    """For `alternative`: the hypothesis that explains the same cited evidence
+    better. The one honest way to attack a lead without new evidence."""
 
 
 class ChallengerVerdict(BaseModel):
@@ -520,7 +558,71 @@ def challenger_stage(
         stripped_ops, removed = strip_not_entailed_ops(verdict.additional_ops, verification_report)
         log_stripped_claims(repo, removed, dag_node="challenger")
         verdict = verdict.model_copy(update={"additional_ops": stripped_ops})
-    return verdict
+    # Last, so it sees the ops as they FINALLY stand. The entailment strip
+    # above can remove the very `add_evidence` op a `cited` outcome rests on,
+    # and a claim backed by evidence that was just stripped is exactly the
+    # unbacked case this downgrades.
+    return normalize_counter_arguments(verdict)
+
+
+def normalize_counter_arguments(verdict: ChallengerVerdict) -> ChallengerVerdict:
+    """Make each counter-argument's stated outcome match what it actually did
+    (ADR 0054).
+
+    Normalised in code rather than enforced by the contract, because a
+    contract failure on this node STOPS THE TURN and she gets no reply. A
+    model that ignores the new fields — an older one, a degraded one, one
+    having a bad day — would take the chat down entirely. The same reasoning
+    as `_tolerate_unknown_audience` and the evidence-strength synonyms: take
+    what arrived, make it honest, log the discrepancy.
+
+    Every correction moves in the SAFE direction. `cited` is the only outcome
+    that puts weight on the retirement scale, so an unbacked `cited` is
+    downgraded to `nothing-on-file`: the failure mode is a lead surviving that
+    might have gone, never a lead retired on a citation that was not there.
+    Nothing here is ever upgraded.
+    """
+    cited_ids = _counter_evidence_ids(verdict)
+    fixed: list[CounterArgument] = []
+    for counter in verdict.counter_arguments:
+        outcome = counter.outcome
+        looked_for = counter.looked_for
+        alternative_id = counter.alternative_id
+
+        if outcome == "cited" and counter.hypothesis_id not in cited_ids:
+            logger.warning(
+                "challenger: %s claimed 'cited' with no add_evidence/against op; "
+                "recording as 'nothing-on-file'",
+                counter.hypothesis_id,
+            )
+            outcome = "nothing-on-file"
+        elif outcome == "alternative" and not alternative_id.strip():
+            logger.info(
+                "challenger: %s claimed 'alternative' without naming one; "
+                "recording as 'nothing-on-file'",
+                counter.hypothesis_id,
+            )
+            outcome = "nothing-on-file"
+        elif outcome == "nothing-on-file" and counter.hypothesis_id in cited_ids:
+            # It cited something and under-claimed. Believe the op, which is
+            # the thing the retirement pass will read either way.
+            outcome = "cited"
+
+        if outcome == "nothing-on-file" and not looked_for.strip():
+            # An abstention that names nothing is a shrug. Recorded as one
+            # rather than dropped: "we asked and got no subject" is itself
+            # worth being able to count later.
+            looked_for = UNNAMED_SEARCH
+        fixed.append(
+            counter.model_copy(
+                update={
+                    "outcome": outcome,
+                    "looked_for": looked_for,
+                    "alternative_id": alternative_id,
+                }
+            )
+        )
+    return verdict.model_copy(update={"counter_arguments": fixed})
 
 
 def apply_stage(
@@ -851,10 +953,56 @@ def route_turn(client: LlmClient, text: str) -> TurnRoute:
 # --------------------------------------------------------------------------
 
 
+def _diff_touched_ids(diff: LedgerDiff) -> set[str]:
+    """Every hypothesis id this diff adds or updates.
+
+    All tiers (ADR 0054). The previous version collected `most-likely` only,
+    and the live board holds **zero** leads in that tier — so the contract
+    built on it covered nothing at all, for as long as the board has looked
+    like this.
+    """
+    touched: set[str] = set()
+    for op in diff.ops:
+        if isinstance(op, AddHypothesis):
+            touched.add(op.hypothesis.id)
+        elif isinstance(op, UpdateHypothesis):
+            touched.add(op.id)
+    return touched
+
+
+def _counter_evidence_ids(verdict: ChallengerVerdict) -> set[str]:
+    """Ids the verdict actually cites counter-evidence for, from its OWN ops.
+
+    An `outcome: cited` is a claim about an op; this is the op. Checking the
+    claim against the ops rather than trusting the label is the same rule
+    CLAUDE.md rule 3 states about stage order — the deterministic thing
+    decides, the model's word does not.
+    """
+    cited: set[str] = set()
+    for op in verdict.additional_ops:
+        if isinstance(op, AddEvidence) and op.for_or_against == "against":
+            cited.add(op.id)
+    return cited
+
+
 def _challenger_min_counterarguments_contract() -> Contract:
-    """Postcondition: the Challenger must produce >=1 substantive
-    counter-argument for every hypothesis the proposed diff places (or
-    updates into) the `most-likely` tier (ADR 0002)."""
+    """Postcondition: the Challenger must account for every hypothesis the
+    proposed diff touches, and each account must name what kind of attack it
+    made (ADR 0002, widened by ADR 0054).
+
+    Three outcomes are valid and exactly one of them moves the balance scale:
+
+    - `cited` — must be backed by a real `add_evidence`/`against` op in this
+      verdict's own `additional_ops`. The label alone is not the evidence.
+    - `nothing-on-file` — must name what was looked for. An abstention that
+      names nothing is a shrug.
+    - `alternative` — must name a different hypothesis id.
+
+    `nothing-on-file` is deliberately easy to give. A contract that accepted
+    only `cited` would pay a frontier model to invent counter-evidence, and on
+    ADR 0053's scale an invented `strong` item is four units against a real
+    lead. The cheap honest answer is what keeps the other two truthful.
+    """
 
     def predicate(ctx: Ctx, value: BaseModel | None) -> str | None:
         diff = ctx.get("ledger_maintainer")
@@ -862,23 +1010,37 @@ def _challenger_min_counterarguments_contract() -> Contract:
             return "ledger_maintainer diff missing from context"
         assert isinstance(value, ChallengerVerdict)
 
-        most_likely_ids: set[str] = set()
-        for op in diff.ops:
-            if isinstance(op, AddHypothesis) and op.hypothesis.tier == "most-likely":
-                most_likely_ids.add(op.hypothesis.id)
-            elif isinstance(op, UpdateHypothesis) and op.tier == "most-likely":
-                most_likely_ids.add(op.id)
-
-        challenged_ids = {c.hypothesis_id for c in value.counter_arguments if c.argument.strip()}
-        missing = most_likely_ids - challenged_ids
+        touched = _diff_touched_ids(diff)
+        accounted = {c.hypothesis_id for c in value.counter_arguments if c.argument.strip()}
+        missing = touched - accounted
         if missing:
-            return (
-                "missing a substantive counter-argument for most-likely "
-                f"hypothesis id(s): {sorted(missing)}"
-            )
+            return f"missing a substantive counter-argument for hypothesis id(s): {sorted(missing)}"
+
+        cited_ids = _counter_evidence_ids(value)
+        problems: list[str] = []
+        for counter in value.counter_arguments:
+            if counter.hypothesis_id not in touched:
+                # An attack on a lead this diff did not touch is welcome and
+                # unconstrained — the Challenger is allowed to go after the
+                # standing board, and holding that to the same bar would
+                # discourage it.
+                continue
+            # Only the one invariant that matters for safety, and only as a
+            # regression guard: `normalize_counter_arguments` has already
+            # downgraded any unbacked `cited`, so reaching here means that
+            # normalisation did not run. A missing `looked_for` is NOT failed
+            # — normalisation fills it, and a contract violation on this node
+            # stops the turn and she gets no reply.
+            if counter.outcome == "cited" and counter.hypothesis_id not in cited_ids:
+                problems.append(
+                    f"{counter.hypothesis_id}: outcome 'cited' with no "
+                    "add_evidence/against op to back it"
+                )
+        if problems:
+            return "counter-argument outcome(s) not backed: " + "; ".join(sorted(problems))
         return None
 
-    return Contract(name="challenger_min_counterarguments_per_most_likely", predicate=predicate)
+    return Contract(name="challenger_accounts_for_every_touched_hypothesis", predicate=predicate)
 
 
 def _apply_ledger_version_incremented_contract() -> Contract:

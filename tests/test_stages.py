@@ -121,15 +121,45 @@ def _make_primary_transport(
     return transport
 
 
+# The hypothesis ids the standard fixture diffs touch. ADR 0054 widened
+# `challenger_accounts_for_every_touched_hypothesis` from `most-likely` alone
+# to every tier, so a fake that names only `sle-01` now violates it — in
+# nineteen tests that are about something else entirely.
+_FIXTURE_HYPOTHESIS_IDS = ("sle-01", "pe-01")
+
+
 def _make_challenger_transport(
     counter_arguments: list[dict[str, Any]],
     additional_ops: list[dict[str, Any]],
     calls: list[TransportRequest],
+    *,
+    auto_cover: tuple[str, ...] = _FIXTURE_HYPOTHESIS_IDS,
 ):
+    """Fake for role `challenger`.
+
+    `auto_cover` fills a `nothing-on-file` counter-argument for any fixture id
+    the caller did not name, so a test about the citation check or the output
+    gate is not rewritten every time the Challenger's own contract widens.
+    The entries it adds are the weakest valid outcome — they satisfy the
+    contract and move nothing — so a test that cares about a real attack still
+    has to state one. Pass `auto_cover=()` to let the contract fire.
+    """
+    named = {c["hypothesis_id"] for c in counter_arguments}
+    covered = list(counter_arguments) + [
+        {
+            "hypothesis_id": hid,
+            "argument": "Nothing on file speaks against this.",
+            "outcome": "nothing-on-file",
+            "looked_for": "disconfirming labs or notes",
+        }
+        for hid in auto_cover
+        if hid not in named
+    ]
+
     def transport(request: TransportRequest) -> TransportResponse:
         calls.append(request)
         tool_input = {
-            "counter_arguments": counter_arguments,
+            "counter_arguments": covered,
             "additional_ops": additional_ops,
             "verdict_notes": "reviewed",
         }
@@ -334,6 +364,10 @@ def test_redteam_patient_theory_is_quarantined_and_context_wired_through(
             }
         ],
         calls=calls,
+        # This case's diff proposes her own theory, not the standard fixture
+        # pair. ADR 0054 covers every touched id, so the fake has to cover
+        # the id this diff actually names.
+        auto_cover=("mcas-01", "pe-01"),
     )
     client = _build_client(primary_transport, challenger_transport)
 
@@ -1184,7 +1218,17 @@ def test_clean_diagnostic_turn_makes_the_expected_model_call_count(
                     {
                         "hypothesis_id": "sle-01",
                         "argument": "Anti-dsDNA has not been checked yet.",
-                    }
+                        "outcome": "nothing-on-file",
+                        "looked_for": "anti-dsDNA",
+                    },
+                    # ADR 0054: every hypothesis the diff touches, not just
+                    # the most-likely one. `pe-01` is in the diff above.
+                    {
+                        "hypothesis_id": "pe-01",
+                        "argument": "Nothing on file speaks against this.",
+                        "outcome": "nothing-on-file",
+                        "looked_for": "D-dimer, imaging",
+                    },
                 ],
                 "additional_ops": [],
                 "verdict_notes": "reviewed",

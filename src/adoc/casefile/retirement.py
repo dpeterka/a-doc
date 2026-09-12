@@ -115,6 +115,15 @@ class RetirementReport(BaseModel):
     """What a retirement pass would do, and what it deliberately left alone."""
 
     retirements: list[Retirement] = Field(default_factory=list)
+    at_capacity: dict[str, int] = Field(default_factory=dict)
+    """Tiers sitting AT their cap with nothing eligible left to fold, and how
+    many leads each holds (ADR 0054).
+
+    `folds proposed: 0` means two opposite things and reads identically: a
+    tier comfortably under its cap, or a tier pinned against its limit with
+    every rule that could lower it inert. The live board has been in the
+    second state since 2026-09-09 — `expanded` at exactly 20 in-differential
+    against a cap of 20 — and said nothing."""
     protected_count: int = 0
     """Active hypotheses excluded from consideration entirely because they are
     can't-miss or patient-origin. Counted so the report can say what was left
@@ -485,6 +494,36 @@ def _fold_rank(hypothesis: Hypothesis, today: date) -> tuple[int, int, int]:
     )
 
 
+def tiers_at_capacity(
+    ledger: Ledger,
+    *,
+    today: date,
+    emerging_window_days: int = EMERGING_WINDOW_DAYS,
+) -> dict[str, int]:
+    """Tiers whose differential is AT the cap with no eligible lead to fold.
+
+    Same counting rule as `propose_tier_folds`, deliberately: a report that
+    described capacity differently from how the fold measures it would be
+    telling the reader about a tier the code is not looking at.
+    """
+    at_capacity: dict[str, int] = {}
+    active = [h for h in ledger.hypotheses if h.status in ACTIVE_STATUSES]
+    for tier, cap in TIER_CAPS.items():
+        in_tier = [h for h in active if h.tier == tier]
+        in_differential = [
+            h for h in in_tier if not is_emerging(h, today=today, window_days=emerging_window_days)
+        ]
+        occupied = len(in_differential)
+        eligible = [h for h in in_differential if not is_protected(h)]
+        if occupied >= cap and occupied - cap <= 0 and eligible:
+            at_capacity[tier] = occupied
+        elif occupied >= cap and not eligible:
+            # Full AND nothing may be folded — worth saying even more loudly
+            # than the ordinary pinned case.
+            at_capacity[tier] = occupied
+    return at_capacity
+
+
 def propose_tier_folds(
     ledger: Ledger,
     *,
@@ -622,7 +661,10 @@ def propose_retirements(
     )
 
     return RetirementReport(
-        retirements=retirements, protected_count=protected, refused_exclusions=refused
+        retirements=retirements,
+        protected_count=protected,
+        refused_exclusions=refused,
+        at_capacity=tiers_at_capacity(ledger, today=today),
     )
 
 
@@ -669,6 +711,19 @@ def render_retirements(report: RetirementReport) -> list[str]:
         # can still have refused an exclusion or protected a lead, and both
         # are worth saying.
         lines += ["_Nothing was retired from the differential this week._", ""]
+    if report.at_capacity:
+        # ADR 0054. Without this, "nothing was retired" covers both a quiet
+        # week and a board pinned against its ceiling with every rule that
+        # could lower it inert — and the second went unsaid for as long as it
+        # was true.
+        for tier, occupied in sorted(report.at_capacity.items()):
+            lines.append(
+                f"_The **{tier}** tier is full: {occupied} lead(s) against a limit of "
+                f"{TIER_CAPS.get(tier, occupied)}. The list cannot get shorter on its own "
+                "from here — something has to be ruled out, or answered, for a lead to "
+                "leave._"
+            )
+        lines.append("")
     if report.refused_exclusions:
         # A model reaching for the one strength that bypasses the balance
         # scale is worth seeing. Silently ignoring it would hide the attempt.

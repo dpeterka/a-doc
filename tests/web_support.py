@@ -96,15 +96,44 @@ def make_informational_transport(text: str, calls: list[TransportRequest]) -> Tr
     return transport
 
 
+# The hypothesis ids the web tests' fixture diffs touch. ADR 0054 widened the
+# Challenger contract from `most-likely` alone to every tier, so a fake that
+# names nothing now violates it — in twenty-two tests about chat rendering,
+# question capture and rate limiting.
+FIXTURE_HYPOTHESIS_IDS = ("sle-01", "pe-01")
+
+
 def make_challenger_transport(
     counter_arguments: list[dict[str, Any]],
     additional_ops: list[dict[str, Any]],
     calls: list[TransportRequest],
+    *,
+    auto_cover: tuple[str, ...] = FIXTURE_HYPOTHESIS_IDS,
 ) -> Transport:
+    """Fake for role `challenger`.
+
+    `auto_cover` supplies a `nothing-on-file` counter-argument for any fixture
+    id the caller did not name, so a test about the chat page is not rewritten
+    whenever the Challenger's own contract changes. The filled entries are the
+    weakest valid outcome — they satisfy the contract and move nothing — so a
+    test that needs a real attack still has to state one.
+    """
+    named = {c["hypothesis_id"] for c in counter_arguments}
+    covered = list(counter_arguments) + [
+        {
+            "hypothesis_id": hid,
+            "argument": "Nothing on file speaks against this.",
+            "outcome": "nothing-on-file",
+            "looked_for": "disconfirming labs or notes",
+        }
+        for hid in auto_cover
+        if hid not in named
+    ]
+
     def transport(request: TransportRequest) -> TransportResponse:
         calls.append(request)
         tool_input = {
-            "counter_arguments": counter_arguments,
+            "counter_arguments": covered,
             "additional_ops": additional_ops,
             "verdict_notes": "reviewed",
         }
