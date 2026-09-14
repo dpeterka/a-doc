@@ -202,6 +202,22 @@ def _happy_path_transport(calls: list[TransportRequest]) -> Any:
     test_chooser_items = [
         {"text": "Ask your doctor about a complement C3/C4 panel.", "hypothesis_ids": [SLE_ID]}
     ]
+    rule_out_proposals = [
+        {
+            "id": SLE_ID,
+            "rule_out": "a CRP above 500",
+            "analyte": "CRP",
+            "operator": "above",
+            "threshold": 500.0,
+        },
+        {
+            "id": PE_ID,
+            "rule_out": "a CRP above 1",
+            "analyte": "CRP",
+            "operator": "above",
+            "threshold": 1.0,
+        },
+    ]
 
     def transport(request: TransportRequest) -> TransportResponse:
         calls.append(request)
@@ -215,6 +231,17 @@ def _happy_path_transport(calls: list[TransportRequest]) -> Any:
             tool_input = {"notes": notes}
         elif name == "TestChooserPayload":
             tool_input = {"items": test_chooser_items}
+        elif name == "RuleOutProposals":
+            # ADR 0054. Two proposals against the seeded CRP row (8.5, no
+            # reference range on file, so `normal` cannot be judged):
+            #   - `sle-01` above 500 — nothing meets that, so it is INERT and
+            #     the review applies it.
+            #   - `pe-01` above 1 — 8.5 clears it, so applying would END a
+            #     live lead at the next review. Held for a person.
+            # Before this branch existed the dispatcher raised, the node
+            # swallowed it, and the backfill did nothing while the call count
+            # still went up — the assertion passed for the wrong reason.
+            tool_input = {"proposals": rule_out_proposals}
         else:  # pragma: no cover - defensive
             raise AssertionError(f"unexpected schema: {name}")
         return TransportResponse(text="", tool_input=tool_input, input_tokens=10, output_tokens=10)
@@ -262,8 +289,15 @@ def test_full_review_happy_path(repo: DataRepo, db: LabsDb) -> None:
     assert report.tag == "review-2026-08-23"
     assert report.commit_sha
 
-    # Blind panel + adjudication + challenge sweep + test chooser = 5 calls.
-    assert len(calls) == 5
+    # Blind panel + adjudication + challenge sweep + test chooser = 5, plus
+    # ONE `rule_out_backfill` batch (ADR 0054) = 6.
+    #
+    # The backfill is batched at `BATCH_SIZE` (8) leads per call, so on the
+    # live board's 29 leads without a machine-checkable end condition it costs
+    # four. It returns before calling anything when no lead needs one, which
+    # is the steady state once the board has them — the cost is front-loaded,
+    # not recurring.
+    assert len(calls) == 6
 
     markdown_path = repo.root / report.markdown_path
     assert markdown_path.exists()
@@ -2411,6 +2445,7 @@ _PRE_0043_ORDER = [
     "staleness_scan",
     "deferred_entailment_sweep",
     "ops_metrics",
+    "rule_out_backfill",
     "resolution_scan",
     "convergence_snapshot",
     "render_report",
@@ -2858,3 +2893,74 @@ def test_the_snapshot_waits_for_the_resolution_scan() -> None:
     block = source[decl : decl + 700]
 
     assert '"resolution_scan"' in block, "convergence_snapshot declares no edge to resolution_scan"
+
+
+def _seed_crp(db: LabsDb, *, value: float = 8.5) -> None:
+    """One CRP row, so the backfill's proposed checks name an analyte that is
+    actually on file. `_checkable` refuses an analyte nobody has measured —
+    a check on an invented name can never fire and is indistinguishable from
+    a working one."""
+    sha = "7" * 64
+    db.upsert_document(
+        LabDocument(sha256=sha, filename="crp.pdf", doc_type="lab-result", page_count=1)
+    )
+    db.insert_results(
+        [
+            LabResult(
+                date=date(2026, 5, 2),
+                name="CRP",
+                name_raw="CRP",
+                value=value,
+                source_doc=sha,
+                raw_json=json.dumps({"name_raw": "CRP"}),
+            )
+        ]
+    )
+
+
+def test_the_backfill_applies_only_what_cannot_end_a_lead(repo: DataRepo, db: LabsDb) -> None:
+    """ADR 0054's decision, exercised end to end.
+
+    The harness proposes two checks against the seeded CRP row of 8.5:
+    `sle-01` above 500 (nothing meets it) and `pe-01` above 1 (8.5 clears it).
+
+    The first attaches a condition and moves nothing; the second would end a
+    live lead at the next review, so it must be written to the proposals file
+    for a person instead. Applying an unreviewed file applies everything —
+    that is why the split exists — and a node that got this backwards would
+    retire a diagnosis nobody had agreed to retire.
+    """
+    from adoc.casefile.rule_out_backfill import PROPOSALS_RELPATH, load_proposals
+
+    _seed_ledger(repo)
+    _seed_crp(db)
+    client = _build_client(_happy_path_transport([]))
+
+    run_weekly_review(repo, db, client, clock=_fixed_clock)
+
+    ledger = load_ledger(repo.root / LEDGER_RELPATH)
+    by_id = {h.id: h for h in ledger.hypotheses}
+
+    assert by_id[SLE_ID].rule_out_check is not None, "the inert proposal was not applied"
+    assert by_id[SLE_ID].rule_out_check.threshold == 500.0
+    assert by_id[PE_ID].rule_out_check is None, "a check that is ALREADY MET was applied"
+
+    held = load_proposals(repo.root / PROPOSALS_RELPATH)
+    assert [p.id for p in held.proposals] == [PE_ID]
+    assert held.proposals[0].retires_on_next_review is True
+
+
+def test_the_backfill_reports_what_it_did_and_what_it_held(repo: DataRepo, db: LabsDb) -> None:
+    """Both counts, separately. "Applied 1" and "held 1" are different
+    decisions — the first needed nobody, the second is waiting on a person —
+    and a single number would hide which."""
+    _seed_ledger(repo)
+    _seed_crp(db)
+    client = _build_client(_happy_path_transport([]))
+
+    report = run_weekly_review(repo, db, client, clock=_fixed_clock)
+
+    text = (repo.root / report.markdown_path).read_text(encoding="utf-8")
+
+    assert "Giving leads a way to end" in text
+    assert "held back" in text

@@ -603,3 +603,68 @@ def test_an_ended_lead_needs_no_rule_out() -> None:
     from adoc.casefile.rule_out_backfill import needs_checkable_rule_out
 
     assert needs_checkable_rule_out(_ledger(_hyp("done-01", status="ruled-out"))) == []
+
+
+# --- ADR 0054: which half may apply without a person reading it --------------
+
+
+def _proposal(pid: str, *, met: bool, has_check: bool = True) -> ReviewableProposal:
+    from adoc.casefile.schema import RuleOutCheck
+
+    return ReviewableProposal(
+        id=pid,
+        name=f"Condition {pid}",
+        rule_out="a normal ferritin",
+        check=RuleOutCheck(analyte="Ferritin", operator="normal") if has_check else None,
+        retires_on_next_review=met,
+    )
+
+
+def test_a_check_not_yet_met_is_inert() -> None:
+    """The proposals file is reviewed BY DELETION, so applying an unreviewed
+    file applies everything. The question is which half may apply unattended,
+    and it is not a judgement call: a check nothing on file satisfies attaches
+    a condition and retires nothing — now, or at the next review. It only
+    matters once a future result meets it, and `retirement_pass` evaluates it
+    fresh against real data at that point."""
+    from adoc.casefile.rule_out_backfill import split_by_effect
+
+    split = split_by_effect([_proposal("a", met=False)])
+
+    assert [p.id for p in split.inert] == ["a"]
+    assert split.would_retire == []
+
+
+def test_a_check_already_met_waits_for_a_person() -> None:
+    """Applying this one ends a live lead the next time a review runs. A wrong
+    one ends a real diagnosis."""
+    from adoc.casefile.rule_out_backfill import split_by_effect
+
+    split = split_by_effect([_proposal("b", met=True)])
+
+    assert [p.id for p in split.would_retire] == ["b"]
+    assert split.inert == []
+
+
+def test_a_proposal_with_no_check_is_inert() -> None:
+    """Prose with nothing to evaluate cannot end anything — `_rule_out_met`
+    reads `rule_out_check` and nothing else. This is the common case, because
+    `check_is_expressible` refuses more than it accepts."""
+    from adoc.casefile.rule_out_backfill import split_by_effect
+
+    split = split_by_effect([_proposal("c", met=True, has_check=False)])
+
+    assert [p.id for p in split.inert] == ["c"]
+
+
+def test_the_split_loses_nothing() -> None:
+    """Every proposal lands on exactly one side. One quietly dropped would be
+    a lead left with no way to end and nothing saying so."""
+    from adoc.casefile.rule_out_backfill import split_by_effect
+
+    every = [_proposal("a", met=False), _proposal("b", met=True), _proposal("c", met=False)]
+
+    split = split_by_effect(every)
+
+    assert split.total == len(every)
+    assert {p.id for p in split.inert} | {p.id for p in split.would_retire} == {"a", "b", "c"}
