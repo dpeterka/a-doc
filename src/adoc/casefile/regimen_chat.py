@@ -103,7 +103,15 @@ def to_entries(
         when: date | None = None
         precision = None
         if change.when_text:
-            parsed = parse_approx_date_with_precision(change.when_text)
+            # `today=` matters and was omitted. The parser falls back to
+            # `date.today()`, so "two months ago" meant two months before the
+            # machine's current date rather than before the conversation it
+            # was said in — and re-reading an old transcript would date it to
+            # now. Every caller already threads a `today` through for
+            # `reported_on` and `attested_on`, so the parameter looked like it
+            # governed the whole function while governing everything except
+            # the one computation that is actually about time.
+            parsed = parse_approx_date_with_precision(change.when_text, today=today)
             if parsed is not None:
                 when, precision = parsed
 

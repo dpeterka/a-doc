@@ -272,6 +272,57 @@ def proposals_to_ops(
     return ops, skipped
 
 
+class ProposalSplit(BaseModel):
+    """Proposals sorted by whether applying one can end a live lead today
+    (ADR 0054).
+
+    The proposals file is reviewed **by deletion** — a person removes what
+    they disagree with and whatever survives is applied. So an unreviewed file
+    applied wholesale applies everything, and "may this run unattended" is
+    really "which half may".
+
+    The split is not a judgement call:
+
+    - **`inert`** — the check is NOT met against the labs on file. Applying it
+      attaches an end condition to a lead and retires nothing, now or at the
+      next review. It only ever matters once a future result satisfies it, and
+      at that point `retirement_pass` evaluates it fresh against real data.
+    - **`would_retire`** — the check is ALREADY met. Applying it ends that
+      lead the next time a review runs. A wrong one ends a live lead, so these
+      wait for a person.
+
+    `check_is_expressible` has already refused anything whose prose the
+    grammar cannot hold — the cosyntropin-stimulated cortisol case, where a
+    plain `Cortisol above 18` would have retired a can't-miss
+    adrenal-insufficiency lead on a baseline draw. This split is the second
+    gate, not the only one.
+    """
+
+    inert: list[ReviewableProposal] = Field(default_factory=list)
+    would_retire: list[ReviewableProposal] = Field(default_factory=list)
+
+    @property
+    def total(self) -> int:
+        return len(self.inert) + len(self.would_retire)
+
+
+def split_by_effect(proposals: Sequence[ReviewableProposal]) -> ProposalSplit:
+    """Sort proposals into what applying them would do today.
+
+    A proposal with NO check is `inert` by construction: there is nothing for
+    `_rule_out_met` to evaluate, so it carries prose for a reader and moves
+    nothing. That is the common case — `check_is_expressible` refuses more
+    than it accepts.
+    """
+    split = ProposalSplit()
+    for proposal in proposals:
+        if proposal.check is not None and proposal.retires_on_next_review:
+            split.would_retire.append(proposal)
+        else:
+            split.inert.append(proposal)
+    return split
+
+
 def needs_rule_out(ledger: Ledger) -> list[Hypothesis]:
     """Active leads with nothing at all that could end them.
 
