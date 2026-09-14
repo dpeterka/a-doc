@@ -262,8 +262,15 @@ def test_full_review_happy_path(repo: DataRepo, db: LabsDb) -> None:
     assert report.tag == "review-2026-08-23"
     assert report.commit_sha
 
-    # Blind panel + adjudication + challenge sweep + test chooser = 5 calls.
-    assert len(calls) == 5
+    # Blind panel + adjudication + challenge sweep + test chooser = 5, plus
+    # ONE `rule_out_backfill` batch (ADR 0054) = 6.
+    #
+    # The backfill is batched at `BATCH_SIZE` (8) leads per call, so on the
+    # live board's 29 leads without a machine-checkable end condition it costs
+    # four. It returns before calling anything when no lead needs one, which
+    # is the steady state once the board has them — the cost is front-loaded,
+    # not recurring.
+    assert len(calls) == 6
 
     markdown_path = repo.root / report.markdown_path
     assert markdown_path.exists()
@@ -2411,6 +2418,7 @@ _PRE_0043_ORDER = [
     "staleness_scan",
     "deferred_entailment_sweep",
     "ops_metrics",
+    "rule_out_backfill",
     "resolution_scan",
     "convergence_snapshot",
     "render_report",

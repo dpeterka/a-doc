@@ -175,3 +175,33 @@ def test_relative_timing_survives_into_the_interference_answer(repo: DataRepo) -
     assert entry.started_precision == "month"
     assert entry.overlaps(date(2026, 5, 2)) == "not-yet-started"
     assert entry.overlaps(date(2026, 7, 15)) == "active"
+
+
+def test_a_relative_date_is_measured_from_the_turn_not_the_wall_clock() -> None:
+    """`today=` governs every date in this function except, until now, the one
+    that is actually about time.
+
+    `parse_approx_date_with_precision` accepts a `today` and falls back to
+    `date.today()`; the caller never passed one. So "two months ago" was two
+    months before the machine's current date, not before the conversation it
+    was said in — and re-reading an old transcript would date it to now.
+
+    The test above pinned `today=2026-08-28` and passed for three weeks, until
+    the wall clock drifted far enough to change the answer. A bug that only
+    appears on certain real-world dates is one CI cannot be relied on to find.
+    """
+    from datetime import timedelta
+
+    long_ago = date.today() - timedelta(days=900)
+
+    entries, _dropped = to_entries(
+        [RegimenChange(name="Biotin", action="started", when_text="two months ago")],
+        message="I started Biotin two months ago",
+        today=long_ago,
+        source_ref="patient-report:test",
+    )
+
+    assert entries[0].started is not None
+    # Two months before the TURN, which is ~900 days ago — not two months
+    # before now.
+    assert entries[0].started < date.today() - timedelta(days=800)
