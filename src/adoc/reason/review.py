@@ -91,11 +91,21 @@ from adoc.casefile.retirement import (
     LabFact,
     LabLookup,
     RetirementReport,
+    evaluate_rule_out,
     propose_retirements,
     render_retirements,
     retirements_to_diff,
 )
 from adoc.casefile.rule_out import strip_ops_missing_rule_out
+from adoc.casefile.rule_out_backfill import (
+    PROPOSALS_RELPATH,
+    ProposalFile,
+    ReviewableProposal,
+    needs_checkable_rule_out,
+    propose_rule_outs,
+    split_by_effect,
+    write_proposals,
+)
 from adoc.casefile.schema import (
     AddEvidence,
     AddHypothesis,
@@ -753,6 +763,22 @@ class RoleCost(BaseModel):
     input_tokens: int
     output_tokens: int
     cost_estimate: float
+
+
+class BackfillScanResult(BaseModel):
+    """What the per-review rule-out backfill did (ADR 0054).
+
+    `applied` and `held` are separate counts because they are separate
+    decisions: the first needed nobody, the second is waiting on a person."""
+
+    considered: int = 0
+    applied: int = 0
+    """Proposals whose check is not met — attaching them retires nothing now."""
+    held: int = 0
+    """Proposals whose check is ALREADY met. Applying one ends a live lead at
+    the next review, so they go to the proposals file and wait."""
+    inexpressible: list[str] = Field(default_factory=list)
+    error: str = ""
 
 
 class ResolutionScanResult(BaseModel):
@@ -1814,6 +1840,7 @@ def render_review_markdown(
     engine_query: LabPhenotypeResult | None = None,
     emerging_window_days: int = EMERGING_WINDOW_DAYS,
     literature: LiteratureRefreshResult | None = None,
+    backfill: BackfillScanResult | None = None,
     resolution: ResolutionScanResult | None = None,
     convergence: ConvergenceSnapshot | None = None,
     convergence_previous: ConvergenceSnapshot | None = None,
@@ -1961,6 +1988,25 @@ def render_review_markdown(
     # ADR 0049. Before the boundary section: a lead that may already be over
     # is clinical news, and the reader should reach it while still reading
     # about her case.
+    if backfill is not None and (backfill.applied or backfill.held):
+        lines += [
+            "## Giving leads a way to end",
+            "",
+            f"{backfill.applied} lead(s) now carry a condition that would settle them — "
+            "a specific result that, if it comes back a certain way, takes them off the "
+            "list automatically. None of those conditions is met by anything on file "
+            "today, so nothing changed because of this.",
+            "",
+        ]
+        if backfill.held:
+            lines += [
+                f"{backfill.held} more were held back because the result that would "
+                "settle them is **already on file**. Applying those would end a live "
+                "lead, so they are written to `case/proposed-rule-outs.yaml` for a "
+                "person to read first.",
+                "",
+            ]
+
     if resolution is not None and resolution.items:
         lines += render_resolution_questions(resolution.items)
 
@@ -2978,6 +3024,98 @@ def build_review_dag(
         results["ops_metrics"] = metrics
         return metrics
 
+    def _rule_out_backfill_fn(ctx: Ctx) -> BaseModel:
+        """Give every lead an end condition a machine can evaluate (ADR 0054).
+
+        4 of 33 active leads carried a `rule_out_check` the day this was
+        written, so `_rule_out_met` — the only deterministic rule that ends a
+        lead on evidence rather than on absence or age — could physically
+        reach four of them.
+
+        Applies only the half that cannot end anything today. A proposal whose
+        check is not yet met attaches a condition and moves nothing; the
+        retirement pass evaluates it fresh against real data whenever a future
+        result satisfies it. A proposal whose check is ALREADY met would end a
+        live lead at the next review, so it goes to `proposed-rule-outs.yaml`
+        and waits for a person (ADR 0047's review-by-deletion file).
+
+        Never raises. A review that produced a differential must not be lost
+        because a rule-out could not be proposed.
+        """
+        ledger = ctx["apply_review_diff"]
+        assert isinstance(ledger, Ledger)
+        result = BackfillScanResult()
+        try:
+            targets = needs_checkable_rule_out(ledger)
+            result.considered = len(targets)
+            if not targets:
+                results["rule_out_backfill"] = result
+                return result
+
+            ops, report = propose_rule_outs(client, ledger, analytes=db.distinct_analyte_names())
+            result.inexpressible = list(report.inexpressible)
+            labs = build_lab_lookup(db)
+            by_id = {h.id: h for h in ledger.hypotheses}
+            reviewable: list[ReviewableProposal] = []
+            for op in ops:
+                met, why = (
+                    evaluate_rule_out(op.rule_out_check, labs)
+                    if op.rule_out_check is not None
+                    else (False, "")
+                )
+                reviewable.append(
+                    ReviewableProposal(
+                        id=op.id,
+                        name=by_id[op.id].name if op.id in by_id else op.id,
+                        rule_out=op.rule_out or "",
+                        check=op.rule_out_check,
+                        retires_on_next_review=met,
+                        evaluates_to=why,
+                    )
+                )
+            split = split_by_effect(reviewable)
+            result.applied = len(split.inert)
+            result.held = len(split.would_retire)
+
+            if split.would_retire:
+                write_proposals(
+                    repo.root / PROPOSALS_RELPATH,
+                    ProposalFile(
+                        generated=clock().date(),
+                        app_version=__version__,
+                        model_id="challenger",
+                        proposals=split.would_retire,
+                    ),
+                )
+
+            inert_ids = {p.id for p in split.inert}
+            inert_ops = [op for op in ops if op.id in inert_ids]
+            if inert_ops:
+                repo.apply_ledger_diff(
+                    ledger_path,
+                    repo.root / HISTORY_RELPATH,
+                    LedgerDiff(
+                        provenance=Provenance(
+                            app_version=__version__,
+                            prompt_template_version="rule_out_backfill@v1",
+                            model_id="challenger",
+                            dag_node="rule_out_backfill",
+                            timestamp=clock(),
+                        ),
+                        rationale=(
+                            f"Attached a machine-checkable rule-out to {len(inert_ops)} lead(s) "
+                            "(ADR 0054). None is met on the labs currently on file, so nothing "
+                            "is retired by this diff."
+                        ),
+                        ops=inert_ops,
+                    ),
+                )
+        except Exception as exc:  # noqa: BLE001 - a review must survive this
+            logger.warning("rule_out_backfill: failed: %s", exc, exc_info=True)
+            result.error = str(exc)
+        results["rule_out_backfill"] = result
+        return result
+
     def _resolution_scan_fn(ctx: Ctx) -> BaseModel:
         """Analytes heading back toward normal under a live lead (ADR 0049).
 
@@ -3142,6 +3280,11 @@ def build_review_dag(
                 else None
             ),
             literature=literature_result,
+            backfill=(
+                bf
+                if isinstance(bf := results.get("rule_out_backfill"), BackfillScanResult)
+                else None
+            ),
             resolution=(
                 res
                 if isinstance(res := results.get("resolution_scan"), ResolutionScanResult)
@@ -3390,6 +3533,16 @@ def build_review_dag(
     )
     nodes.append(
         Node(
+            name="rule_out_backfill",
+            fn=_rule_out_backfill_fn,
+            input_model=Ledger,
+            output_model=BackfillScanResult,
+            depends_on="apply_review_diff",
+            after=("ops_metrics",),
+        )
+    )
+    nodes.append(
+        Node(
             name="resolution_scan",
             fn=_resolution_scan_fn,
             input_model=Ledger,
@@ -3409,7 +3562,7 @@ def build_review_dag(
             # to that store. Without this edge the two ordered by declaration
             # order alone — the same unstated dependency ADR 0043 was written
             # about, reintroduced one release later.
-            after=("resolution_scan",),
+            after=("resolution_scan", "rule_out_backfill"),
         )
     )
     nodes.append(

@@ -2419,6 +2419,7 @@ _PRE_0043_ORDER = [
     "deferred_entailment_sweep",
     "ops_metrics",
     "rule_out_backfill",
+    "rule_out_backfill",
     "resolution_scan",
     "convergence_snapshot",
     "render_report",
