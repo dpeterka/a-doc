@@ -5,6 +5,52 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.36.0] — 2026-09-14
+
+### Added
+
+- **The rule-out backfill runs every review, applying only the half that
+  cannot end a lead.** 4 of 33 active leads carried a machine-checkable end
+  condition, so `_rule_out_met` — the only deterministic rule that ends a lead
+  on evidence rather than on absence or age — could reach four of them.
+
+  ADR 0047's proposals file is reviewed **by deletion**: a person removes what
+  they disagree with and whatever survives is applied. So applying an
+  unreviewed file applies everything, and the only real question is which half
+  may apply unattended. It is not a judgement call:
+
+  | | applying it does | |
+  |---|---|---|
+  | check **not met** on file | attaches a condition; retires nothing now or next review | applied automatically |
+  | check **already met** | ends that lead at the next review | held in `proposed-rule-outs.yaml` |
+
+  `check_is_expressible` has already refused anything whose prose the grammar
+  cannot hold — the cosyntropin-stimulated cortisol case, where a plain
+  `Cortisol above 18` would have retired a can't-miss adrenal-insufficiency
+  lead on a baseline draw. `split_by_effect` is the second gate.
+
+  Cost: one batch call per 8 leads needing one, and none once the board has
+  them. Front-loaded, not recurring.
+
+### Fixed
+
+- **A relative date was measured from the wall clock, not the conversation.**
+  `regimen_chat` threads a `today` into `reported_on` and `attested_on` and
+  never passed it to `parse_approx_date_with_precision`, which falls back to
+  `date.today()`. So **"two months ago" meant two months before the machine's
+  current date**, not before the turn it was said in — and re-reading an old
+  transcript would date it to now.
+
+  The existing test pinned `today=2026-08-28` and passed for three weeks,
+  until the wall clock drifted far enough to change the answer. A bug that
+  surfaces only on certain real-world dates is one CI cannot be relied on to
+  find, so the new test builds its dates relative to `date.today()`.
+
+- **The review harness raised on the backfill's schema and the node swallowed
+  it**, so the backfill did nothing in tests while the call count still went
+  up — an assertion passing for the wrong reason. Found by a negative control
+  that did not fail.
+
 ## [0.35.0] — 2026-09-12
 
 *ADR 0054 — the Challenger must pay for what it proposes.*
