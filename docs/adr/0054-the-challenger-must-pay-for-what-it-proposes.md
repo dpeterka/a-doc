@@ -227,8 +227,23 @@ is the third instance of this exact shape after `_EVIDENCE_STRENGTHS` and ADR
 `_rule_out_met` reads `rule_out_check` and nothing else. The narrow function
 saw **3** of 33 leads; the wide one sees **29**.
 
-**Deferred: the backfill does not yet run as a review node.** The ADR said it
-should run every review. The measured blocker is that it proposes into a
-two-step human-reviewed file (`case/proposed-rule-outs.yaml`, ADR 0047) and
-wiring it to run unattended needs a decision about who applies the proposals.
-Recorded here rather than half-built.
+**The backfill now runs as a review node, applying only the inert half.**
+This was briefly deferred as "needs a decision about who applies the
+proposals", which was vague enough to be useless. The decision is narrow: ADR
+0047's file is reviewed **by deletion** — a person removes what they disagree
+with and whatever survives is applied — so applying an unreviewed file applies
+everything, and the question is only *which half* may apply unattended.
+
+It is not a judgement call:
+
+- A check **not met** by anything on file attaches a condition and retires
+  nothing, now or at the next review. It matters only once a future result
+  satisfies it, and `retirement_pass` evaluates it fresh against real data at
+  that point. Applied automatically.
+- A check **already met** ends that lead the next time a review runs. Written
+  to `proposed-rule-outs.yaml` and left for a person.
+
+`split_by_effect` makes the split, `check_is_expressible` has already refused
+anything whose prose the grammar cannot hold, and the review report says both
+counts. Cost: one `propose_rule_outs` batch call per 8 leads needing one, and
+none at all once the board has them — front-loaded, not recurring.
