@@ -5,6 +5,54 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.36.1] — 2026-09-15
+
+### Fixed
+
+- **The backfill counted 30 leads and proposed against 3.** `propose_rule_outs`
+  targeted `needs_rule_out` — active leads with no prose *and* no check, **3 of
+  34** on the live ledger — while the review node computed
+  `needs_checkable_rule_out` (**30 of 34**) for its report. So the 2026-09-14
+  review reported considering thirty leads, proposed against three, and applied
+  **one**.
+
+  `_rule_out_met` reads `rule_out_check` and never the prose, so the 26
+  prose-only leads it skipped are exactly the ones with no way to end at all.
+  `propose_rule_outs` now defaults to the wide set and accepts an explicit
+  `targets` list so a caller that has already computed the set cannot disagree
+  with the number in its own report.
+
+  Nothing pinned this: a negative control passed against the reintroduced bug.
+
+- **The proposals queue had no way in.** The review writes
+  `case/proposed-rule-outs.yaml` and reports proposals as "held for a person to
+  read first" — into a YAML file on an EFS volume, reachable only through `aws
+  ecs execute-command` or a CLI run on a machine with the data directory
+  mounted. There was no web route.
+
+  A queue nobody can open is not a queue, and "held for review" reads exactly
+  like "dropped". `/ledger/rule-outs` renders what is waiting, linked from the
+  ledger page. Read-only: accepting one ends a live lead at the next review, so
+  it still goes through `adoc rule-out-backfill --apply-from` on a reviewed
+  file. An unreadable file renders as an error rather than an empty queue — the
+  two mean opposite things.
+
+### Measured
+
+Four reviews now on record, and the board has not moved since the tier cap
+fired on 09-09:
+
+| review | version | active | off board |
+|---|---|---|---|
+| 09-09 | 0.33.1 | 32 | 15 |
+| 09-10 | 0.34.0 | 33 | 0 |
+| 09-12 | 0.35.0 | 34 | 0 |
+| 09-14 | 0.36.0 | 34 | 0 |
+
+ADR 0054 shipped in 0.35.0 and changed nothing measurable, which the backfill
+bug above partly explains. Whether it does once the backfill reaches all 30
+leads is the next thing to measure, not to assume.
+
 ## [0.36.0] — 2026-09-14
 
 ### Added
