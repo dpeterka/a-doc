@@ -808,3 +808,93 @@ def test_the_sorted_out_control_is_offered_on_an_active_lead(tmp_path: Path) -> 
     body = client.get("/ledger").text
 
     assert "/ledger/hypotheses/pheochromocytoma/resolved" in body
+
+
+# --- the proposals queue has a way in (ADR 0054) -----------------------------
+
+
+def test_the_proposals_page_renders_what_is_waiting(tmp_path: Path) -> None:
+    """The review has been writing `case/proposed-rule-outs.yaml` and saying
+    proposals were "held for a person to read first" — into a YAML file on an
+    EFS volume, reachable only through `aws ecs execute-command` or a CLI run
+    on a machine with the data directory mounted.
+
+    A queue nobody can open is not a queue, and "held for review" reads
+    exactly like "dropped".
+    """
+    from adoc.casefile.rule_out_backfill import (
+        PROPOSALS_RELPATH,
+        ProposalFile,
+        ReviewableProposal,
+        write_proposals,
+    )
+    from adoc.casefile.schema import RuleOutCheck
+
+    app, repo, _db, _calls = build_app(tmp_path)
+    _seed_one(repo)
+    write_proposals(
+        repo.root / PROPOSALS_RELPATH,
+        ProposalFile(
+            generated=date(2026, 9, 14),
+            proposals=[
+                ReviewableProposal(
+                    id="pheochromocytoma",
+                    name="Pheochromocytoma",
+                    rule_out="normal plasma metanephrines",
+                    check=RuleOutCheck(analyte="Metanephrines", operator="normal"),
+                    retires_on_next_review=True,
+                    evaluates_to="Metanephrines is within the lab's reference range",
+                )
+            ],
+        ),
+    )
+    client = TestClient(app)
+    login(client)
+
+    body = client.get("/ledger/rule-outs").text
+
+    assert "Pheochromocytoma" in body
+    assert "normal plasma metanephrines" in body
+    assert "would take the lead off your list" in body
+
+
+def test_an_empty_queue_says_nothing_is_waiting(tmp_path: Path) -> None:
+    app, repo, _db, _calls = build_app(tmp_path)
+    _seed_one(repo)
+    client = TestClient(app)
+    login(client)
+
+    body = client.get("/ledger/rule-outs").text
+
+    assert "Nothing is waiting" in body
+
+
+def test_an_unreadable_file_is_not_rendered_as_an_empty_queue(tmp_path: Path) -> None:
+    """Distinct on purpose. A file that cannot be read is an operational
+    problem; rendering it as "nothing waiting" hides it behind the ordinary
+    case — the shape this codebase keeps finding."""
+    from adoc.casefile.rule_out_backfill import PROPOSALS_RELPATH
+
+    app, repo, _db, _calls = build_app(tmp_path)
+    _seed_one(repo)
+    path = repo.root / PROPOSALS_RELPATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{ not: [valid\n", encoding="utf-8")
+    client = TestClient(app)
+    login(client)
+
+    response = client.get("/ledger/rule-outs")
+
+    assert response.status_code == 200, "a bad file must not 500 the page"
+    assert "could not be read" in response.text
+    assert "Nothing is waiting" not in response.text
+
+
+def test_the_ledger_page_links_to_the_queue(tmp_path: Path) -> None:
+    """A page nothing links to is a page nobody finds."""
+    app, repo, _db, _calls = build_app(tmp_path)
+    _seed_one(repo)
+    client = TestClient(app)
+    login(client)
+
+    assert "/ledger/rule-outs" in client.get("/ledger").text

@@ -512,13 +512,26 @@ def propose_rule_outs(
     *,
     batch_size: int = BATCH_SIZE,
     analytes: Iterable[str] = (),
+    targets: Sequence[Hypothesis] | None = None,
 ) -> tuple[list[UpdateHypothesis], BackfillReport]:
-    """Ops setting `rule_out` on every lead that has none, plus a report.
+    """Ops setting `rule_out` on leads that need one, plus a report.
+
+    `targets` defaults to `needs_checkable_rule_out` — every active lead with
+    no MACHINE-CHECKABLE end condition. It used to be `needs_rule_out`, which
+    is the much narrower set with no prose either, and the difference was not
+    academic: on the live ledger `needs_checkable_rule_out` is **30 of 34**
+    and `needs_rule_out` is **3**.
+
+    The review node measured the wide set for its report and this function
+    acted on the narrow one, so a review that said it had considered thirty
+    leads proposed against three. `_rule_out_met` reads `rule_out_check` and
+    never the prose, so the twenty-six prose-only leads it skipped are exactly
+    the ones that cannot be ended by anything.
 
     Never raises for a bad batch: one unusable response must not cost the
     other five batches, the same posture every other stage here takes.
     """
-    targets = needs_rule_out(ledger)
+    targets = list(targets) if targets is not None else needs_checkable_rule_out(ledger)
     known_analytes = sorted({a.strip() for a in analytes if a.strip()})
     lowered = {a.lower(): a for a in known_analytes}
     report = BackfillReport(considered=len(targets))

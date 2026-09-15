@@ -43,6 +43,7 @@ from starlette.responses import RedirectResponse, Response
 from adoc import __version__
 from adoc.casefile.ledger import load_ledger
 from adoc.casefile.repo import HISTORY_RELPATH, LEDGER_RELPATH, DataRepo
+from adoc.casefile.rule_out_backfill import PROPOSALS_RELPATH, load_proposals
 from adoc.casefile.schema import (
     AddEvidence,
     Evidence,
@@ -176,6 +177,51 @@ def ledger_view(
             "latest_review": latest_review,
             "prior_review_filenames": prior_review_filenames,
             "review_trigger_phrase": REVIEW_TRIGGER_PHRASE,
+        },
+    )
+
+
+@router.get("/rule-outs")
+def proposed_rule_outs(
+    request: Request,
+    repo: DataRepo = Depends(get_repo),
+) -> Response:
+    """Proposed rule-outs a review held back for a person to read.
+
+    This page exists because the file did not have one. The review has been
+    writing `case/proposed-rule-outs.yaml` and reporting that proposals were
+    "held for a person to read first" — into a YAML file on an EFS volume,
+    reachable only through `aws ecs execute-command` or a CLI run on a machine
+    with the data directory mounted. A queue nobody can open is not a queue,
+    and "held for review" reads exactly like "dropped".
+
+    Read-only. Accepting a proposal still goes through
+    `adoc rule-out-backfill --apply-from`, which applies a REVIEWED file —
+    these are the ones whose check is already met, so accepting one ends a
+    live lead at the next review (ADR 0054).
+    """
+    path = repo.root / PROPOSALS_RELPATH
+    proposals: list[Any] = []
+    error = ""
+    generated = None
+    if path.is_file():
+        try:
+            loaded = load_proposals(path)
+            proposals = list(loaded.proposals)
+            generated = loaded.generated
+        except Exception as exc:  # noqa: BLE001 - a bad file must not 500 the page
+            logger.warning("proposed_rule_outs: could not read %s: %s", path, exc)
+            error = str(exc)
+
+    return templates.TemplateResponse(
+        request,
+        "proposed_rule_outs.html",
+        {
+            "proposals": proposals,
+            "generated": generated,
+            "error": error,
+            "relpath": PROPOSALS_RELPATH,
+            "exists": path.is_file(),
         },
     )
 
