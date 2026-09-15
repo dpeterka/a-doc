@@ -668,3 +668,52 @@ def test_the_split_loses_nothing() -> None:
 
     assert split.total == len(every)
     assert {p.id for p in split.inert} | {p.id for p in split.would_retire} == {"a", "b", "c"}
+
+
+def test_a_prose_only_lead_is_proposed_against() -> None:
+    """The bug this file's `needs_checkable_rule_out` was added for, and which
+    shipped anyway because nothing pinned it.
+
+    `propose_rule_outs` targeted `needs_rule_out` — leads with no prose AND no
+    check — while the review node counted `needs_checkable_rule_out`. On the
+    live ledger that is 3 against 30, so a review reported considering thirty
+    leads and proposed against three. It applied ONE.
+
+    `_rule_out_met` reads `rule_out_check` and never the prose, so a lead
+    carrying only prose has no way to end at all. Those are precisely the ones
+    the backfill exists for.
+    """
+    prose_only = _hyp("prose-01", rule_out="a normal cosyntropin-stimulated cortisol")
+    client, calls = _client(
+        [
+            {
+                "proposals": [
+                    {
+                        "id": "prose-01",
+                        "rule_out": "a ferritin within range",
+                        "analyte": "Ferritin",
+                        "operator": "normal",
+                    }
+                ]
+            }
+        ]
+    )
+
+    ops, report = propose_rule_outs(client, _ledger(prose_only), analytes=["Ferritin"])
+
+    assert report.considered == 1, "a prose-only lead was not considered"
+    assert [op.id for op in ops] == ["prose-01"]
+    assert ops[0].rule_out_check is not None
+
+
+def test_an_explicit_target_list_wins() -> None:
+    """The caller decides when it has already computed the set — the review
+    node has, and a second walk of the ledger could disagree with the number
+    it just put in its own report."""
+    a = _hyp("a")
+    b = _hyp("b")
+    client, _calls = _client([{"proposals": []}])
+
+    _ops, report = propose_rule_outs(client, _ledger(a, b), targets=[a])
+
+    assert report.considered == 1
