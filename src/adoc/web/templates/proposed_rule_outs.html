@@ -1,0 +1,62 @@
+{% extends "base.html" %}
+{% block title %}Ways a lead could end — a-doc{% endblock %}
+{% block content %}
+  <h1>Ways a lead could end</h1>
+
+  <p class="muted">
+    A lead stays on your list until something can settle it. These are conditions a-doc
+    worked out — a specific result that, if it came back a certain way, would take the lead
+    off the list. The ones here are held back because <strong>the result is already on
+    file</strong>: accepting one would end that lead at the next review, so a person reads
+    them first.
+  </p>
+
+  {% if error %}
+    {# Distinct from "nothing is waiting" on purpose: a file that cannot be read
+       is an operational problem, and rendering it as an empty queue would hide it. #}
+    <p class="banner banner-info" role="status">
+      The proposals file could not be read: {{ error }}
+    </p>
+  {% elif not exists %}
+    <p class="muted">
+      Nothing is waiting. The review writes to <code>{{ relpath }}</code> only when it finds
+      a condition that is already met — most of what it proposes is applied straight away,
+      because it cannot end anything yet.
+    </p>
+  {% elif not proposals %}
+    <p class="muted">Nothing is waiting for review.</p>
+  {% else %}
+    <p class="muted">
+      {{ proposals | length }} waiting{% if generated %}, written {{ generated.isoformat() }}{% endif %}.
+      Accepting these is not something the web page does — they are applied from
+      <code>{{ relpath }}</code> with <code>adoc rule-out-backfill --apply-from</code>, after
+      deleting the ones you do not accept.
+    </p>
+
+    {% for p in proposals %}
+      <article class="card">
+        <h2>{{ p.name }}</h2>
+        <p><strong>Would be settled by:</strong> {{ p.rule_out }}</p>
+        {% if p.check %}
+          <p class="muted">
+            Checked as: {{ p.check.analyte }} {{ p.check.operator }}
+            {%- if p.check.threshold is not none %} {{ p.check.threshold }}{% endif %}
+            {%- if p.check.unit %} {{ p.check.unit }}{% endif %}
+          </p>
+        {% endif %}
+        {% if p.evaluates_to %}
+          <p class="muted">On your current results: {{ p.evaluates_to }}</p>
+        {% endif %}
+        <p class="chip chip-status">
+          {% if p.retires_on_next_review %}
+            Accepting this would take the lead off your list
+          {% else %}
+            Nothing on file meets this yet
+          {% endif %}
+        </p>
+      </article>
+    {% endfor %}
+  {% endif %}
+
+  <p><a href="/ledger">&larr; Back to the full picture</a></p>
+{% endblock %}

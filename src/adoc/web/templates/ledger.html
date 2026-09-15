@@ -7,6 +7,9 @@
     <p class="agenda-cta">
       <a href="/export/agenda" class="button">🖨️ Print a one-page agenda for your next appointment</a>
     </p>
+    {# The proposals queue had no way in at all: the review wrote it to a YAML
+       file on an EFS volume and said it was "held for a person to read". #}
+    <p class="muted"><a href="/ledger/rule-outs">Ways a lead could end &rarr;</a></p>
     {% set groups = ledger.hypotheses | group_hypotheses %}
     <p class="muted">
       Every lead a-doc has considered — {{ ledger.hypotheses | length }} in all, version
