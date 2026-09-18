@@ -573,8 +573,19 @@ def test_a_patient_can_retire_a_cant_miss_lead(tmp_path: Path) -> None:
     assert hypothesis.status == "ruled-out"
     evidence = hypothesis.evidence_against[-1]
     assert evidence.strength == "definitive-exclusion"
-    assert evidence.source.startswith("patient-report:")
+    # An ENCOUNTER, not `patient-report:`. That scheme came off
+    # `DEFINITIVE_EXCLUSION_SOURCES` because the citation checker resolves it
+    # unconditionally and the entailment verifier cannot read it at all, so a
+    # model writing one had an unchecked route to ending a can't-miss lead.
+    # Her statement still ends this lead — it is now recorded as an encounter,
+    # which `DefaultSourceTextResolver` can actually resolve and check.
+    assert evidence.source.startswith("encounter:")
     assert "Dr Alvarez" in evidence.claim
+    written = (repo.root / "case" / "encounters" / evidence.source.split(":", 1)[1]).read_text(
+        encoding="utf-8"
+    )
+    assert "Metanephrines came back clear" in written
+    assert "Dr Alvarez" in written
 
 
 def test_retiring_writes_through_the_invariant_checked_path(tmp_path: Path) -> None:

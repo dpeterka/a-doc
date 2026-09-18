@@ -985,3 +985,55 @@ def test_the_report_says_the_list_cannot_shorten_on_its_own() -> None:
 
     assert "is full" in rendered
     assert "cannot get shorter on its own" in rendered
+
+
+def test_a_patient_report_can_no_longer_end_a_lead_automatically() -> None:
+    """`patient-report:` came off `DEFINITIVE_EXCLUSION_SOURCES`.
+
+    The citation checker resolves that scheme unconditionally — "the patient's
+    own statement, and grammar-validity is enough" — and the entailment
+    verifier returns `insufficient_source`, which is explicitly not a failure.
+    So a model writing `strength="definitive-exclusion"` with a
+    `patient-report:` ref had an UNCHECKED one-field route to ending a
+    can't-miss lead, and nothing anywhere would have judged the claim.
+
+    What a person says still ends leads — through an encounter, which resolves
+    and can therefore be checked.
+    """
+    said = Evidence(
+        claim="my doctor said it's definitely not lupus",
+        source="patient-report:2026-09-01",
+        strength="definitive-exclusion",
+    )
+    lead = _h("sle-01", evidence_for=[_ev(strength="strong")], evidence_against=[said])
+
+    report = propose_retirements(_ledger(lead), today=_TODAY)
+
+    assert report.retirements == [], "a patient-report ref ended a lead"
+    assert report.refused_exclusions, "and the refusal was not even reported"
+    assert weigh_evidence([said]) == 0
+
+
+def test_an_encounter_can_still_end_a_lead() -> None:
+    """The fix must not disarm the mechanism. A person's statement, recorded
+    as an encounter, is resolvable source text and still ends the lead."""
+    recorded = Evidence(
+        claim="ruled out by her rheumatologist",
+        source="encounter:2026-09-01--ruled-out-sle-01.md",
+        strength="definitive-exclusion",
+    )
+    lead = _h("sle-01", evidence_for=[_ev(strength="strong")], evidence_against=[recorded])
+
+    report = propose_retirements(_ledger(lead), today=_TODAY)
+
+    assert [r.hypothesis_id for r in report.retirements] == ["sle-01"]
+    assert report.retirements[0].cause == "definitive-exclusion"
+
+
+def test_the_permitted_sources_are_all_resolvable() -> None:
+    """Every permitted prefix must be one `DefaultSourceTextResolver` can turn
+    into text. A source that cannot be resolved cannot be entailment-checked,
+    and an unverifiable claim was exactly the hole `patient-report:` left."""
+    from adoc.casefile.retirement import DEFINITIVE_EXCLUSION_SOURCES
+
+    assert set(DEFINITIVE_EXCLUSION_SOURCES) == {"labs:", "doc:", "encounter:"}

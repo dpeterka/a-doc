@@ -29,6 +29,7 @@ from adoc.casefile.questions import (
     QUESTIONS_RELPATH,
     OpenQuestion,
     OpenQuestions,
+    commit_questions,
     load_questions,
     next_question_to_ask,
     question_id,
@@ -436,6 +437,33 @@ def ledger_maintainer_stage(
 
     assert diff is not None
 
+    # Close any next-appointment question this message answered.
+    #
+    # AFTER the retry loop, not inside it: a citation retry would otherwise
+    # close a question on an attempt that was then thrown away. Deliberately
+    # NOT gated on `diff.ops` being non-empty — answering "yes, here is every
+    # supplement I take" changes the record without necessarily changing the
+    # differential, and gating on ops is the exact mistake that made the
+    # intake version do nothing for the messages it was written for.
+    #
+    # BEFORE the citation/entailment block below, so the evidence minted from
+    # an answer goes through the same checks as everything else in this diff.
+    #
+    # `patient_message`, not a constant. This used to store "Answered in
+    # conversation." — and since `chat.py` runs this turn before
+    # `run_visit_capture`, and `mark_answered` skips an already-answered
+    # question, that constant overwrote nothing and her real words were never
+    # recorded on a diagnostic turn. The length cap lives in `mark_answered`,
+    # not here: two call sites each slicing is how the two paths diverged.
+    newly_closed = resolve_answered(
+        repo.root,
+        answered_question_ids,
+        on=datetime.now(UTC).date(),
+        note=patient_message.strip(),
+    )
+    if newly_closed:
+        logger.info("ledger_maintainer: closed %d open question(s)", len(newly_closed))
+
     all_claims = claims_from_ops(diff.ops)
     synchronous_claims, deferred_claims = _partition_claims_by_tier(
         all_claims, diff.ops, prior_ledger
@@ -451,21 +479,6 @@ def ledger_maintainer_stage(
         log_stripped_claims(repo, removed, dag_node="ledger_maintainer")
         diff = diff.model_copy(update={"ops": stripped_ops})
 
-    # Close any next-appointment question this message answered.
-    #
-    # AFTER the diff is settled, not inside the retry loop: a citation retry
-    # would otherwise close a question on an attempt that was then thrown
-    # away. Deliberately NOT gated on `diff.ops` being non-empty — answering
-    # "yes, here is every supplement I take" changes the record without
-    # necessarily changing the differential, and gating on ops is the exact
-    # mistake that made the intake version do nothing for the messages it was
-    # written for.
-    resolve_answered(
-        repo.root,
-        answered_question_ids,
-        on=datetime.now(UTC).date(),
-        note="Answered in conversation.",
-    )
     return diff
 
 
@@ -1658,6 +1671,14 @@ def run_diagnostic_turn(
         # in `finally` means that turn still marks correctly, because the
         # ledger genuinely changed even though the reply was withheld.
         _mark_review_wanted_if_ledger_changed(repo, sink)
+        # One commit for the whole turn. Three separate places write this file
+        # on a single diagnostic turn — `resolve_answered` in the maintainer,
+        # `gap_scan` and `record_chat_ask` in the composer — and none of them
+        # committed it, so answered-question state rode the weekly review's
+        # sweep and sat un-backed-up for up to a week. In `finally` for the
+        # same reason as the marker above: a withheld reply still changed the
+        # store.
+        commit_questions(repo, "casefile: open questions updated by a chat turn")
 
     reply = sink["composer"]
     assert isinstance(reply, PatientReply)

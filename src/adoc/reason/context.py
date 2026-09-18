@@ -885,7 +885,12 @@ def build_context(
     # none ever answered, while the answers sat in the record as facts. ADR
     # 0032's addendum: a derived artifact is never the read path for data
     # that has a source of truth.
-    open_questions = render_for_context(load_questions(repo.root / Path(QUESTIONS_RELPATH)))
+    # `today` injected, not read inside. `regimen_chat` shipped the other way
+    # and "two months ago" came out relative to the machine's clock rather
+    # than the conversation.
+    open_questions = render_for_context(
+        load_questions(repo.root / Path(QUESTIONS_RELPATH)), today=date.today()
+    )
     sections.append(
         ContextSection(key="open_questions", title="Open Questions", content=open_questions)
     )
