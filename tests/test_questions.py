@@ -13,6 +13,7 @@ from datetime import date
 from pathlib import Path
 
 from adoc.casefile.questions import (
+    ANSWER_NOTE_MAX,
     MAX_CHAT_ASKS,
     QUESTIONS_RELPATH,
     OpenQuestion,
@@ -61,7 +62,7 @@ def test_answering_survives_the_next_review_reproposing_it() -> None:
     question = _question("Your supplement labels")
     store = OpenQuestions(questions=[question])
 
-    answered, _ = mark_answered(store, [question.id], on=_LATER, note="Takes biotin 10mg.")
+    answered, _, _closed = mark_answered(store, [question.id], on=_LATER, note="Takes biotin 10mg.")
     after_review = merge_proposed(answered, [question], asked_on=_LATER)
 
     assert after_review.by_id(question.id).status == "answered"
@@ -72,7 +73,7 @@ def test_reproposing_refreshes_wording_but_not_state() -> None:
     """Newer phrasing is the better one to show if it ever reopens, but the
     status is the store's to keep, never the model's to overwrite."""
     question = _question("Your supplement labels")
-    answered, _ = mark_answered(
+    answered, _, _closed = mark_answered(
         OpenQuestions(questions=[question]), [question.id], on=_LATER, note="n"
     )
 
@@ -89,7 +90,7 @@ def test_a_question_the_chooser_stops_proposing_is_not_deleted() -> None:
     and return in the next. Deleting would lose the answer and re-ask from
     scratch."""
     question = _question("Your supplement labels")
-    answered, _ = mark_answered(
+    answered, _, _closed = mark_answered(
         OpenQuestions(questions=[question]), [question.id], on=_LATER, note="n"
     )
 
@@ -106,7 +107,7 @@ def test_an_unknown_id_is_reported_not_raised() -> None:
     real = _question("Your supplement labels")
     store = OpenQuestions(questions=[real])
 
-    updated, unknown = mark_answered(store, ["invented-id", real.id], on=_LATER)
+    updated, unknown, _closed = mark_answered(store, ["invented-id", real.id], on=_LATER)
 
     assert unknown == ["invented-id"]
     assert updated.by_id(real.id).status == "answered"
@@ -116,10 +117,10 @@ def test_answering_twice_keeps_the_first_answer() -> None:
     """A later message touching the same topic must not overwrite the date
     and note that actually closed it."""
     question = _question("Your supplement labels")
-    once, _ = mark_answered(
+    once, _, _closed = mark_answered(
         OpenQuestions(questions=[question]), [question.id], on=_LATER, note="first"
     )
-    twice, _ = mark_answered(once, [question.id], on=date(2026, 10, 1), note="second")
+    twice, _, _closed = mark_answered(once, [question.id], on=date(2026, 10, 1), note="second")
 
     assert twice.by_id(question.id).answered_on == _LATER
     assert twice.by_id(question.id).answer_note == "first"
@@ -139,7 +140,7 @@ def test_open_questions_filters_by_audience() -> None:
 
 def test_round_trips_through_disk(tmp_path: Path) -> None:
     question = _question("Your supplement labels")
-    answered, _ = mark_answered(
+    answered, _, _closed = mark_answered(
         OpenQuestions(questions=[question]), [question.id], on=_LATER, note="Takes biotin."
     )
     path = tmp_path / "case" / "questions-open.yaml"
@@ -175,7 +176,7 @@ def test_context_renders_only_open_questions_with_their_ids() -> None:
     mine = _question("Every supplement you take", audience="you")
     theirs = _question("ACTH stimulation test", audience="doctor")
     done = _question("Already answered", audience="you")
-    store, _ = mark_answered(
+    store, _, _closed = mark_answered(
         OpenQuestions(questions=[mine, theirs, done]),
         [done.id],
         on=date(2026, 9, 1),
@@ -204,17 +205,17 @@ def test_resolve_answered_closes_and_survives_a_bad_id(tmp_path: Path) -> None:
         tmp_path, [mine.id, "not-a-question"], on=date(2026, 9, 1), note="Answered in chat."
     )
 
-    assert closed == 1
+    assert closed == [mine.id]
     reloaded = load_questions(path)
     assert reloaded.by_id(mine.id).status == "answered"
     assert reloaded.open_questions() == []
 
 
-def test_resolve_answered_on_an_unwritable_store_returns_zero(tmp_path: Path) -> None:
+def test_resolve_answered_on_an_unwritable_store_returns_nothing(tmp_path: Path) -> None:
     """A turn must survive a broken store."""
     from adoc.casefile.questions import resolve_answered
 
-    assert resolve_answered(tmp_path / "nope", ["x"], on=date(2026, 9, 1), note="") == 0
+    assert resolve_answered(tmp_path / "nope", ["x"], on=date(2026, 9, 1), note="") == []
 
 
 # --- ADR 0048 §1: the chat follows up on questions that already exist -----------------------------
@@ -329,3 +330,75 @@ def test_nothing_to_ask_returns_none_rather_than_inventing() -> None:
     """An empty backlog must not produce a filler question — that is what
     ADR 0048 §2's `gap_scan` is for, and it is a separate decision."""
     assert next_question_to_ask(OpenQuestions(questions=[])) is None
+
+
+# --- ADR-pending Phase 1: her words, not a constant --------------------------
+
+
+def test_mark_answered_reports_which_ids_newly_closed() -> None:
+    """The idempotence key for turning an answer into evidence. Without it a
+    re-review re-proposing the same panel would mint the evidence again."""
+    first = _question("Your supplement labels")
+    second = _question("Morning stiffness")
+    store = OpenQuestions(questions=[first, second])
+
+    once, _unknown, closed = mark_answered(store, [first.id], on=_LATER, note="biotin 10mg")
+    assert closed == [first.id]
+
+    _twice, _unknown2, closed_again = mark_answered(once, [first.id], on=_LATER, note="again")
+    assert closed_again == [], "an already-answered question reported as newly closed"
+
+
+def test_an_unknown_id_is_not_reported_as_closed() -> None:
+    real = _question("Your supplement labels")
+
+    _store, unknown, closed = mark_answered(
+        OpenQuestions(questions=[real]), ["invented", real.id], on=_LATER
+    )
+
+    assert unknown == ["invented"]
+    assert closed == [real.id]
+
+
+def test_the_diagnostic_path_stores_her_words_not_a_constant() -> None:
+    """`stages.py` wrote the literal "Answered in conversation." while the
+    intake path wrote her text. `chat.py` runs the diagnostic turn FIRST and
+    `mark_answered` skips an already-answered question, so the constant won
+    and her words were discarded on every diagnostic turn.
+    """
+    import inspect
+
+    from adoc.reason import stages as module
+
+    source = inspect.getsource(module.ledger_maintainer_stage)
+
+    assert "Answered in conversation." not in source
+    assert "patient_message.strip()" in source
+
+
+def test_the_answer_is_capped_at_the_length_intake_uses(tmp_path: Path) -> None:
+    """280, matching `intake/agent.py`. Two different caps would be two
+    different records of the same sentence."""
+    question = _question("Your supplement labels")
+    path = tmp_path / QUESTIONS_RELPATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    save_questions(path, OpenQuestions(questions=[question]))
+
+    from adoc.casefile.questions import resolve_answered
+
+    resolve_answered(tmp_path, [question.id], on=_LATER, note="x" * 400)
+
+    assert len(load_questions(path).by_id(question.id).answer_note) == ANSWER_NOTE_MAX
+
+
+def test_there_is_one_closer_not_two() -> None:
+    """The two copies diverged, which is how the constant came to overwrite
+    her words. `intake/agent.py` now calls the shared one."""
+    import inspect
+
+    from adoc.intake import agent
+
+    source = inspect.getsource(agent)
+
+    assert "_resolve_answered_questions" not in source
+    assert "resolve_answered(" in source

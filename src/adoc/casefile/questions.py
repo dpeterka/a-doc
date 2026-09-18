@@ -28,10 +28,13 @@ import re
 from collections.abc import Collection, Sequence
 from datetime import date
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, Field
 from ruamel.yaml import YAML
+
+if TYPE_CHECKING:  # pragma: no cover - import cycle: repo does not import questions
+    from adoc.casefile.repo import DataRepo
 
 logger = logging.getLogger(__name__)
 
@@ -161,23 +164,41 @@ def merge_proposed(
     return OpenQuestions(questions=sorted(merged.values(), key=lambda q: q.id))
 
 
+ANSWER_NOTE_MAX = 280
+"""How much of her answer is stored on the question.
+
+Enforced HERE rather than at each call site. It used to be sliced by the two
+callers independently, and two copies of the same rule is precisely how the
+diagnostic path came to store a constant while the intake path stored her
+words. One closer, one cap.
+
+280 is what the intake path chose: long enough for a real answer, short enough
+that a whole conversation does not land in a committed medical record."""
+
+
 def mark_answered(
     questions: OpenQuestions,
     ids: list[str],
     *,
     on: date,
     note: str = "",
-) -> tuple[OpenQuestions, list[str]]:
-    """Close the named questions. Returns the updated store and the ids that
-    matched nothing.
+) -> tuple[OpenQuestions, list[str], list[str]]:
+    """Close the named questions. Returns `(store, unknown, newly_closed)`.
 
     Unknown ids are REPORTED, not raised: ADR 0028's rule that one bad
     identifier costs its own claim and never the rest of the payload. A model
     that invents an id must not be able to discard the four real answers
     alongside it.
+
+    `newly_closed` excludes ids that were already `answered`, and that
+    distinction is load-bearing rather than cosmetic: it is the idempotence
+    key for turning an answer into evidence. A re-review re-proposing the same
+    panel leaves it answered, so it reports as not-newly-closed and mints
+    nothing a second time.
     """
     updated = questions.model_copy(deep=True)
     unknown: list[str] = []
+    newly_closed: list[str] = []
     for question_id in ids:
         question = updated.by_id(question_id)
         if question is None:
@@ -187,12 +208,17 @@ def mark_answered(
             continue
         question.status = "answered"
         question.answered_on = on
-        question.answer_note = note.strip()
-    return updated, unknown
+        question.answer_note = note.strip()[:ANSWER_NOTE_MAX]
+        newly_closed.append(question_id)
+    return updated, unknown, newly_closed
 
 
-def resolve_answered(root: Path, ids: Sequence[str], *, on: date, note: str) -> int:
-    """Close the questions `ids` names. Returns how many actually closed.
+def resolve_answered(root: Path, ids: Sequence[str], *, on: date, note: str) -> list[str]:
+    """Close the questions `ids` names. Returns the ids that NEWLY closed.
+
+    The ids rather than a count, because a caller that wants to act on an
+    answer — attach it to the lead it was about — needs to know *which* ones
+    it may act on, and must not act twice on the same one.
 
     Never raises into the caller: a chat turn must not fail because a
     question could not be closed, and the answer itself is already recorded
@@ -204,10 +230,10 @@ def resolve_answered(root: Path, ids: Sequence[str], *, on: date, note: str) -> 
     production and not one had ever been answered.
     """
     if not ids:
-        return 0
+        return []
     try:
         path = root / QUESTIONS_RELPATH
-        updated, unknown = mark_answered(load_questions(path), list(ids), on=on, note=note)
+        updated, unknown, closed = mark_answered(load_questions(path), list(ids), on=on, note=note)
         save_questions(path, updated)
         if unknown:
             logger.warning(
@@ -215,10 +241,32 @@ def resolve_answered(root: Path, ids: Sequence[str], *, on: date, note: str) -> 
                 len(unknown),
                 ", ".join(sorted(unknown)),
             )
-        return len(ids) - len(unknown)
+        return closed
     except Exception as exc:  # noqa: BLE001 - never fail a turn over this
         logger.warning("questions: could not resolve answered questions: %s", exc)
-        return 0
+        return []
+
+
+def commit_questions(repo: DataRepo, message: str) -> None:
+    """Commit `case/questions-open.yaml`, if git has anything to commit.
+
+    The store is written by three separate places on one diagnostic turn
+    (`resolve_answered` in the maintainer, `gap_scan` and `record_chat_ask` in
+    the composer) and by the intake capture pass, and **none of them committed
+    it**. It rode the weekly review's `paths=["case"]` sweep, so up to a week
+    of answered-question state sat uncommitted — and therefore unbacked-up,
+    because `backup.py` bundles committed refs only.
+
+    Called once per turn rather than once per write: EFS git commits are not
+    free and three per turn would triple what a chat already pays.
+
+    Never raises. A turn that produced a real reply must not fail because a
+    commit did not land; the next one will pick the file up.
+    """
+    try:
+        repo.commit(message, paths=[QUESTIONS_RELPATH])
+    except Exception as exc:  # noqa: BLE001 - never fail a turn over this
+        logger.warning("questions: could not commit %s: %s", QUESTIONS_RELPATH, exc)
 
 
 MAX_CHAT_ASKS = 2

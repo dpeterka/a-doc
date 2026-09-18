@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal
 
@@ -49,8 +49,7 @@ from adoc.casefile.patient_updates import (
 from adoc.casefile.questions import (
     QUESTIONS_RELPATH,
     load_questions,
-    mark_answered,
-    save_questions,
+    resolve_answered,
 )
 from adoc.casefile.regimen import REGIMEN_RELPATH, load_regimen, save_regimen
 from adoc.casefile.regimen_chat import (
@@ -767,29 +766,6 @@ def _write_section_from_facts(
     data = facts_to_section_data(facts_store.facts, section_key)
     section_data = spec.schema.model_validate(data)
     return write_section(repo, section_key, section_data)
-
-
-def _resolve_answered_questions(repo: DataRepo, ids: list[str], *, on: date, note: str) -> None:
-    """Close any next-appointment questions this turn answered.
-
-    Never raises into the caller: a chat turn must not fail because a
-    question could not be closed. An id that matches nothing is logged and
-    dropped — the answer itself is already recorded as a fact regardless.
-    """
-    if not ids:
-        return
-    try:
-        path = repo.root / QUESTIONS_RELPATH
-        updated, unknown = mark_answered(load_questions(path), ids, on=on, note=note)
-        save_questions(path, updated)
-        if unknown:
-            logger.warning(
-                "visit capture: %d answered-question id(s) matched nothing: %s",
-                len(unknown),
-                ", ".join(sorted(unknown)),
-            )
-    except Exception as exc:  # noqa: BLE001 - never fail a turn over this
-        logger.warning("visit capture: could not resolve answered questions: %s", exc)
 
 
 def _sync_regimen_from_facts(repo: DataRepo, facts_store: IntakeFactsStore) -> None:
@@ -1573,11 +1549,17 @@ def run_visit_capture(client: LlmClient, repo: DataRepo, db: LabsDb, text: str) 
     # question that asked for them. Gating on `ops` would leave the question
     # open and the next review would ask her again — the exact defect this
     # store exists to fix (ADR 0033).
-    _resolve_answered_questions(
-        repo,
+    # The shared closer, not a second copy. This function used to be
+    # duplicated here, and the copies diverged: the diagnostic DAG's version
+    # stored the constant "Answered in conversation." while this one stored
+    # her words — and because `chat.py` runs the DAG first and `mark_answered`
+    # skips an already-answered question, the constant won and her words were
+    # silently discarded on every diagnostic turn.
+    resolve_answered(
+        repo.root,
         turn.answered_question_ids,
         on=datetime.now(UTC).date(),
-        note=text.strip()[:280],
+        note=text.strip(),
     )
 
     if not turn.ops:
