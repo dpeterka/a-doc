@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import logging
 import re
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -41,7 +41,9 @@ from fastapi import APIRouter, Depends, Form, Request
 from starlette.responses import RedirectResponse, Response
 
 from adoc import __version__
+from adoc.casefile.encounters import Encounter, EncounterFrontmatter, write_encounter
 from adoc.casefile.ledger import load_ledger
+from adoc.casefile.patient_updates import ENCOUNTERS_RELDIR
 from adoc.casefile.repo import HISTORY_RELPATH, LEDGER_RELPATH, DataRepo
 from adoc.casefile.rule_out_backfill import PROPOSALS_RELPATH, load_proposals
 from adoc.casefile.schema import (
@@ -290,6 +292,52 @@ def mark_resolved(
     return RedirectResponse(url="/ledger", status_code=303)
 
 
+def _write_retirement_encounter(
+    repo: DataRepo,
+    *,
+    hypothesis_id: str,
+    hypothesis_name: str,
+    reason: str,
+    clinician: str,
+    today: date,
+) -> str | None:
+    """Record what she said her doctor ruled out, as an encounter.
+
+    Returns the filename to cite, or `None` if it could not be written.
+
+    This exists so the retirement has a source the entailment verifier can
+    actually read. `patient-report:<date>` resolved to nothing — there was no
+    resolver for the scheme — so a definitive exclusion citing one was
+    permanently unverifiable. An encounter is the same statement in a form
+    the rest of the system can check.
+    """
+    try:
+        encounter = Encounter(
+            frontmatter=EncounterFrontmatter(
+                date=today,
+                type="patient-report",
+                provider=clinician or None,
+                reported_on=today,
+            ),
+            summary=(
+                f"Reported that {hypothesis_name} has been ruled out"
+                + (f" by {clinician}" if clinician else "")
+                + f". In her words: {reason}"
+            ),
+        )
+        path = write_encounter(
+            repo.root / ENCOUNTERS_RELDIR, encounter, f"ruled-out-{hypothesis_id}"
+        )
+        repo.commit(
+            f"casefile: recorded that {hypothesis_name} was ruled out",
+            paths=[f"{ENCOUNTERS_RELDIR}/{path.name}"],
+        )
+        return path.name
+    except Exception as exc:  # noqa: BLE001 - a failed write must not 500 the page
+        logger.warning("retire_hypothesis: could not write encounter: %s", exc)
+        return None
+
+
 @router.post("/hypotheses/{hypothesis_id}/retire")
 def retire_hypothesis(
     request: Request,
@@ -323,6 +371,22 @@ def retire_hypothesis(
 
     today = datetime.now(UTC).date()
     attributed = f"{reason_text} (per {clinician.strip()})" if clinician.strip() else reason_text
+
+    hypothesis_name = next(h.name for h in ledger.hypotheses if h.id == hypothesis_id)
+    encounter_name = _write_retirement_encounter(
+        repo,
+        hypothesis_id=hypothesis_id,
+        hypothesis_name=hypothesis_name,
+        reason=reason_text,
+        clinician=clinician.strip(),
+        today=today,
+    )
+    if encounter_name is None:
+        # No encounter, no citable source. Better to leave the lead standing
+        # than to record a definitive exclusion citing nothing.
+        logger.warning("retire_hypothesis: could not write the encounter for %s", hypothesis_id)
+        return RedirectResponse(url="/ledger", status_code=303)
+
     diff = LedgerDiff(
         provenance=Provenance(
             app_version=__version__,
@@ -338,10 +402,19 @@ def retire_hypothesis(
                 for_or_against="against",
                 evidence=Evidence(
                     claim=attributed,
-                    # Her own report of what her doctor said. A permitted
-                    # source for a definitive exclusion (ADR 0038) precisely
-                    # because a person, not a model, is asserting it.
-                    source=f"patient-report:{today.isoformat()}",
+                    # An ENCOUNTER, not `patient-report:`. Her report of what
+                    # her doctor said is still what ends this lead — a person,
+                    # not a model, is asserting it — but `patient-report:` is
+                    # no longer a permitted definitive-exclusion source
+                    # (`retirement.DEFINITIVE_EXCLUSION_SOURCES`), because the
+                    # citation checker resolves that scheme unconditionally
+                    # and the entailment verifier cannot check it at all.
+                    #
+                    # Writing the encounter costs one file and makes her words
+                    # resolvable: `DefaultSourceTextResolver` reads
+                    # `encounter:` refs, so this claim is checkable where the
+                    # old one was permanently `insufficient_source`.
+                    source=f"encounter:{encounter_name}",
                     strength="definitive-exclusion",
                 ),
             ),
