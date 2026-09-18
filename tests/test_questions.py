@@ -9,11 +9,12 @@ the next review asked again.
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 from adoc.casefile.questions import (
     ANSWER_NOTE_MAX,
+    MAX_ANSWERED_SHOWN,
     MAX_CHAT_ASKS,
     QUESTIONS_RELPATH,
     OpenQuestion,
@@ -24,6 +25,7 @@ from adoc.casefile.questions import (
     next_question_to_ask,
     question_id,
     record_chat_ask,
+    render_for_context,
     save_questions,
 )
 
@@ -161,7 +163,7 @@ def test_a_missing_file_is_an_empty_store(tmp_path: Path) -> None:
 # --- the loop that was never closed -----------------------------------------
 
 
-def test_context_renders_only_open_questions_with_their_ids() -> None:
+def test_context_offers_open_questions_and_reports_answered_ones() -> None:
     """The reasoning stages read the STORE, not `questions-open.md`.
 
     The markdown was a rendering nothing regenerated, so it could not know
@@ -183,12 +185,24 @@ def test_context_renders_only_open_questions_with_their_ids() -> None:
         note="told us",
     )
 
-    rendered = render_for_context(store)
+    rendered = render_for_context(store, today=date(2026, 9, 2))
 
     assert f"`{mine.id}`" in rendered
     assert f"`{theirs.id}`" in rendered
-    assert done.id not in rendered, "an answered question was offered again"
     assert rendered.index(mine.id) < rendered.index(theirs.id), "hers should come first"
+
+    # The property this pins changed in ADR 0055, and the change is narrow.
+    # It used to assert `done.id not in rendered` — the answered question must
+    # not appear AT ALL. It now appears, in its own block, labelled answered
+    # and carrying what she said.
+    #
+    # What must still hold is the thing that assertion was protecting: an
+    # answered question is never offered as OPEN and never re-asked. The old
+    # assertion enforced that by making the answer invisible, and the cost was
+    # that no review could tell "she said no" from "we stopped asking".
+    open_half = rendered.split("**Recently answered")[0]
+    assert done.id not in open_half, "an answered question was offered as open"
+    assert "told us" in rendered, "her answer is not in the pack"
 
 
 def test_resolve_answered_closes_and_survives_a_bad_id(tmp_path: Path) -> None:
@@ -402,3 +416,75 @@ def test_there_is_one_closer_not_two() -> None:
 
     assert "_resolve_answered_questions" not in source
     assert "resolve_answered(" in source
+
+
+# --- the answered block (ADR 0055) -------------------------------------------
+
+
+def _answered(panel: str, *, on: date, note: str) -> OpenQuestion:
+    q = _question(panel)
+    store, _unknown, _closed = mark_answered(OpenQuestions(questions=[q]), [q.id], on=on, note=note)
+    return store.questions[0]
+
+
+def test_an_answer_inside_the_window_is_shown_with_what_she_said() -> None:
+    """The whole point. Before this the review saw a question disappear and
+    could not tell whether she had said yes, said no, or simply stopped being
+    asked — `answer_note` was written and read nowhere in the codebase."""
+    store = OpenQuestions(
+        questions=[
+            _answered("Your supplements", on=date(2026, 9, 1), note="biotin 10mg, nothing else")
+        ]
+    )
+
+    rendered = render_for_context(store, today=date(2026, 9, 10))
+
+    assert "Recently answered" in rendered
+    assert "biotin 10mg, nothing else" in rendered
+    assert "2026-09-01" in rendered
+
+
+def test_an_old_answer_drops_out() -> None:
+    """A year-old answer about a supplement she has since changed is worse
+    than silence."""
+    store = OpenQuestions(
+        questions=[_answered("Your supplements", on=date(2025, 1, 1), note="biotin")]
+    )
+
+    assert "Recently answered" not in render_for_context(store, today=date(2026, 9, 10))
+
+
+def test_an_answer_with_no_recorded_note_is_omitted() -> None:
+    """The pre-fix backlog, closed when the diagnostic path stored a constant
+    and the intake path's real text was discarded. Rendering `answered: ""`
+    would read as though she had answered emptily."""
+    store = OpenQuestions(questions=[_answered("Your supplements", on=date(2026, 9, 1), note="")])
+
+    assert "Recently answered" not in render_for_context(store, today=date(2026, 9, 10))
+
+
+def test_the_newest_answers_survive_the_cap() -> None:
+    """Newest first, so the cap drops the stalest rather than an arbitrary
+    slice."""
+    questions = [
+        _answered(f"Panel {i}", on=date(2026, 9, 1) + timedelta(days=i), note=f"answer {i}")
+        for i in range(MAX_ANSWERED_SHOWN + 5)
+    ]
+
+    rendered = render_for_context(
+        OpenQuestions(questions=questions), today=date(2026, 10, 1), max_answered=3
+    )
+
+    assert "answer 19" in rendered
+    assert "answer 0" not in rendered
+
+
+def test_the_window_is_measured_from_the_injected_date() -> None:
+    """Read from the clock instead, and the pack's contents depend on when it
+    happened to be built — the bug `regimen_chat` shipped and had to fix."""
+    store = OpenQuestions(
+        questions=[_answered("Your supplements", on=date(2026, 9, 1), note="biotin")]
+    )
+
+    assert "biotin" in render_for_context(store, today=date(2026, 9, 2))
+    assert "biotin" not in render_for_context(store, today=date(2030, 1, 1))

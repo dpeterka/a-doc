@@ -26,7 +26,7 @@ from __future__ import annotations
 import logging
 import re
 from collections.abc import Collection, Sequence
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
@@ -338,7 +338,28 @@ def record_chat_ask(store: OpenQuestions, question_id_: str, *, on: date) -> Ope
     return store
 
 
-def render_for_context(store: OpenQuestions) -> str:
+ANSWERED_WINDOW_DAYS = 90
+"""How long an answer stays in the context pack.
+
+The block exists so a reasoning stage can tell "she said no" from "we stopped
+asking", and so a reworded re-proposal is recognised as something already
+answered. Both of those decay: a year-old answer about a supplement she has
+since changed is worse than silence. 90 days spans roughly thirteen review
+cycles at the 7-day floor."""
+
+MAX_ANSWERED_SHOWN = 15
+"""A cap, because the backlog is not small — 55 questions stood open on the
+live store when `next_question_to_ask` was written. Newest first, so the cap
+drops the stalest."""
+
+
+def render_for_context(
+    store: OpenQuestions,
+    *,
+    today: date | None = None,
+    window_days: int = ANSWERED_WINDOW_DAYS,
+    max_answered: int = MAX_ANSWERED_SHOWN,
+) -> str:
     """The open questions, as the reasoning stages should see them.
 
     Ids are included because a model that must close a question has to name
@@ -367,6 +388,46 @@ def render_for_context(store: OpenQuestions) -> str:
             if question.ask:
                 lines.append(f"  - {question.ask}")
         lines.append("")
+    answered = _recently_answered(store, today=today, window_days=window_days)[:max_answered]
+    if answered:
+        # The third block, and the one the review had no way to see. Until it
+        # existed, `render_for_context` emitted OPEN questions only, so every
+        # stage reading the context pack could tell that a question had gone
+        # away and nothing else — not whether she said yes, said no, or was
+        # never asked again. `answer_note` was written and read nowhere.
+        #
+        # This does not reopen the defect the "only open questions" rule was
+        # written for. That rule stops an ANSWERED question being offered as
+        # open and re-asked; a separately headed block that says outright it
+        # has been answered keeps that property.
+        lines.append("**Recently answered — she has already told us these**")
+        lines.append("")
+        for question in answered:
+            when = question.answered_on.isoformat() if question.answered_on else "an earlier turn"
+            lines.append(f'- `{question.id}` — {question.panel} → {when}: "{question.answer_note}"')
+        lines.append("")
     if not lines:
         return "_No open questions._"
     return "\n".join(lines).rstrip()
+
+
+def _recently_answered(
+    store: OpenQuestions, *, today: date | None, window_days: int
+) -> list[OpenQuestion]:
+    """Answered questions worth showing, newest first.
+
+    An answer with no recorded note is skipped. Those are the pre-fix backlog,
+    closed when the diagnostic path stored a constant and the intake path's
+    real text was discarded — rendering `answered: ""` would say less than
+    saying nothing and would read as though she had answered emptily.
+    """
+    cutoff = (today or date.today()) - timedelta(days=window_days)
+    recent = [
+        q
+        for q in store.questions
+        if q.status == "answered"
+        and q.answer_note.strip()
+        and q.answered_on is not None
+        and q.answered_on >= cutoff
+    ]
+    return sorted(recent, key=lambda q: (q.answered_on or date.min, q.id), reverse=True)
