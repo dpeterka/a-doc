@@ -82,7 +82,21 @@ The caller that has both (`reason.review`) builds it."""
 # a can't-miss lead. `pmid:` is refused because literature knows nothing about
 # this patient, and `engine:` because a phenotype engine that never ranked
 # something has not refuted it (ADR 0036's whole `neutral` argument).
-DEFINITIVE_EXCLUSION_SOURCES = ("labs:", "doc:", "encounter:", "patient-report:")
+#
+# `patient-report:` was on this list and is no longer. It had to come off
+# before a chat answer could become evidence: the citation checker resolves
+# that scheme unconditionally ("the patient's own statement, and
+# grammar-validity is enough") and the entailment verifier returns
+# `insufficient_source`, which is explicitly not a failure — so a model that
+# wrote `strength="definitive-exclusion"` with a `patient-report:` ref had an
+# unchecked one-field route to ending a can't-miss lead.
+#
+# What a person says still ends leads. It goes through an ENCOUNTER instead:
+# `web/routes/ledger.py`'s retire form writes a `patient-report`-typed
+# encounter and cites `encounter:<file>`. That costs nothing and buys a real
+# check — `DefaultSourceTextResolver` resolves `encounter:`, so the words
+# become entailment-checkable rather than permanently unverifiable.
+DEFINITIVE_EXCLUSION_SOURCES = ("labs:", "doc:", "encounter:")
 
 # How long a low-value hypothesis may sit untouched before it is parked. Only
 # applies to `low`/`minimal` probability: a `high` or `moderate` lead that has

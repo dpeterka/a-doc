@@ -26,12 +26,15 @@ from __future__ import annotations
 import logging
 import re
 from collections.abc import Collection, Sequence
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, Field
 from ruamel.yaml import YAML
+
+if TYPE_CHECKING:  # pragma: no cover - import cycle: repo does not import questions
+    from adoc.casefile.repo import DataRepo
 
 logger = logging.getLogger(__name__)
 
@@ -161,23 +164,41 @@ def merge_proposed(
     return OpenQuestions(questions=sorted(merged.values(), key=lambda q: q.id))
 
 
+ANSWER_NOTE_MAX = 280
+"""How much of her answer is stored on the question.
+
+Enforced HERE rather than at each call site. It used to be sliced by the two
+callers independently, and two copies of the same rule is precisely how the
+diagnostic path came to store a constant while the intake path stored her
+words. One closer, one cap.
+
+280 is what the intake path chose: long enough for a real answer, short enough
+that a whole conversation does not land in a committed medical record."""
+
+
 def mark_answered(
     questions: OpenQuestions,
     ids: list[str],
     *,
     on: date,
     note: str = "",
-) -> tuple[OpenQuestions, list[str]]:
-    """Close the named questions. Returns the updated store and the ids that
-    matched nothing.
+) -> tuple[OpenQuestions, list[str], list[str]]:
+    """Close the named questions. Returns `(store, unknown, newly_closed)`.
 
     Unknown ids are REPORTED, not raised: ADR 0028's rule that one bad
     identifier costs its own claim and never the rest of the payload. A model
     that invents an id must not be able to discard the four real answers
     alongside it.
+
+    `newly_closed` excludes ids that were already `answered`, and that
+    distinction is load-bearing rather than cosmetic: it is the idempotence
+    key for turning an answer into evidence. A re-review re-proposing the same
+    panel leaves it answered, so it reports as not-newly-closed and mints
+    nothing a second time.
     """
     updated = questions.model_copy(deep=True)
     unknown: list[str] = []
+    newly_closed: list[str] = []
     for question_id in ids:
         question = updated.by_id(question_id)
         if question is None:
@@ -187,12 +208,17 @@ def mark_answered(
             continue
         question.status = "answered"
         question.answered_on = on
-        question.answer_note = note.strip()
-    return updated, unknown
+        question.answer_note = note.strip()[:ANSWER_NOTE_MAX]
+        newly_closed.append(question_id)
+    return updated, unknown, newly_closed
 
 
-def resolve_answered(root: Path, ids: Sequence[str], *, on: date, note: str) -> int:
-    """Close the questions `ids` names. Returns how many actually closed.
+def resolve_answered(root: Path, ids: Sequence[str], *, on: date, note: str) -> list[str]:
+    """Close the questions `ids` names. Returns the ids that NEWLY closed.
+
+    The ids rather than a count, because a caller that wants to act on an
+    answer — attach it to the lead it was about — needs to know *which* ones
+    it may act on, and must not act twice on the same one.
 
     Never raises into the caller: a chat turn must not fail because a
     question could not be closed, and the answer itself is already recorded
@@ -204,10 +230,10 @@ def resolve_answered(root: Path, ids: Sequence[str], *, on: date, note: str) -> 
     production and not one had ever been answered.
     """
     if not ids:
-        return 0
+        return []
     try:
         path = root / QUESTIONS_RELPATH
-        updated, unknown = mark_answered(load_questions(path), list(ids), on=on, note=note)
+        updated, unknown, closed = mark_answered(load_questions(path), list(ids), on=on, note=note)
         save_questions(path, updated)
         if unknown:
             logger.warning(
@@ -215,10 +241,32 @@ def resolve_answered(root: Path, ids: Sequence[str], *, on: date, note: str) -> 
                 len(unknown),
                 ", ".join(sorted(unknown)),
             )
-        return len(ids) - len(unknown)
+        return closed
     except Exception as exc:  # noqa: BLE001 - never fail a turn over this
         logger.warning("questions: could not resolve answered questions: %s", exc)
-        return 0
+        return []
+
+
+def commit_questions(repo: DataRepo, message: str) -> None:
+    """Commit `case/questions-open.yaml`, if git has anything to commit.
+
+    The store is written by three separate places on one diagnostic turn
+    (`resolve_answered` in the maintainer, `gap_scan` and `record_chat_ask` in
+    the composer) and by the intake capture pass, and **none of them committed
+    it**. It rode the weekly review's `paths=["case"]` sweep, so up to a week
+    of answered-question state sat uncommitted — and therefore unbacked-up,
+    because `backup.py` bundles committed refs only.
+
+    Called once per turn rather than once per write: EFS git commits are not
+    free and three per turn would triple what a chat already pays.
+
+    Never raises. A turn that produced a real reply must not fail because a
+    commit did not land; the next one will pick the file up.
+    """
+    try:
+        repo.commit(message, paths=[QUESTIONS_RELPATH])
+    except Exception as exc:  # noqa: BLE001 - never fail a turn over this
+        logger.warning("questions: could not commit %s: %s", QUESTIONS_RELPATH, exc)
 
 
 MAX_CHAT_ASKS = 2
@@ -290,7 +338,28 @@ def record_chat_ask(store: OpenQuestions, question_id_: str, *, on: date) -> Ope
     return store
 
 
-def render_for_context(store: OpenQuestions) -> str:
+ANSWERED_WINDOW_DAYS = 90
+"""How long an answer stays in the context pack.
+
+The block exists so a reasoning stage can tell "she said no" from "we stopped
+asking", and so a reworded re-proposal is recognised as something already
+answered. Both of those decay: a year-old answer about a supplement she has
+since changed is worse than silence. 90 days spans roughly thirteen review
+cycles at the 7-day floor."""
+
+MAX_ANSWERED_SHOWN = 15
+"""A cap, because the backlog is not small — 55 questions stood open on the
+live store when `next_question_to_ask` was written. Newest first, so the cap
+drops the stalest."""
+
+
+def render_for_context(
+    store: OpenQuestions,
+    *,
+    today: date | None = None,
+    window_days: int = ANSWERED_WINDOW_DAYS,
+    max_answered: int = MAX_ANSWERED_SHOWN,
+) -> str:
     """The open questions, as the reasoning stages should see them.
 
     Ids are included because a model that must close a question has to name
@@ -319,6 +388,46 @@ def render_for_context(store: OpenQuestions) -> str:
             if question.ask:
                 lines.append(f"  - {question.ask}")
         lines.append("")
+    answered = _recently_answered(store, today=today, window_days=window_days)[:max_answered]
+    if answered:
+        # The third block, and the one the review had no way to see. Until it
+        # existed, `render_for_context` emitted OPEN questions only, so every
+        # stage reading the context pack could tell that a question had gone
+        # away and nothing else — not whether she said yes, said no, or was
+        # never asked again. `answer_note` was written and read nowhere.
+        #
+        # This does not reopen the defect the "only open questions" rule was
+        # written for. That rule stops an ANSWERED question being offered as
+        # open and re-asked; a separately headed block that says outright it
+        # has been answered keeps that property.
+        lines.append("**Recently answered — she has already told us these**")
+        lines.append("")
+        for question in answered:
+            when = question.answered_on.isoformat() if question.answered_on else "an earlier turn"
+            lines.append(f'- `{question.id}` — {question.panel} → {when}: "{question.answer_note}"')
+        lines.append("")
     if not lines:
         return "_No open questions._"
     return "\n".join(lines).rstrip()
+
+
+def _recently_answered(
+    store: OpenQuestions, *, today: date | None, window_days: int
+) -> list[OpenQuestion]:
+    """Answered questions worth showing, newest first.
+
+    An answer with no recorded note is skipped. Those are the pre-fix backlog,
+    closed when the diagnostic path stored a constant and the intake path's
+    real text was discarded — rendering `answered: ""` would say less than
+    saying nothing and would read as though she had answered emptily.
+    """
+    cutoff = (today or date.today()) - timedelta(days=window_days)
+    recent = [
+        q
+        for q in store.questions
+        if q.status == "answered"
+        and q.answer_note.strip()
+        and q.answered_on is not None
+        and q.answered_on >= cutoff
+    ]
+    return sorted(recent, key=lambda q: (q.answered_on or date.min, q.id), reverse=True)
