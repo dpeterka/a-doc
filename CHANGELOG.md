@@ -5,6 +5,73 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.37.0] — 2026-09-21
+
+*What she answers reaches the review (ADR 0055).*
+
+Shipped ahead of the next conversation, because on 0.36.1 the chat would ask
+her a question and then discard her answer.
+
+### Measured first
+
+```
+total questions:  97      answered ever:  0
+hers to answer:   45      ever asked in chat:  0
+```
+
+**The chat has never asked her anything.** `chat_asks` is 0 on all 45.
+ADR 0048 §1 first shipped in **v0.32.0**; the last chat turn was
+**2026-09-02**, when v0.30.0 was live. The mechanism has never had a turn to
+run in — the same shape as the review that sat on `app_version 0.31.1` for
+five days. Every earlier statement about her "stopping answering" was wrong:
+she was never asked.
+
+### Added
+
+- **The review can see what she answered.** `render_for_context` filtered to
+  open questions only, so all five context-consuming review nodes could tell
+  that a question had gone away and nothing else — not whether she said yes,
+  said no, or was never asked again. `answer_note` was written and read
+  **nowhere** in the codebase. New third block: 90 days, capped at 15, newest
+  first, empty notes skipped, `today` injected rather than read from the clock.
+
+### Fixed
+
+- **Her words were never stored on a diagnostic turn.**
+  `ledger_maintainer_stage` passed the constant `"Answered in conversation."`
+  while the intake capture pass passed her real text — and because `chat.py`
+  runs the diagnostic turn *first* and `mark_answered` skips an
+  already-`answered` question, the constant landed and the real text was
+  silently discarded. One closer now, with the 280-character cap inside it:
+  the cap was applied at two call sites, which is how the two paths diverged.
+
+- **A model could end a lead by attributing a statement to her.**
+  `patient-report:` was in `DEFINITIVE_EXCLUSION_SOURCES`, the citation checker
+  resolves that scheme unconditionally, and the entailment verifier returns
+  `insufficient_source` — explicitly not a failure. One field, checked by
+  nothing, ending a can't-miss lead. A person's statement still ends leads,
+  now through a `patient-report` encounter cited as `encounter:<file>`, which
+  `DefaultSourceTextResolver` can read and therefore check.
+
+- **`case/questions-open.yaml` is committed once per turn.** Three places
+  wrote it on a single diagnostic turn and none committed it; it rode the
+  weekly review's sweep, so up to a week of answered-question state was
+  uncommitted and therefore un-backed-up.
+
+### Pinned property changed
+
+`test_context_renders_only_open_questions_with_their_ids` asserted an answered
+question must not appear at all. It now appears, in its own block, labelled
+answered. What that assertion protected — **never offered as open, never
+re-asked** — is pinned explicitly and unchanged. ADR 0055 records the change.
+
+### Not yet
+
+An answer is recorded and read but still **cannot move a lead**. That is the
+next step, and it was deliberately held back: it needs a prompt bump and the
+safety suite, and shipping it before `patient-report:` came off the exclusion
+list would have handed the model the very route this release closes.
+
 ## [0.36.1] — 2026-09-15
 
 ### Fixed
