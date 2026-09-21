@@ -239,7 +239,16 @@ def test_the_waiting_indicator_keeps_its_honest_wording(tmp_path: Path) -> None:
 
     assert "can take a few minutes" in body
     assert "you can leave this page open" in body
-    assert 'hx-get="/chat/progress"' in body
+    # The BEHAVIOUR, not the mechanism. This asserted
+    # `hx-get="/chat/progress"` — an htmx polling attribute that also carried
+    # `hx-trigger="load, every 2s"` and so polled from page load forever,
+    # whether or not a turn was running, and swapped into the very node that
+    # owned its timer. The page still fetches `/chat/progress` while a turn
+    # runs; it is now driven by the script that knows when a turn starts and
+    # stops. Not a safety-pinned property (CLAUDE.md rule 2 covers the
+    # red-team transcript, ledger invariants and DAG contracts), so no ADR.
+    assert "/chat/progress" in body
+    assert 'id="chat-stage"' in body
 
 
 def test_every_node_of_the_real_diagnostic_dag_has_a_label(tmp_path: Path) -> None:
