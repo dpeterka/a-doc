@@ -1124,3 +1124,64 @@ def test_the_transcript_endpoint_needs_a_login(tmp_path: Path) -> None:
     response = TestClient(app).get("/chat/transcript", follow_redirects=False)
 
     assert response.status_code in (302, 303, 401, 403)
+
+
+# --- the progress poll (ADR 0046, fixed) -------------------------------------
+
+
+def _chat_template() -> str:
+    from pathlib import Path
+
+    return (
+        Path(__file__).parent.parent / "src" / "adoc" / "web" / "templates" / "chat.html"
+    ).read_text(encoding="utf-8")
+
+
+def test_an_idle_chat_page_polls_nothing() -> None:
+    """`#chat-stage` carried `hx-trigger="load, every 2s"` and a comment
+    saying it polled "only while this indicator is showing".
+
+    `display: none` on the parent does NOT stop an htmx timer, so the page hit
+    `/chat/progress` every two seconds from load, forever, whether or not a
+    turn was running. The comment and the markup disagreed and the markup won.
+    """
+    markup = _chat_template()
+
+    assert "every 2s" not in markup.split("{#")[0] or "hx-trigger" not in markup
+    for line in markup.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("{#") or stripped.startswith("`") or "was" in stripped:
+            continue
+        assert "hx-trigger=" not in stripped, f"an htmx timer is back: {stripped}"
+
+
+def test_the_polling_element_is_not_its_own_swap_target() -> None:
+    """It was `hx-swap="innerHTML"` with no `hx-target`, so every tick replaced
+    the innards of the node that owned the timer. Production threw
+    `TypeError: can't access property "htmx-internal-data", e is null` from
+    inside htmx, and an uncaught error in htmx's own loop can leave the rest of
+    the page unbound — which is what a Send button that does nothing looks
+    like.
+    """
+    markup = _chat_template()
+
+    stage = next(line for line in markup.splitlines() if 'id="chat-stage"' in line)
+
+    assert "hx-" not in stage, f"chat-stage carries htmx attributes again: {stage.strip()}"
+
+
+def test_the_stage_poll_is_tied_to_the_turn() -> None:
+    """Started when a turn starts, cleared when it ends. That is what makes
+    "an idle page polls nothing" true rather than aspirational."""
+    markup = _chat_template()
+
+    # Called from the handler, not merely defined. Source order says nothing
+    # about runtime order, which is what the first version of this assertion
+    # got wrong.
+    begin = markup.index("htmx:beforeRequest")
+    handler = markup[begin : markup.index("});", begin)]
+    assert "startStagePolling()" in handler, "a turn starting does not start the stage poll"
+
+    stop = markup.index("function stopPolling")
+    body = markup[stop : markup.index("function startStagePolling")]
+    assert "clearInterval(stagePoller)" in body, "the stage poll is never stopped"

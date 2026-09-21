@@ -5,6 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.37.1] — 2026-09-21
+
+### Fixed
+
+- **The chat page polled `/chat/progress` every two seconds, forever.**
+  `#chat-stage` carried `hx-trigger="load, every 2s"` beside a comment saying
+  it polled *"only while this indicator is showing"*. `display: none` on the
+  parent does not stop an htmx timer, so the poll ran from page load whether
+  or not a turn was running. The comment and the markup disagreed and the
+  markup won.
+
+  It also had `hx-swap="innerHTML"` with no `hx-target`, so it swapped into
+  **itself** — every tick replacing the innards of the node that owned the
+  timer. Reported from the live site:
+
+      Uncaught TypeError: can't access property "htmx-internal-data", e is null
+          ae https://adoc.petabloc.io/static/vendor/htmx.min.js:1
+
+  An uncaught error inside htmx's own loop can leave the rest of the page
+  unbound, which is what a Send button that does nothing looks like.
+
+  The progress fetch is now driven by the JS poller that already tracks the
+  real request lifecycle — it starts on `htmx:beforeRequest` and stops on
+  delivery. An idle page polls nothing, which is what the markup always
+  claimed.
+
+  **The crash was not reproduced.** `/chat/progress` logged 0 requests in the
+  preceding two hours because nobody had the page open, so the runaway poll is
+  read from the code rather than measured. What is certain is that the trigger
+  was unconditional and the element swapped into itself.
+
 ## [0.37.0] — 2026-09-21
 
 *What she answers reaches the review (ADR 0055).*

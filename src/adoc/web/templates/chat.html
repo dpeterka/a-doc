@@ -65,13 +65,22 @@
         <span class="chat-pending-dot" aria-hidden="true"></span>
         Thinking. A question about your differential works through your whole case
         file and can take a few minutes — you can leave this page open.
-        {# ADR 0046: which minute. Polls only while this indicator is
-           showing, and renders nothing at all when no turn is running, so a
-           quiet page makes no requests it can see the results of. #}
-        <span id="chat-stage"
-              hx-get="/chat/progress"
-              hx-trigger="load, every 2s"
-              hx-swap="innerHTML"></span>
+        {# ADR 0046: which minute.
+           Filled by the script below, NOT by an htmx polling trigger. It was
+           `hx-trigger="load, every 2s"`, with a comment claiming it polled
+           "only while this indicator is showing" — but `display: none` on the
+           parent does not stop an htmx timer, so the page hit /chat/progress
+           every two seconds from load, forever, whether or not a turn was
+           running.
+           It also swapped into itself (`hx-swap="innerHTML"`, no target), so
+           every tick replaced the innards of the node that owned the timer.
+           Production threw `TypeError: can't access property
+           "htmx-internal-data", e is null` from inside htmx, and an uncaught
+           error in htmx's own loop can leave the rest of the page unbound —
+           which is what a Send button that does nothing looks like.
+           The script drives this off the real request lifecycle instead: it
+           already knows when a turn starts and ends. #}
+        <span id="chat-stage"></span>
       </span>
     </div>
   </form>
@@ -133,6 +142,7 @@
       // into a short delay instead of a lost answer, and covers a phone
       // changing networks just as well as it covers the load balancer.
       var poller = null;
+      var stagePoller = null;
       var pendingSince = 0;
 
       function bubbleCount() {
@@ -145,8 +155,33 @@
           clearInterval(poller);
           poller = null;
         }
+        if (stagePoller) {
+          clearInterval(stagePoller);
+          stagePoller = null;
+        }
+        var stage = document.getElementById("chat-stage");
+        if (stage) stage.innerHTML = "";
         var lost = document.getElementById("chat-lost");
         if (lost) lost.hidden = true;
+      }
+
+      // ADR 0046's "which minute", on the turn's clock rather than the page's.
+      // Started when a turn starts and cleared when it ends, so an idle page
+      // makes no requests at all — which is what the markup used to claim and
+      // an unconditional `every 2s` htmx trigger could never deliver.
+      function startStagePolling() {
+        if (stagePoller) return;
+        var tick = function () {
+          fetch("/chat/progress", { headers: { "X-Requested-With": "poll" } })
+            .then(function (r) { return r.ok ? r.text() : null; })
+            .then(function (html) {
+              var stage = document.getElementById("chat-stage");
+              if (stage && html !== null) stage.innerHTML = html;
+            })
+            .catch(function () { /* a failed poll is not fatal */ });
+        };
+        tick();
+        stagePoller = setInterval(tick, 2000);
       }
 
       function startPolling() {
@@ -179,7 +214,10 @@
 
       var form = document.querySelector('form[hx-post="/chat/send"]');
       if (form) {
-        form.addEventListener("htmx:beforeRequest", startPolling);
+        form.addEventListener("htmx:beforeRequest", function () {
+          startPolling();
+          startStagePolling();
+        });
         // htmx swapped the reply in itself -- nothing left to wait for.
         form.addEventListener("htmx:afterSwap", stopPolling);
         // The request died. Say so, and keep polling: the answer is still coming.
